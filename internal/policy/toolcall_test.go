@@ -49,3 +49,29 @@ func TestCommandPolicyReasonNoSecret(t *testing.T) {
 		t.Errorf("reason should name the pattern: %q", reason)
 	}
 }
+
+// TestCommandPolicyWhitespaceEvasion proves padding (extra spaces, tabs,
+// newlines) cannot slip a destructive command past the denylist (audit L4).
+func TestCommandPolicyWhitespaceEvasion(t *testing.T) {
+	p := DefaultCommandPolicy()
+	evasions := []string{
+		"rm  -rf  /",        // doubled spaces
+		"rm\t-rf /",         // tab
+		"rm -rf\t/",         // tab before root
+		"echo hi\nrm -rf /", // newline-spliced
+		"git   push origin", // padded git push
+		"git\tpush",         // tab git push
+		"sudo\t apt-get install x",
+	}
+	for _, c := range evasions {
+		if ok, _ := p.Check(c); ok {
+			t.Errorf("Check(%q) allowed, want denied (whitespace evasion)", c)
+		}
+	}
+	// Benign commands with ordinary spacing remain allowed.
+	for _, c := range []string{"go test ./...", "git status", "rm -rf ./build/tmp"} {
+		if ok, reason := p.Check(c); !ok {
+			t.Errorf("Check(%q) denied (%s), want allowed", c, reason)
+		}
+	}
+}

@@ -34,14 +34,19 @@ var irreversibleSignals = []string{
 
 // Classify labels an action by reversibility + blast radius.
 func Classify(action string) Class {
-	a := strings.ToLower(action)
+	a := collapseWS(strings.ToLower(action))
 	for _, sig := range irreversibleSignals {
-		if strings.Contains(a, sig) {
+		if strings.Contains(a, collapseWS(sig)) {
 			return Irreversible
 		}
 	}
 	return Reversible
 }
+
+// collapseWS collapses every run of whitespace (spaces, tabs, newlines) to a
+// single space and trims, so a denied or irreversible pattern cannot be slipped
+// past a substring check with padding like "rm  -rf" or "git\tpush" (audit L4).
+func collapseWS(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // Approver asks a human to approve an irreversible action. Phase 0 can use a
 // console approver; the Telegram channel supplies an interactive one in Phase 1,

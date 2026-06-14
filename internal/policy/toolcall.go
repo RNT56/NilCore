@@ -11,11 +11,13 @@ type CommandPolicy struct {
 	Denied []string // case-insensitive substrings that deny a command
 }
 
-// Check reports whether cmd may run, and if not, why.
+// Check reports whether cmd may run, and if not, why. The command and each
+// pattern are whitespace-normalized first (see collapseWS), so padding like
+// "rm  -rf  /" or "git\tpush" cannot evade the denylist (audit L4).
 func (p CommandPolicy) Check(cmd string) (allowed bool, reason string) {
-	lc := strings.ToLower(cmd)
+	lc := collapseWS(strings.ToLower(cmd))
 	for _, d := range p.Denied {
-		if strings.Contains(lc, strings.ToLower(d)) {
+		if strings.Contains(lc, collapseWS(strings.ToLower(d))) {
 			return false, "blocked by tool-call policy: matches denied pattern " + strconvQuote(d)
 		}
 	}

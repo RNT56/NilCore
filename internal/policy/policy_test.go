@@ -17,3 +17,18 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyWhitespaceEvasion proves padded irreversible signals are still
+// caught (audit L4).
+func TestClassifyWhitespaceEvasion(t *testing.T) {
+	for _, action := range []string{
+		"git  push origin main",
+		"git\tpush --force",
+		"please  deploy   to prod",
+		"kubectl   apply -f x.yaml",
+	} {
+		if got := Classify(action); got != Irreversible {
+			t.Errorf("Classify(%q) = %v, want irreversible", action, got)
+		}
+	}
+}
