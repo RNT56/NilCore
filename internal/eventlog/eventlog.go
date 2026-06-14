@@ -1,13 +1,17 @@
 // Package eventlog is an append-only audit trail (invariant I5). It writes JSON
 // Lines to a file (zero dependencies); every model call, tool execution, verify,
-// and gate decision is recorded and replayable. Each event is hash-chained to the
-// previous one so tampering or reordering is detectable (P2-T06), and secret-
-// looking values are redacted before write so the log never holds a credential.
-// The cross-project store (SQLite) graduates this log in Phase 4.
+// and gate decision is recorded and replayable. Each event carries a monotonic
+// sequence number and is hash-chained to the previous one, so tampering,
+// reordering, or a dropped event is detectable (P2-T06). When NILCORE_LOG_HMAC_KEY
+// is set the chain is keyed (HMAC-SHA256), so an attacker who cannot read the key
+// cannot forge a chain that verifies (audit L6). Secret-looking values are
+// redacted before write so the log never holds a credential. The cross-project
+// store (SQLite) graduates this log in Phase 4.
 package eventlog
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +27,7 @@ import (
 // Event is one recorded step. Keep it flat and greppable.
 type Event struct {
 	Time    time.Time      `json:"time"`
+	Seq     uint64         `json:"seq"` // monotonic position; anchors against reordering/gaps
 	Task    string         `json:"task"`
 	Kind    string         `json:"kind"` // task_start | model_call | tool_exec | verify | gate | ...
 	Backend string         `json:"backend,omitempty"`
@@ -36,8 +41,19 @@ type Log struct {
 	mu    sync.Mutex
 	f     *os.File
 	prev  string       // hash of the last *durably written* event
+	seq   uint64       // sequence number for the next event
+	key   []byte       // optional HMAC key (NILCORE_LOG_HMAC_KEY); nil = plain SHA-256
 	store *store.Store // optional second backing (P4-T02); JSONL stays the export
 	err   error        // first write failure, if any (a broken audit trail is loud)
+}
+
+// logKey reads the optional chain HMAC key from the environment (invariant I3:
+// secrets from the environment only). An empty value leaves the chain unkeyed.
+func logKey() []byte {
+	if k := os.Getenv("NILCORE_LOG_HMAC_KEY"); k != "" {
+		return []byte(k)
+	}
+	return nil
 }
 
 // UseStore wires a SQLite store as a second backing: each appended event (with
@@ -49,15 +65,18 @@ func (l *Log) UseStore(s *store.Store) {
 	}
 }
 
-// Open opens (creating if needed) the log at path, continuing the hash chain from
-// any existing content.
+// Open opens (creating if needed) the log at path, continuing the hash chain and
+// the sequence counter from any existing content.
 func Open(path string) (*Log, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{f: f}
-	l.prev = lastHash(path)
+	l := &Log{f: f, key: logKey()}
+	if last, ok := lastEvent(path); ok {
+		l.prev = last.Hash
+		l.seq = last.Seq + 1
+	}
 	return l, nil
 }
 
@@ -74,7 +93,8 @@ func (l *Log) Append(e Event) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	e.Prev = l.prev
-	e.Hash = hashEvent(e)
+	e.Seq = l.seq
+	e.Hash = chainHash(e, l.key)
 	b, err := json.Marshal(e)
 	if err != nil {
 		l.fail(fmt.Errorf("marshal event: %w", err))
@@ -87,13 +107,14 @@ func (l *Log) Append(e Event) {
 			err = fmt.Errorf("short write: %d of %d bytes", n, len(line))
 		}
 		l.fail(fmt.Errorf("append event: %w", err))
-		// The anchor was not (fully) persisted: keep prev pointing at the last
-		// event that actually reached disk, so the chain stays consistent with
+		// The anchor was not (fully) persisted: keep prev and seq pointing at the
+		// last event that actually reached disk, so the chain stays consistent with
 		// the file. A partial line, if any, surfaces as corruption under Verify —
 		// the honest signal, never a silent gap.
 		return
 	}
 	l.prev = e.Hash
+	l.seq++
 
 	// Second backing: mirror the (already hash-chained, now-durable) event into
 	// the store. Only after the file write landed, so the two backings agree.
@@ -136,31 +157,39 @@ func (l *Log) Close() error {
 	return l.f.Close()
 }
 
-// hashEvent computes the chain hash over the event (with Hash cleared), so it
-// covers Prev and is reproducible by Verify.
-func hashEvent(e Event) string {
+// chainHash computes the chain hash over the event (with Hash cleared), so it
+// covers Prev and Seq and is reproducible by Verify. With a non-empty key it is
+// HMAC-SHA256 (unforgeable without the key); otherwise plain SHA-256.
+func chainHash(e Event, key []byte) string {
 	e.Hash = ""
 	b, _ := json.Marshal(e)
+	if len(key) > 0 {
+		m := hmac.New(sha256.New, key)
+		m.Write(b)
+		return hex.EncodeToString(m.Sum(nil))
+	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
 
-// lastHash returns the Hash of the last event in the file (empty if none).
-func lastHash(path string) string {
+// lastEvent returns the last event in the file (ok=false if none/corrupt).
+func lastEvent(path string) (Event, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
-		return ""
+		return Event{}, false
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	var e Event
 	if json.Unmarshal([]byte(lines[len(lines)-1]), &e) != nil {
-		return ""
+		return Event{}, false
 	}
-	return e.Hash
+	return e, true
 }
 
-// Verify re-reads the log at path and checks the hash chain end to end, returning
-// an error at the first tampered, reordered, or corrupt event.
+// Verify re-reads the log at path and checks the chain end to end — sequence
+// anchor, prev links, and (keyed) hashes — returning an error at the first
+// tampered, reordered, dropped, or corrupt event. It reads NILCORE_LOG_HMAC_KEY
+// the same way Open does, so a keyed log is verified under its key.
 func Verify(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -169,17 +198,21 @@ func Verify(path string) error {
 	if len(data) == 0 {
 		return nil
 	}
+	key := logKey()
 	prev := ""
 	for i, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		var e Event
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			return fmt.Errorf("event %d: %w", i+1, err)
 		}
+		if e.Seq != uint64(i) {
+			return fmt.Errorf("event %d: sequence anchor mismatch (got %d, want %d)", i+1, e.Seq, i)
+		}
 		if e.Prev != prev {
 			return fmt.Errorf("event %d: chain break (prev does not link)", i+1)
 		}
-		if hashEvent(e) != e.Hash {
-			return fmt.Errorf("event %d: hash mismatch (tampered)", i+1)
+		if want := chainHash(e, key); !hmac.Equal([]byte(want), []byte(e.Hash)) {
+			return fmt.Errorf("event %d: hash mismatch (tampered or wrong key)", i+1)
 		}
 		prev = e.Hash
 	}

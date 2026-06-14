@@ -197,3 +197,52 @@ func TestRedactionShapesAndNesting(t *testing.T) {
 		t.Error("non-secret content should be preserved")
 	}
 }
+
+// TestHMACKeyedChain proves a keyed chain verifies under its key but not without
+// it or under a different key — so an attacker who cannot read NILCORE_LOG_HMAC_KEY
+// cannot forge a chain that passes Verify (audit L6).
+func TestHMACKeyedChain(t *testing.T) {
+	t.Setenv("NILCORE_LOG_HMAC_KEY", "k-super-secret")
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		log.Append(Event{Task: "t", Kind: "step", Detail: map[string]any{"i": i}})
+	}
+	log.Close()
+
+	if err := Verify(path); err != nil {
+		t.Fatalf("keyed chain should verify with its key: %v", err)
+	}
+	t.Setenv("NILCORE_LOG_HMAC_KEY", "")
+	if err := Verify(path); err == nil {
+		t.Fatal("keyed chain verified with no key — HMAC not enforced")
+	}
+	t.Setenv("NILCORE_LOG_HMAC_KEY", "wrong-key")
+	if err := Verify(path); err == nil {
+		t.Fatal("keyed chain verified under the wrong key")
+	}
+}
+
+// TestSequenceAnchorDetectsReorder proves the per-event sequence number catches a
+// reordering of otherwise-valid lines (audit L6).
+func TestSequenceAnchorDetectsReorder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, _ := Open(path)
+	log.Append(Event{Kind: "a"})
+	log.Append(Event{Kind: "b"})
+	log.Append(Event{Kind: "c"})
+	log.Close()
+
+	data, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	lines[1], lines[2] = lines[2], lines[1] // swap two events
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(path); err == nil {
+		t.Fatal("reordered events were not detected")
+	}
+}
