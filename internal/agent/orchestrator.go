@@ -11,6 +11,7 @@ import (
 
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/policy"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -56,8 +57,23 @@ type Orchestrator struct {
 	BaseRepo string               // git repo that worktrees are created from
 	NewEnv   func(dir string) Env // builds backend + verifier for a worktree dir
 	Log      *eventlog.Log
-	Router   Router  // defaults to SingleRouter
-	Spawner  Spawner // defaults to NoSpawner
+	Router   Router          // defaults to SingleRouter
+	Spawner  Spawner         // defaults to NoSpawner
+	Approver policy.Approver // consulted for irreversible actions; nil denies them
+}
+
+// Gate decides whether an action may proceed right now and records the decision.
+// Reversible actions auto-proceed unattended; irreversible ones (merge, push,
+// deploy, payments) require the human Approver — denied by default when none is
+// wired. This is the integration-boundary seam that later phases call before any
+// irreversible step (P3 routing/proactivity, P5 self-edit, serve-mode channels).
+func (o *Orchestrator) Gate(action string) bool {
+	class := policy.Classify(action)
+	allowed := policy.Gate(action, o.Approver)
+	o.Log.Append(eventlog.Event{Kind: "gate", Detail: map[string]any{
+		"action": action, "class": class.String(), "allowed": allowed,
+	}})
+	return allowed
 }
 
 // Outcome is the final, verifier-confirmed result of a task.

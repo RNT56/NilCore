@@ -24,6 +24,7 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/verify"
 )
@@ -81,6 +82,7 @@ func main() {
 		Log:      log,
 		Router:   agent.SingleRouter{},
 		Spawner:  agent.NoSpawner{},
+		Approver: policy.NewConsoleApprover(os.Stdin, os.Stdout),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
