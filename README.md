@@ -234,12 +234,6 @@ eval/                  measure-first eval harness
 
 ---
 
-## Status
-
-**Shipped — `v0.1.0`.** All 56 tasks of the build plan ([`docs/TASKS.md`](docs/TASKS.md)) are complete across Phases 0–6: the verifying, sandboxed, bounded core that plans, parallelizes across three backends, understands code structurally, remembers across projects, and improves itself under a human gate — running unattended with authorized control, metered budgets, durable resumption, and bounded resources.
-
----
-
 <div align="center">
 
 **No ambient authority. One loop, fully observable. You can always read the trace and pull the plug.**
