@@ -2,6 +2,7 @@ package eventlog
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,5 +159,41 @@ func TestAppendKeepsChainConsistentOnWriteFailure(t *testing.T) {
 	// The file holds exactly the one good event and still verifies end to end.
 	if err := Verify(path); err != nil {
 		t.Fatalf("failed append corrupted the log: %v", err)
+	}
+}
+
+// TestRedactionShapesAndNesting covers the broadened secret shapes (bare AWS key
+// ids, GitHub fine-grained PATs, Google API keys, PEM headers — audit L2/L3) and
+// recursion into nested maps and slices (audit L5).
+func TestRedactionShapesAndNesting(t *testing.T) {
+	akia := "AKIAIOSFODNN7EXAMPLE" // bare, no separator (old regex missed it)
+	gpat := "github_pat_" + strings.Repeat("A", 24)
+	gkey := "AIza" + strings.Repeat("b", 35)
+	pem := "-----BEGIN RSA PRIVATE KEY-----"
+	sk := "sk-abc123def456ghi789jkl"
+
+	d := map[string]any{
+		"aws":    "id=" + akia,
+		"gh":     gpat,
+		"google": gkey,
+		"pem":    pem,
+		"nested": map[string]any{
+			"cmd":     "run --token " + sk,
+			"api_key": "sk-shouldvanish",
+		},
+		"args": []any{"--secret", sk, "ok"},
+		"keep": "harmless",
+	}
+	redact(d)
+
+	blob, _ := json.Marshal(d)
+	s := string(blob)
+	for _, leak := range []string{akia, gpat, gkey, pem, sk, "sk-shouldvanish"} {
+		if strings.Contains(s, leak) {
+			t.Errorf("secret leaked through redaction: %q present in %s", leak, s)
+		}
+	}
+	if !strings.Contains(s, "harmless") {
+		t.Error("non-secret content should be preserved")
 	}
 }
