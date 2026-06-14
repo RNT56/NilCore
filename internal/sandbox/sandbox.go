@@ -61,6 +61,20 @@ func NewContainer(runtime, image, hostDir string) *Container {
 
 func (c *Container) Workdir() string { return c.HostDir }
 
+// AllowEgressVia routes the container's network through an allowlist proxy
+// (proxyURL, e.g. policy.ProxyURL(addr)). Without this, egress is denied entirely
+// (--network none). The proxy enforces the policy.Egress allowlist, so only
+// approved hosts are reachable even though the container now has a network.
+func (c *Container) AllowEgressVia(proxyURL string) {
+	c.Network = "bridge"
+	if c.Env == nil {
+		c.Env = map[string]string{}
+	}
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		c.Env[k] = proxyURL
+	}
+}
+
 // runArgs builds the container runtime argument list (extracted so the hardening
 // flags are unit-testable without launching a container).
 func (c *Container) runArgs(cmd string) []string {

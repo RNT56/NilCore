@@ -64,3 +64,26 @@ func TestEnvInjection(t *testing.T) {
 		t.Errorf("env not injected: %s", got)
 	}
 }
+
+func TestEgressDefaultDeny(t *testing.T) {
+	c := NewContainer("docker", "img", "/work")
+	got := argsString(c, "x")
+	if !strings.Contains(got, "--network none") {
+		t.Errorf("default should deny egress (--network none): %s", got)
+	}
+	if strings.Contains(got, "HTTP_PROXY") {
+		t.Errorf("default should not set a proxy: %s", got)
+	}
+}
+
+func TestAllowEgressVia(t *testing.T) {
+	c := NewContainer("docker", "img", "/work")
+	c.AllowEgressVia("http://127.0.0.1:8888")
+	got := argsString(c, "x")
+	if !strings.Contains(got, "--network bridge") {
+		t.Errorf("proxied egress should use a bridge network: %s", got)
+	}
+	if !strings.Contains(got, "HTTP_PROXY=http://127.0.0.1:8888") {
+		t.Errorf("proxy env not set: %s", got)
+	}
+}
