@@ -10,8 +10,11 @@ import (
 	"fmt"
 
 	"nilcore/internal/backend"
+	"nilcore/internal/blackboard"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/planner"
 	"nilcore/internal/policy"
+	"nilcore/internal/spawn"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -60,6 +63,17 @@ type Orchestrator struct {
 	Router   Router          // defaults to SingleRouter
 	Spawner  Spawner         // defaults to NoSpawner
 	Approver policy.Approver // consulted for irreversible actions; nil denies them
+
+	// Phase 3 adaptive layer (P3-T05) — all optional; when unset, Execute is the
+	// single-task path. When Plan + ShouldPlan are set and a goal is complex,
+	// Execute decomposes it, runs the subtasks in parallel worktrees via RunSub,
+	// records statuses on the Board, and aggregates. The verifier stays the gate
+	// (each subtask verifies its own worktree through RunSub).
+	Plan        func(ctx context.Context, goal string) (planner.Tree, error)
+	RunSub      func(ctx context.Context, st spawn.Subtask) spawn.Result
+	Board       *blackboard.Blackboard
+	ShouldPlan  func(goal string) bool
+	MaxParallel int
 }
 
 // Gate decides whether an action may proceed right now and records the decision.
@@ -84,9 +98,22 @@ type Outcome struct {
 	Detail   string // verifier output (tail) when it did not pass
 }
 
-// Execute runs one task: create an isolated worktree, run the backend in it,
-// then re-verify as the gate. The worktree is always cleaned up.
+// Execute runs one task. Complex goals are decomposed and parallelized (the
+// adaptive layer); everything else takes the single-task path. Either way the
+// verifier is the final gate.
 func (o *Orchestrator) Execute(ctx context.Context, t backend.Task) (Outcome, error) {
+	if o.Plan != nil && o.ShouldPlan != nil && o.ShouldPlan(t.Goal) {
+		if out, handled, err := o.executePlanned(ctx, t); handled || err != nil {
+			return out, err
+		}
+		// planning declined or failed — fall through to the single-task path.
+	}
+	return o.executeSingle(ctx, t)
+}
+
+// executeSingle runs one task: create an isolated worktree, run the backend in
+// it, then re-verify as the gate. The worktree is always cleaned up.
+func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outcome, error) {
 	if o.NewEnv == nil {
 		return Outcome{}, fmt.Errorf("orchestrator: NewEnv is required")
 	}
