@@ -131,7 +131,7 @@ nilcore serve -channel telegram          # needs TELEGRAM_BOT_TOKEN
 nilcore init
 ```
 
-**Model selection** is `provider:model` via `NILCORE_MODEL` (default `claude-sonnet-4-6`; a bare name → Anthropic, e.g. `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`).
+**Model selection** is `provider:model` via `NILCORE_MODEL` (default `claude-sonnet-4-6`; a bare name → Anthropic, e.g. `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`). Selecting the OpenRouter provider with no model — `openrouter` or `openrouter:` — defaults to **`openrouter/fusion`**, OpenRouter's multi-model panel that fuses several frontier models into one answer (it bills the cumulative cost of the panel).
 **Every step** is appended to a hash‑chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Secrets come from the environment and never hit disk, logs, or prompts.
 
 ---

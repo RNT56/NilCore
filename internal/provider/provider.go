@@ -38,10 +38,15 @@ func withKey(env, vendor string, build func(string) model.Provider) (model.Provi
 }
 
 // split separates "provider:model"; a spec with no colon is a bare Anthropic
-// model. Only the first colon splits, so OpenRouter "provider/model" ids survive.
+// model, except a bare "openrouter" which selects that provider's default model
+// (Fusion). Only the first colon splits, so OpenRouter "provider/model" ids
+// survive, and "openrouter:" (empty model) also takes the default.
 func split(spec string) (vendor, modelID string) {
 	if i := strings.Index(spec, ":"); i >= 0 {
 		return spec[:i], spec[i+1:]
+	}
+	if spec == "openrouter" {
+		return "openrouter", "" // NewOpenRouter applies DefaultOpenRouterModel
 	}
 	return "anthropic", spec
 }

@@ -29,9 +29,22 @@ func NewOpenAI(key, modelID string) *OpenAI {
 	return &OpenAI{key: key, model: modelID, baseURL: "https://api.openai.com/v1", http: &http.Client{Timeout: 5 * time.Minute}}
 }
 
+// DefaultOpenRouterModel is OpenRouter's Fusion alias: a multi-model panel that
+// runs the prompt across several frontier models and synthesizes the best answer
+// (launched as a public experiment 2026-03-31, since integrated into the API). It
+// is the default when the openrouter provider is
+// selected without an explicit model — e.g. NILCORE_MODEL="openrouter". Note: it
+// bills the cumulative cost of every model in the panel, so it is opt-in via the
+// provider, not the global default model.
+const DefaultOpenRouterModel = "openrouter/fusion"
+
 // NewOpenRouter returns an OpenRouter provider (OpenAI-compatible). The model id
-// carries the `provider/model` namespace, e.g. "meta-llama/llama-3.1-70b".
+// carries the `provider/model` namespace, e.g. "meta-llama/llama-3.1-70b"; an
+// empty id falls back to DefaultOpenRouterModel.
 func NewOpenRouter(key, modelID string) *OpenAI {
+	if modelID == "" {
+		modelID = DefaultOpenRouterModel
+	}
 	return &OpenAI{key: key, model: modelID, baseURL: "https://openrouter.ai/api/v1", http: &http.Client{Timeout: 5 * time.Minute}}
 }
 

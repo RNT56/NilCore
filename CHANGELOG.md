@@ -18,6 +18,8 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 _All 56 tasks in the `docs/TASKS.md` DAG are merged — see [0.1.0] below._
 
+- **openrouter-fusion-default** — Default the OpenRouter provider to `openrouter/fusion` (OpenRouter's GA multi-model Fusion panel) when selected without an explicit model. `NewOpenRouter` falls back to `DefaultOpenRouterModel` on an empty id, and `provider.Resolve` now routes a bare `openrouter` (and `openrouter:`) to the provider's default; explicit `openrouter:<provider/model>` ids are unchanged. Stdlib-only, no interface change (Provider contract untouched). Tests cover bare/empty/explicit selection. _Owns:_ `internal/provider/`. _(Phase 1)_
+
 ---
 
 ## [0.1.0] — 2026-06-14

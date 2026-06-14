@@ -117,6 +117,8 @@ func TestResolve(t *testing.T) {
 		{"anthropic:claude-opus-4-8", "claude-opus-4-8"},
 		{"openai:gpt-5.5", "gpt-5.5"},
 		{"openrouter:meta-llama/llama-3.1-70b", "meta-llama/llama-3.1-70b"},
+		{"openrouter", "openrouter/fusion"},  // bare provider → Fusion default
+		{"openrouter:", "openrouter/fusion"}, // empty model → Fusion default
 	}
 	for _, c := range cases {
 		p, err := Resolve(c.spec)
