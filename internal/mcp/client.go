@@ -1,0 +1,151 @@
+// Package mcp connects MCP (Model Context Protocol) servers as typed code APIs on
+// the sandbox filesystem — Anthropic's "code execution with MCP" model (P1-T09).
+// Rather than loading every tool definition into context, the client lists a
+// server's tools once and generates deterministic wrappers under
+// ./mcp/servers/<server>/<tool>; the executor discovers them on demand with its
+// read/search tools and invokes/chains them by writing code that runs in the
+// sandbox, so unused tools cost ~zero tokens. Calls are gated (P2-T04) and the
+// glue runs under the injection guard (P2-T05). Implemented over JSON-RPC 2.0 in
+// the standard library — no external dependency (invariant I6).
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+)
+
+// Tool is an MCP tool definition.
+type Tool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"inputSchema"`
+}
+
+// Gate decides whether an MCP tool call may proceed. It returns (false, reason)
+// to deny — e.g. an irreversible call routed to the human gate. nil allows all.
+type Gate func(server, tool string, args json.RawMessage) (allowed bool, reason string)
+
+// Client speaks JSON-RPC 2.0 to one MCP server over a duplex stream.
+type Client struct {
+	Server string
+	Gate   Gate
+
+	enc    *json.Encoder
+	dec    *json.Decoder
+	closer io.Closer
+	nextID int
+}
+
+// NewClient wires a client to a duplex transport (stdio pipe, socket, …).
+func NewClient(server string, rw io.ReadWriteCloser) *Client {
+	return &Client{Server: server, enc: json.NewEncoder(rw), dec: json.NewDecoder(rw), closer: rw}
+}
+
+// Close closes the transport.
+func (c *Client) Close() error {
+	if c.closer != nil {
+		return c.closer.Close()
+	}
+	return nil
+}
+
+type rpcRequest struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type rpcResponse struct {
+	ID     int             `json:"id"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *rpcError       `json:"error,omitempty"`
+}
+
+func (c *Client) call(ctx context.Context, method string, params any, result any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.nextID++
+	id := c.nextID
+	if err := c.enc.Encode(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
+		return fmt.Errorf("mcp send %s: %w", method, err)
+	}
+	for {
+		var resp rpcResponse
+		if err := c.dec.Decode(&resp); err != nil {
+			return fmt.Errorf("mcp recv %s: %w", method, err)
+		}
+		if resp.ID != id {
+			continue // a notification or an unrelated message — skip it
+		}
+		if resp.Error != nil {
+			return fmt.Errorf("mcp %s: %s", method, resp.Error.Message)
+		}
+		if result != nil && len(resp.Result) > 0 {
+			return json.Unmarshal(resp.Result, result)
+		}
+		return nil
+	}
+}
+
+func (c *Client) notify(method string, params any) error {
+	return c.enc.Encode(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+// Initialize performs the MCP handshake.
+func (c *Client) Initialize(ctx context.Context) error {
+	var res json.RawMessage
+	err := c.call(ctx, "initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "nilcore", "version": "0.1"},
+	}, &res)
+	if err != nil {
+		return err
+	}
+	return c.notify("notifications/initialized", map[string]any{})
+}
+
+// ListTools returns the server's tools (used once to generate wrappers).
+func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
+	var res struct {
+		Tools []Tool `json:"tools"`
+	}
+	if err := c.call(ctx, "tools/list", map[string]any{}, &res); err != nil {
+		return nil, err
+	}
+	return res.Tools, nil
+}
+
+// CallTool invokes a tool after the gate approves it. A denied call never reaches
+// the server — it returns a structured error the executor surfaces as data.
+func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	if c.Gate != nil {
+		if ok, reason := c.Gate(c.Server, name, args); !ok {
+			return "", fmt.Errorf("mcp call %s/%s denied: %s", c.Server, name, reason)
+		}
+	}
+	var res struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := c.call(ctx, "tools/call", map[string]any{"name": name, "arguments": args}, &res); err != nil {
+		return "", err
+	}
+	var out string
+	for _, b := range res.Content {
+		out += b.Text
+	}
+	return out, nil
+}
