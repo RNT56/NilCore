@@ -205,8 +205,6 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 </div>
 
-Built one verified‑green commit at a time — `make verify` + lint passing on every push, in CI. The wide independent layers (the 8‑package code‑intelligence stack, the 7 runtime‑ops packages) were drafted by parallel agents and integrated under the same green gate.
-
 ---
 
 ## What's inside
