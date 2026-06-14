@@ -1,0 +1,91 @@
+package graph
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func openMem(t *testing.T) *Graph {
+	t.Helper()
+	g, err := Open(filepath.Join(t.TempDir(), "g.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { g.Close() })
+	return g
+}
+
+// edges: a -> b -> c, and a -> d
+func seed(t *testing.T, g *Graph) {
+	ctx := context.Background()
+	for _, e := range []Edge{
+		{"a", "b", "calls"}, {"b", "c", "calls"}, {"a", "d", "calls"},
+	} {
+		if err := g.AddEdge(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCallersCallees(t *testing.T) {
+	g := openMem(t)
+	seed(t, g)
+	ctx := context.Background()
+
+	callees, _ := g.Callees(ctx, "a")
+	if len(callees) != 2 || callees[0] != "b" || callees[1] != "d" {
+		t.Errorf("Callees(a) = %v, want [b d]", callees)
+	}
+	callers, _ := g.Callers(ctx, "c")
+	if len(callers) != 1 || callers[0] != "b" {
+		t.Errorf("Callers(c) = %v, want [b]", callers)
+	}
+}
+
+func TestClosureAndReachable(t *testing.T) {
+	g := openMem(t)
+	seed(t, g)
+	ctx := context.Background()
+
+	clos, _ := g.Closure(ctx, "a")
+	want := map[string]bool{"b": true, "c": true, "d": true}
+	if len(clos) != 3 {
+		t.Fatalf("Closure(a) = %v, want 3 nodes", clos)
+	}
+	for _, id := range clos {
+		if !want[id] {
+			t.Errorf("unexpected node %q in closure", id)
+		}
+	}
+	if ok, _ := g.Reachable(ctx, "a", "c"); !ok {
+		t.Error("c should be reachable from a (a->b->c)")
+	}
+	if ok, _ := g.Reachable(ctx, "c", "a"); ok {
+		t.Error("a should not be reachable from c")
+	}
+}
+
+func TestBuildFileIdempotent(t *testing.T) {
+	src := `package p
+func helper() int { return 1 }
+func Run() int { return helper() + helper() }
+`
+	path := filepath.Join(t.TempDir(), "p.go")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g := openMem(t)
+	ctx := context.Background()
+	if err := g.BuildFile(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, path); err != nil { // rebuild must not duplicate
+		t.Fatal(err)
+	}
+	callees, _ := g.Callees(ctx, "Run")
+	if len(callees) != 1 || callees[0] != "helper" {
+		t.Errorf("Run callees = %v, want [helper] (deduped)", callees)
+	}
+}
