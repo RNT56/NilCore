@@ -7,6 +7,7 @@
 package eventlog
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nilcore/internal/store"
 )
 
 // Event is one recorded step. Keep it flat and greppable.
@@ -30,9 +33,19 @@ type Event struct {
 
 // Log is a thread-safe, append-only, hash-chained writer.
 type Log struct {
-	mu   sync.Mutex
-	f    *os.File
-	prev string // hash of the last appended event
+	mu    sync.Mutex
+	f     *os.File
+	prev  string       // hash of the last appended event
+	store *store.Store // optional second backing (P4-T02); JSONL stays the export
+}
+
+// UseStore wires a SQLite store as a second backing: each appended event (with
+// its hash chain) is also written to the store, while the JSONL file remains
+// available as an export. Append's signature and all callers are unchanged.
+func (l *Log) UseStore(s *store.Store) {
+	if l != nil {
+		l.store = s
+	}
 }
 
 // Open opens (creating if needed) the log at path, continuing the hash chain from
@@ -64,6 +77,15 @@ func (l *Log) Append(e Event) {
 	b, _ := json.Marshal(e)
 	_, _ = l.f.Write(append(b, '\n'))
 	l.prev = e.Hash
+
+	// Second backing: mirror the (already hash-chained) event into the store.
+	if l.store != nil {
+		detail, _ := json.Marshal(e.Detail)
+		_ = l.store.InsertEvent(context.Background(), store.Event{
+			Time: e.Time, Task: e.Task, Kind: e.Kind, Backend: e.Backend,
+			Detail: string(detail), Prev: e.Prev, Hash: e.Hash,
+		})
+	}
 }
 
 // Close closes the underlying file.

@@ -1,10 +1,13 @@
 package eventlog
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"nilcore/internal/store"
 )
 
 func TestChainIntegrity(t *testing.T) {
@@ -78,5 +81,45 @@ func TestRedaction(t *testing.T) {
 	// Redaction happens before hashing, so the chain still verifies.
 	if err := Verify(path); err != nil {
 		t.Fatalf("Verify after redaction: %v", err)
+	}
+}
+
+func TestStoreBacking(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.UseStore(s)
+	for i := 0; i < 3; i++ {
+		log.Append(Event{Task: "t1", Kind: "step", Detail: map[string]any{"i": i}})
+	}
+	log.Close()
+
+	// Events landed in the store...
+	evs, err := s.EventsByTask(context.Background(), "t1")
+	if err != nil || len(evs) != 3 {
+		t.Fatalf("store events = %d, %v", len(evs), err)
+	}
+	// ...with the hash chain preserved.
+	prev := ""
+	for i, e := range evs {
+		if e.Prev != prev {
+			t.Errorf("event %d: chain break in store", i)
+		}
+		if e.Hash == "" {
+			t.Errorf("event %d: missing hash in store", i)
+		}
+		prev = e.Hash
+	}
+	// JSONL export still verifies end to end.
+	if err := Verify(path); err != nil {
+		t.Errorf("JSONL still must verify: %v", err)
 	}
 }
