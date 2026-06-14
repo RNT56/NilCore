@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"nilcore/internal/channel"
+	"nilcore/internal/eventlog"
 )
 
 const defaultAPIBase = "https://api.telegram.org"
@@ -33,6 +34,9 @@ type Bot struct {
 	offset  int                   // last seen update_id
 	askSeq  atomic.Int64          // unique gate-callback ids
 	pending []channel.TaskRequest // task messages seen while awaiting a gate answer
+
+	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
+	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
 }
 
 var _ channel.Channel = (*Bot)(nil)
@@ -47,6 +51,15 @@ func New(token string) *Bot {
 	}
 }
 
+// SetAuthorizer restricts who may answer an irreversible-action gate: a button
+// click from a principal allow rejects is logged and ignored, so a bystander who
+// can see the chat cannot approve a gate (audit H3). With a nil allow (the
+// default) any responder is honored — serve always sets this.
+func (b *Bot) SetAuthorizer(allow func(string) bool, log *eventlog.Log) {
+	b.authorize = allow
+	b.log = log
+}
+
 type tgMessage struct {
 	From struct {
 		ID int64 `json:"id"`
@@ -58,7 +71,10 @@ type tgMessage struct {
 }
 
 type tgCallback struct {
-	ID      string `json:"id"`
+	ID   string `json:"id"`
+	From struct {
+		ID int64 `json:"id"`
+	} `json:"from"`
 	Message struct {
 		Chat struct {
 			ID int64 `json:"id"`
@@ -155,6 +171,16 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 		}
 		for _, u := range ups {
 			if u.CallbackQuery != nil && strings.HasSuffix(u.CallbackQuery.Data, ":"+id) {
+				clicker := strconv.FormatInt(u.CallbackQuery.From.ID, 10)
+				if b.authorize != nil && !b.authorize(clicker) {
+					if b.log != nil {
+						b.log.Append(eventlog.Event{Kind: "unauthorized_gate",
+							Detail: map[string]any{"principal": clicker, "thread": threadID}})
+					}
+					_ = b.call(ctx, "answerCallbackQuery", map[string]any{
+						"callback_query_id": u.CallbackQuery.ID, "text": "Not authorized to answer this gate."}, nil)
+					continue // ignore; keep waiting for an authorized responder
+				}
 				_ = b.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": u.CallbackQuery.ID}, nil)
 				return strings.HasPrefix(u.CallbackQuery.Data, "yes:"), nil
 			}

@@ -12,6 +12,11 @@ import (
 	"path/filepath"
 )
 
+// DefaultImage is the sandbox container image suggested by `nilcore init` and the
+// fallback when a run sets none — a minimal, widely-pullable base. It matches the
+// run path's default so a config written by the wizard is usable as-is.
+const DefaultImage = "docker.io/library/debian:stable-slim"
+
 // ProviderConfig records a provider and the SecretStore name under which its key
 // is stored — not the key.
 type ProviderConfig struct {
@@ -21,8 +26,9 @@ type ProviderConfig struct {
 
 // ChannelConfig records the chat channel and its token secret-references.
 type ChannelConfig struct {
-	Type      string   `json:"type"`       // telegram | slack | none
-	TokenRefs []string `json:"token_refs"` // secret names (never tokens)
+	Type      string   `json:"type"`            // telegram | slack | none
+	TokenRefs []string `json:"token_refs"`      // secret names (never tokens)
+	Allow     []string `json:"allow,omitempty"` // principal ids permitted to drive serve (merged with NILCORE_ALLOWLIST)
 }
 
 // Config is the on-disk NilCore configuration. It holds references to secrets,

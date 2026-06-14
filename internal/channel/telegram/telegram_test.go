@@ -111,3 +111,37 @@ func TestAsk(t *testing.T) {
 		})
 	}
 }
+
+// TestAskRejectsUnauthorizedClicker proves a gate button click from a principal
+// outside the allowlist is ignored (logged, kept waiting), and an authorized
+// click is honored — even when both arrive in the same update batch.
+func TestAskRejectsUnauthorizedClicker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/getUpdates"):
+			// First an intruder clicks yes, then the authorized user clicks no.
+			_, _ = io.WriteString(w, `{"ok":true,"result":[`+
+				`{"update_id":10,"callback_query":{"id":"cb1","from":{"id":666},"data":"yes:ask-1","message":{"chat":{"id":99}}}},`+
+				`{"update_id":11,"callback_query":{"id":"cb2","from":{"id":42},"data":"no:ask-1","message":{"chat":{"id":99}}}}`+
+				`]}`)
+		default:
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	b := New("t")
+	b.baseURL = srv.URL
+	b.SetAuthorizer(func(p string) bool { return p == "42" }, nil)
+
+	ctx, cancel := ctx5(t)
+	defer cancel()
+	ok, err := b.Ask(ctx, "99", "merge to main?")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	// The intruder's "yes" must NOT win; the authorized "no" decides.
+	if ok {
+		t.Fatal("an unauthorized clicker's approval was honored")
+	}
+}

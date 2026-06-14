@@ -142,3 +142,32 @@ func TestWSFrame(t *testing.T) {
 		t.Fatalf("frame op=%x payload=%q", op, payload)
 	}
 }
+
+// TestAskRejectsUnauthorizedClicker proves a Block Kit gate click from a user
+// outside the allowlist is ignored, and the authorized user's answer decides.
+func TestAskRejectsUnauthorizedClicker(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	b := New("app", "bot")
+	b.apiBase = srv.URL
+	b.SetAuthorizer(func(u string) bool { return u == "U1" }, nil)
+	b.src = &fakeSource{events: []event{
+		{Type: "interactive", EnvelopeID: "e1", Payload: json.RawMessage(
+			`{"type":"block_actions","user":{"id":"UHACK"},"actions":[{"value":"yes:ask-1"}],"channel":{"id":"C9"}}`)},
+		{Type: "interactive", EnvelopeID: "e2", Payload: json.RawMessage(
+			`{"type":"block_actions","user":{"id":"U1"},"actions":[{"value":"no:ask-1"}],"channel":{"id":"C9"}}`)},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	ok, err := b.Ask(ctx, "C9", "merge to main?")
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	if ok {
+		t.Fatal("an unauthorized clicker's approval was honored")
+	}
+}

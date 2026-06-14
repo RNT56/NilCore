@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"nilcore/internal/channel"
+	"nilcore/internal/eventlog"
 )
 
 const defaultAPIBase = "https://slack.com/api"
@@ -49,6 +50,9 @@ type Bot struct {
 	connect func(ctx context.Context) (eventSource, error)
 	askSeq  atomic.Int64
 	pending []channel.TaskRequest
+
+	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
+	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
 }
 
 var _ channel.Channel = (*Bot)(nil)
@@ -58,6 +62,15 @@ func New(appToken, botToken string) *Bot {
 	b := &Bot{appToken: appToken, botToken: botToken, apiBase: defaultAPIBase, http: &http.Client{Timeout: 30 * time.Second}}
 	b.connect = b.dialSocket
 	return b
+}
+
+// SetAuthorizer restricts who may answer an irreversible-action gate: a button
+// click from a principal allow rejects is logged and ignored, so a bystander in
+// the channel cannot approve a gate (audit H3). With a nil allow (the default)
+// any responder is honored — serve always sets this.
+func (b *Bot) SetAuthorizer(allow func(string) bool, log *eventlog.Log) {
+	b.authorize = allow
+	b.log = log
 }
 
 // Receive blocks until the next user message, returning it as a task request.
@@ -134,7 +147,14 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 		}
 		switch ev.Type {
 		case "interactive":
-			if val, ok := blockAction(ev.Payload); ok && strings.HasSuffix(val, ":"+id) {
+			if val, user, ok := blockAction(ev.Payload); ok && strings.HasSuffix(val, ":"+id) {
+				if b.authorize != nil && !b.authorize(user) {
+					if b.log != nil {
+						b.log.Append(eventlog.Event{Kind: "unauthorized_gate",
+							Detail: map[string]any{"principal": user, "thread": threadID}})
+					}
+					continue // ignore; keep waiting for an authorized responder
+				}
 				return strings.HasPrefix(val, "yes:"), nil
 			}
 		case "events_api":
@@ -186,17 +206,20 @@ func messageRequest(payload json.RawMessage) (channel.TaskRequest, bool) {
 	return channel.TaskRequest{Goal: e.Text, Sender: e.User, ThreadID: e.Channel}, true
 }
 
-func blockAction(payload json.RawMessage) (value string, ok bool) {
+func blockAction(payload json.RawMessage) (value, user string, ok bool) {
 	var p struct {
-		Type    string `json:"type"`
+		Type string `json:"type"`
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
 		Actions []struct {
 			Value string `json:"value"`
 		} `json:"actions"`
 	}
 	if json.Unmarshal(payload, &p) != nil || p.Type != "block_actions" || len(p.Actions) == 0 {
-		return "", false
+		return "", "", false
 	}
-	return p.Actions[0].Value, true
+	return p.Actions[0].Value, p.User.ID, true
 }
 
 // dialSocket opens a Socket Mode WebSocket via apps.connections.open.
