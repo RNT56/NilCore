@@ -145,6 +145,49 @@ func (g *Graph) Reachable(ctx context.Context, from, to string) (bool, error) {
 	return false, nil
 }
 
+// Nodes returns all nodes (for whole-graph algorithms like PageRank).
+func (g *Graph) Nodes(ctx context.Context) ([]Node, error) {
+	rows, err := g.db.QueryContext(ctx, `SELECT id, kind, name, file FROM nodes ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Node
+	for rows.Next() {
+		var n Node
+		if err := rows.Scan(&n.ID, &n.Kind, &n.Name, &n.File); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// Edges returns all edges (optionally filter by kind with kind != "").
+func (g *Graph) Edges(ctx context.Context, kind string) ([]Edge, error) {
+	q := `SELECT from_id, to_id, kind FROM edges`
+	args := []any{}
+	if kind != "" {
+		q += ` WHERE kind = ?`
+		args = append(args, kind)
+	}
+	q += ` ORDER BY from_id, to_id`
+	rows, err := g.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Edge
+	for rows.Next() {
+		var e Edge
+		if err := rows.Scan(&e.From, &e.To, &e.Kind); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (g *Graph) neighbors(ctx context.Context, q, arg string) ([]string, error) {
 	rows, err := g.db.QueryContext(ctx, q, arg)
 	if err != nil {
