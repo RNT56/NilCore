@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -37,10 +38,19 @@ func (w *Wizard) Run() (Config, error) {
 		}
 		return v
 	}
-	// captureSecret stores a value under name and returns the reference (name) if
-	// a value was given; never echoes the value.
+	// captureSecret reads a secret with terminal echo disabled so the key is not
+	// shown on screen, stores it under name, and returns the reference (the name).
+	// The value is never echoed, logged, or written to the config — only its name.
 	captureSecret := func(prompt, name string) (string, error) {
-		v := ask(prompt, "")
+		fmt.Fprintf(w.Out, "%s: ", prompt)
+		restore := echoOff(w.In)
+		ok := sc.Scan()
+		restore()
+		fmt.Fprintln(w.Out) // the hidden Enter left the cursor on the prompt line
+		if !ok {
+			return "", nil
+		}
+		v := strings.TrimSpace(sc.Text())
 		if v == "" {
 			return "", nil
 		}
@@ -172,6 +182,38 @@ func onPath(bin string) bool {
 	}
 	_, err := exec.LookPath(bin)
 	return err == nil
+}
+
+// echoOff disables terminal echo while a secret is typed and returns a function
+// that restores it. Stdlib only (invariant I6: no x/term dependency) — it toggles
+// echo via stty on the controlling terminal. It is a no-op when in is not a
+// terminal (a pipe or a test reader) or when stty is unavailable, so
+// non-interactive provisioning is never broken; it just degrades to visible
+// input in that case (audit L8).
+func echoOff(in io.Reader) func() {
+	f, ok := in.(*os.File)
+	if !ok {
+		return func() {}
+	}
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return func() {}
+	}
+	if sttyEcho(f, false) != nil {
+		return func() {}
+	}
+	return func() { _ = sttyEcho(f, true) }
+}
+
+// sttyEcho turns terminal echo on or off for the given tty.
+func sttyEcho(tty *os.File, on bool) error {
+	mode := "-echo"
+	if on {
+		mode = "echo"
+	}
+	cmd := exec.Command("stty", mode)
+	cmd.Stdin = tty
+	return cmd.Run()
 }
 
 func defaultRuntime() string {
