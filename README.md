@@ -11,8 +11,8 @@ NilCore borrows intelligence instead of re‑encoding it — so the whole agent 
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-1%20(pure--Go%20SQLite)-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~8.1k%20LOC-1f6feb)](#-the-receipts)
-[![Sandboxed](https://img.shields.io/badge/execution-100%25%20sandboxed-2ea44f)](#-the-seven-invariants-non-negotiable)
+[![Agent size](https://img.shields.io/badge/agent-~8.1k%20LOC-1f6feb)](#the-receipts)
+[![Sandboxed](https://img.shields.io/badge/execution-100%25%20sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
 
@@ -26,11 +26,11 @@ nilcore -dir ./repo -goal "make the failing test in math_test.go pass"
 
 ---
 
-## 🤔 Why another coding agent?
+## Why another coding agent?
 
 Because most of them ask you to trust a black box. NilCore is built on the opposite bet: **trust comes from verification, sandboxing, and a trace you can read — not from a bigger model.** Here's the pain, and how NilCore kills it:
 
-| 😖 The pain you've felt | ⚙️ How NilCore solves it |
+| The pain you've felt | How NilCore solves it |
 |---|---|
 | **"It said it was done. It wasn't."** | The **verifier is the only authority on done.** After *any* backend runs, your project's own build/test/lint re‑runs and that verdict ships the work — a self‑report never does. |
 | **"It ran a destructive command / touched my host."** | **Everything the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs). Destructive commands are denylisted *before* execution. Nothing runs on your machine. |
@@ -44,21 +44,21 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 
 ---
 
-## 🔁 The core loop
+## The core loop
 
 Everything orbits one loop. The verifier — *your* checks — is the source of truth.
 
 ```mermaid
 flowchart LR
-    G([🎯 Goal]) --> CTX[gather context<br/>+ memory + code-intel]
-    CTX --> M[🧠 model picks a tool]
-    M --> S[📦 execute in sandbox]
+    G([Goal]) --> CTX[gather context<br/>+ memory + code-intel]
+    CTX --> M[model picks a tool]
+    M --> S[execute in sandbox]
     S --> O[observe]
-    O --> V{✅ VERIFY<br/>build · test · lint}
+    O --> V{VERIFY<br/>build · test · lint}
     V -- red --> M
     V -- green --> GATE{irreversible?}
-    GATE -- reversible --> SHIP([🚀 shipped])
-    GATE -- merge / push / deploy --> HUMAN[🙋 human gate<br/>console / chat]
+    GATE -- reversible --> SHIP([shipped])
+    GATE -- merge / push / deploy --> HUMAN[human gate<br/>console / chat]
     HUMAN --> SHIP
 ```
 
@@ -66,37 +66,37 @@ flowchart LR
 
 ---
 
-## ✨ What you get
+## What you get
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-**🧩 Hybrid backends, one contract**
+▸ **Hybrid backends, one contract**
 Native loop + delegate to Codex / Claude Code. Add one without touching the core.
 
-**🛡️ Hardened sandbox**
+▸ **Hardened sandbox**
 Rootless containers, dropped caps, read‑only rootfs, default‑deny egress with an allowlist proxy.
 
-**🔑 Secrets that never leak**
+▸ **Secrets that never leak**
 Keychain / encrypted‑file vault / env / external hook. The model never sees a key.
 
-**📡 Drive it from your phone**
+▸ **Drive it from your phone**
 `serve` on a VPS; Telegram & Slack. Gates become inline Yes/No.
 
 </td>
 <td width="50%" valign="top">
 
-**🧠 Code intelligence**
+▸ **Code intelligence**
 AST · call graph · PageRank repo‑map · LSP · semantic search · Impact Set + SBFL · live worktree‑aware updates.
 
-**🎛️ Adaptive orchestration**
+▸ **Adaptive orchestration**
 Plan complex goals → parallel subworkers in isolated worktrees → race best‑of‑N with the **verifier as judge**.
 
-**🧾 Tamper‑evident audit**
+▸ **Tamper‑evident audit**
 Append‑only, hash‑chained, secret‑redacted event log. Replay any run.
 
-**♻️ Runs unattended**
+▸ **Runs unattended**
 Provider retry/failover, cost ceilings, durable resume on restart, resource GC, health checks.
 
 </td>
@@ -105,7 +105,7 @@ Provider retry/failover, cost ceilings, durable resume on restart, resource GC, 
 
 ---
 
-## 🚀 Quickstart
+## Quickstart
 
 **Requires** Go 1.25+ and a container runtime (`podman` rootless preferred, or `docker`).
 
@@ -136,7 +136,7 @@ nilcore init
 
 ---
 
-## 🧭 Our dogma — first principles, ranked by leverage
+## Our dogma — first principles, ranked by leverage
 
 By 2026 the frontier models inside every serious agent have **converged**. The harness does the rest. NilCore's bet is to be the **best harness** — and "best" is the disciplined application of a short list, not a long list of features.
 
@@ -155,7 +155,7 @@ By 2026 the frontier models inside every serious agent have **converged**. The h
 
 ---
 
-## 🔒 The seven invariants (non‑negotiable)
+## The seven invariants (non‑negotiable)
 
 These hold in every commit. Break one and the change is rejected — no matter how good the rest is.
 
@@ -169,7 +169,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 ---
 
-## 🏗️ Architecture at a glance
+## Architecture at a glance
 
 ```mermaid
 flowchart TD
@@ -181,7 +181,7 @@ flowchart TD
     BK --> VERIFY[verify<br/>source of truth]
     AGENT --> POLICY[policy<br/>gate · egress · tool-call]
     AGENT --> LOG[eventlog<br/>hash-chained + store]
-    AGENT --> CI[codeintel<br/>ast→graph→repomap→retrieve]
+    AGENT --> CI[codeintel<br/>ast to graph to repomap to retrieve]
     AGENT --> MEM[memory<br/>cross-project SQLite]
     CLI --> CHAN[channel<br/>telegram · slack]
 ```
@@ -190,7 +190,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 ---
 
-## 📊 The receipts
+## The receipts
 
 <div align="center">
 
@@ -209,7 +209,7 @@ Built one verified‑green commit at a time — `make verify` + lint passing on 
 
 ---
 
-## 📦 What's inside
+## What's inside
 
 ```text
 cmd/nilcore/           run · serve · init
@@ -234,7 +234,7 @@ eval/                  measure-first eval harness
 
 ---
 
-## 🩺 Status
+## Status
 
 **Shipped — `v0.1.0`.** All 56 tasks of the build plan ([`docs/TASKS.md`](docs/TASKS.md)) are complete across Phases 0–6: the verifying, sandboxed, bounded core that plans, parallelizes across three backends, understands code structurally, remembers across projects, and improves itself under a human gate — running unattended with authorized control, metered budgets, durable resumption, and bounded resources.
 
