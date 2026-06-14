@@ -77,7 +77,7 @@ On a bare Linux VPS there is no keychain, so the encrypted vault needs a master 
 - **systemd-creds / cloud KMS** — platform-managed; unattended and strong. Recommended for production.
 - **Key-file (`0600`, owner-only)** — default. Unattended and simple; only as strong as the host's filesystem and access controls.
 
-Pick per deployment in `nilcore init`; the default is the key-file.
+`nilcore init` selects the backend automatically: the OS keychain when its CLI is present, otherwise the encrypted-file vault sealed with the **key-file** master key (the headless default above). The passphrase and KMS strategies are constructed directly (`MasterKeyFromPassphrase` / external) and are not yet wizard-selectable.
 
 ## 9. Provider & CLI auth reference
 

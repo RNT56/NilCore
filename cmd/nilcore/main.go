@@ -1,7 +1,12 @@
 // Command nilcore is the entrypoint. It dispatches subcommands:
 //
-//	nilcore -goal "..." [-dir ./repo] ...     run one task to completion (default)
-//	nilcore serve -channel telegram ...        listen on a chat channel and dispatch
+//	nilcore init                          guided setup (keys, runtime, backend, channel, allowlist)
+//	nilcore -goal "..." [-dir ./repo] ... run one task to completion (default)
+//	nilcore serve -channel telegram ...   listen on a chat channel and dispatch
+//	nilcore doctor                        check whether this host is ready to run/serve
+//	nilcore config show                   print the active configuration (secret-free)
+//	nilcore secret set <name>             store/rotate a single secret
+//	nilcore version | help                build version | usage banner
 //
 // Each run happens in a disposable git worktree of -dir (which must be a git
 // repo): a backend runs inside a container sandbox, then the verifier decides
@@ -11,11 +16,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -41,39 +50,87 @@ import (
 	"nilcore/internal/verify"
 )
 
+// version is the build version, overridable at release time via
+// -ldflags "-X main.version=<tag>". It falls back to the VCS revision.
+var version = "dev"
+
 func main() {
 	args := os.Args[1:]
-	switch {
-	case len(args) > 0 && args[0] == "serve":
-		serveMain(args[1:])
-	case len(args) > 0 && args[0] == "init":
-		initMain(args[1:])
-	default:
-		runMain(args)
+	if len(args) == 0 {
+		usage(os.Stdout)
+		return
 	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		usage(os.Stdout)
+	case "-v", "--version", "version":
+		fmt.Println(versionString())
+	case "serve":
+		serveMain(args[1:])
+	case "init":
+		initMain(args[1:])
+	case "doctor":
+		doctorMain(args[1:])
+	case "config":
+		configMain(args[1:])
+	case "secret":
+		secretMain(args[1:])
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			runMain(args) // documented `nilcore -goal ...` default
+			return
+		}
+		fmt.Fprintf(os.Stderr, "error: unknown command %q\nrun 'nilcore help' for usage\n", args[0])
+		os.Exit(2)
+	}
+}
+
+// usageText is the top-level help: what NilCore is, then the command list, then
+// the first-time on-ramp. Hand-written so the front door reads like a product,
+// not a flag dump.
+const usageText = `NilCore — a tiny, robust coding agent. The harness is small; the model is the engine.
+
+Usage:
+  nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
+  nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
+  nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
+  nilcore doctor                        check whether this host is ready to run/serve
+  nilcore config show                   print the active configuration (secret-free)
+  nilcore secret set <name>             store or rotate a single secret in the secret store
+  nilcore version                       print the build version
+
+Run 'nilcore <command> -h' for a command's flags.
+First time? Start with: nilcore init
+`
+
+func usage(w io.Writer) { fmt.Fprint(w, usageText) }
+
+// versionString reports the build version: the ldflags-stamped tag, or the VCS
+// revision recorded in the build info when running an un-stamped binary.
+func versionString() string {
+	if version == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			for _, s := range bi.Settings {
+				if s.Key == "vcs.revision" {
+					rev := s.Value
+					if len(rev) > 12 {
+						rev = rev[:12]
+					}
+					return "nilcore dev (" + rev + ")"
+				}
+			}
+		}
+	}
+	return "nilcore " + version
 }
 
 // initMain runs the onboarding wizard (or non-interactive provisioning).
 func initMain(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	nonInteractive := fs.Bool("non-interactive", false, "assemble config from environment without prompting")
+	allowEmpty := fs.Bool("allow-empty", false, "write the config even with no captured provider key (env-only setup)")
 	configPath := fs.String("config", "", "config output path (default: <config-dir>/config.json)")
 	_ = fs.Parse(args)
-
-	store := detectStore(true)
-	var (
-		cfg onboard.Config
-		err error
-	)
-	if *nonInteractive {
-		cfg, err = onboard.FromEnv(os.Getenv, store)
-	} else {
-		w := &onboard.Wizard{In: os.Stdin, Out: os.Stdout, Secrets: store}
-		cfg, err = w.Run()
-	}
-	if err != nil {
-		fatal(err)
-	}
 
 	path := *configPath
 	if path == "" {
@@ -83,10 +140,195 @@ func initMain(args []string) {
 		}
 		path = filepath.Join(dir, "config.json")
 	}
+
+	store := detectStore(true)
+	if store.Name() == "env" {
+		fatal(fmt.Errorf("no writable secret backend: no OS keychain found and the encrypted vault under the " +
+			"config dir could not be created — fix the config-dir permissions, or provide a keychain"))
+	}
+
+	var (
+		cfg onboard.Config
+		err error
+	)
+	if *nonInteractive {
+		cfg, err = onboard.FromEnv(os.Getenv, store)
+	} else {
+		w := &onboard.Wizard{In: os.Stdin, Out: os.Stdout, Secrets: store, ConfigPath: path}
+		cfg, err = w.Run()
+	}
+	if errors.Is(err, onboard.ErrAborted) {
+		fmt.Fprintf(os.Stderr, "aborted — config not written (any keys you entered were already saved to "+
+			"the %s backend; re-run `nilcore init` to finish)\n", store.Name())
+		return
+	}
+	if err != nil {
+		fatal(err)
+	}
+
+	if len(cfg.Providers) == 0 && !*allowEmpty {
+		fatal(fmt.Errorf("no provider key was captured, so this config cannot run a task; " +
+			"re-run `nilcore init` (or pass -allow-empty to write an env-only config)"))
+	}
+
 	if err := cfg.Save(path); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: secrets were stored in the %s backend but the config could not be "+
+			"written; re-running `nilcore init` will reuse them\n", store.Name())
 		fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "wrote config to %s (secrets stored in the %s backend)\n", path, store.Name())
+	printNextSteps(os.Stderr, cfg)
+}
+
+// printNextSteps closes onboarding with a concrete on-ramp instead of a flat
+// confirmation — including the serve allowlist reminder when a channel was set,
+// so the operator is never led into serve's empty-allowlist refusal blind.
+func printNextSteps(w io.Writer, cfg onboard.Config) {
+	fmt.Fprintln(w, "\nYou're set. Try:")
+	fmt.Fprintln(w, `  nilcore -dir ./repo -goal "fix the failing test"`)
+	if cfg.Channel.Type == "telegram" || cfg.Channel.Type == "slack" {
+		if len(cfg.Channel.Allow) == 0 {
+			fmt.Fprintf(w, "  set an allowlist before serving: export NILCORE_ALLOWLIST=<%s-user-id>\n", cfg.Channel.Type)
+		}
+		fmt.Fprintf(w, "  nilcore serve -channel %s\n", cfg.Channel.Type)
+	}
+	fmt.Fprintln(w, "  nilcore doctor   # re-check readiness anytime")
+}
+
+// doctorMain reports whether this host can actually run (and serve), reusing the
+// config's Readiness plus a live credential-resolution check. Exits non-zero when
+// not run-ready, so it is usable as a scripted health gate.
+func doctorMain(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	configPath := fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)")
+	_ = fs.Parse(args)
+
+	b := loadBoot(*configPath)
+	report, ready := diagnose(b.cfg, b.cred)
+	fmt.Print(report)
+	if !ready {
+		os.Exit(1)
+	}
+}
+
+// diagnose renders the doctor report and reports run-readiness. It is pure over
+// (config, credential resolver), so it is testable without touching the host.
+func diagnose(cfg onboard.Config, cred func(string) string) (string, bool) {
+	var b strings.Builder
+	ok := func(c bool) string {
+		if c {
+			return "✓"
+		}
+		return "✗"
+	}
+	b.WriteString("Configuration:\n")
+	b.WriteString(cfg.Readiness())
+
+	b.WriteString("\nCredentials (environment or stored):\n")
+	anyResolved := false
+	if len(cfg.Providers) == 0 {
+		b.WriteString("  ✗ no providers configured — run `nilcore init`\n")
+	}
+	for _, p := range cfg.Providers {
+		env := providerEnv(p.Name)
+		resolved := env != "" && cred(env) != ""
+		anyResolved = anyResolved || resolved
+		fmt.Fprintf(&b, "  %s %s key resolves (%s)\n", ok(resolved), p.Name, env)
+	}
+	// Run-readiness keys on the *configured backend's* credential, not merely on
+	// some provider resolving — so `nilcore doctor`'s exit code (a scripted gate)
+	// matches what the chosen backend actually needs.
+	ready := anyResolved
+	switch cfg.Backend {
+	case "codex", "claude-code":
+		env := backendKeyEnv(cfg)
+		ready = cred(env) != ""
+		fmt.Fprintf(&b, "  %s %s backend key resolves (%s)\n", ok(ready), cfg.Backend, env)
+	default: // native
+		if cfg.Executor != "" {
+			ready = cred(providerEnv(vendorOf(cfg.Executor))) != ""
+		}
+	}
+
+	for _, env := range channelEnvs(cfg.Channel.Type) {
+		fmt.Fprintf(&b, "  %s %s resolves\n", ok(cred(env) != ""), env)
+	}
+	if cfg.Channel.Type == "telegram" || cfg.Channel.Type == "slack" {
+		allow := principalAllowlist(cfg)
+		fmt.Fprintf(&b, "  %s serve allowlist resolves (%d) — required to serve\n", ok(len(allow) > 0), len(allow))
+	}
+	return b.String(), ready
+}
+
+// backendKeyEnv returns the credential env-var the configured backend needs:
+// the codex/claude-code delegated key, or the native executor's provider key.
+func backendKeyEnv(cfg onboard.Config) string {
+	switch cfg.Backend {
+	case "codex":
+		return "CODEX_API_KEY"
+	case "claude-code":
+		return "ANTHROPIC_API_KEY"
+	default: // native
+		if cfg.Executor == "" {
+			return ""
+		}
+		return providerEnv(vendorOf(cfg.Executor))
+	}
+}
+
+// channelEnvs returns the credential env-var names a channel needs, for the
+// doctor's resolution check.
+func channelEnvs(channelType string) []string {
+	switch channelType {
+	case "telegram":
+		return []string{"TELEGRAM_BOT_TOKEN"}
+	case "slack":
+		return []string{"SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"}
+	default:
+		return nil
+	}
+}
+
+// configMain handles `nilcore config show`: print the active configuration. The
+// config holds only secret *references*, so it is safe to print verbatim.
+func configMain(args []string) {
+	if len(args) == 0 || args[0] != "show" {
+		fatal(fmt.Errorf("usage: nilcore config show [-config <path>]"))
+	}
+	fs := flag.NewFlagSet("config show", flag.ExitOnError)
+	configPath := fs.String("config", "", "config file (default: <config-dir>/config.json)")
+	_ = fs.Parse(args[1:])
+
+	cfg := loadConfig(*configPath)
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Println(string(out))
+}
+
+// secretMain handles `nilcore secret set <name>`: store or rotate a single
+// credential in the writable secret store, reading the value with echo disabled.
+func secretMain(args []string) {
+	if len(args) < 2 || args[0] != "set" {
+		fatal(fmt.Errorf("usage: nilcore secret set <name>"))
+	}
+	name := args[1]
+	store := detectStore(true)
+	if store.Name() == "env" {
+		fatal(fmt.Errorf("no writable secret backend: no OS keychain and no encrypted vault could be created"))
+	}
+	val, err := onboard.PromptSecret("Value for "+name, os.Stdin, os.Stdout)
+	if err != nil {
+		fatal(err)
+	}
+	if val == "" {
+		fatal(fmt.Errorf("empty value — nothing stored"))
+	}
+	if err := store.Set(name, val); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "stored %s in the %s backend\n", name, store.Name())
 }
 
 // commonFlags registers the flags shared by run and serve on fs.
@@ -118,7 +360,7 @@ func runMain(args []string) {
 	_ = fs.Parse(args)
 
 	if *goal == "" {
-		fmt.Fprintln(os.Stderr, "error: --goal is required")
+		fmt.Fprintln(os.Stderr, "error: --goal is required\nrun 'nilcore help' for usage")
 		os.Exit(2)
 	}
 
@@ -128,7 +370,10 @@ func runMain(args []string) {
 	absDir := mustAbs(*c.dir)
 	log := openLog(*c.logPath)
 	defer log.Close()
-	prov := resolveProvider(*c.backendName, b)
+	prov, err := resolveProvider(*c.backendName, b)
+	if err != nil {
+		fatal(err)
+	}
 	mem, cp := setupPersistence(log)
 
 	orch := &agent.Orchestrator{
@@ -169,7 +414,10 @@ func serveMain(args []string) {
 	absDir := mustAbs(*c.dir)
 	log := openLog(*c.logPath)
 	defer log.Close()
-	prov := resolveProvider(*c.backendName, b)
+	prov, err := resolveProvider(*c.backendName, b)
+	if err != nil {
+		fatal(err)
+	}
 	allow := principalAllowlist(b.cfg)
 	if len(allow) == 0 {
 		fatal(fmt.Errorf("serve refuses to start with an empty principal allowlist (no ambient authority): " +
@@ -177,7 +425,10 @@ func serveMain(args []string) {
 			"or add \"allow\" to the channel section of config.json"))
 	}
 	chName := channelSpec(*channelName, b.cfg)
-	ch := buildChannel(chName, b.cred, allow, log)
+	ch, err := buildChannel(chName, b.cred, allow, log)
+	if err != nil {
+		fatal(err)
+	}
 	mem, cp := setupPersistence(log)
 	newEnv := envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir)
 
@@ -218,20 +469,24 @@ func serveMain(args []string) {
 // resolveProvider builds the model provider for the native backend and validates
 // the backend name + required secret up front. The model spec is NILCORE_MODEL,
 // else the configured executor, else the built-in default; the key resolves
-// environment-first then SecretStore via b.cred.
-func resolveProvider(backendName string, b boot) model.Provider {
+// environment-first then SecretStore via b.cred. A missing key is reported with
+// the actionable remedy (run init / export the var) rather than a bare error.
+func resolveProvider(backendName string, b boot) (model.Provider, error) {
 	switch backendName {
 	case "native":
-		p, err := provider.ResolveWith(modelSpec(os.Getenv("NILCORE_MODEL"), b.cfg.Executor), b.cred)
+		spec := modelSpec(os.Getenv("NILCORE_MODEL"), b.cfg.Executor)
+		p, err := provider.ResolveWith(spec, b.cred)
 		if err != nil {
-			fatal(err)
+			if env := providerEnv(vendorOf(spec)); env != "" {
+				return nil, fmt.Errorf("%w; run `nilcore init` to store the key, or set %s in the environment", err, env)
+			}
+			return nil, fmt.Errorf("%w; run `nilcore init` to store the key", err)
 		}
-		return p
+		return p, nil
 	case "codex", "claude-code":
-		return nil
+		return nil, nil
 	default:
-		fatal(fmt.Errorf("unknown backend %q (want native | codex | claude-code)", backendName))
-		return nil
+		return nil, fmt.Errorf("unknown backend %q (want native | codex | claude-code)", backendName)
 	}
 }
 
@@ -350,29 +605,29 @@ type authChannel interface {
 // buildChannel constructs the chat transport and wraps it in deny-all-by-default
 // authorization: only principals in allow may command the agent (Receive) or
 // answer an irreversible-action gate (Ask). Wiring both sides closes audit H2/H3
-// — a freshly-deployed bot is inert to whoever merely finds it.
-func buildChannel(name string, cred func(string) string, allow []string, log *eventlog.Log) channel.Channel {
+// — a freshly-deployed bot is inert to whoever merely finds it. A missing token
+// is reported with the remedy rather than a bare requirement.
+func buildChannel(name string, cred func(string) string, allow []string, log *eventlog.Log) (channel.Channel, error) {
 	var bot authChannel
 	switch name {
 	case "telegram":
 		tok := cred("TELEGRAM_BOT_TOKEN")
 		if tok == "" {
-			fatal(fmt.Errorf("TELEGRAM_BOT_TOKEN is required for the telegram channel"))
+			return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required for the telegram channel; run `nilcore init` or set it in the environment")
 		}
 		bot = telegram.New(tok)
 	case "slack":
 		app, bt := cred("SLACK_APP_TOKEN"), cred("SLACK_BOT_TOKEN")
 		if app == "" || bt == "" {
-			fatal(fmt.Errorf("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required for the slack channel"))
+			return nil, fmt.Errorf("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required for the slack channel; run `nilcore init` or set them in the environment")
 		}
 		bot = slack.New(app, bt)
 	default:
-		fatal(fmt.Errorf("unknown channel %q (want telegram | slack)", name))
-		return nil
+		return nil, fmt.Errorf("unknown channel %q (want telegram | slack)", name)
 	}
 	auth := channel.NewAuthorized(bot, allow, log) // filters inbound commands
 	bot.SetAuthorizer(auth.Permit, log)            // and gate-button answers
-	return auth
+	return auth, nil
 }
 
 // principalAllowlist is the set of principals permitted to command the agent and
@@ -430,28 +685,106 @@ func loadBoot(configPath string) boot {
 	return boot{cfg: cfg, cred: newCredResolver(cfg, detectStore(false), os.Getenv)}
 }
 
-// detectStore selects the host SecretStore. With an OS keychain it uses that.
-// Without one it uses the encrypted file vault under the config dir (AES-256-GCM
-// sealed by a 0600 key file — the headless default, docs/SECRETS.md §8): when
-// forWrite (`nilcore init`) it provisions the key + vault so onboarding works with
-// no keychain; otherwise it only opens an EXISTING vault, so a pure-environment run
-// never creates files. Falls back to the read-only environment store when no vault
-// is usable. init (write) and the run path (read) use the same selection, so a key
-// stored at init is found at run time.
+// detectStore selects the host SecretStore. It resolves the config dir and
+// delegates to detectStoreIn; with no config dir it falls back to the keychain or
+// the read-only environment store.
 func detectStore(forWrite bool) secrets.SecretStore {
-	if kc := secrets.Detect(); kc.Name() == "keychain" {
-		return kc
-	}
 	dir, err := paths.ConfigDir()
 	if err != nil {
+		if kc := secrets.Detect(); kc.Name() == "keychain" {
+			return kc
+		}
 		return secrets.EnvStore{}
 	}
-	if !forWrite {
-		if _, err := os.Stat(filepath.Join(dir, "secrets.vault")); err != nil {
-			return secrets.EnvStore{} // nothing persisted → environment only
+	return detectStoreIn(dir, forWrite)
+}
+
+// detectStoreIn picks the SecretStore for dir. On the write path (`nilcore init`)
+// it commits to a single backend: the OS keychain if present, else a freshly
+// provisioned encrypted file vault, else the read-only environment store. On the
+// read path (run/serve) it returns a fallthrough CHAIN of every available backend
+// (keychain, an existing vault, the environment) so a key stored at init is found
+// at run time even if the keychain became unavailable in between — and a
+// pure-environment host (no vault) never has files created for it.
+func detectStoreIn(dir string, forWrite bool) secrets.SecretStore {
+	return assembleStore(dir, forWrite, secrets.Detect())
+}
+
+// assembleStore is detectStoreIn with the host keychain injected, so the
+// keychain-present and keychain-absent paths are both testable hermetically.
+func assembleStore(dir string, forWrite bool, keychain secrets.SecretStore) secrets.SecretStore {
+	hasKeychain := keychain.Name() == "keychain"
+	if forWrite {
+		if hasKeychain {
+			return keychain
+		}
+		if v := fileVault(dir); v.Name() == "file" {
+			return v
+		}
+		return secrets.EnvStore{}
+	}
+	var stores []secrets.SecretStore
+	if hasKeychain {
+		stores = append(stores, keychain)
+	}
+	// Include the file vault only when BOTH the vault and its key already exist,
+	// so a read never provisions a fresh key (which could not decrypt an existing
+	// vault) and a pure-environment host creates no files.
+	_, vaultErr := os.Stat(filepath.Join(dir, "secrets.vault"))
+	_, keyErr := os.Stat(filepath.Join(dir, "secrets.key"))
+	if vaultErr == nil && keyErr == nil {
+		if v := fileVault(dir); v.Name() == "file" {
+			stores = append(stores, v)
 		}
 	}
-	return fileVault(dir)
+	stores = append(stores, secrets.EnvStore{})
+	if len(stores) == 1 {
+		return stores[0]
+	}
+	return chainStore{stores}
+}
+
+// chainStore tries an ordered list of backends so a secret stored in any one of
+// them resolves. Get returns the first hit; Set/Delete target the first backend
+// that accepts the write (the read-only environment store is skipped).
+type chainStore struct{ stores []secrets.SecretStore }
+
+func (c chainStore) Get(name string) (string, error) {
+	for _, s := range c.stores {
+		if v, err := s.Get(name); err == nil {
+			return v, nil
+		}
+	}
+	return "", secrets.ErrNotFound
+}
+
+func (c chainStore) Set(name, value string) error {
+	for _, s := range c.stores {
+		if err := s.Set(name, value); err == nil {
+			return nil
+		}
+	}
+	return secrets.ErrReadOnly
+}
+
+func (c chainStore) Delete(name string) error {
+	err := secrets.ErrNotFound
+	for _, s := range c.stores {
+		e := s.Delete(name)
+		if e == nil {
+			return nil
+		}
+		err = e
+	}
+	return err
+}
+
+func (c chainStore) Name() string {
+	names := make([]string, 0, len(c.stores))
+	for _, s := range c.stores {
+		names = append(names, s.Name())
+	}
+	return strings.Join(names, "+")
 }
 
 // fileVault opens (provisioning the master key if absent) the encrypted vault in
@@ -469,8 +802,10 @@ func fileVault(dir string) secrets.SecretStore {
 }
 
 // loadConfig reads config.json (from configPath or the default location). A
-// missing or unreadable config is not an error — it yields the zero Config, and
-// the run falls back to the environment + built-in defaults.
+// missing config is not an error — it yields the zero Config, and the run falls
+// back to the environment + built-in defaults. A present-but-invalid config is
+// surfaced as a loud stderr warning (then degrades) rather than vanishing
+// silently, so a typo in a hand-edited config.json is diagnosable.
 func loadConfig(configPath string) onboard.Config {
 	path := configPath
 	if path == "" {
@@ -482,6 +817,9 @@ func loadConfig(configPath string) onboard.Config {
 	}
 	cfg, err := onboard.Load(path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "warning: ignoring %v\n", err) // err already names the path
+		}
 		return onboard.Config{}
 	}
 	return cfg
@@ -507,9 +845,8 @@ func newCredResolver(cfg onboard.Config, store secrets.SecretStore, getenv func(
 }
 
 // secretRefsByEnv maps each credential's environment-variable name to the
-// SecretStore reference recorded in config.json — including CODEX_API_KEY, which
-// `nilcore init` now captures as a "codex" provider entry (the delegated backend
-// key), so it resolves env-first then SecretStore like any provider key.
+// SecretStore reference recorded in config.json. The codex key, when captured by
+// the wizard as a provider, is resolvable from the store like any other.
 func secretRefsByEnv(cfg onboard.Config) map[string]string {
 	m := map[string]string{}
 	for _, p := range cfg.Providers {
@@ -548,6 +885,19 @@ func providerEnv(name string) string {
 	}
 }
 
+// vendorOf returns the provider vendor of a "provider:model" spec (a bare model
+// is Anthropic, a bare "openrouter" is OpenRouter), so a missing-key error can
+// name the exact environment variable to set.
+func vendorOf(spec string) string {
+	if i := strings.Index(spec, ":"); i >= 0 {
+		return spec[:i]
+	}
+	if spec == "openrouter" {
+		return "openrouter"
+	}
+	return "anthropic"
+}
+
 // modelSpec picks the role→provider:model spec: NILCORE_MODEL wins, then the
 // configured executor, then the built-in default.
 func modelSpec(envSpec, cfgExecutor string) string {
@@ -572,15 +922,18 @@ func channelSpec(flagVal string, cfg onboard.Config) string {
 	return "telegram"
 }
 
-// applyConfigDefaults lets config.json supply runtime/image when the operator did
-// not pass the corresponding flag. Explicit flags always win; built-in defaults
-// fill the rest.
+// applyConfigDefaults lets config.json supply runtime/image/backend when the
+// operator did not pass the corresponding flag. Explicit flags always win;
+// built-in defaults fill the rest.
 func applyConfigDefaults(c commonFlags, cfg onboard.Config, set map[string]bool) {
 	if !set["runtime"] && cfg.Runtime != "" {
 		*c.runtime = cfg.Runtime
 	}
 	if !set["image"] && cfg.Image != "" {
 		*c.image = cfg.Image
+	}
+	if !set["backend"] && cfg.Backend != "" {
+		*c.backendName = cfg.Backend
 	}
 }
 
