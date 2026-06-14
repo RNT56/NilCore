@@ -1,0 +1,29 @@
+# Sample systemd unit for running NilCore in `serve` mode on a Linux VPS (P1-T07).
+# Install: copy to /etc/systemd/system/nilcore.service, edit User/paths, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nilcore
+#
+# Secrets come from the environment ONLY (invariant I3). Prefer systemd
+# credentials or an EnvironmentFile with 0600 perms over inline Environment=.
+[Unit]
+Description=NilCore coding agent (serve mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nilcore
+Group=nilcore
+# Keep keys out of the unit file; load them from a root-owned 0600 file:
+EnvironmentFile=/etc/nilcore/nilcore.env
+ExecStart=/usr/local/bin/nilcore serve -channel telegram
+Restart=on-failure
+RestartSec=5
+# Hardening (defense in depth; the agent's own sandbox is separate).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=nilcore
+
+[Install]
+WantedBy=multi-user.target
