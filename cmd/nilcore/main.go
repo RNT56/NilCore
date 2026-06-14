@@ -221,7 +221,15 @@ func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verif
 	case "claude-code":
 		return &backend.ClaudeCode{Box: box, Key: os.Getenv("ANTHROPIC_API_KEY"), Log: log}
 	default: // native
-		return &backend.Native{Model: prov, Box: box, Verifier: v, Log: log, Tools: tools.Default(), MaxSteps: maxSteps}
+		return &backend.Native{
+			Model:        prov,
+			Box:          box,
+			Verifier:     v,
+			Log:          log,
+			Tools:        tools.Default(),
+			CommandGuard: policy.DefaultCommandPolicy().Check,
+			MaxSteps:     maxSteps,
+		}
 	}
 }
 

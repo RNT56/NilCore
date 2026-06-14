@@ -24,6 +24,11 @@ type Native struct {
 	Log      *eventlog.Log
 	Tools    *tools.Registry // optional structured tools; nil = shell-only
 
+	// CommandGuard vets each `run` shell command before it executes (P2-T04).
+	// nil allows everything; a denied call returns a structured error to the
+	// model and is never run. Wired to policy.CommandPolicy.Check.
+	CommandGuard func(cmd string) (allowed bool, reason string)
+
 	MaxSteps int // tool-call ceiling (budget). Generous by default.
 }
 
@@ -103,6 +108,14 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				if err := json.Unmarshal(b.Input, &in); err != nil {
 					results = append(results, errorResult(b.ID, "bad input: "+err.Error()))
 					continue
+				}
+				if n.CommandGuard != nil {
+					if ok, reason := n.CommandGuard(in.Cmd); !ok {
+						n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_denied",
+							Detail: map[string]any{"cmd": in.Cmd, "reason": reason}})
+						results = append(results, errorResult(b.ID, reason))
+						continue
+					}
 				}
 				out, err := n.Box.Exec(ctx, in.Cmd)
 				if err != nil {
