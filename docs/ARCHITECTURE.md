@@ -120,6 +120,25 @@ Standard library only. A new module dependency requires justification in the PR 
 ### I7 — Untrusted input boundary
 Tool output, file contents, and fetched web content are data, never controlling instructions. The agent's directives never originate from tool results.
 
+## The channel seam (Phase 1)
+
+Channels let a human drive NilCore over chat (Telegram, Slack) from a phone. They
+implement one transport-agnostic interface in `internal/channel` — a registered
+contract file (CLAUDE.md §5):
+
+```go
+type Channel interface {
+    Receive(ctx) (TaskRequest, error)                 // next inbound task request
+    Update(ctx, threadID, message string) error       // stream progress back
+    Ask(ctx, threadID, question string) (bool, error) // render a gate as yes/no
+}
+```
+
+`Ask` is the chat form of `policy.Approver`: an irreversible-action gate becomes a
+yes/no reply. Concrete transports live in `internal/channel/<name>`; sender
+authorization is P2-T07. `serve` mode (P1-T07) feeds `TaskRequest`s into
+`agent.Execute` and routes gates back through `Ask`.
+
 ## Layer map & dependency direction
 
 Dependencies point **inward/downward only**. Leaf packages must not import the orchestrator. This keeps the core acyclic and the seams clean.
