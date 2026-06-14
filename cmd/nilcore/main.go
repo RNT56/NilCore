@@ -120,16 +120,17 @@ func runMain(args []string) {
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov := resolveProvider(*c.backendName)
-	mem := setupMemory(log)
+	mem, cp := setupPersistence(log)
 
 	orch := &agent.Orchestrator{
-		BaseRepo:  absDir,
-		NewEnv:    envFactory(c, prov, log, mem, absDir),
-		Log:       log,
-		Router:    agent.SingleRouter{},
-		Spawner:   agent.NoSpawner{},
-		Approver:  policy.NewConsoleApprover(os.Stdin, os.Stdout),
-		OnSuccess: memWriteBack(mem, absDir),
+		BaseRepo:   absDir,
+		NewEnv:     envFactory(c, prov, log, mem, absDir),
+		Log:        log,
+		Router:     agent.SingleRouter{},
+		Spawner:    agent.NoSpawner{},
+		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		OnSuccess:  memWriteBack(mem, absDir),
+		Checkpoint: cp,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
@@ -158,18 +159,19 @@ func serveMain(args []string) {
 	defer log.Close()
 	prov := resolveProvider(*c.backendName)
 	ch := buildChannel(*channelName)
-	mem := setupMemory(log)
+	mem, cp := setupPersistence(log)
 	newEnv := envFactory(c, prov, log, mem, absDir)
 
 	run := func(ctx context.Context, t backend.Task, approver policy.Approver) (string, error) {
 		orch := &agent.Orchestrator{
-			BaseRepo:  absDir,
-			NewEnv:    newEnv,
-			Log:       log,
-			Router:    agent.SingleRouter{},
-			Spawner:   agent.NoSpawner{},
-			Approver:  approver, // gate questions route back to this thread
-			OnSuccess: memWriteBack(mem, absDir),
+			BaseRepo:   absDir,
+			NewEnv:     newEnv,
+			Log:        log,
+			Router:     agent.SingleRouter{},
+			Spawner:    agent.NoSpawner{},
+			Approver:   approver, // gate questions route back to this thread
+			OnSuccess:  memWriteBack(mem, absDir),
+			Checkpoint: cp,
 		}
 		out, err := orch.Execute(ctx, t)
 		if err != nil {
@@ -188,6 +190,9 @@ func serveMain(args []string) {
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", *channelName)
 	if err := srv.Serve(ctx); err != nil {
 		fatal(err)
+	}
+	if cp != nil {
+		_ = cp.Interrupt(context.Background()) // SIGTERM: checkpoint in-flight before exit (P6-T03)
 	}
 }
 
@@ -246,19 +251,20 @@ func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verif
 	}
 }
 
-// setupMemory opens the persistent store (best-effort), wires it as a second
-// backing for the event log, and returns the memory API (nil if unavailable).
-func setupMemory(log *eventlog.Log) *memory.Memory {
+// setupPersistence opens the persistent store (best-effort), wires it as a second
+// backing for the event log, and returns the memory API and the task checkpointer
+// (both nil if the store is unavailable — persistence is optional, never blocking).
+func setupPersistence(log *eventlog.Log) (*memory.Memory, *agent.Checkpoint) {
 	dir, err := paths.EnsureDir(paths.DataDir())
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	s, err := store.Open(filepath.Join(dir, "nilcore.db"))
 	if err != nil {
-		return nil // memory is optional; never block a run on it
+		return nil, nil
 	}
 	log.UseStore(s)
-	return memory.New(s)
+	return memory.New(s), agent.NewCheckpoint(s)
 }
 
 // memWriteBack persists a durable record after a verified task (P4-T05).

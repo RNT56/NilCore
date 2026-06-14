@@ -78,6 +78,9 @@ type Orchestrator struct {
 	// OnSuccess, if set, runs after a verified single-task completion (P4-T05),
 	// so durable conventions/decisions can be written back to memory.
 	OnSuccess func(ctx context.Context, t backend.Task, out Outcome)
+
+	// Checkpoint, if set, persists task state for crash/restart durability (P6-T03).
+	Checkpoint *Checkpoint
 }
 
 // Gate decides whether an action may proceed right now and records the decision.
@@ -128,6 +131,9 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 
 	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_start",
 		Detail: map[string]any{"goal": t.Goal, "base_repo": o.BaseRepo}})
+	if o.Checkpoint != nil {
+		_ = o.Checkpoint.Begin(ctx, t) // durable: mark running (P6-T03)
+	}
 
 	wt, err := worktree.Create(ctx, o.BaseRepo, t.ID)
 	if err != nil {
@@ -169,6 +175,9 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		Summary:  res.Summary,
 		Verified: rep.Passed,
 		Detail:   rep.Output,
+	}
+	if o.Checkpoint != nil {
+		_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, out.Verified) // durable: terminal status
 	}
 	if rep.Passed && o.OnSuccess != nil {
 		o.OnSuccess(ctx, t, out) // write durable facts back to memory (P4-T05)

@@ -175,3 +175,26 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
 	t.Updated, _ = time.Parse(tsFmt, updated)
 	return t, nil
 }
+
+// TasksByStatus returns tasks in a given status (e.g. "running", "interrupted")
+// — used to resume in-flight work after a restart (P6-T03).
+func (s *Store) TasksByStatus(ctx context.Context, status string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, goal, status, created, updated FROM tasks WHERE status = ? ORDER BY id`, status)
+	if err != nil {
+		return nil, fmt.Errorf("tasks by status: %w", err)
+	}
+	defer rows.Close()
+	var out []Task
+	for rows.Next() {
+		var t Task
+		var created, updated string
+		if err := rows.Scan(&t.ID, &t.Goal, &t.Status, &created, &updated); err != nil {
+			return nil, err
+		}
+		t.Created, _ = time.Parse(tsFmt, created)
+		t.Updated, _ = time.Parse(tsFmt, updated)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
