@@ -1,6 +1,6 @@
 # CLAUDE.md — source of truth
 
-**Read this file in full before touching anything.** It is the constitution for every agent — human or AI — working on nullclaw. If anything you are about to do conflicts with this file, stop: this file wins.
+**Read this file in full before touching anything.** It is the constitution for every agent — human or AI — working on NilCore. If anything you are about to do conflicts with this file, stop: this file wins.
 
 **Read order:** `CLAUDE.md` (this file) → `docs/PREREQUISITES.md` → `docs/ARCHITECTURE.md` → `docs/PERSONA.md` → `docs/TASKS.md` → `CHANGELOG.md`.
 
@@ -21,7 +21,7 @@ When in doubt, do **less**, and never guess on anything that touches an invarian
 
 ## 1. North star
 
-nullclaw is a tiny, robust coding agent. **The harness is small; the model is the engine.** Coding fluency and best-practice knowledge live in the model, so our code stays small *on purpose*. Robustness comes from three disciplines, and only these:
+NilCore is a tiny, robust coding agent. **The harness is small; the model is the engine.** Coding fluency and best-practice knowledge live in the model, so our code stays small *on purpose*. Robustness comes from three disciplines, and only these:
 
 - the agent **verifies** its own work (the project's own checks are the only authority on "done"),
 - everything executable is **sandboxed**,
@@ -95,13 +95,13 @@ Among eligible tasks, take the **lowest ID**. If none are eligible, poll and wai
 
 ```sh
 git fetch origin
-git worktree add ../nullclaw-P1-T03 -b task/P1-T03 origin/main
-cd ../nullclaw-P1-T03
+git worktree add ../nilcore-P1-T03 -b task/P1-T03 origin/main
+cd ../nilcore-P1-T03
 # ... do the work, scoped strictly to T.Owns ...
 make verify
 ```
 
-(This is exactly the worktree-per-task pattern nullclaw itself uses — you are dogfooding the product.)
+(This is exactly the worktree-per-task pattern NilCore itself uses — you are dogfooding the product.)
 
 ### Definition of Done
 
@@ -159,7 +159,7 @@ docs/
   ARCHITECTURE.md      ← decided architecture + invariants + frozen contract
   PERSONA.md           ← the running agent's voice, autonomy, and behavior
   TASKS.md             ← the work queue: master DAG + in-depth task specs
-cmd/nullclaw/          ← entrypoint
+cmd/nilcore/           ← entrypoint
 internal/
   model/               ← Anthropic Messages API client (stdlib only)
   backend/             ← CodingBackend contract + native / codex / claude-code

@@ -9,9 +9,9 @@ import (
 	"context"
 	"fmt"
 
-	"nullclaw/internal/backend"
-	"nullclaw/internal/eventlog"
-	"nullclaw/internal/verify"
+	"nilcore/internal/backend"
+	"nilcore/internal/eventlog"
+	"nilcore/internal/verify"
 )
 
 type Orchestrator struct {

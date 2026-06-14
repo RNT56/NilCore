@@ -16,7 +16,7 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
-_No tasks merged yet. Claim one from `docs/TASKS.md` and add your entry here._
+- **P0-T02** — Compile & `make verify` green. Initialized the git repo; restructured the flat offline scaffold into the documented tree (`cmd/nilcore` + `internal/{model,backend,agent,sandbox,verify,eventlog,policy}`); unified the project identity on `nilcore` (module, all imports, system prompt, Makefile, env var, relocated `CHANGELOG.md` to the repo root per CLAUDE.md §8); and authored the missing stdlib-only `internal/model` Anthropic Messages API client the native loop drives. `go build`/`go vet`/`go test` all pass; zero external dependencies preserved (invariant I6); no public contract changed (I1). _Owns:_ (whole tree). _(Phase 0)_
 
 ---
 

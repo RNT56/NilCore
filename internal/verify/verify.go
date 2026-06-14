@@ -8,7 +8,7 @@ import (
 	"context"
 	"strings"
 
-	"nullclaw/internal/sandbox"
+	"nilcore/internal/sandbox"
 )
 
 // Report is the result of running the project's checks.

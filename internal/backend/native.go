@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"strings"
 
-	"nullclaw/internal/eventlog"
-	"nullclaw/internal/model"
-	"nullclaw/internal/sandbox"
-	"nullclaw/internal/verify"
+	"nilcore/internal/eventlog"
+	"nilcore/internal/model"
+	"nilcore/internal/sandbox"
+	"nilcore/internal/verify"
 )
 
-// Native is nullclaw's own coding loop: the model proposes a shell action, the
+// Native is nilcore's own coding loop: the model proposes a shell action, the
 // sandbox runs it, the verifier judges, and the loop repeats until the checks
 // pass or the step budget is exhausted. This is the frozen core contract —
 // capability grows around it, not inside it.
@@ -27,7 +27,7 @@ type Native struct {
 
 func (n *Native) Name() string { return "native" }
 
-const systemPrompt = `You are nullclaw's native coding worker. You operate inside a sandboxed
+const systemPrompt = `You are nilcore's native coding worker. You operate inside a sandboxed
 working directory via the "run" tool, which executes shell commands and returns
 stdout, stderr, and the exit code. Make the smallest change that satisfies the
 goal. Inspect files before editing them. When you believe the goal is met and

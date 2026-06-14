@@ -1,5 +1,5 @@
 // Package policy decides what the agent may do unattended. The rule chosen for
-// nullclaw: auto-run reversible actions, pause for a human gate on irreversible
+// nilcore: auto-run reversible actions, pause for a human gate on irreversible
 // ones. Inside a worktree + container almost everything is reversible, so gates
 // naturally concentrate at the integration boundary (merge, push, deploy, pay).
 package policy
