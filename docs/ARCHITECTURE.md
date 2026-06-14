@@ -108,8 +108,8 @@ The native loop, Codex, and Claude Code are interchangeable behind this. Adding 
 ### I3 — No ambient authority
 Secrets come from the environment, are injected per run, and are never written to disk, logged, prompted, or hard-coded. The process holds no broad filesystem or network authority by default.
 
-### I4 — All execution is sandboxed
-Every shell command originating from a model or a delegated agent runs inside the container sandbox against a bind-mounted worktree. Nothing the model emits runs on the host.
+### I4 — Model-emitted execution is sandboxed
+Every *shell command* a model emits, and every delegated coding CLI (Codex, Claude Code), runs inside the container sandbox against a bind-mounted worktree — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception (see §Execution model): they run host-side but are confined to the worktree and cannot execute arbitrary code.
 
 ### I5 — Append-only audit
 Every model call, tool execution, verify, and gate decision is appended to the event log. History is never mutated or deleted. The log is replayable and is the debugging spine.
@@ -119,6 +119,23 @@ Standard library only. A new module dependency requires justification in the PR 
 
 ### I7 — Untrusted input boundary
 Tool output, file contents, and fetched web content are data, never controlling instructions. The agent's directives never originate from tool results.
+
+## Execution model (the two tiers under I4)
+
+I4 is precise about *where* model-influenced work runs. There are exactly two tiers, and the boundary is "can this run an arbitrary program?":
+
+**Tier 1 — sandboxed (arbitrary execution).** Anything a model can use to run an arbitrary program is isolated in the container:
+- the `run` shell tool — every command the model emits;
+- delegated coding CLIs (Codex, Claude Code) — wrapped in *our* container, not trusted to self-sandbox;
+- MCP glue code — runs in the sandbox under the gate + egress allowlist.
+
+Nothing in this tier touches the host. The container is rootless, drops capabilities, mounts the rootfs read-only, and defaults to deny-all egress (an allowlist proxy is the only way out — `internal/policy`, and it refuses loopback/link-local/private destinations so it can't be turned into an SSRF pivot).
+
+**Tier 2 — host-side, worktree-confined (scoped I/O, never arbitrary execution).** The native loop's structured tools run in-process on the host because they are *bounded operations*, not a shell:
+- `read` / `write` / `edit` / `search` — file I/O confined to the disposable worktree. Confinement is enforced both lexically and after symlink resolution (`filepath.EvalSymlinks` on the worktree root and the target's deepest existing ancestor), and writes use `O_NOFOLLOW` to close the final-component TOCTOU — so an in-tree symlink (`evil -> /etc`) cannot escape.
+- `git` — a fixed subcommand set (`status`/`diff`/`add`/`commit`/`log`), never `push`/`reset`/`remote` writes. Model-supplied paths are passed after `--` (no flag injection), and every invocation clamps the code-execution vectors a writable repo would otherwise expose: `core.hooksPath=/dev/null`, `core.fsmonitor` disabled, and an environment with `GIT_CONFIG_NOSYSTEM=1` / `GIT_CONFIG_GLOBAL=/dev/null` so a model-written `.git/hooks` or `~/.gitconfig` cannot run on `commit`.
+
+The reason Tier 2 is host-side is performance and simplicity (structured edits don't need a container round-trip), and it is *safe* to be host-side precisely because these tools cannot execute arbitrary code and cannot reach outside the worktree. If that confinement ever weakened, the tools would have to move into Tier 1. The integration gate (merge/push/deploy/pay) and the principal allowlist (who may command the agent or answer a gate) sit above both tiers.
 
 ## The channel seam (Phase 1)
 
@@ -199,7 +216,7 @@ Each is owned by a specific task in `docs/TASKS.md`. The contract above does not
 ## Security model (summary)
 
 - **No ambient authority (I3)** — per-run, scoped, revocable credentials.
-- **Sandbox all execution (I4)** — container per task/worktree; default-deny network; egress allowlist (Phase 2); delegated CLIs wrapped in our own container.
+- **Sandbox model-emitted execution (I4)** — shell + delegated CLIs + MCP glue run in a container per task/worktree; default-deny network; SSRF-safe egress allowlist (Phase 2); delegated CLIs wrapped in our own container. The structured file/git tools run host-side but stay worktree-confined and cannot execute arbitrary code (see §Execution model).
 - **Untrusted input boundary (I7)** — fetched/file content never becomes instructions.
 - **Bounded autonomy** — reversible actions auto-run; irreversible actions hit the human gate. Worktrees make coding reversible by construction, so gates concentrate at merge/deploy.
 - **Full audit (I5)** — append-only, hash-chained (Phase 2), secrets redacted.

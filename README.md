@@ -12,13 +12,13 @@ NilCore borrows intelligence instead of re‑encoding it — so the whole agent 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-1%20(pure--Go%20SQLite)-2ea44f)](go.mod)
 [![Agent size](https://img.shields.io/badge/agent-~8.1k%20LOC-1f6feb)](#the-receipts)
-[![Sandboxed](https://img.shields.io/badge/execution-100%25%20sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
+[![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
 
 ---
 
-> **TL;DR** — Point NilCore at a repo and a goal. It works in a throwaway git worktree, runs every command in a sandbox, and **isn't done until *your* checks pass** — not until the model *says* it's done. Drive it from your terminal or your phone. It never holds your keys, never runs on the host, and never decides "done" on its own word.
+> **TL;DR** — Point NilCore at a repo and a goal. It works in a throwaway git worktree, runs every command the model emits inside a sandbox, and **isn't done until *your* checks pass** — not until the model *says* it's done. Drive it from your terminal or your phone. It never holds your keys, never lets the model run an arbitrary program on the host, and never decides "done" on its own word.
 
 ```sh
 nilcore -dir ./repo -goal "make the failing test in math_test.go pass"
@@ -33,7 +33,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | The pain you've felt | How NilCore solves it |
 |---|---|
 | **"It said it was done. It wasn't."** | The **verifier is the only authority on done.** After *any* backend runs, your project's own build/test/lint re‑runs and that verdict ships the work — a self‑report never does. |
-| **"It ran a destructive command / touched my host."** | **Everything the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs). Destructive commands are denylisted *before* execution. Nothing runs on your machine. |
+| **"It ran a destructive command / touched my host."** | **Every command the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs), destructive ones denylisted *before* execution. The model can't run an arbitrary program on your machine; its file edits are confined to a throwaway worktree. |
 | **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
 | **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. |
@@ -162,7 +162,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 1. **One frozen backend contract** — `Run(ctx, Task) (Result, error)`. Native, Codex, Claude Code are interchangeable behind it.
 2. **The verifier is the only authority on "done."** A self‑report never governs.
 3. **No ambient authority.** Secrets via env only; never on disk, in logs, in prompts, or in code.
-4. **All execution is sandboxed.** Nothing the model emits runs on the host.
+4. **Model-emitted execution is sandboxed.** Shell commands and delegated CLIs run in the container; the structured file/git tools run host-side but stay confined to the worktree — the model can't run an arbitrary program on the host.
 5. **The audit log is append‑only** — hash‑chained, redacted, replayable. History is never mutated.
 6. **Zero‑dependency core** — standard library only. (SQLite, pure‑Go, is the single sanctioned exception.)
 7. **Untrusted input is data, never instructions.**

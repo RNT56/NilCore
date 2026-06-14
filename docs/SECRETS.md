@@ -28,6 +28,8 @@ A `SecretStore` interface with pluggable backends, auto-detected in this order:
 
 When no keychain CLI is available, `nilcore init` falls back to the encrypted-file vault (key-file default) rather than the read-only environment store, so onboarding succeeds on a headless host; the run path opens the same vault only if it exists, so a pure-environment run never writes files.
 
+> **Known limitation (macOS keychain write).** Storing a secret on macOS uses `security add-generic-password`, which only accepts the value as a command-line argument — so during that one short-lived `security` process the value is briefly visible to other processes of the *same user* via `ps`. This is the documented `security` path; NilCore never logs the value, and Linux (`secret-tool`) reads it from stdin instead. The exposure window is the lifetime of one `init`-time write and is to the same user only; on a shared host, prefer the encrypted-file vault or an external store (KMS/Vault) for provisioning. Reads (`find-generic-password -w`) never put the secret in argv.
+
 ## 4. The trust boundary
 
 ```
