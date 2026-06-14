@@ -171,3 +171,53 @@ func TestSymlinkEscapeRejected(t *testing.T) {
 		t.Errorf("legit read round-trip = %q", got)
 	}
 }
+
+func TestGitDiffArgInjectionNeutralized(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	c := exec.Command("git", "init", "-q")
+	c.Dir = dir
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	// A path that would be a flag if `--` weren't inserted: --output writes the
+	// diff to an attacker-named file. With `--` it's an (unmatched) pathspec.
+	target := filepath.Join(dir, "EXFIL")
+	inj := `{"op":"diff","paths":["--output=` + target + `"]}`
+	_, _ = run(t, GitTool{}, dir, inj)
+	if _, err := os.Stat(target); err == nil {
+		t.Fatal("git diff treated a model path as --output: arg injection not neutralized")
+	}
+}
+
+func TestGitHooksNeutralized(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	c := exec.Command("git", "init", "-q")
+	c.Dir = dir
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("init: %v\n%s", err, out)
+	}
+	// A model can write into .git/hooks; a pre-commit hook must NOT run on commit.
+	marker := filepath.Join(dir, "HOOK_RAN")
+	hook := "#!/bin/sh\ntouch '" + marker + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, ".git", "hooks", "pre-commit"), []byte(hook), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, GitTool{}, dir, `{"op":"add"}`); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, err := run(t, GitTool{}, dir, `{"op":"commit","message":"x"}`); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("pre-commit hook executed: core.hooksPath clamp not effective")
+	}
+}
