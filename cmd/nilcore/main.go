@@ -1,14 +1,15 @@
-// Command nilcore runs one coding task end to end: pick a backend, execute it
-// inside a container sandbox against a working directory, then let the verifier
-// decide whether it actually passed. This is the Phase 0 core — the smallest
-// thing that proves the loop converges. The channel, memory, and routing layers
-// grow around it without changing this contract.
+// Command nilcore runs one coding task end to end: create a fresh git worktree
+// of the target repo, run a backend inside a container sandbox against it, then
+// let the verifier decide whether it actually passed. The channel, memory, and
+// routing layers grow around this without changing the backend contract.
 //
 // Example:
 //
 //	export ANTHROPIC_API_KEY=sk-...
 //	nilcore -dir ./repo -goal "make the failing test in math_test.go pass" \
 //	         -verify "go build ./... && go test ./..."
+//
+// -dir must be a git repository; each run happens in a disposable worktree of it.
 package main
 
 import (
@@ -56,23 +57,39 @@ func main() {
 	}
 	defer log.Close()
 
-	box := sandbox.NewContainer(*runtime, *image, absDir)
-	v := verify.New(box, *checkCmd)
-
-	be, err := pickBackend(*backendName, box, v, log, *maxSteps)
-	if err != nil {
+	// Validate the backend selection up front so failures surface before a
+	// worktree is created (the factory below is called inside Execute).
+	if err := validateBackend(*backendName); err != nil {
 		fatal(err)
 	}
 
-	orch := &agent.Orchestrator{Backend: be, Verifier: v, Log: log}
+	// NewEnv builds a sandbox + verifier + backend pointed at a given worktree;
+	// the orchestrator calls it once per task.
+	newEnv := func(dir string) agent.Env {
+		box := sandbox.NewContainer(*runtime, *image, dir)
+		v := verify.New(box, *checkCmd)
+		be, err := pickBackend(*backendName, box, v, log, *maxSteps)
+		if err != nil {
+			fatal(err) // unreachable after validateBackend, but never run unverified
+		}
+		return agent.Env{Backend: be, Verifier: v}
+	}
+
+	orch := &agent.Orchestrator{
+		BaseRepo: absDir,
+		NewEnv:   newEnv,
+		Log:      log,
+		Router:   agent.SingleRouter{},
+		Spawner:  agent.NoSpawner{},
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
+	// Dir is assigned by the orchestrator from the worktree it creates.
 	task := backend.Task{
 		ID:   fmt.Sprintf("t-%d", time.Now().Unix()),
 		Goal: *goal,
-		Dir:  absDir,
 	}
 
 	out, err := orch.Execute(ctx, task)
@@ -84,6 +101,22 @@ func main() {
 	if !out.Verified {
 		fmt.Printf("\nchecks did not pass:\n%s\n", out.Detail)
 		os.Exit(1)
+	}
+}
+
+// validateBackend checks the backend name (and required secrets) before any
+// work begins, so the user sees a clean error rather than a mid-run failure.
+func validateBackend(name string) error {
+	switch name {
+	case "native":
+		if os.Getenv("ANTHROPIC_API_KEY") == "" {
+			return fmt.Errorf("ANTHROPIC_API_KEY is required for the native backend")
+		}
+		return nil
+	case "codex", "claude-code":
+		return nil
+	default:
+		return fmt.Errorf("unknown backend %q (want native | codex | claude-code)", name)
 	}
 }
 

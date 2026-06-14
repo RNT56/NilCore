@@ -13,6 +13,7 @@ package smoke
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -47,10 +48,14 @@ func TestNativeLoopConverges(t *testing.T) {
 		t.Fatalf("build nilcore: %v\n%s", err, out)
 	}
 
-	// Copy the failing fixture into a throwaway worktree the sandbox can write.
+	// Copy the failing fixture into a throwaway repo the orchestrator can branch
+	// a worktree from and the sandbox can write to.
 	work := filepath.Join(t.TempDir(), "work")
 	if err := copyTree(filepath.Join(root, "test", "fixtures", "failing-go"), work); err != nil {
 		t.Fatalf("copy fixture: %v", err)
+	}
+	if err := gitInit(work); err != nil {
+		t.Fatalf("git init fixture: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
@@ -88,6 +93,23 @@ func detectRuntime() string {
 
 func imagePresent(rt string) bool {
 	return exec.Command(rt, "image", "inspect", sandboxImage).Run() == nil
+}
+
+// gitInit turns dir into a git repo with one commit, so the orchestrator can
+// branch a worktree from it.
+func gitInit(dir string) error {
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"add", "."},
+		{"-c", "user.email=smoke@nilcore.local", "-c", "user.name=smoke", "commit", "-q", "-m", "fixture"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, out)
+		}
+	}
+	return nil
 }
 
 // repoRoot returns the module root (two levels up from this package).
