@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"nilcore/internal/eventlog"
+	"nilcore/internal/guard"
 	"nilcore/internal/model"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/tools"
@@ -124,7 +125,13 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				}
 				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_exec",
 					Detail: map[string]any{"cmd": in.Cmd, "exit": out.ExitCode}})
-				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: render(out)})
+				rendered := render(out)
+				if guard.Suspicious(rendered) {
+					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "injection_flagged",
+						Detail: map[string]any{"source": "shell output"}})
+				}
+				// Untrusted boundary (I7): fence tool output as data, never instructions.
+				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: guard.Wrap("shell output", rendered)})
 
 			default:
 				if n.Tools != nil && n.Tools.Has(b.Name) {
@@ -135,7 +142,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					}
 					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_exec",
 						Detail: map[string]any{"tool": b.Name}})
-					results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: out})
+					results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: guard.Wrap(b.Name+" output", out)})
 					continue
 				}
 				results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
@@ -157,7 +164,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			// failure, in one user message, and keep going.
 			fail := append(results, model.Block{
 				Type: "text",
-				Text: "The checks did not pass. Fix the issues and call finish again.\n\n" + rep.Output,
+				Text: "The checks did not pass. Fix the issues and call finish again.\n\n" + guard.Wrap("verifier output", rep.Output),
 			})
 			msgs = append(msgs, model.Message{Role: "user", Content: fail})
 			continue
