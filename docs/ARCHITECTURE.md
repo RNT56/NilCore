@@ -106,7 +106,7 @@ The native loop, Codex, and Claude Code are interchangeable behind this. Adding 
 `Result.SelfClaimed` is advisory. After **any** backend runs, the orchestrator re-runs the project's checks (`verify.Verifier.Check`) and that boolean decides whether work ships. This is what makes delegating to black-box agents safe: their self-report never governs.
 
 ### I3 — No ambient authority
-Secrets come from the environment, are injected per run, and are never written to disk, logged, prompted, or hard-coded. The process holds no broad filesystem or network authority by default.
+Secrets are held by the `SecretStore` (environment / OS keychain / encrypted vault / external), are injected per run, and are never written to disk in plaintext, logged, prompted, hard-coded, or given to the model. The process holds no broad filesystem or network authority by default. (See the Security section above and `docs/SECRETS.md` for the operational form.)
 
 ### I4 — Model-emitted execution is sandboxed
 Every *shell command* a model emits, and every delegated coding CLI (Codex, Claude Code), runs inside the container sandbox against a bind-mounted worktree — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception (see §Execution model): they run host-side but are confined to the worktree and cannot execute arbitrary code.
