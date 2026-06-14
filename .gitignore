@@ -10,3 +10,7 @@
 
 # macOS
 .DS_Store
+
+# Local Claude Code session state (per-machine, not shared)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
