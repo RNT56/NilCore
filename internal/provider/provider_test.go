@@ -21,14 +21,14 @@ func TestAnthropicComplete(t *testing.T) {
 			t.Errorf("missing anthropic-version header")
 		}
 		var req anthropicRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Model != "claude-x" {
 			t.Errorf("model = %q", req.Model)
 		}
 		if len(req.Messages) != 1 || len(req.Tools) != 1 {
 			t.Errorf("messages/tools = %d/%d", len(req.Messages), len(req.Tools))
 		}
-		io.WriteString(w, `{"content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t1","name":"run","input":{"cmd":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":7}}`)
+		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"hi"},{"type":"tool_use","id":"t1","name":"run","input":{"cmd":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":7}}`)
 	}))
 	defer srv.Close()
 
@@ -54,7 +54,7 @@ func TestOpenAITranslation(t *testing.T) {
 			t.Errorf("authorization = %q", r.Header.Get("authorization"))
 		}
 		var req oaiRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		// system + user + assistant(tool_calls) + tool
 		var sawSystem, sawTool, sawAssistantToolCall bool
 		for _, m := range req.Messages {
@@ -77,7 +77,7 @@ func TestOpenAITranslation(t *testing.T) {
 		if len(req.Tools) != 1 || req.Tools[0].Function.Name != "run" {
 			t.Errorf("tools = %+v", req.Tools)
 		}
-		io.WriteString(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"run","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
 	}))
 	defer srv.Close()
 

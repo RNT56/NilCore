@@ -72,10 +72,10 @@ func TestUpdate(t *testing.T) {
 	var gotChan, gotText string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotChan, _ = body["channel"].(string)
 		gotText, _ = body["text"].(string)
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer srv.Close()
 
@@ -93,11 +93,11 @@ func TestAsk(t *testing.T) {
 	var sawBlocks bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		if _, ok := body["blocks"]; ok {
 			sawBlocks = true
 		}
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer srv.Close()
 

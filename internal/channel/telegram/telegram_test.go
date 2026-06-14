@@ -18,10 +18,10 @@ func ctx5(t *testing.T) (context.Context, context.CancelFunc) {
 func TestReceive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/getUpdates") {
-			io.WriteString(w, `{"ok":true,"result":[{"update_id":1,"message":{"from":{"id":42},"chat":{"id":99},"text":"fix the bug"}}]}`)
+			_, _ = io.WriteString(w, `{"ok":true,"result":[{"update_id":1,"message":{"from":{"id":42},"chat":{"id":99},"text":"fix the bug"}}]}`)
 			return
 		}
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer srv.Close()
 
@@ -44,12 +44,12 @@ func TestUpdate(t *testing.T) {
 	var gotText string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
 			gotChat, _ = body["chat_id"].(float64)
 			gotText, _ = body["text"].(string)
 		}
-		io.WriteString(w, `{"ok":true}`)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer srv.Close()
 
@@ -79,17 +79,17 @@ func TestAsk(t *testing.T) {
 			var sawKeyboard bool
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var body map[string]any
-				json.NewDecoder(r.Body).Decode(&body)
+				_ = json.NewDecoder(r.Body).Decode(&body)
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/sendMessage"):
 					if _, ok := body["reply_markup"]; ok {
 						sawKeyboard = true
 					}
-					io.WriteString(w, `{"ok":true}`)
+					_, _ = io.WriteString(w, `{"ok":true}`)
 				case strings.HasSuffix(r.URL.Path, "/getUpdates"):
-					io.WriteString(w, `{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","data":"`+tc.data+`","message":{"chat":{"id":99}}}}]}`)
+					_, _ = io.WriteString(w, `{"ok":true,"result":[{"update_id":7,"callback_query":{"id":"cb1","data":"`+tc.data+`","message":{"chat":{"id":99}}}}]}`)
 				default:
-					io.WriteString(w, `{"ok":true}`)
+					_, _ = io.WriteString(w, `{"ok":true}`)
 				}
 			}))
 			b := New("t")
