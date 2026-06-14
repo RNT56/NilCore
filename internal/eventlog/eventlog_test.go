@@ -123,3 +123,40 @@ func TestStoreBacking(t *testing.T) {
 		t.Errorf("JSONL still must verify: %v", err)
 	}
 }
+
+// TestAppendKeepsChainConsistentOnWriteFailure proves a failed write neither
+// advances the hash chain nor corrupts the log: the failure is surfaced via Err,
+// the on-disk chain still verifies, and prev stays anchored to the last durable
+// event (audit M4 — previously the error was swallowed and prev advanced anyway).
+func TestAppendKeepsChainConsistentOnWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	l, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Append(Event{Kind: "first"}) // lands on disk
+	anchor := l.prev
+	if anchor == "" {
+		t.Fatal("expected a chain anchor after the first append")
+	}
+	if l.Err() != nil {
+		t.Fatalf("unexpected early error: %v", l.Err())
+	}
+
+	// Force every subsequent write to fail by closing the underlying file.
+	if err := l.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l.Append(Event{Kind: "second"}) // must fail
+
+	if l.Err() == nil {
+		t.Fatal("write failure was swallowed: Err() is nil")
+	}
+	if l.prev != anchor {
+		t.Fatal("hash chain advanced past an event that was never written")
+	}
+	// The file holds exactly the one good event and still verifies end to end.
+	if err := Verify(path); err != nil {
+		t.Fatalf("failed append corrupted the log: %v", err)
+	}
+}

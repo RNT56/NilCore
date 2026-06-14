@@ -35,8 +35,9 @@ type Event struct {
 type Log struct {
 	mu    sync.Mutex
 	f     *os.File
-	prev  string       // hash of the last appended event
+	prev  string       // hash of the last *durably written* event
 	store *store.Store // optional second backing (P4-T02); JSONL stays the export
+	err   error        // first write failure, if any (a broken audit trail is loud)
 }
 
 // UseStore wires a SQLite store as a second backing: each appended event (with
@@ -74,11 +75,28 @@ func (l *Log) Append(e Event) {
 	defer l.mu.Unlock()
 	e.Prev = l.prev
 	e.Hash = hashEvent(e)
-	b, _ := json.Marshal(e)
-	_, _ = l.f.Write(append(b, '\n'))
+	b, err := json.Marshal(e)
+	if err != nil {
+		l.fail(fmt.Errorf("marshal event: %w", err))
+		return // never advance the chain past a record we could not encode
+	}
+	line := append(b, '\n')
+	n, err := l.f.Write(line)
+	if err != nil || n != len(line) {
+		if err == nil {
+			err = fmt.Errorf("short write: %d of %d bytes", n, len(line))
+		}
+		l.fail(fmt.Errorf("append event: %w", err))
+		// The anchor was not (fully) persisted: keep prev pointing at the last
+		// event that actually reached disk, so the chain stays consistent with
+		// the file. A partial line, if any, surfaces as corruption under Verify —
+		// the honest signal, never a silent gap.
+		return
+	}
 	l.prev = e.Hash
 
-	// Second backing: mirror the (already hash-chained) event into the store.
+	// Second backing: mirror the (already hash-chained, now-durable) event into
+	// the store. Only after the file write landed, so the two backings agree.
 	if l.store != nil {
 		detail, _ := json.Marshal(e.Detail)
 		_ = l.store.InsertEvent(context.Background(), store.Event{
@@ -86,6 +104,28 @@ func (l *Log) Append(e Event) {
 			Detail: string(detail), Prev: e.Prev, Hash: e.Hash,
 		})
 	}
+}
+
+// fail records the first write failure and emits a one-line diagnostic. A
+// silently broken audit trail is unacceptable (invariant I5), so the failure is
+// both retained (see Err) and surfaced on stderr the moment it happens.
+func (l *Log) fail(err error) {
+	if l.err == nil {
+		l.err = err
+	}
+	fmt.Fprintf(os.Stderr, "nilcore: event log write failed: %v\n", err)
+}
+
+// Err reports the first write failure the log has encountered, or nil if the
+// audit trail is intact. Operators can poll it to detect a degraded log (e.g. a
+// full disk) without changing Append's fire-and-forget signature.
+func (l *Log) Err() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
 }
 
 // Close closes the underlying file.
