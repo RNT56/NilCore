@@ -20,7 +20,7 @@ const DefaultImage = "docker.io/library/debian:stable-slim"
 // ProviderConfig records a provider and the SecretStore name under which its key
 // is stored — not the key.
 type ProviderConfig struct {
-	Name   string `json:"name"`    // anthropic | openai | openrouter
+	Name   string `json:"name"`    // anthropic | openai | openrouter | codex
 	KeyRef string `json:"key_ref"` // secret name in the SecretStore
 }
 

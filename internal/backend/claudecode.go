@@ -24,6 +24,9 @@ type ClaudeCode struct {
 func (c *ClaudeCode) Name() string { return "claude-code" }
 
 func (c *ClaudeCode) Run(ctx context.Context, t Task) (Result, error) {
+	if err := ensureCLI(ctx, c.Box, "claude"); err != nil {
+		return Result{Backend: c.Name()}, err
+	}
 	cmd := "claude -p " + shellQuote(t.Goal) + " --output-format stream-json --permission-mode acceptEdits"
 	out, err := c.Box.ExecWithEnv(ctx, cmd, map[string]string{"ANTHROPIC_API_KEY": c.Key})
 	if err != nil {

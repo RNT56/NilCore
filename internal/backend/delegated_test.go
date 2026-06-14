@@ -82,3 +82,16 @@ func TestClaudeCodeInjectsKeyPerRunAndNeverLogsIt(t *testing.T) {
 		t.Fatal("secret leaked into the event log")
 	}
 }
+
+func TestDelegatedFailsFastWhenCLIMissing(t *testing.T) {
+	// fakeBox returns a non-zero exit for everything, so the `command -v` pre-flight
+	// reports the CLI is absent and the backend fails fast before running the task.
+	cx := &Codex{Box: &fakeBox{exit: 1}, Key: "k"}
+	if _, err := cx.Run(context.Background(), Task{ID: "t", Goal: "x"}); err == nil || !strings.Contains(err.Error(), "not installed") {
+		t.Fatalf("codex: want a clear missing-CLI error, got %v", err)
+	}
+	cc := &ClaudeCode{Box: &fakeBox{exit: 1}, Key: "k"}
+	if _, err := cc.Run(context.Background(), Task{ID: "t", Goal: "x"}); err == nil || !strings.Contains(err.Error(), "not installed") {
+		t.Fatalf("claude-code: want a clear missing-CLI error, got %v", err)
+	}
+}

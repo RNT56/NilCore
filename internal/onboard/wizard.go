@@ -110,6 +110,14 @@ func (w *Wizard) Run() (Config, error) {
 		}
 	}
 
+	// Delegated-backend key (optional): the codex backend reads CODEX_API_KEY;
+	// claude-code reuses the Anthropic key captured above.
+	if ref, err := captureSecret("\n  Codex API key (for the codex backend; blank to skip)", "codex_api_key"); err != nil {
+		return Config{}, err
+	} else if ref != "" {
+		cfg.Providers = append(cfg.Providers, ProviderConfig{Name: "codex", KeyRef: ref})
+	}
+
 	cfg.Delegated = detectDelegated()
 
 	fmt.Fprintf(w.Out, "\nReadiness:\n%s\n", cfg.Readiness())
@@ -130,6 +138,7 @@ func FromEnv(getenv func(string) string, store secrets.SecretStore) (Config, err
 		{"anthropic", "ANTHROPIC_API_KEY", "anthropic_api_key"},
 		{"openai", "OPENAI_API_KEY", "openai_api_key"},
 		{"openrouter", "OPENROUTER_API_KEY", "openrouter_api_key"},
+		{"codex", "CODEX_API_KEY", "codex_api_key"}, // delegated codex backend key
 	} {
 		if v := getenv(p.env); v != "" {
 			if err := store.Set(p.secret, v); err != nil {

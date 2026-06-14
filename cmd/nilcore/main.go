@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/channel"
@@ -91,19 +92,21 @@ func initMain(args []string) {
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
 	dir, backendName, runtime, image, checkCmd, logPath, config *string
-	maxSteps                                                    *int
+	maxSteps, advisorMaxCalls, escalateAfter                    *int
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
 	return commonFlags{
-		dir:         fs.String("dir", ".", "git repository tasks run against (in a disposable worktree)"),
-		backendName: fs.String("backend", "native", "native | codex | claude-code"),
-		runtime:     fs.String("runtime", "podman", "container runtime: podman | docker"),
-		image:       fs.String("image", onboard.DefaultImage, "sandbox image"),
-		checkCmd:    fs.String("verify", "make verify", "command that returns 0 when the task is done"),
-		logPath:     fs.String("log", "nilcore.events.jsonl", "append-only event log path"),
-		config:      fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)"),
-		maxSteps:    fs.Int("max-steps", 60, "tool-call budget for the native loop"),
+		dir:             fs.String("dir", ".", "git repository tasks run against (in a disposable worktree)"),
+		backendName:     fs.String("backend", "native", "native | codex | claude-code"),
+		runtime:         fs.String("runtime", "podman", "container runtime: podman | docker"),
+		image:           fs.String("image", onboard.DefaultImage, "sandbox image"),
+		checkCmd:        fs.String("verify", "make verify", "command that returns 0 when the task is done"),
+		logPath:         fs.String("log", "nilcore.events.jsonl", "append-only event log path"),
+		config:          fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)"),
+		maxSteps:        fs.Int("max-steps", 60, "tool-call budget for the native loop"),
+		advisorMaxCalls: fs.Int("advisor-max-calls", 4, "per-task ceiling on advisor escalations (native backend)"),
+		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
 	}
 }
 
@@ -130,7 +133,7 @@ func runMain(args []string) {
 
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, log, mem, absDir),
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir),
 		Log:        log,
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
@@ -176,7 +179,7 @@ func serveMain(args []string) {
 	chName := channelSpec(*channelName, b.cfg)
 	ch := buildChannel(chName, b.cred, allow, log)
 	mem, cp := setupPersistence(log)
-	newEnv := envFactory(c, prov, b.cred, log, mem, absDir)
+	newEnv := envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir)
 
 	run := func(ctx context.Context, t backend.Task, approver policy.Approver) (string, error) {
 		orch := &agent.Orchestrator{
@@ -232,17 +235,51 @@ func resolveProvider(backendName string, b boot) model.Provider {
 	}
 }
 
+// advisorCfg carries the optional strong-model advisor tier from boot into the
+// per-task native backend. A nil prov means no advisor (the loop runs without
+// escalation, exactly as before).
+type advisorCfg struct {
+	prov          model.Provider
+	maxCalls      int
+	escalateAfter int
+}
+
+// resolveAdvisor builds the advisor tier for the native backend: NILCORE_ADVISOR,
+// else the configured advisor model, else none. A configured advisor that cannot
+// be resolved (e.g. missing key) is reported and skipped — the run proceeds
+// without escalation rather than failing, since the advisor is an enhancement.
+func resolveAdvisor(backendName string, b boot, c commonFlags) advisorCfg {
+	adv := advisorCfg{maxCalls: *c.advisorMaxCalls, escalateAfter: *c.escalateAfter}
+	if backendName != "native" {
+		return adv
+	}
+	spec := os.Getenv("NILCORE_ADVISOR")
+	if spec == "" {
+		spec = b.cfg.Advisor
+	}
+	if spec == "" {
+		return adv
+	}
+	p, err := provider.ResolveWith(spec, b.cred)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "advisor disabled: %v\n", err)
+		return adv
+	}
+	adv.prov = p
+	return adv
+}
+
 // envFactory builds the per-worktree backend+verifier factory.
-func envFactory(c commonFlags, prov model.Provider, cred func(string) string, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
+func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
 	return func(dir string) agent.Env {
 		box := sandbox.NewContainer(*c.runtime, *c.image, dir)
 		v := verify.New(box, *c.checkCmd)
-		be := buildBackend(*c.backendName, prov, cred, box, v, log, *c.maxSteps, mem, project)
+		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project)
 		return agent.Env{Backend: be, Verifier: v}
 	}
 }
 
-func buildBackend(name string, prov model.Provider, cred func(string) string, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string) backend.CodingBackend {
+func buildBackend(name string, prov model.Provider, cred func(string) string, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string) backend.CodingBackend {
 	switch name {
 	case "codex":
 		// Key resolved env-first then SecretStore (I3); injected into the container per run.
@@ -258,6 +295,11 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, bo
 			Tools:        tools.Default(),
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
+		}
+		// A fresh advisor per task so its per-task consult ceiling is honored.
+		if adv.prov != nil {
+			n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+			n.EscalateAfter = adv.escalateAfter
 		}
 		if mem != nil {
 			n.MemoryContext = func(ctx context.Context, _ string) string {
@@ -465,8 +507,9 @@ func newCredResolver(cfg onboard.Config, store secrets.SecretStore, getenv func(
 }
 
 // secretRefsByEnv maps each credential's environment-variable name to the
-// SecretStore reference recorded in config.json. CODEX_API_KEY is not captured by
-// the wizard, so it has no reference and stays environment-only.
+// SecretStore reference recorded in config.json — including CODEX_API_KEY, which
+// `nilcore init` now captures as a "codex" provider entry (the delegated backend
+// key), so it resolves env-first then SecretStore like any provider key.
 func secretRefsByEnv(cfg onboard.Config) map[string]string {
 	m := map[string]string{}
 	for _, p := range cfg.Providers {
@@ -498,6 +541,8 @@ func providerEnv(name string) string {
 		return "OPENAI_API_KEY"
 	case "openrouter":
 		return "OPENROUTER_API_KEY"
+	case "codex":
+		return "CODEX_API_KEY" // delegated backend key, resolved like a provider key
 	default:
 		return ""
 	}

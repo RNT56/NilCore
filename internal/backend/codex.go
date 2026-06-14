@@ -28,6 +28,9 @@ type Codex struct {
 func (c *Codex) Name() string { return "codex" }
 
 func (c *Codex) Run(ctx context.Context, t Task) (Result, error) {
+	if err := ensureCLI(ctx, c.Box, "codex"); err != nil {
+		return Result{Backend: c.Name()}, err
+	}
 	cmd := "codex exec --json --full-auto " + shellQuote(t.Goal)
 	out, err := c.Box.ExecWithEnv(ctx, cmd, map[string]string{"CODEX_API_KEY": c.Key})
 	if err != nil {
@@ -45,6 +48,21 @@ func (c *Codex) Run(ctx context.Context, t Task) (Result, error) {
 // shellQuote single-quotes s for safe use in `sh -c`.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// ensureCLI fails fast if the delegated CLI is not present in the sandbox image.
+// The delegated backends run the CLI *inside* the container, so this is the check
+// that matters — a clear, actionable error beats a cryptic "command not found"
+// surfacing as a failed task.
+func ensureCLI(ctx context.Context, box sandbox.Sandbox, cli string) error {
+	out, err := box.Exec(ctx, "command -v "+cli)
+	if err != nil {
+		return fmt.Errorf("checking for the %s CLI in the sandbox: %w", cli, err)
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("the %q CLI is not installed in the sandbox image; add it to the image or use -backend native", cli)
+	}
+	return nil
 }
 
 // lastEventText extracts the final human-readable text from a JSONL event
