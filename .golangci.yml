@@ -1,20 +1,30 @@
-# golangci-lint configuration for NilCore.
-# CI pins the linter version (see .github/workflows/ci.yml) so this format
-# stays stable. The Makefile is a frozen contract file, so CI invokes
-# golangci-lint directly rather than through a make target.
+# golangci-lint v2 configuration for NilCore. v2 is required because the SQLite
+# dependency (modernc) pulls the go.mod toolchain to go 1.25, which the v1 line
+# cannot analyze. CI pins the linter version (see .github/workflows/ci.yml).
+version: "2"
+
 run:
   timeout: 5m
 
+# errcheck, govet, ineffassign, staticcheck, unused are in v2's default set.
+# The standard exclusion presets drop the idiomatic, safe-to-ignore unchecked
+# errors (deferred Close, writes to buffers, etc.) — real bugs still surface.
 linters:
   enable:
-    - errcheck      # unchecked errors
-    - govet         # suspicious constructs
-    - ineffassign   # ineffectual assignments
-    - staticcheck   # broad static analysis
-    - gofmt         # formatting
-    - goimports     # import grouping/ordering
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+  exclusions:
+    presets:
+      - common-false-positives
+      - std-error-handling
 
 issues:
-  # Show every finding; a clean tree is the bar (CLAUDE.md §4).
   max-issues-per-linter: 0
   max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
