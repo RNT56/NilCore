@@ -113,26 +113,30 @@ Provider retry/failover, cost ceilings, durable resume on restart, resource GC, 
 # Install (or grab a binary from Releases)
 curl -fsSL https://raw.githubusercontent.com/RNT56/NilCore/main/scripts/install.sh | sh
 
-export ANTHROPIC_API_KEY=sk-...
+# 1) Guided setup — one pass: providers + keys (→ SecretStore), runtime, backend,
+#    chat channel + serve allowlist. Re-check readiness anytime with `nilcore doctor`.
+nilcore init
 
-# 1) Run one task to completion (the native loop, in a disposable worktree)
+# 2) Run one task to completion (the native loop, in a disposable worktree)
 nilcore -dir ./repo \
         -goal "fix the failing test in math_test.go" \
         -verify "go build ./... && go test ./..."
 
-# 2) Delegate the same task to Claude Code or Codex — verified the same way
+# 3) Delegate the same task to Claude Code or Codex — verified the same way
 nilcore -dir ./repo -goal "..." -backend claude-code
 nilcore -dir ./repo -goal "..." -backend codex
 
-# 3) Drive it from your phone: gates become chat replies
-nilcore serve -channel telegram          # needs TELEGRAM_BOT_TOKEN
+# 4) Drive it from your phone: gates become chat replies
+nilcore serve -channel telegram          # needs a channel + allowlist (from `nilcore init`)
 
-# 4) Guided setup (providers, keys → SecretStore, runtime, channel)
-nilcore init
+# Prefer env vars / CI? Skip the wizard and export keys directly:
+#   export ANTHROPIC_API_KEY=sk-...   (or NILCORE_* for scripted: nilcore init -non-interactive)
 ```
 
+**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
+
 **Model selection** is `provider:model` via `NILCORE_MODEL` (default `claude-sonnet-4-6`; a bare name → Anthropic, e.g. `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`). Selecting the OpenRouter provider with no model — `openrouter` or `openrouter:` — defaults to **`openrouter/fusion`**, OpenRouter's multi-model panel that fuses several frontier models into one answer (it bills the cumulative cost of the panel).
-**Every step** is appended to a hash‑chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Secrets come from the environment and never hit disk, logs, or prompts.
+**Every step** is appended to a hash‑chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Plaintext secrets never hit disk, logs, or prompts; on a headless host they are sealed in an encrypted-file vault (AES‑256‑GCM, owner‑only key).
 
 ---
 
@@ -173,7 +177,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 ```mermaid
 flowchart TD
-    CLI[cmd/nilcore<br/>run · serve · init] --> AGENT[agent<br/>orchestrator + adaptive routing]
+    CLI[cmd/nilcore<br/>init · run · serve · doctor] --> AGENT[agent<br/>orchestrator + adaptive routing]
     AGENT --> BK[backend<br/>native · codex · claude-code]
     AGENT --> WT[worktree<br/>disposable per task]
     BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter]
@@ -210,7 +214,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           run · serve · init
+cmd/nilcore/           init · run · serve · doctor · config · secret · version
 internal/
   model, provider      canonical message format + Anthropic/OpenAI/OpenRouter
   backend              CodingBackend contract + native / codex / claude-code

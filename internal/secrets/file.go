@@ -181,6 +181,13 @@ func MasterKeyFromFile(keyPath string) ([]byte, error) {
 	if len(b) < 32 {
 		return nil, fmt.Errorf("master key file %s shorter than 32 bytes", keyPath)
 	}
+	// Self-heal a key file loosened by an external action (backup restore, rsync
+	// without -p, a bad umask): the key sits beside the vault, so its 0600 mode is
+	// the only thing guarding every stored secret. Best-effort — a chmod we cannot
+	// perform (not the owner) still lets the key load.
+	if fi, statErr := os.Stat(keyPath); statErr == nil && fi.Mode().Perm()&0o077 != 0 {
+		_ = os.Chmod(keyPath, 0o600)
+	}
 	return b[:32], nil
 }
 

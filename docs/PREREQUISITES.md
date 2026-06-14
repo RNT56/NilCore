@@ -50,11 +50,12 @@ The guided path — works on macOS and on a headless Linux VPS over SSH:
 
 ```sh
 nilcore init        # interactive wizard: providers + keys (→ SecretStore),
-                    # executor/advisor models, Codex/Claude Code, sandbox
-                    # runtime + image, channel — then an end-to-end smoke test
+                    # executor/advisor models, backend, sandbox runtime + image,
+                    # channel + serve allowlist — then a readiness summary
+nilcore doctor      # re-check readiness (keys resolve, runtime, serve allowlist)
 ```
 
-`nilcore init` also has a non-interactive mode (flags/env) for scripted VPS provisioning. Under the hood it does what the manual path below does.
+`nilcore init` also has a non-interactive mode (`-non-interactive`, driven by `NILCORE_*`/provider env vars) for scripted VPS provisioning, including a Slack channel and the serve allowlist. Under the hood it does what the manual path below does.
 
 Manual / advanced path:
 
