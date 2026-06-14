@@ -6,7 +6,15 @@ import (
 )
 
 func argsString(c *Container, cmd string) string {
-	return strings.Join(c.runArgs(cmd), " ")
+	return strings.Join(c.runArgs(cmd, nil), " ")
+}
+
+func TestExecWithEnvArgs(t *testing.T) {
+	c := NewContainer("docker", "img", "/work")
+	args := strings.Join(c.runArgs("codex exec", map[string]string{"CODEX_API_KEY": "sk-run"}), " ")
+	if !strings.Contains(args, "CODEX_API_KEY=sk-run") {
+		t.Errorf("per-run env not injected: %s", args)
+	}
 }
 
 func TestRunArgsHardenedDocker(t *testing.T) {

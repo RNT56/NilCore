@@ -1,44 +1,50 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
+
+	"nilcore/internal/eventlog"
+	"nilcore/internal/sandbox"
 )
 
 // Codex delegates the task to OpenAI's Codex CLI in non-interactive mode:
 //
 //	codex exec --json --full-auto "<goal>"
 //
-// It streams JSONL events on stdout; we keep the last human-readable message as
-// the summary. In production this command runs *inside* the sandbox container
-// (Codex sandboxes itself too — defense in depth) with CODEX_API_KEY injected
-// for the single run. Phase 0 ships the exec + parse seam; richer event
-// handling (per-event file-change tracking) is a Phase 1 detail.
+// It runs *inside* the sandbox container (defense in depth — Codex sandboxes
+// itself too) with CODEX_API_KEY injected per run (P2-T03): the key reaches the
+// container only for this invocation and is never written to disk, logged, or put
+// in a prompt (invariant I3). It streams JSONL on stdout; the last human-readable
+// message becomes the summary.
 type Codex struct {
-	Bin string // defaults to "codex"
+	Box sandbox.Sandbox
+	Key string // CODEX_API_KEY, injected per run; never logged
+	Log *eventlog.Log
 }
 
 func (c *Codex) Name() string { return "codex" }
 
 func (c *Codex) Run(ctx context.Context, t Task) (Result, error) {
-	bin := c.Bin
-	if bin == "" {
-		bin = "codex"
+	cmd := "codex exec --json --full-auto " + shellQuote(t.Goal)
+	out, err := c.Box.ExecWithEnv(ctx, cmd, map[string]string{"CODEX_API_KEY": c.Key})
+	if err != nil {
+		return Result{Backend: c.Name()}, fmt.Errorf("codex exec: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, bin, "exec", "--json", "--full-auto", t.Goal)
-	cmd.Dir = t.Dir // codex exec requires a git repo; the worktree is one
+	// Log the run WITHOUT the key (only the exit code and that codex ran).
+	c.Log.Append(eventlog.Event{Task: t.ID, Backend: c.Name(), Kind: "tool_exec",
+		Detail: map[string]any{"cli": "codex", "exit": out.ExitCode}})
+	if out.ExitCode != 0 {
+		return Result{Backend: c.Name(), Summary: tailStr(out.Stderr, 500)}, nil
+	}
+	return Result{Backend: c.Name(), Summary: lastEventText(out.Stdout), SelfClaimed: true}, nil
+}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return Result{Backend: c.Name()}, fmt.Errorf("codex exec: %w (%s)", err, tailStr(stderr.String(), 500))
-	}
-	return Result{Backend: c.Name(), Summary: lastEventText(stdout.String()), SelfClaimed: true}, nil
+// shellQuote single-quotes s for safe use in `sh -c`.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // lastEventText extracts the final human-readable text from a JSONL event

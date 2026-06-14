@@ -21,9 +21,12 @@ type Result struct {
 	ExitCode int
 }
 
-// Sandbox executes a shell command against a project directory.
+// Sandbox executes a shell command against a project directory. ExecWithEnv
+// injects per-invocation environment (e.g. a delegated CLI's API key, P2-T03):
+// the values reach the container only for that single run and are never logged.
 type Sandbox interface {
 	Exec(ctx context.Context, cmd string) (Result, error)
+	ExecWithEnv(ctx context.Context, cmd string, env map[string]string) (Result, error)
 	Workdir() string
 }
 
@@ -76,8 +79,9 @@ func (c *Container) AllowEgressVia(proxyURL string) {
 }
 
 // runArgs builds the container runtime argument list (extracted so the hardening
-// flags are unit-testable without launching a container).
-func (c *Container) runArgs(cmd string) []string {
+// flags are unit-testable without launching a container). perRun env is merged
+// on top of the container's persistent Env, for per-invocation secret injection.
+func (c *Container) runArgs(cmd string, perRun map[string]string) []string {
 	args := []string{"run", "--rm", "--network", c.Network}
 
 	if c.Hardened {
@@ -103,17 +107,26 @@ func (c *Container) runArgs(cmd string) []string {
 
 	// Per-run secret injection (P2-T03): keys reach the container only for this
 	// invocation, never persisted, never logged.
-	for k := range c.Env {
-		args = append(args, "-e", k+"="+c.Env[k])
+	for k, v := range c.Env {
+		args = append(args, "-e", k+"="+v)
+	}
+	for k, v := range perRun {
+		args = append(args, "-e", k+"="+v)
 	}
 
 	args = append(args, "-v", fmt.Sprintf("%s:/work", c.HostDir), "-w", "/work", c.Image, "sh", "-c", cmd)
 	return args
 }
 
+// Exec runs cmd with no extra per-run environment.
 func (c *Container) Exec(ctx context.Context, cmd string) (Result, error) {
+	return c.ExecWithEnv(ctx, cmd, nil)
+}
+
+// ExecWithEnv runs cmd, injecting env into the container for this invocation only.
+func (c *Container) ExecWithEnv(ctx context.Context, cmd string, env map[string]string) (Result, error) {
 	var stdout, stderr bytes.Buffer
-	ec := exec.CommandContext(ctx, c.Runtime, c.runArgs(cmd)...)
+	ec := exec.CommandContext(ctx, c.Runtime, c.runArgs(cmd, env)...)
 	ec.Stdout = &stdout
 	ec.Stderr = &stderr
 	err := ec.Run()

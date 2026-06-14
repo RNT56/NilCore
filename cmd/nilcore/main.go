@@ -216,9 +216,10 @@ func envFactory(c commonFlags, prov model.Provider, log *eventlog.Log) func(stri
 func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int) backend.CodingBackend {
 	switch name {
 	case "codex":
-		return &backend.Codex{}
+		// Key from the environment only (I3); injected into the container per run.
+		return &backend.Codex{Box: box, Key: os.Getenv("CODEX_API_KEY"), Log: log}
 	case "claude-code":
-		return &backend.ClaudeCode{}
+		return &backend.ClaudeCode{Box: box, Key: os.Getenv("ANTHROPIC_API_KEY"), Log: log}
 	default: // native
 		return &backend.Native{Model: prov, Box: box, Verifier: v, Log: log, Tools: tools.Default(), MaxSteps: maxSteps}
 	}
