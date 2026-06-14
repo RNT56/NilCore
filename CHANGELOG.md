@@ -16,6 +16,21 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
+_All 56 tasks in the `docs/TASKS.md` DAG are merged — see [0.1.0] below._
+
+---
+
+## [0.1.0] — 2026-06-14
+
+The full build per `docs/TASKS.md`, Phases 0–6 complete (56 tasks). NilCore is now
+the agent described in `CLAUDE.md`: a small, verifying, sandboxed, bounded core
+that plans, parallelizes across three coding backends behind one frozen contract,
+talks to a human over Telegram/Slack with chat-based gates, remembers across
+projects, understands code structurally (AST → graph → repo-map → retrieval), and
+improves itself under a human gate — running unattended with authorized control,
+metered budgets, durable resumption, and bounded resources. All seven invariants
+hold; the only dependency is a pure-Go SQLite driver.
+
 - **P6-T03** — Task durability + resume + graceful shutdown. `agent.Checkpoint` persists task state to the store (`running` → `done`/`failed`, single-write so a crash never leaves partial state); the orchestrator marks a task running at start and terminal at the end. `Interrupt` is the clean **SIGTERM checkpoint** (running → interrupted); `InFlight`/`Resume` re-run leftover work on restart, **failing cleanly** (with a surfaced reason) any task that can't resume. `store.TasksByStatus` backs it; `cmd/nilcore` wires the checkpointer and checkpoints in-flight work on `serve` shutdown. Tested: SIGTERM checkpoint → resume-from-checkpoint → done, and resume-fails-cleanly → failed. _Owns:_ `internal/agent/`. _(Phase 6)_
 - **P6-T01** — Provider resilience. `model.Resilient` wraps an ordered list of providers behind the unchanged `Provider` seam: retry with exponential backoff + jitter and a per-call timeout, failover across providers (errors joined), and a per-provider circuit breaker that opens after N consecutive failures and recovers after a cooldown. All knobs configurable; clock/sleep injected so tests are deterministic. 12 tests (retry/failover/breaker-trip/breaker-recover/timeout/cancellation). _Owns:_ `internal/model/`. _(Phase 6)_
 - **P6-T02** — Cost metering + ceiling enforcement. `internal/budget.Ledger` meters tokens + dollars **per task and globally** (RWMutex, race-clean); `Charge` refuses (and does not record) a spend that would exceed the task or global ceiling (`ErrCeiling`). Tested under `-race`: accrual, task/global ceiling refusal, exact-ceiling allowance, negative/cancelled rejection, 64×100 concurrent charges. _Owns:_ `internal/budget/`. _(Phase 6)_
