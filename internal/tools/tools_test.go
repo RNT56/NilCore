@@ -129,3 +129,45 @@ func TestGitTool(t *testing.T) {
 		t.Error("commit without message should fail")
 	}
 }
+
+func TestSymlinkEscapeRejected(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("top secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An in-tree symlink that points OUTSIDE the worktree.
+	if err := os.Symlink(outside, filepath.Join(dir, "leak")); err != nil {
+		t.Skip("symlinks unsupported on this platform")
+	}
+	// A symlink whose target is a specific outside file.
+	if err := os.Symlink(secret, filepath.Join(dir, "evil")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reading/writing THROUGH the symlinked dir must be rejected.
+	if _, err := run(t, ReadTool{}, dir, `{"path":"leak/secret.txt"}`); err == nil {
+		t.Error("read via an in-tree symlink to outside must be rejected")
+	}
+	if _, err := run(t, WriteTool{}, dir, `{"path":"leak/pwn.txt","content":"x"}`); err == nil {
+		t.Error("write via an in-tree symlink to outside must be rejected")
+	}
+	// Reading the symlink file itself (points out) must be rejected.
+	if _, err := run(t, ReadTool{}, dir, `{"path":"evil"}`); err == nil {
+		t.Error("reading a symlink that points outside must be rejected")
+	}
+	// Editing through the symlink must be rejected (and never touch the secret).
+	_, _ = run(t, EditTool{}, dir, `{"path":"evil","old":"top secret","new":"pwned"}`)
+	if b, _ := os.ReadFile(secret); string(b) != "top secret" {
+		t.Fatal("confinement breached: the outside file was modified")
+	}
+
+	// Regression: a legit nested NEW file under the worktree still works.
+	if _, err := run(t, WriteTool{}, dir, `{"path":"sub/ok.txt","content":"fine"}`); err != nil {
+		t.Errorf("legit nested write should still succeed: %v", err)
+	}
+	if got, _ := run(t, ReadTool{}, dir, `{"path":"sub/ok.txt"}`); got != "fine" {
+		t.Errorf("legit read round-trip = %q", got)
+	}
+}

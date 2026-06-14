@@ -9,21 +9,75 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
-// safePath resolves rel against workdir and confirms it stays inside it, so a
-// tool can never read or write outside the worktree (inspectable confinement).
+// safePath resolves rel against workdir and confirms it stays inside it — both
+// lexically AND after following symlinks — so a tool can never read or write
+// outside the worktree. A lexical check alone is not enough: an in-tree symlink
+// (e.g. `evil -> /etc`) would otherwise let a write escape. We therefore resolve
+// the worktree root and the deepest existing ancestor of the target through
+// EvalSymlinks and re-check containment. (Writes additionally use O_NOFOLLOW to
+// close the TOCTOU window on the final component — see writeNoFollow.)
 func safePath(workdir, rel string) (string, error) {
 	if rel == "" {
 		return "", fmt.Errorf("empty path")
 	}
-	abs := filepath.Join(workdir, rel)
-	clean := filepath.Clean(abs)
-	root := filepath.Clean(workdir)
-	if clean != root && !strings.HasPrefix(clean, root+string(os.PathSeparator)) {
+	root, err := filepath.EvalSymlinks(workdir)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree root: %w", err)
+	}
+	root = filepath.Clean(root)
+
+	target := filepath.Clean(filepath.Join(root, rel))
+	if !within(root, target) {
 		return "", fmt.Errorf("path %q escapes the worktree", rel)
 	}
-	return clean, nil
+
+	// Resolve the deepest existing ancestor (the target itself may not exist yet,
+	// e.g. a new file) and confirm it still resolves inside the worktree — this is
+	// what catches an in-tree symlink pointing out.
+	probe := target
+	for {
+		if _, lerr := os.Lstat(probe); lerr == nil {
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	real, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", rel, err)
+	}
+	if !within(root, filepath.Clean(real)) {
+		return "", fmt.Errorf("path %q resolves outside the worktree (symlink escape)", rel)
+	}
+	return target, nil
+}
+
+// within reports whether p is root or lives under it.
+func within(root, p string) bool {
+	return p == root || strings.HasPrefix(p, root+string(os.PathSeparator))
+}
+
+// writeNoFollow writes content to p, refusing to follow a symlink at the final
+// path component (defends against a symlink swapped in after safePath's check).
+func writeNoFollow(p string, content []byte) error {
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // ReadTool returns the contents of a file in the worktree.
@@ -74,10 +128,7 @@ func (WriteTool) Run(_ context.Context, workdir string, input json.RawMessage) (
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(p, []byte(in.Content), 0o644); err != nil {
+	if err := writeNoFollow(p, []byte(in.Content)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(in.Content), in.Path), nil
@@ -126,7 +177,7 @@ func (EditTool) Run(_ context.Context, workdir string, input json.RawMessage) (s
 	} else {
 		out = strings.Replace(src, in.Old, in.New, 1)
 	}
-	if err := os.WriteFile(p, []byte(out), 0o644); err != nil {
+	if err := writeNoFollow(p, []byte(out)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("edited %s (%d replacement(s))", in.Path, n), nil
