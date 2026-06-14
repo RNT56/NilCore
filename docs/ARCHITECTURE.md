@@ -153,7 +153,8 @@ policy  (leaf, imported by agent)
 
 | Package | Responsibility | May import |
 |---|---|---|
-| `internal/model` | Messages API client | stdlib only |
+| `internal/model` | canonical message/tool format + `Provider` seam | stdlib only |
+| `internal/provider` | vendor adapters (anthropic / openai / openrouter) | `model` |
 | `internal/sandbox` | container command execution | stdlib only |
 | `internal/verify` | run project checks, report pass/fail | `sandbox` |
 | `internal/eventlog` | append-only JSONL audit | stdlib only |

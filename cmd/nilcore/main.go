@@ -25,6 +25,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
+	"nilcore/internal/provider"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/verify"
 )
@@ -58,10 +59,21 @@ func main() {
 	}
 	defer log.Close()
 
-	// Validate the backend selection up front so failures surface before a
-	// worktree is created (the factory below is called inside Execute).
-	if err := validateBackend(*backendName); err != nil {
-		fatal(err)
+	// Resolve the model provider up front (native backend) so a missing key
+	// surfaces before any worktree is created. Model selection is
+	// "provider:model" via NILCORE_MODEL; a bare model defaults to Anthropic.
+	var prov model.Provider
+	switch *backendName {
+	case "native":
+		p, err := provider.Resolve(getenv("NILCORE_MODEL", "claude-sonnet-4-6"))
+		if err != nil {
+			fatal(err)
+		}
+		prov = p
+	case "codex", "claude-code":
+		// No up-front secret needed in Phase 1 (delegated CLIs authenticate themselves).
+	default:
+		fatal(fmt.Errorf("unknown backend %q (want native | codex | claude-code)", *backendName))
 	}
 
 	// NewEnv builds a sandbox + verifier + backend pointed at a given worktree;
@@ -69,10 +81,7 @@ func main() {
 	newEnv := func(dir string) agent.Env {
 		box := sandbox.NewContainer(*runtime, *image, dir)
 		v := verify.New(box, *checkCmd)
-		be, err := pickBackend(*backendName, box, v, log, *maxSteps)
-		if err != nil {
-			fatal(err) // unreachable after validateBackend, but never run unverified
-		}
+		be := buildBackend(*backendName, prov, box, v, log, *maxSteps)
 		return agent.Env{Backend: be, Verifier: v}
 	}
 
@@ -106,42 +115,22 @@ func main() {
 	}
 }
 
-// validateBackend checks the backend name (and required secrets) before any
-// work begins, so the user sees a clean error rather than a mid-run failure.
-func validateBackend(name string) error {
+// buildBackend constructs the chosen backend for a worktree. The backend name is
+// validated up front in main, so this does not return an error.
+func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int) backend.CodingBackend {
 	switch name {
-	case "native":
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			return fmt.Errorf("ANTHROPIC_API_KEY is required for the native backend")
-		}
-		return nil
-	case "codex", "claude-code":
-		return nil
-	default:
-		return fmt.Errorf("unknown backend %q (want native | codex | claude-code)", name)
-	}
-}
-
-func pickBackend(name string, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int) (backend.CodingBackend, error) {
-	switch name {
-	case "native":
-		key := os.Getenv("ANTHROPIC_API_KEY")
-		if key == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY is required for the native backend")
-		}
+	case "codex":
+		return &backend.Codex{}
+	case "claude-code":
+		return &backend.ClaudeCode{}
+	default: // native
 		return &backend.Native{
-			Model:    model.New(key, getenv("NILCORE_MODEL", "claude-sonnet-4-6")),
+			Model:    prov,
 			Box:      box,
 			Verifier: v,
 			Log:      log,
 			MaxSteps: maxSteps,
-		}, nil
-	case "codex":
-		return &backend.Codex{}, nil
-	case "claude-code":
-		return &backend.ClaudeCode{}, nil
-	default:
-		return nil, fmt.Errorf("unknown backend %q (want native | codex | claude-code)", name)
+		}
 	}
 }
 

@@ -17,7 +17,7 @@ import (
 // pass or the step budget is exhausted. This is the frozen core contract —
 // capability grows around it, not inside it.
 type Native struct {
-	Model    *model.Client
+	Model    model.Provider
 	Box      sandbox.Sandbox
 	Verifier verify.Verifier
 	Log      *eventlog.Log
