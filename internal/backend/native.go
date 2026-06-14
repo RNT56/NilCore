@@ -9,6 +9,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/model"
 	"nilcore/internal/sandbox"
+	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
 
@@ -21,6 +22,7 @@ type Native struct {
 	Box      sandbox.Sandbox
 	Verifier verify.Verifier
 	Log      *eventlog.Log
+	Tools    *tools.Registry // optional structured tools; nil = shell-only
 
 	MaxSteps int // tool-call ceiling (budget). Generous by default.
 }
@@ -40,7 +42,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		steps = 60 // generous: optimize for finishing
 	}
 
-	tools := []model.Tool{
+	toolDefs := []model.Tool{
 		{
 			Name:        "run",
 			Description: "Run a shell command in the working directory. Returns stdout, stderr, exit code.",
@@ -52,6 +54,11 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			InputSchema: json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`),
 		},
 	}
+	// Structured tools (read/write/edit/search/git) load from the registry, so
+	// adding a tool never edits this loop; shell ("run") stays the fallback.
+	if n.Tools != nil {
+		toolDefs = append(n.Tools.Defs(), toolDefs...)
+	}
 
 	user := "Goal:\n" + t.Goal
 	if len(t.Constraints) > 0 {
@@ -60,7 +67,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: user}}}}
 
 	for i := 0; i < steps; i++ {
-		resp, err := n.Model.Complete(ctx, systemPrompt, msgs, tools, 4096)
+		resp, err := n.Model.Complete(ctx, systemPrompt, msgs, toolDefs, 4096)
 		if err != nil {
 			return Result{Backend: n.Name()}, fmt.Errorf("model step %d: %w", i, err)
 		}
@@ -107,6 +114,17 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: render(out)})
 
 			default:
+				if n.Tools != nil && n.Tools.Has(b.Name) {
+					out, err := n.Tools.Dispatch(ctx, b.Name, t.Dir, b.Input)
+					if err != nil {
+						results = append(results, errorResult(b.ID, b.Name+": "+err.Error()))
+						continue
+					}
+					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_exec",
+						Detail: map[string]any{"tool": b.Name}})
+					results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: out})
+					continue
+				}
 				results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
 			}
 		}

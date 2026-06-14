@@ -27,6 +27,7 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/provider"
 	"nilcore/internal/sandbox"
+	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
 
@@ -129,6 +130,7 @@ func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verif
 			Box:      box,
 			Verifier: v,
 			Log:      log,
+			Tools:    tools.Default(),
 			MaxSteps: maxSteps,
 		}
 	}
