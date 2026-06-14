@@ -1,0 +1,12 @@
+# Local env and secrets — never committed (invariant I3)
+.env
+
+# Append-only event log output
+*.events.jsonl
+
+# Built binaries
+/nilcore
+/cmd/nilcore/nilcore
+
+# macOS
+.DS_Store
