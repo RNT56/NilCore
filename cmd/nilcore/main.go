@@ -59,7 +59,7 @@ func initMain(args []string) {
 	configPath := fs.String("config", "", "config output path (default: <config-dir>/config.json)")
 	_ = fs.Parse(args)
 
-	store := secrets.Detect()
+	store := detectStore(true)
 	var (
 		cfg onboard.Config
 		err error
@@ -173,7 +173,8 @@ func serveMain(args []string) {
 			"set NILCORE_ALLOWLIST to a comma-separated list of permitted channel user ids, " +
 			"or add \"allow\" to the channel section of config.json"))
 	}
-	ch := buildChannel(channelSpec(*channelName, b.cfg), b.cred, allow, log)
+	chName := channelSpec(*channelName, b.cfg)
+	ch := buildChannel(chName, b.cred, allow, log)
 	mem, cp := setupPersistence(log)
 	newEnv := envFactory(c, prov, b.cred, log, mem, absDir)
 
@@ -202,7 +203,7 @@ func serveMain(args []string) {
 	defer stop()
 
 	srv := &server.Server{Channel: ch, Log: log, Run: run}
-	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", *channelName)
+	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	if err := srv.Serve(ctx); err != nil {
 		fatal(err)
 	}
@@ -384,7 +385,45 @@ type boot struct {
 
 func loadBoot(configPath string) boot {
 	cfg := loadConfig(configPath)
-	return boot{cfg: cfg, cred: newCredResolver(cfg, secrets.Detect(), os.Getenv)}
+	return boot{cfg: cfg, cred: newCredResolver(cfg, detectStore(false), os.Getenv)}
+}
+
+// detectStore selects the host SecretStore. With an OS keychain it uses that.
+// Without one it uses the encrypted file vault under the config dir (AES-256-GCM
+// sealed by a 0600 key file — the headless default, docs/SECRETS.md §8): when
+// forWrite (`nilcore init`) it provisions the key + vault so onboarding works with
+// no keychain; otherwise it only opens an EXISTING vault, so a pure-environment run
+// never creates files. Falls back to the read-only environment store when no vault
+// is usable. init (write) and the run path (read) use the same selection, so a key
+// stored at init is found at run time.
+func detectStore(forWrite bool) secrets.SecretStore {
+	if kc := secrets.Detect(); kc.Name() == "keychain" {
+		return kc
+	}
+	dir, err := paths.ConfigDir()
+	if err != nil {
+		return secrets.EnvStore{}
+	}
+	if !forWrite {
+		if _, err := os.Stat(filepath.Join(dir, "secrets.vault")); err != nil {
+			return secrets.EnvStore{} // nothing persisted → environment only
+		}
+	}
+	return fileVault(dir)
+}
+
+// fileVault opens (provisioning the master key if absent) the encrypted vault in
+// dir, falling back to the read-only environment store if it cannot be sealed.
+func fileVault(dir string) secrets.SecretStore {
+	key, err := secrets.MasterKeyFromFile(filepath.Join(dir, "secrets.key"))
+	if err != nil {
+		return secrets.EnvStore{}
+	}
+	vault, err := secrets.OpenFileVault(filepath.Join(dir, "secrets.vault"), key)
+	if err != nil {
+		return secrets.EnvStore{}
+	}
+	return vault
 }
 
 // loadConfig reads config.json (from configPath or the default location). A

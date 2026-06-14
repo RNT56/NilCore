@@ -141,3 +141,25 @@ func TestResolveMissingKey(t *testing.T) {
 		t.Error("expected error when key is absent")
 	}
 }
+
+// TestResolveWith proves the injected key lookup is honored (not the process
+// environment), so the composition root can source keys from a SecretStore.
+func TestResolveWith(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "") // ensure the real environment is empty
+	lookup := func(name string) string {
+		if name == "OPENROUTER_API_KEY" {
+			return "from-lookup"
+		}
+		return ""
+	}
+	p, err := ResolveWith("openrouter", lookup)
+	if err != nil {
+		t.Fatalf("ResolveWith: %v", err)
+	}
+	if p.Model() != "openrouter/fusion" {
+		t.Errorf("model = %q, want openrouter/fusion", p.Model())
+	}
+	if _, err := ResolveWith("anthropic:claude-x", func(string) string { return "" }); err == nil {
+		t.Error("expected error when the lookup yields no key")
+	}
+}

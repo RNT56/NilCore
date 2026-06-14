@@ -36,7 +36,7 @@ func TestWizardRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if cfg.Runtime != "docker" || cfg.Image != "nilcore/sandbox:latest" {
+	if cfg.Runtime != "docker" || cfg.Image != DefaultImage {
 		t.Errorf("runtime=%q image=%q", cfg.Runtime, cfg.Image)
 	}
 	if len(cfg.Providers) != 1 || cfg.Providers[0].Name != "anthropic" || cfg.Providers[0].KeyRef != "anthropic_api_key" {

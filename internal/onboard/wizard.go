@@ -52,7 +52,7 @@ func (w *Wizard) Run() (Config, error) {
 
 	cfg := Config{Runtime: defaultRuntime()}
 	cfg.Runtime = ask("Container runtime (podman|docker)", cfg.Runtime)
-	cfg.Image = ask("Sandbox image", "nilcore/sandbox:latest")
+	cfg.Image = ask("Sandbox image", DefaultImage)
 
 	// Providers + keys (keys → SecretStore, config keeps the reference).
 	fmt.Fprintln(w.Out, "\nProvider keys (leave blank to skip a provider):")
@@ -112,7 +112,7 @@ func (w *Wizard) Run() (Config, error) {
 func FromEnv(getenv func(string) string, store secrets.SecretStore) (Config, error) {
 	cfg := Config{
 		Runtime:  orDefault(getenv("NILCORE_RUNTIME"), defaultRuntime()),
-		Image:    orDefault(getenv("NILCORE_IMAGE"), "nilcore/sandbox:latest"),
+		Image:    orDefault(getenv("NILCORE_IMAGE"), DefaultImage),
 		Executor: orDefault(getenv("NILCORE_EXECUTOR"), "anthropic:claude-sonnet-4-6"),
 		Advisor:  orDefault(getenv("NILCORE_ADVISOR"), "anthropic:claude-opus-4-8"),
 	}

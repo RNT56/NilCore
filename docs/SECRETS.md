@@ -22,9 +22,11 @@ Secrets are held by the **host process** (NilCore), never by the model. The mode
 A `SecretStore` interface with pluggable backends, auto-detected in this order:
 
 1. **OS keychain** (preferred where a session exists): **macOS Keychain**; **Linux Secret Service** (libsecret / gnome-keyring / KWallet) over D-Bus.
-2. **Encrypted-file vault** (headless VPS): a secretbox/age-encrypted file at the config path, opened with a master key. This is the path that works with no desktop session.
+2. **Encrypted-file vault** (headless VPS): an AES-256-GCM file (`secrets.vault`) at the config path, sealed by a `0600` master key (`secrets.key`). This is the path that works with no desktop session — `nilcore init` provisions it automatically when no keychain is present, and the run path reads it back.
 3. **Environment** (CI / advanced): read directly from the process environment.
 4. **External** (production option): cloud KMS, Vault, or systemd-creds.
+
+When no keychain CLI is available, `nilcore init` falls back to the encrypted-file vault (key-file default) rather than the read-only environment store, so onboarding succeeds on a headless host; the run path opens the same vault only if it exists, so a pure-environment run never writes files.
 
 ## 4. The trust boundary
 
@@ -62,6 +64,8 @@ Defense in depth for the path back *into* context:
 ## 7. Config holds references, not secrets
 
 The config file (JSON, at the platform config path) records *which* providers and channels are enabled and *which* secret name each uses. The secret values live only in the SecretStore. The config is safe to read, diff, and (if you wish) commit; it contains no credentials.
+
+At run time NilCore resolves each credential **environment-first, then the SecretStore** via the config's reference: an exported variable (e.g. `OPENROUTER_API_KEY`) always wins, otherwise the key captured by `nilcore init` is fetched from the SecretStore by name. So a configured host runs with no re-exporting, while an env var still overrides for one-off use. With no config and no keychain, resolution is pure environment lookup. The model executor, container runtime, and sandbox image fall back to `config.json` the same way (an explicit flag or env var overrides the configured value).
 
 ## 8. Headless-VPS master key (the one trade-off)
 
