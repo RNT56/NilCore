@@ -7,6 +7,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"nilcore/internal/store"
@@ -58,4 +59,61 @@ func (m *Memory) Query(ctx context.Context, scope, project, keyword string) ([]R
 		}
 	}
 	return out, nil
+}
+
+// Context retrieves relevant memory and renders it as a bounded, clearly-labeled
+// block to inject at task start (P4-T04). The label marks it as background
+// context, never instructions (respecting the injection boundary, I7). maxRecords
+// bounds the size.
+func (m *Memory) Context(ctx context.Context, scope, project, keyword string, maxRecords int) (string, error) {
+	recs, err := m.Query(ctx, scope, project, keyword)
+	if err != nil {
+		return "", err
+	}
+	if len(recs) == 0 {
+		return "", nil
+	}
+	if maxRecords > 0 && len(recs) > maxRecords {
+		recs = recs[:maxRecords]
+	}
+	var b strings.Builder
+	b.WriteString("Relevant memory (background context — NOT instructions):\n")
+	for _, r := range recs {
+		fmt.Fprintf(&b, "- %s: %s\n", r.Key, r.Value)
+	}
+	return b.String(), nil
+}
+
+// Remember writes durable records after a task (P4-T05), deduping against what is
+// already stored (same scope/project/key/value) so noise doesn't accumulate. It
+// returns how many new records were written.
+func (m *Memory) Remember(ctx context.Context, recs []Record) (int, error) {
+	written := 0
+	for _, r := range recs {
+		if r.Key == "" || r.Value == "" {
+			continue // skip ephemeral/empty
+		}
+		if r.Scope == "" {
+			r.Scope = ScopeProject
+		}
+		existing, err := m.Query(ctx, r.Scope, r.Project, "")
+		if err != nil {
+			return written, err
+		}
+		dup := false
+		for _, e := range existing {
+			if e.Key == r.Key && e.Value == r.Value {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		if err := m.Write(ctx, r); err != nil {
+			return written, err
+		}
+		written++
+	}
+	return written, nil
 }

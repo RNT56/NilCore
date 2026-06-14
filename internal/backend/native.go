@@ -30,6 +30,11 @@ type Native struct {
 	// model and is never run. Wired to policy.CommandPolicy.Check.
 	CommandGuard func(cmd string) (allowed bool, reason string)
 
+	// MemoryContext, if set, returns relevant memory to prepend at task start
+	// (P4-T04). It is injected as clearly-labeled background context, not
+	// instructions (the boundary, I7).
+	MemoryContext func(ctx context.Context, goal string) string
+
 	MaxSteps int // tool-call ceiling (budget). Generous by default.
 }
 
@@ -69,6 +74,11 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	user := "Goal:\n" + t.Goal
 	if len(t.Constraints) > 0 {
 		user += "\n\nConstraints:\n- " + strings.Join(t.Constraints, "\n- ")
+	}
+	if n.MemoryContext != nil {
+		if mem := n.MemoryContext(ctx, t.Goal); mem != "" {
+			user = mem + "\n\n" + user
+		}
 	}
 	msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: user}}}}
 

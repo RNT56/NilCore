@@ -74,6 +74,10 @@ type Orchestrator struct {
 	Board       *blackboard.Blackboard
 	ShouldPlan  func(goal string) bool
 	MaxParallel int
+
+	// OnSuccess, if set, runs after a verified single-task completion (P4-T05),
+	// so durable conventions/decisions can be written back to memory.
+	OnSuccess func(ctx context.Context, t backend.Task, out Outcome)
 }
 
 // Gate decides whether an action may proceed right now and records the decision.
@@ -160,10 +164,14 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify",
 		Detail: map[string]any{"passed": rep.Passed}})
 
-	return Outcome{
+	out := Outcome{
 		Backend:  res.Backend,
 		Summary:  res.Summary,
 		Verified: rep.Passed,
 		Detail:   rep.Output,
-	}, nil
+	}
+	if rep.Passed && o.OnSuccess != nil {
+		o.OnSuccess(ctx, t, out) // write durable facts back to memory (P4-T05)
+	}
+	return out, nil
 }

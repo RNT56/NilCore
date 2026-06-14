@@ -3,6 +3,7 @@ package memory_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"nilcore/internal/memory"
@@ -60,5 +61,46 @@ func TestWriteDefaultsToProject(t *testing.T) {
 	got, _ := m.Query(ctx, memory.ScopeProject, "p", "")
 	if len(got) != 1 {
 		t.Errorf("expected default project scope; got %d", len(got))
+	}
+}
+
+func TestContextLabeledAndBounded(t *testing.T) {
+	m := newMem(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		_ = m.Write(ctx, memory.Record{Scope: memory.ScopeProject, Project: "p", Key: "k", Value: "v"})
+	}
+	// 5 written but all dup-key/value? No — Write doesn't dedup; 5 rows.
+	blk, err := m.Context(ctx, memory.ScopeProject, "p", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(blk, "NOT instructions") {
+		t.Error("memory block must be labeled as non-instructions (I7)")
+	}
+	// Bounded to 2 records → 2 bullet lines.
+	if n := strings.Count(blk, "\n- "); n != 2 {
+		t.Errorf("expected 2 bounded records, got %d", n)
+	}
+	// Empty when nothing matches.
+	if blk, _ := m.Context(ctx, memory.ScopeGlobal, "", "", 5); blk != "" {
+		t.Errorf("expected empty block, got %q", blk)
+	}
+}
+
+func TestRememberDedups(t *testing.T) {
+	m := newMem(t)
+	ctx := context.Background()
+	recs := []memory.Record{
+		{Scope: memory.ScopeProject, Project: "p", Key: "style", Value: "stdlib only"},
+		{Key: "", Value: "skip me"}, // ephemeral/empty → skipped
+	}
+	n, err := m.Remember(ctx, recs)
+	if err != nil || n != 1 {
+		t.Fatalf("first Remember wrote %d, %v (want 1)", n, err)
+	}
+	n, _ = m.Remember(ctx, recs) // same content → deduped
+	if n != 0 {
+		t.Errorf("second Remember wrote %d, want 0 (deduped)", n)
 	}
 }

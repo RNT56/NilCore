@@ -24,6 +24,7 @@ import (
 	"nilcore/internal/channel/slack"
 	"nilcore/internal/channel/telegram"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/memory"
 	"nilcore/internal/model"
 	"nilcore/internal/onboard"
 	"nilcore/internal/paths"
@@ -32,6 +33,7 @@ import (
 	"nilcore/internal/sandbox"
 	"nilcore/internal/secrets"
 	"nilcore/internal/server"
+	"nilcore/internal/store"
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
@@ -118,14 +120,16 @@ func runMain(args []string) {
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov := resolveProvider(*c.backendName)
+	mem := setupMemory(log)
 
 	orch := &agent.Orchestrator{
-		BaseRepo: absDir,
-		NewEnv:   envFactory(c, prov, log),
-		Log:      log,
-		Router:   agent.SingleRouter{},
-		Spawner:  agent.NoSpawner{},
-		Approver: policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		BaseRepo:  absDir,
+		NewEnv:    envFactory(c, prov, log, mem, absDir),
+		Log:       log,
+		Router:    agent.SingleRouter{},
+		Spawner:   agent.NoSpawner{},
+		Approver:  policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		OnSuccess: memWriteBack(mem, absDir),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
@@ -154,16 +158,18 @@ func serveMain(args []string) {
 	defer log.Close()
 	prov := resolveProvider(*c.backendName)
 	ch := buildChannel(*channelName)
-	newEnv := envFactory(c, prov, log)
+	mem := setupMemory(log)
+	newEnv := envFactory(c, prov, log, mem, absDir)
 
 	run := func(ctx context.Context, t backend.Task, approver policy.Approver) (string, error) {
 		orch := &agent.Orchestrator{
-			BaseRepo: absDir,
-			NewEnv:   newEnv,
-			Log:      log,
-			Router:   agent.SingleRouter{},
-			Spawner:  agent.NoSpawner{},
-			Approver: approver, // gate questions route back to this thread
+			BaseRepo:  absDir,
+			NewEnv:    newEnv,
+			Log:       log,
+			Router:    agent.SingleRouter{},
+			Spawner:   agent.NoSpawner{},
+			Approver:  approver, // gate questions route back to this thread
+			OnSuccess: memWriteBack(mem, absDir),
 		}
 		out, err := orch.Execute(ctx, t)
 		if err != nil {
@@ -204,16 +210,16 @@ func resolveProvider(backendName string) model.Provider {
 }
 
 // envFactory builds the per-worktree backend+verifier factory.
-func envFactory(c commonFlags, prov model.Provider, log *eventlog.Log) func(string) agent.Env {
+func envFactory(c commonFlags, prov model.Provider, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
 	return func(dir string) agent.Env {
 		box := sandbox.NewContainer(*c.runtime, *c.image, dir)
 		v := verify.New(box, *c.checkCmd)
-		be := buildBackend(*c.backendName, prov, box, v, log, *c.maxSteps)
+		be := buildBackend(*c.backendName, prov, box, v, log, *c.maxSteps, mem, project)
 		return agent.Env{Backend: be, Verifier: v}
 	}
 }
 
-func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int) backend.CodingBackend {
+func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string) backend.CodingBackend {
 	switch name {
 	case "codex":
 		// Key from the environment only (I3); injected into the container per run.
@@ -221,7 +227,7 @@ func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verif
 	case "claude-code":
 		return &backend.ClaudeCode{Box: box, Key: os.Getenv("ANTHROPIC_API_KEY"), Log: log}
 	default: // native
-		return &backend.Native{
+		n := &backend.Native{
 			Model:        prov,
 			Box:          box,
 			Verifier:     v,
@@ -230,6 +236,40 @@ func buildBackend(name string, prov model.Provider, box sandbox.Sandbox, v verif
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
 		}
+		if mem != nil {
+			n.MemoryContext = func(ctx context.Context, _ string) string {
+				blk, _ := mem.Context(ctx, memory.ScopeProject, project, "", 10)
+				return blk
+			}
+		}
+		return n
+	}
+}
+
+// setupMemory opens the persistent store (best-effort), wires it as a second
+// backing for the event log, and returns the memory API (nil if unavailable).
+func setupMemory(log *eventlog.Log) *memory.Memory {
+	dir, err := paths.EnsureDir(paths.DataDir())
+	if err != nil {
+		return nil
+	}
+	s, err := store.Open(filepath.Join(dir, "nilcore.db"))
+	if err != nil {
+		return nil // memory is optional; never block a run on it
+	}
+	log.UseStore(s)
+	return memory.New(s)
+}
+
+// memWriteBack persists a durable record after a verified task (P4-T05).
+func memWriteBack(mem *memory.Memory, project string) func(context.Context, backend.Task, agent.Outcome) {
+	if mem == nil {
+		return nil
+	}
+	return func(ctx context.Context, t backend.Task, out agent.Outcome) {
+		_, _ = mem.Remember(ctx, []memory.Record{{
+			Scope: memory.ScopeProject, Project: project, Key: "task:" + t.ID, Value: out.Summary,
+		}})
 	}
 }
 
