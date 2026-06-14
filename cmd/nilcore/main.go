@@ -25,9 +25,12 @@ import (
 	"nilcore/internal/channel/telegram"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/model"
+	"nilcore/internal/onboard"
+	"nilcore/internal/paths"
 	"nilcore/internal/policy"
 	"nilcore/internal/provider"
 	"nilcore/internal/sandbox"
+	"nilcore/internal/secrets"
 	"nilcore/internal/server"
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
@@ -35,11 +38,50 @@ import (
 
 func main() {
 	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "serve" {
+	switch {
+	case len(args) > 0 && args[0] == "serve":
 		serveMain(args[1:])
-		return
+	case len(args) > 0 && args[0] == "init":
+		initMain(args[1:])
+	default:
+		runMain(args)
 	}
-	runMain(args)
+}
+
+// initMain runs the onboarding wizard (or non-interactive provisioning).
+func initMain(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	nonInteractive := fs.Bool("non-interactive", false, "assemble config from environment without prompting")
+	configPath := fs.String("config", "", "config output path (default: <config-dir>/config.json)")
+	_ = fs.Parse(args)
+
+	store := secrets.Detect()
+	var (
+		cfg onboard.Config
+		err error
+	)
+	if *nonInteractive {
+		cfg, err = onboard.FromEnv(os.Getenv, store)
+	} else {
+		w := &onboard.Wizard{In: os.Stdin, Out: os.Stdout, Secrets: store}
+		cfg, err = w.Run()
+	}
+	if err != nil {
+		fatal(err)
+	}
+
+	path := *configPath
+	if path == "" {
+		dir, derr := paths.ConfigDir()
+		if derr != nil {
+			fatal(derr)
+		}
+		path = filepath.Join(dir, "config.json")
+	}
+	if err := cfg.Save(path); err != nil {
+		fatal(err)
+	}
+	fmt.Fprintf(os.Stderr, "wrote config to %s (secrets stored in the %s backend)\n", path, store.Name())
 }
 
 // commonFlags registers the flags shared by run and serve on fs.
