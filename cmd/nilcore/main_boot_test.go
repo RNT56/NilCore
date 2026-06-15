@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -125,7 +126,7 @@ func TestDiagnose(t *testing.T) {
 			return "sk-x"
 		}
 		return ""
-	})
+	}, nil)
 	if !ready {
 		t.Errorf("should be ready:\n%s", report)
 	}
@@ -133,13 +134,54 @@ func TestDiagnose(t *testing.T) {
 		t.Errorf("report missing credential line:\n%s", report)
 	}
 
-	_, ready = diagnose(cfg, func(string) string { return "" })
+	_, ready = diagnose(cfg, func(string) string { return "" }, nil)
 	if ready {
 		t.Error("no resolvable key → not ready")
 	}
-	_, ready = diagnose(onboard.Config{}, func(string) string { return "" })
+	_, ready = diagnose(onboard.Config{}, func(string) string { return "" }, nil)
 	if ready {
 		t.Error("no providers → not ready")
+	}
+}
+
+// TestDiagnoseLiveCheck proves the optional live check folds into run-readiness:
+// a failing probe makes the host not-ready even when the key resolves.
+func TestDiagnoseLiveCheck(t *testing.T) {
+	cfg := onboard.Config{
+		Backend:   "native",
+		Providers: []onboard.ProviderConfig{{Name: "anthropic", KeyRef: "anthropic_api_key"}},
+		Executor:  "anthropic:claude-sonnet-4-6",
+	}
+	cred := func(env string) string {
+		if env == "ANTHROPIC_API_KEY" {
+			return "sk"
+		}
+		return ""
+	}
+	report, ready := diagnose(cfg, cred, func(string) error { return errors.New("401 unauthorized") })
+	if ready {
+		t.Error("failing live check must make the host not-ready")
+	}
+	if !strings.Contains(report, "responds") || !strings.Contains(report, "401") {
+		t.Errorf("report should show the live failure:\n%s", report)
+	}
+	if _, ready := diagnose(cfg, cred, func(string) error { return nil }); !ready {
+		t.Error("passing live check should be ready")
+	}
+}
+
+func TestLiveSpecs(t *testing.T) {
+	native := onboard.Config{Backend: "native", Executor: "anthropic:x", Advisor: "anthropic:y"}
+	if got := liveSpecs(native); strings.Join(got, ",") != "anthropic:x,anthropic:y" {
+		t.Errorf("native specs = %v", got)
+	}
+	// A distinct advisor is added once; an advisor equal to the executor is not duplicated.
+	same := onboard.Config{Backend: "native", Executor: "anthropic:x", Advisor: "anthropic:x"}
+	if got := liveSpecs(same); len(got) != 1 {
+		t.Errorf("duplicate advisor should collapse, got %v", got)
+	}
+	if got := liveSpecs(onboard.Config{Backend: "codex", Executor: "anthropic:x"}); got != nil {
+		t.Errorf("delegated backend has no live spec, got %v", got)
 	}
 }
 
@@ -158,7 +200,7 @@ func TestDiagnoseBackendAware(t *testing.T) {
 		}
 		return ""
 	}
-	if _, ready := diagnose(cfg, anthropicOnly); ready {
+	if _, ready := diagnose(cfg, anthropicOnly, nil); ready {
 		t.Error("codex backend with no CODEX_API_KEY must not be ready")
 	}
 	withCodex := func(env string) string {
@@ -167,7 +209,7 @@ func TestDiagnoseBackendAware(t *testing.T) {
 		}
 		return ""
 	}
-	if _, ready := diagnose(cfg, withCodex); !ready {
+	if _, ready := diagnose(cfg, withCodex, nil); !ready {
 		t.Error("codex backend with CODEX_API_KEY must be ready")
 	}
 }

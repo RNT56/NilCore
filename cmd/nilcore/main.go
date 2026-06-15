@@ -201,10 +201,15 @@ func printNextSteps(w io.Writer, cfg onboard.Config) {
 func doctorMain(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	configPath := fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)")
+	check := fs.Bool("check", false, "make a minimal live API call per model to verify the keys actually authenticate (network)")
 	_ = fs.Parse(args)
 
 	b := loadBoot(*configPath)
-	report, ready := diagnose(b.cfg, b.cred)
+	var checker func(string) error
+	if *check {
+		checker = liveChecker(b.cred)
+	}
+	report, ready := diagnose(b.cfg, b.cred, checker)
 	fmt.Print(report)
 	if !ready {
 		os.Exit(1)
@@ -212,8 +217,9 @@ func doctorMain(args []string) {
 }
 
 // diagnose renders the doctor report and reports run-readiness. It is pure over
-// (config, credential resolver), so it is testable without touching the host.
-func diagnose(cfg onboard.Config, cred func(string) string) (string, bool) {
+// (config, credential resolver), so it is testable without touching the host; the
+// optional check verifies a model spec authenticates with a live call (nil skips).
+func diagnose(cfg onboard.Config, cred func(string) string, check func(string) error) (string, bool) {
 	var b strings.Builder
 	ok := func(c bool) string {
 		if c {
@@ -257,7 +263,57 @@ func diagnose(cfg onboard.Config, cred func(string) string) (string, bool) {
 		allow := principalAllowlist(cfg)
 		fmt.Fprintf(&b, "  %s serve allowlist resolves (%d) — required to serve\n", ok(len(allow) > 0), len(allow))
 	}
+
+	// Optional live check: prove the configured model actually authenticates,
+	// not merely that a key is present. A failure makes the host not-ready.
+	if check != nil {
+		b.WriteString("\nLive model check:\n")
+		specs := liveSpecs(cfg)
+		if len(specs) == 0 {
+			b.WriteString("  - skipped (no native model to probe for this backend)\n")
+		}
+		for _, spec := range specs {
+			err := check(spec)
+			fmt.Fprintf(&b, "  %s %s responds\n", ok(err == nil), spec)
+			if err != nil {
+				fmt.Fprintf(&b, "      %v\n", err)
+				ready = false
+			}
+		}
+	}
 	return b.String(), ready
+}
+
+// liveSpecs returns the provider:model specs `doctor -check` verifies with a live
+// call: the native executor (and a distinct advisor). Delegated backends use a
+// CLI key with no model.Provider to probe, so they are presence-checked only.
+func liveSpecs(cfg onboard.Config) []string {
+	if cfg.Backend != "" && cfg.Backend != "native" {
+		return nil
+	}
+	var specs []string
+	if cfg.Executor != "" {
+		specs = append(specs, cfg.Executor)
+	}
+	if cfg.Advisor != "" && cfg.Advisor != cfg.Executor {
+		specs = append(specs, cfg.Advisor)
+	}
+	return specs
+}
+
+// liveChecker verifies a provider:model spec can authenticate, with a minimal
+// one-token request and a short timeout. Used by `nilcore doctor -check`.
+func liveChecker(cred func(string) string) func(string) error {
+	return func(spec string) error {
+		prov, err := provider.ResolveWith(spec, cred)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err = prov.Complete(ctx, "", []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "ping"}}}}, nil, 1)
+		return err
+	}
 }
 
 // backendKeyEnv returns the credential env-var the configured backend needs:
