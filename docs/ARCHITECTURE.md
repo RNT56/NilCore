@@ -167,8 +167,11 @@ the interactive terminal REPL (`nilcore chat`) or an existing serve channel — 
 just talks, from a typo fix to "plan and ship a whole service." The harness infers
 internally which machine runs (native loop / supervisor / project loop), the
 conversation **persists** (a follow-up *continues* the work, it does not restart
-it), and the user can **queue or steer** messages mid-work. The full design is
-`docs/CONVERSATIONAL.md`; this section records the shipped seams and how they sit
+it), the model's prose is **streamed live** as it is generated, and the user can
+**queue or steer** messages mid-work — a steer mid-stream interrupts the generation
+yet keeps the partial reasoning. The full design is `docs/CONVERSATIONAL.md` (and
+the streaming layer is detailed in the *Live token streaming* subsection below);
+this section records the shipped seams and how they sit
 inside the invariants. Four leaf packages compose the existing machinery **without
 touching the frozen `backend.CodingBackend` contract** — the loop seams are
 additive and nil-gated (nil = byte-identical), exactly like `Advisor`/`Peer`:
@@ -223,6 +226,146 @@ a `Complete` cancelled by a SIGTERM/deadline returns cleanly (`interrupted` Resu
 `ctx` outcome), never confused with a steer (a steer no longer cancels `Complete` at
 all). nil `Inbox` ⇒ no `Drain`, no steer check — byte-identical to the
 pre-conversational loop.
+
+### Live token streaming + interrupt-but-preserve (ST)
+
+The conversational front door paints the model's prose **as it is generated**, not
+in one block when the turn finishes — and a steer can now cut a *generation* short
+while keeping the reasoning it already produced. This is the streaming layer. It is
+purely **additive**: `Provider.Complete` is unchanged (I1), the frozen
+`backend.CodingBackend` contract is untouched, and every non-conversational path
+(`run`/`build`/`serve` scripting/CI) keeps using `Complete` byte-for-byte.
+
+**The optional `model.Streamer` seam (additive to `Provider`).** A provider MAY
+also implement `model.Streamer` — `Stream(ctx, system, msgs, tools, maxTokens,
+onChunk func(model.Chunk)) (Response, error)` — alongside `Complete`. The loops
+type-assert for it and fall back to `Complete` when a provider does not implement
+it, so `Stream` never changes `Provider`. The contract a `Streamer` MUST honor:
+(1) it assembles and returns the **same** `Response` `Complete` would for the same
+inputs (identical `Content` blocks, `StopReason`, `Usage`) — the stream is a
+delivery detail, not a different reply; (2) it forwards each output-text delta to
+`onChunk` (a `model.Chunk{Text}`) as it is decoded, before the full `Response` is
+ready, with the concatenation of forwarded chunks equal to the response's output
+text; (3) `onChunk` is called synchronously on the read loop and must not block;
+(4) **interrupt-but-preserve** — if `ctx` is cancelled mid-stream, `Stream` stops
+reading and returns the **partial** `Response` assembled so far **together with**
+`ctx.Err()`, so a caller can cut an in-flight generation short yet keep the text
+already produced.
+
+**Three provider SSE adapters (stdlib only, I6).** All three vendor adapters in
+`internal/provider` implement `Streamer` with the standard library only —
+`net/http` + `bufio` + `encoding/json`, no SDK and no new module:
+
+- **`anthropic`** — POSTs the same `/v1/messages` body as `Complete` with
+  `"stream":true`, scans the Messages SSE event stream with `bufio.Scanner`, and
+  assembles text + `tool_use` blocks from `content_block_start` /
+  `content_block_delta` (`text_delta` and `input_json_delta`) / `message_delta`
+  frames. Text deltas are forwarded to `onChunk`; `tool_use` argument JSON streams
+  as fragments joined at block stop.
+- **`openai`** — POSTs the same `/chat/completions` body with `"stream":true` and
+  `stream_options.include_usage` (so a trailing usage-only frame carries token
+  counts), scans the SSE frames, and assembles text + `tool_use` from the streamed
+  `delta.content` and `delta.tool_calls` fragments, mapping `finish_reason` to the
+  canonical `StopReason`.
+- **`openrouter`** — inherits the OpenAI adapter verbatim (same code, different base
+  URL); it is OpenAI-compatible.
+
+Each adapter's read loop checks `ctx.Err()` on every scan and returns the partial
+`Response` + the context error on cancellation, satisfying interrupt-but-preserve.
+The SSE frames are parsed **as data, never executed** (I7) — only the fields the
+assembler reads are decoded. Tests are hermetic `httptest.Server`s that serve a
+canned SSE body (no network), run under `-race`.
+
+**Decorator delegation (the wrappers stay transparent).** Both provider decorators
+implement `Stream` so streaming is invisible to the loop regardless of what the
+underlying provider supports:
+
+- **`meter.Provider`** (the budget wall) delegates to `Inner.Stream` when the inner
+  is a `Streamer` (passing `onChunk` through untouched), else falls back to
+  `Inner.Complete` and replays the whole reply as one `Chunk`. Either way it
+  **charges** the assembled `Response`'s usage to the shared `budget.Ledger` exactly
+  as `Complete` does — including a partial-on-cancel response (those tokens were
+  produced and are billable) — so the ceiling stays a real termination rail on the
+  streaming path.
+- **`model.Resilient`** (retry/failover/breaker) implements `Stream` with the same
+  retry + backoff + failover + circuit-breaker logic around each provider's `Stream`
+  (or a non-streaming provider's `Complete` replayed as one chunk). Crucially it does
+  **not** forward chunks live: each attempt **buffers** its deltas and flushes them
+  to `onChunk` in order **only on the attempt that ultimately succeeds**, so a
+  retried-then-succeeded (or failed-over) stream emits exactly one committed
+  sequence — never the chunks of a discarded attempt.
+
+Because both decorators satisfy `Streamer`, the loop always sees a `Streamer`
+through the wrapper stack (meter charges, Resilient retries) while the live-token
+property and the single-Response contract are preserved end to end.
+
+**The `emit.KindToken` live-token surface.** The loop forwards each streamed delta
+to the wired `emit.Emitter` as a `KindToken` event. `WriterEmitter` renders a
+`KindToken` raw and inline (no glyph/step framing, no trailing newline) so a run of
+tokens flows as one continuous line as the model thinks; the next framed event
+(`KindIntent`/`KindTool`/`KindVerify`/`KindSteerAck`) flushes a newline first so it
+starts cleanly on its own line.
+
+### Streaming is gated on a wired Emitter
+
+The loop streams **only** when both an `Emitter` is wired **and** `n.Model` is a
+`model.Streamer`; otherwise it calls `Complete` under the task ctx exactly as
+before. So `run`/`build`/`serve` (nil `Emitter`) and any non-streaming provider stay
+byte-identical to the pre-streaming loop — the conversational front door is the only
+caller that pays for streaming, and it pays for it only when a sink is actually
+watching.
+
+### The three steer behaviors (and `/cancel`, Ctrl-C)
+
+With streaming there are now **three** distinct steer behaviors, selected by whether
+the loop is mid-stream and whether streaming is active at all. All three keep "no
+half-applied tool state" true by construction (the task ctx still governs tools), and
+none of them lets the user shortcut the verifier (I2) or un-fence prior data (I7):
+
+1. **Queue (fold at the boundary)** — the default for any message without a steer
+   affordance. The message is appended to `inbox.Box` and **`Drain`'d at the next
+   loop boundary** as an ordinary user turn (logged `queue_drain`). The drive never
+   pauses.
+2. **Steer *with* streaming = INTERRUPT-BUT-PRESERVE** — a steer arrives while the
+   model is mid-`Stream`. The loop wraps **only** the `Stream` call in a
+   per-iteration `context.WithCancelCause` child of the task ctx; a steer watcher
+   cancels it with `loopctl.ErrSteer`. On that cancel the loop **keeps the partial
+   reasoning** (the `text` blocks streamed so far) as the assistant turn, **drops the
+   partial `tool_use`** (a half-built tool call has no matching `tool_result` and
+   would corrupt the conversation), folds the steered feedback in as a user turn, and
+   **re-thinks** next step with its partial reasoning + the feedback in view (logged
+   `steer_interrupt` with `phase:"stream"`, emits a `KindSteerAck`). A steer landing
+   exactly at the finish line (the watcher consumed it after `Stream` already
+   returned) is carried into the post-think gate below so it is never dropped.
+3. **Steer *without* streaming = pause-at-boundary (CV-T01)** — when the loop is not
+   streaming (no `Emitter`, or a non-streaming provider), `Complete` runs under the
+   task ctx and a steer **never cancels the in-flight think**. Instead, after
+   `Complete` returns and the assistant turn is appended but **before any tool runs**,
+   a non-blocking check of the steer signal **HOLDS** every proposed `tool_use` (one
+   "paused" `tool_result` per block, never executed), folds the steered feedback in,
+   and the model reconsiders next step (logged `steer_interrupt` with `phase:"model"`).
+
+Two control verbs sit above all three and are **aborts**, not steers:
+
+- **`/cancel`** (and its alias `/stop`) — aborts the in-flight run by cancelling the
+  task ctx, but keeps the session/conversation alive so the next message starts a
+  fresh drive. A `Complete`/`Stream` cancelled this way returns the clean
+  `interrupted` Result (logged `task_cancel`), distinct from a steer.
+- **Ctrl-C** — abort **and exit**: a graceful shutdown that cancels the task ctx and
+  ends the process. Shutdown **strictly dominates** any racing steer.
+
+**`loopctl` is back for the stream-interrupt discrimination.** Because a cancelled
+`Stream` can now mean three different things — a **shutdown** (task ctx died:
+SIGTERM, deadline, Ctrl-C, `/cancel`), a **steer** (the watcher cancelled with
+`loopctl.ErrSteer`), or a genuine **fault** — the loop cannot just treat any cancel
+the same way. `loopctl.ClassifyCancel(taskCtx, iterCtx)` is the single stdlib-only
+discriminator (re-created for ST; it had been removed under CV-T01 when steer no
+longer cancelled `Complete`): it checks `taskCtx.Err()` first so **shutdown strictly
+dominates** a shutdown-vs-steer race, then reads `context.Cause(iterCtx)` for
+`ErrSteer`, else falls through to fault. The cause travels inside the context (no
+shared mutable flag), so the discriminator is race-free by construction. Both the
+native loop and the supervisor loop import the same `loopctl`, so the two loops share
+one judgment and cannot drift.
 
 ### The trust line (I7)
 
@@ -356,6 +499,7 @@ Each is owned by a specific task in `docs/TASKS.md`. The contract above does not
 | 5 | `internal/skills` (Agent Skills + native plugins), `internal/selfimprove`, `eval/` | plugin capabilities in both formats; gated self-edits scoped to prompts/skills/tools only; the eval harness that earns routing data |
 | 6 | `internal/budget`, `internal/scheduler`, `internal/maint`, `internal/inspect`; resilience in `model`, durability in `agent`, auto-detect in `verify` | runtime resilience & operations — provider retry/failover, metered budgets, crash-safe resumption, concurrent-task scheduling, verify auto-detection, resource GC, operator inspect/health. Config validation/migration now lives in `internal/onboard` (the live config schema). Full design: `docs/OPERATIONS.md` |
 | C | `internal/emit`, `internal/inbox`, `internal/session`; nil-gated `Inbox`/`Seed`/`Emitter` seam on `backend.Native` + `super.Supervisor`; per-thread `Session` map in `internal/server`; `nilcore chat` in `cmd/nilcore` | the conversational front door — one chat where the agent auto-routes (native / supervisor / project), the conversation persists (continue, not restart), and the user queues or steers mid-work. Steer is pause-and-reconsider (never cancels in-flight work): it holds the proposed action and folds the feedback in so the model reconsiders; the principal's message is an un-`Wrap`'d user turn, tool/bus stays fenced. Full design: `docs/CONVERSATIONAL.md` |
+| ST | additive `model.Streamer` seam (`Stream`, `Chunk`) — `Provider.Complete` unchanged; SSE adapters in `internal/provider` (anthropic/openai/openrouter, stdlib-only); `Stream` on the `meter`/`Resilient` decorators; `emit.KindToken`; `loopctl` re-added for the stream-interrupt discrimination; streaming on `backend.Native` + `super.Supervisor`, gated on a wired `Emitter` | live token streaming + interrupt-but-preserve — the model's prose is painted as it is generated, and a steer mid-stream cancels the generation, keeps the partial reasoning, drops the partial `tool_use`, and re-thinks. Three steer behaviors now: queue (fold at boundary), steer-with-streaming (interrupt-but-preserve), steer-without-streaming (pause-at-boundary); `/cancel` and Ctrl-C are aborts. Streaming is gated on a wired `Emitter`, so `run`/`build`/`serve` use `Complete` unchanged. See the *Live token streaming* subsection above |
 
 ## Security model (summary)
 
