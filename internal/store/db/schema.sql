@@ -29,5 +29,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     goal    TEXT NOT NULL,
     status  TEXT NOT NULL,
     created TEXT NOT NULL,
-    updated TEXT NOT NULL
+    updated TEXT NOT NULL,
+    detail  TEXT NOT NULL DEFAULT ''  -- JSON run-state snapshot for restart durability (P5-T03)
 );
+
+-- The `detail` column above lands automatically on a fresh DB. For a DB created
+-- before P5-T03 the CREATE above is a no-op (IF NOT EXISTS), so an additive
+-- migration adds the column in Go (Store.migrate) — guarded by pragma_table_info
+-- because SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS form.
