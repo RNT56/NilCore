@@ -952,6 +952,13 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 				return blk
 			}
 		}
+		// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
+		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
+		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;
+		// no full per-run index cost unless requested).
+		if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+			n.LiveSession = liveSession(mem, project)
+		}
 		return n
 	}
 }
