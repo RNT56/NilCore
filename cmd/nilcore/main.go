@@ -96,6 +96,8 @@ func main() {
 		secretMain(args[1:])
 	case "inspect":
 		inspectMain(args[1:])
+	case "mcp-call":
+		mcpCallMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -122,6 +124,7 @@ Usage:
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
   nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
+  nilcore mcp-call <server> <tool> ...  invoke a configured MCP tool (the runtime bridge for generated wrappers)
   nilcore version                       print the build version
 
 Run 'nilcore <command> -h' for a command's flags.
@@ -483,6 +486,7 @@ func runMain(args []string) {
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*c.dir)
+	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov, err := resolveProvider(*c.backendName, b)
@@ -533,6 +537,7 @@ func serveMain(args []string) {
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*c.dir)
+	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov, err := resolveProvider(*c.backendName, b)
