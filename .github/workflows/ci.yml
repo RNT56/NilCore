@@ -14,6 +14,17 @@ jobs:
   verify:
     name: make verify
     runs-on: ubuntu-latest
+    # internal/integrate exercises real git merges; a hosted runner has no ambient
+    # git identity, and those tests run git under a hardened env that ignores config
+    # files (GIT_CONFIG_GLOBAL=/dev/null), so `git config` won't help — the identity
+    # must come from these env vars, which git honors over config and HardenedEnv
+    # preserves. Without them, merge commits fail with "Committer identity unknown"
+    # (a pre-existing, change-independent failure).
+    env:
+      GIT_AUTHOR_NAME: nilcore-ci
+      GIT_AUTHOR_EMAIL: ci@nilcore.local
+      GIT_COMMITTER_NAME: nilcore-ci
+      GIT_COMMITTER_EMAIL: ci@nilcore.local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
