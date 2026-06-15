@@ -68,6 +68,80 @@ func TestWriterRendersKindStepText(t *testing.T) {
 	}
 }
 
+// TestNilSafeToken asserts a nil *WriterEmitter tolerates a KindToken event.
+func TestNilSafeToken(t *testing.T) {
+	var nilWriter *WriterEmitter
+	nilWriter.Emit(Event{Kind: KindToken, Text: "tok", Step: 1})
+}
+
+// TestTokensRenderRawInline asserts a run of KindToken events concatenates into
+// one continuous line with no per-token glyph/step framing and no trailing
+// newlines between tokens.
+func TestTokensRenderRawInline(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+
+	for _, tok := range []string{"Hel", "lo, ", "wor", "ld"} {
+		em.Emit(Event{Kind: KindToken, Text: tok, Step: 0})
+	}
+
+	out := buf.String()
+	if out != "Hello, world" {
+		t.Fatalf("tokens did not render raw+inline: got %q, want %q", out, "Hello, world")
+	}
+	if strings.Contains(out, "\n") {
+		t.Errorf("streamed tokens must not emit a newline: %q", out)
+	}
+	if strings.ContainsAny(out, "·→✓!-") {
+		t.Errorf("streamed tokens must not be framed with a glyph: %q", out)
+	}
+	if strings.Contains(out, "step ") || strings.Contains(out, KindToken) {
+		t.Errorf("streamed tokens must not carry step/kind framing: %q", out)
+	}
+}
+
+// TestFramedEventBreaksTokenLine asserts a framed event following a run of
+// tokens starts on a fresh line, so the streamed line is closed before the next
+// glyph-framed line.
+func TestFramedEventBreaksTokenLine(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+
+	em.Emit(Event{Kind: KindToken, Text: "thinking", Step: 0})
+	em.Emit(Event{Kind: KindToken, Text: "...", Step: 0})
+	em.Emit(Event{Kind: KindTool, Text: "go test ./...", Step: 3})
+
+	out := buf.String()
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 lines (token run + framed), got %d: %q", len(lines), out)
+	}
+	if lines[0] != "thinking..." {
+		t.Errorf("first line should be the raw token run, got %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "→") || !strings.Contains(lines[1], "go test ./...") {
+		t.Errorf("framed event did not start cleanly on its own line: %q", lines[1])
+	}
+}
+
+// TestFramedEventWithoutPriorTokenIsUnchanged asserts the newline-break only
+// fires after an open token line: a framed event with no preceding token emits
+// exactly one line, preserving the pre-existing rendering.
+func TestFramedEventWithoutPriorTokenIsUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+
+	em.Emit(Event{Kind: KindIntent, Text: "start", Step: 1})
+
+	out := buf.String()
+	if strings.Count(out, "\n") != 1 {
+		t.Fatalf("want exactly one line with no leading break, got %q", out)
+	}
+	if strings.HasPrefix(out, "\n") {
+		t.Errorf("framed event must not be preceded by a stray newline: %q", out)
+	}
+}
+
 // TestWriterConcurrentEmit asserts concurrent emits do not interleave on the
 // underlying writer (one whole line per Emit) and are race-free under -race.
 func TestWriterConcurrentEmit(t *testing.T) {

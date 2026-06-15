@@ -24,6 +24,7 @@ const (
 	KindTool     = "tool"      // a tool the loop is about to run
 	KindVerify   = "verify"    // the verifier's verdict
 	KindSteerAck = "steer_ack" // a steer message was accepted/folded
+	KindToken    = "token"     // an incremental output-text delta (a streamed token)
 )
 
 // Event is one surfaced line of the agent's live reasoning. Step is the loop
@@ -53,9 +54,16 @@ func (NopEmitter) Emit(Event) {}
 // WriterEmitter renders events as one human-readable line each to an io.Writer
 // (the terminal's stdout for `nilcore chat`). It serializes writes with a mutex
 // so concurrent emits never interleave on the underlying writer.
+//
+// A KindToken event is the exception: its Text is written raw and inline (no
+// glyph/step framing, no trailing newline) so a run of tokens flows as one
+// continuous line as the model thinks. midToken records whether the last write
+// left such a line open; the next framed event flushes a newline first so it
+// starts cleanly on its own line.
 type WriterEmitter struct {
-	mu sync.Mutex
-	w  io.Writer
+	mu       sync.Mutex
+	w        io.Writer
+	midToken bool // last write was an unterminated streamed token
 }
 
 // NewWriter returns a WriterEmitter that renders to w. A nil w yields a nil
@@ -67,16 +75,32 @@ func NewWriter(w io.Writer) *WriterEmitter {
 	return &WriterEmitter{w: w}
 }
 
-// Emit renders e as a single line: a kind-specific glyph, the step, and the
-// text. A nil receiver is a safe no-op, so a WriterEmitter built from a nil
-// writer behaves like an absent sink.
+// Emit renders e. A non-token event renders as a single framed line: a
+// kind-specific glyph, the step, and the text. A KindToken event renders its
+// Text raw and inline so streamed tokens concatenate into one continuous line;
+// the next framed event breaks that line with a newline first. A nil receiver
+// is a safe no-op, so a WriterEmitter built from a nil writer behaves like an
+// absent sink.
 func (e *WriterEmitter) Emit(ev Event) {
 	if e == nil {
 		return
 	}
-	line := fmt.Sprintf("%s [step %d] %s: %s\n", glyph(ev.Kind), ev.Step, ev.Kind, ev.Text)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	if ev.Kind == KindToken {
+		// Raw, inline, no trailing newline: tokens flow as one line.
+		_, _ = io.WriteString(e.w, ev.Text)
+		e.midToken = true
+		return
+	}
+
+	// A framed event after an open token line starts on a fresh line.
+	if e.midToken {
+		_, _ = io.WriteString(e.w, "\n")
+		e.midToken = false
+	}
+	line := fmt.Sprintf("%s [step %d] %s: %s\n", glyph(ev.Kind), ev.Step, ev.Kind, ev.Text)
 	_, _ = io.WriteString(e.w, line)
 }
 
