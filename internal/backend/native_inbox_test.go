@@ -447,6 +447,94 @@ func TestNativeNilEmitterByteIdentical(t *testing.T) {
 	}
 }
 
+// stdoutMarkerBox is a sandbox whose Exec returns a distinctive marker in its
+// stdout/stderr, so a test can assert that raw tool OUTPUT is NEVER surfaced as an
+// action-intent line (adv #8): the loop surfaces a harness-authored intent (the
+// command it is ABOUT to run), not laundered output.
+type stdoutMarkerBox struct{ marker string }
+
+func (b *stdoutMarkerBox) Exec(context.Context, string) (sandbox.Result, error) {
+	return sandbox.Result{Stdout: b.marker, Stderr: b.marker, ExitCode: 0}, nil
+}
+func (b *stdoutMarkerBox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
+	return b.Exec(ctx, cmd)
+}
+func (b *stdoutMarkerBox) Workdir() string { return "/work" }
+
+// TestNativeEmitsActionIntentBeforeRun is the C2-T04 acceptance test: with an
+// Emitter wired, the native loop surfaces an action-intent (KindTool) carrying the
+// command it is ABOUT to run, BEFORE Box.Exec dispatches it — so a watching
+// principal sees the action coming and can steer on it. The intent must contain the
+// command (the model's own input) and MUST NOT contain raw tool output (adv #8).
+func TestNativeEmitsActionIntentBeforeRun(t *testing.T) {
+	const marker = "RAW_TOOL_OUTPUT_SHOULD_NEVER_SURFACE"
+	m := &scriptModel{responses: []model.Response{
+		{Content: []model.Block{toolUse("u1", "run", map[string]string{"cmd": "go test ./..."})}, StopReason: "tool_use"},
+		{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	em := &recordingEmitter{}
+	n := &Native{Model: m, Box: &stdoutMarkerBox{marker: marker}, Verifier: okVerifier{}, Emitter: em, MaxSteps: 5}
+	if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	var sawRunIntent bool
+	for _, e := range em.events {
+		// No surfaced event of any kind may carry raw tool output (adv #8).
+		if strings.Contains(e.Text, marker) {
+			t.Errorf("raw tool output leaked into a surfaced %s event: %q", e.Kind, e.Text)
+		}
+		if e.Kind == emit.KindTool && strings.Contains(e.Text, "about to run") && strings.Contains(e.Text, "go test ./...") {
+			sawRunIntent = true
+		}
+	}
+	if !sawRunIntent {
+		t.Error("no KindTool action-intent surfaced for the command before it ran")
+	}
+}
+
+// TestNativeEmitsFinishIntentBeforeVerify asserts the loop surfaces an action
+// intent before the verifier runs on a finish (the verifier — not the model —
+// decides done, I2; surfacing it lets the principal steer before the verdict).
+func TestNativeEmitsFinishIntentBeforeVerify(t *testing.T) {
+	m := &scriptModel{responses: []model.Response{
+		{Content: []model.Block{toolUse("u1", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	em := &recordingEmitter{}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, Emitter: em, MaxSteps: 5}
+	if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var sawFinishIntent bool
+	em.mu.Lock()
+	for _, e := range em.events {
+		if e.Kind == emit.KindTool && strings.Contains(e.Text, "verifier will judge") {
+			sawFinishIntent = true
+		}
+	}
+	em.mu.Unlock()
+	if !sawFinishIntent {
+		t.Error("no action-intent surfaced before the verifier judged a finish")
+	}
+}
+
+// TestNativeNilEmitterNoActionIntent asserts the action-intent path is fully gated
+// on a nil Emitter — a nil sink runs the loop clean (byte-identical), never
+// panicking on the new emit calls (the existing nil-path tests cover behavior; this
+// pins the new run/finish/tool intent calls specifically).
+func TestNativeNilEmitterNoActionIntent(t *testing.T) {
+	m := &scriptModel{responses: []model.Response{
+		{Content: []model.Block{toolUse("u1", "run", map[string]string{"cmd": "echo a"})}, StopReason: "tool_use"},
+		{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, MaxSteps: 5}
+	if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); err != nil {
+		t.Fatalf("Run with nil Emitter: %v", err)
+	}
+}
+
 // TestNativeEmitsPerStepReasoning asserts a wired Emitter receives one intent
 // event per text block of the assistant turn (the steer surface, §5.2).
 func TestNativeEmitsPerStepReasoning(t *testing.T) {

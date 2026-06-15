@@ -11,6 +11,7 @@ import (
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/emit"
 	"nilcore/internal/inbox"
+	"nilcore/internal/integrate"
 	"nilcore/internal/model"
 	"nilcore/internal/roster"
 	"nilcore/internal/spawn"
@@ -492,6 +493,126 @@ func TestSuperEmitsPerRoundReasoning(t *testing.T) {
 	em.mu.Unlock()
 	if !sawIntent {
 		t.Error("no per-round intent surfaced for the planner's text block")
+	}
+}
+
+// TestSuperEmitsSpawnIntentBeforeSpawn is a C2-T04 acceptance test: with an
+// Emitter wired, the supervisor surfaces an action-intent (KindTool) naming the
+// role and goal it is ABOUT to spawn, BEFORE the worker runs — so a watching
+// principal sees the action coming and can steer at the next round. The intent
+// carries the supervisor model's OWN spec (role/goal), never laundered subagent
+// output: a marker the worker returns in its Summary must NOT appear in any
+// surfaced event (adv #8).
+func TestSuperEmitsSpawnIntentBeforeSpawn(t *testing.T) {
+	const workerMarker = "SUBAGENT_OUTPUT_NEVER_SURFACED"
+	var spawnedBeforeIntent bool // set if Spawn runs before the intent is recorded
+	em := &recordingEmitter{}
+	spawnFn := func(_ context.Context, spec SubagentSpec) spawn.Result {
+		// At the moment the worker runs, the spawn intent must already be recorded.
+		em.mu.Lock()
+		var sawIntent bool
+		for _, e := range em.events {
+			if e.Kind == "tool" && strings.Contains(e.Text, "spawning") {
+				sawIntent = true
+			}
+		}
+		em.mu.Unlock()
+		if !sawIntent {
+			spawnedBeforeIntent = true
+		}
+		return spawn.Result{ID: spec.ID, Passed: true, Branch: "task/" + spec.ID, Summary: workerMarker}
+	}
+
+	m := &scriptModel{responses: []model.Response{
+		textResp(toolUse("u1", "spawn_subagent", SubagentSpec{ID: "super.t1", Role: roster.RoleImplementer, Goal: "build the handler"})),
+		textResp(toolUse("u2", "finish", map[string]string{"summary": "done"})),
+	}}
+	s := baseSup(m, passVerifier{})
+	s.Out = em
+	s.Spawn = spawnFn
+	if _, err := s.Run(context.Background(), "goal"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if spawnedBeforeIntent {
+		t.Error("worker ran before the spawn action-intent was surfaced (intent must precede the side effect)")
+	}
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	var sawSpawnIntent bool
+	for _, e := range em.events {
+		if strings.Contains(e.Text, workerMarker) {
+			t.Errorf("raw subagent output leaked into a surfaced %s event: %q", e.Kind, e.Text)
+		}
+		if e.Kind == "tool" && strings.Contains(e.Text, "spawning") &&
+			strings.Contains(e.Text, string(roster.RoleImplementer)) && strings.Contains(e.Text, "build the handler") {
+			sawSpawnIntent = true
+		}
+	}
+	if !sawSpawnIntent {
+		t.Error("no KindTool spawn-intent surfaced (role + goal) before the worker ran")
+	}
+}
+
+// TestSuperEmitsIntegrateIntentBeforeMerge asserts the supervisor surfaces an
+// action-intent naming the branch count it is ABOUT to integrate, BEFORE the merge
+// runs. The integrator's per-branch report (untrusted) must never appear in a
+// surfaced event (adv #8).
+func TestSuperEmitsIntegrateIntentBeforeMerge(t *testing.T) {
+	const mergeMarker = "INTEGRATOR_DETAIL_NEVER_SURFACED"
+	var integratedBeforeIntent bool
+	em := &recordingEmitter{}
+	integrateFn := func(_ context.Context, order []integrate.MergeItem) (string, []integrate.MergeResult, error) {
+		em.mu.Lock()
+		var sawIntent bool
+		for _, e := range em.events {
+			if e.Kind == "tool" && strings.Contains(e.Text, "integrating") {
+				sawIntent = true
+			}
+		}
+		em.mu.Unlock()
+		if !sawIntent {
+			integratedBeforeIntent = true
+		}
+		var results []integrate.MergeResult
+		for _, it := range order {
+			results = append(results, integrate.MergeResult{ID: it.ID + mergeMarker, Branch: it.Branch, Merged: true, Verified: true})
+		}
+		return "task/integration", results, nil
+	}
+
+	// Spawn one passing branch (so mergeOrder has something), then integrate, then finish.
+	m := &scriptModel{responses: []model.Response{
+		textResp(toolUse("u1", "spawn_subagent", SubagentSpec{ID: "super.t1", Role: roster.RoleImplementer, Goal: "build"})),
+		textResp(toolUse("u2", "integrate", map[string]any{})),
+		textResp(toolUse("u3", "finish", map[string]string{"summary": "done"})),
+	}}
+	s := baseSup(m, passVerifier{})
+	s.Out = em
+	s.Spawn = func(_ context.Context, spec SubagentSpec) spawn.Result {
+		return spawn.Result{ID: spec.ID, Passed: true, Branch: "task/" + spec.ID}
+	}
+	s.Integrate = integrateFn
+	if _, err := s.Run(context.Background(), "goal"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if integratedBeforeIntent {
+		t.Error("merge ran before the integrate action-intent was surfaced")
+	}
+
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	var sawIntegrateIntent bool
+	for _, e := range em.events {
+		if strings.Contains(e.Text, mergeMarker) {
+			t.Errorf("integrator output leaked into a surfaced %s event: %q", e.Kind, e.Text)
+		}
+		if e.Kind == "tool" && strings.Contains(e.Text, "integrating") && strings.Contains(e.Text, "1 branch") {
+			sawIntegrateIntent = true
+		}
+	}
+	if !sawIntegrateIntent {
+		t.Error("no KindTool integrate-intent surfaced (branch count) before the merge ran")
 	}
 }
 

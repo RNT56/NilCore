@@ -343,6 +343,13 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 						continue
 					}
 				}
+				// Action intent BEFORE the side effect (C2-T04): surface the command
+				// the loop is about to execute so a watching principal sees the action
+				// coming and can steer it. The clipped command is the MODEL's own input
+				// (a harness-authored structured line), never laundered tool output —
+				// the raw stdout/stderr from Box.Exec is surfaced only as fenced data to
+				// the model, never to this view (adv #8). Gated on a nil Emitter.
+				n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: "about to run: " + clip(in.Cmd, 80)})
 				out, err := n.Box.Exec(ctx, in.Cmd)
 				if err != nil {
 					results = append(results, errorResult(b.ID, "sandbox error: "+err.Error()))
@@ -390,6 +397,12 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 			default:
 				if n.Tools != nil && n.Tools.Has(b.Name) {
+					// Action intent BEFORE the structured tool runs (C2-T04): surface
+					// which tool (write/edit/search/git) is about to execute. Only the
+					// harness-controlled tool NAME is surfaced — never b.Input (which can
+					// carry arbitrary model-supplied bodies) and never the tool's output
+					// (fenced to the model as data, adv #8). Gated on a nil Emitter.
+					n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: "running tool: " + b.Name})
 					out, err := n.Tools.Dispatch(ctx, b.Name, t.Dir, b.Input)
 					if err != nil {
 						results = append(results, errorResult(b.ID, b.Name+": "+err.Error()))
@@ -405,6 +418,10 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		}
 
 		if finished {
+			// Action intent BEFORE the verifier runs (C2-T04): the model has declared
+			// done, but the verifier — not the model — decides (I2). Surface that the
+			// judgement is about to happen so the principal can steer before the verdict.
+			n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: "declaring done — verifier will judge"})
 			// Source of truth: the model's claim does not decide completion.
 			rep, err := n.Verifier.Check(ctx)
 			if err != nil {

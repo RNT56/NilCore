@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"nilcore/internal/agent/bus"
+	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
 	"nilcore/internal/integrate"
@@ -59,7 +60,7 @@ func (s *Supervisor) doPlan(ctx context.Context, b modelToolUse) modelResult {
 // A refused spawn returns a structured error to the model and NEVER runs a worker;
 // the loop stays bounded. A spawned worker's result is recorded on its Handle for
 // await_results; nothing the worker says is ever obeyed (its report is data, I7).
-func (s *Supervisor) doSpawn(ctx context.Context, st *runState, b modelToolUse) modelResult {
+func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b modelToolUse) modelResult {
 	var spec SubagentSpec
 	if err := json.Unmarshal(b.Input, &spec); err != nil {
 		return errf(b.ID, "spawn_subagent: bad input: "+err.Error())
@@ -108,6 +109,14 @@ func (s *Supervisor) doSpawn(ctx context.Context, st *runState, b modelToolUse) 
 	h := &Handle{Spec: spec}
 	st.handles[spec.ID] = h
 	st.spawned++
+
+	// Action intent BEFORE the worker runs (C2-T04): surface that a role-worker is
+	// about to be spawned, so a watching principal sees the action coming and can
+	// steer it at the next round. The role and a clipped goal are the supervisor
+	// model's OWN input (the spec), never laundered subagent output — the worker's
+	// report flows back fenced as data (I7/adv #8). Gated on a nil Emitter.
+	s.emit(emit.Event{Kind: emit.KindTool, Step: round,
+		Text: "spawning " + string(spec.Role) + " for: " + clip(spec.Goal, 80)})
 
 	// Run the worker now (synchronous). The wiring site's SpawnFunc owns the
 	// worktree/sandbox/verifier; the supervisor only sequences. The reader goroutine
@@ -187,7 +196,7 @@ func (s *Supervisor) doAwait(ctx context.Context, st *runState, b modelToolUse) 
 // rolled back by the Integrator and reported (Escalate set) so the supervisor can
 // re-plan. The integrator NEVER lands to base — only the project loop's gated
 // promote does. A nil seam is a clean error.
-func (s *Supervisor) doIntegrate(ctx context.Context, st *runState, b modelToolUse) modelResult {
+func (s *Supervisor) doIntegrate(ctx context.Context, round int, st *runState, b modelToolUse) modelResult {
 	if s.Integrate == nil {
 		return errf(b.ID, "integrate: no integrator wired")
 	}
@@ -195,6 +204,11 @@ func (s *Supervisor) doIntegrate(ctx context.Context, st *runState, b modelToolU
 	if len(order) == 0 {
 		return ok(b.ID, "nothing to integrate: no passing subagent branches yet.")
 	}
+	// Action intent BEFORE the merge runs (C2-T04): surface how many branches are
+	// about to be folded into the integration tree. The count is harness-derived
+	// control data, never subagent output (adv #8). Gated on a nil Emitter.
+	s.emit(emit.Event{Kind: emit.KindTool, Step: round,
+		Text: fmt.Sprintf("integrating %d branch(es)", len(order))})
 	branch, results, err := s.Integrate(ctx, order)
 	if err != nil {
 		return errf(b.ID, "integrate: "+err.Error())
@@ -210,7 +224,7 @@ func (s *Supervisor) doIntegrate(ctx context.Context, st *runState, b modelToolU
 // doCode lets the supervisor write code itself: one bounded CodeFunc pass over the
 // integration tree. The worker's result branch becomes the convergence hint; the
 // verifier still governs at finish (I2). A nil seam is a clean error.
-func (s *Supervisor) doCode(ctx context.Context, st *runState, b modelToolUse) modelResult {
+func (s *Supervisor) doCode(ctx context.Context, round int, st *runState, b modelToolUse) modelResult {
 	var in struct {
 		Goal string `json:"goal"`
 	}
@@ -222,6 +236,12 @@ func (s *Supervisor) doCode(ctx context.Context, st *runState, b modelToolUse) m
 	}
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_code",
 		Detail: map[string]any{"goal_len": len(in.Goal)}})
+	// Action intent BEFORE the supervisor writes code itself (C2-T04): surface the
+	// clipped goal it is about to code, so a watching principal can steer. The goal
+	// is the supervisor model's own input, never laundered output (adv #8). Gated on
+	// a nil Emitter.
+	s.emit(emit.Event{Kind: emit.KindTool, Step: round,
+		Text: "writing code for: " + clip(in.Goal, 80)})
 	res := s.Code(ctx, in.Goal)
 	if res.Branch != "" {
 		st.branch = res.Branch
@@ -329,6 +349,17 @@ func (s *Supervisor) renderIntegration(branch string, results []integrate.MergeR
 			r.ID, r.Branch, r.Merged, r.Verified, r.Conflict, r.Escalate)
 	}
 	return b.String()
+}
+
+// clip shortens s to at most n runes for compact, single-line intent surfacing,
+// cutting on a rune boundary so the surfaced line never carries invalid UTF-8
+// (mirrors backend/native.go's clip).
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // idDepth returns the spawn depth a dotted ID encodes. The top-level supervisor

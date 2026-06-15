@@ -300,7 +300,7 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 
 		msgs = append(msgs, model.Message{Role: "assistant", Content: resp.Content})
 
-		results, finished, summary := s.dispatch(ctx, st, resp.Content)
+		results, finished, summary := s.dispatch(ctx, i, st, resp.Content)
 
 		if finished {
 			// I2: the model's claim does not decide completion. Re-run the project's
@@ -508,7 +508,7 @@ func (s *Supervisor) drainFindings(r *reader) string {
 // plus its summary. It mirrors native.go's per-block switch exactly, so a tool
 // failure is a structured error fed back to the model, never a Go fault. Subagent
 // data that flows back is guard.Wrap-fenced at every seam (I7).
-func (s *Supervisor) dispatch(ctx context.Context, st *runState, content []model.Block) (results []model.Block, finished bool, summary string) {
+func (s *Supervisor) dispatch(ctx context.Context, round int, st *runState, content []model.Block) (results []model.Block, finished bool, summary string) {
 	for _, b := range content {
 		if b.Type != "tool_use" {
 			continue
@@ -526,7 +526,7 @@ func (s *Supervisor) dispatch(ctx context.Context, st *runState, content []model
 			results = append(results, s.doPlan(ctx, b))
 
 		case toolSpawnSubagent:
-			results = append(results, s.doSpawn(ctx, st, b))
+			results = append(results, s.doSpawn(ctx, round, st, b))
 
 		case toolMessageSubagent:
 			results = append(results, s.doMessage(ctx, b))
@@ -535,10 +535,10 @@ func (s *Supervisor) dispatch(ctx context.Context, st *runState, content []model
 			results = append(results, s.doAwait(ctx, st, b))
 
 		case toolIntegrate:
-			results = append(results, s.doIntegrate(ctx, st, b))
+			results = append(results, s.doIntegrate(ctx, round, st, b))
 
 		case toolCode:
-			results = append(results, s.doCode(ctx, st, b))
+			results = append(results, s.doCode(ctx, round, st, b))
 
 		default:
 			// Read/search tools dispatch through the read registry over the
