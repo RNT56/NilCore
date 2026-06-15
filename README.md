@@ -152,7 +152,9 @@ nilcore serve -channel telegram          # needs a channel + allowlist (from `ni
 #   export ANTHROPIC_API_KEY=sk-...   (or NILCORE_* for scripted: nilcore init -non-interactive)
 ```
 
-**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
+**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore inspect [health]` replays the append-only event log into a summary (events by kind, tasks, chain verified) or probes its health as a liveness gate; `nilcore watch` self-starts tasks from dropped signal files — reversible work auto-runs, anything irreversible routes to the human gate; `nilcore propose-edit -goal … -paths …` is the gated self-edit flow (the agent may change its own prompts/skills/tools, never the core or contracts — scope-checked, verified, human-gated); `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
+
+**Capability plug-ins.** Drop a `SKILL.md` (frontmatter + instructions) under `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) and it surfaces to the loop as a `skill_<name>` tool — unused skills cost ~zero context. Configure MCP servers in `mcp.json` (`{name, command}`) and `nilcore` generates typed wrappers under `mcp/servers/` that the executor discovers on demand and invokes via `nilcore mcp-call`. Point `NILCORE_LSP_COMMAND` at a language server (e.g. `gopls`) for compiler-grade "precise" retrieval, and `NILCORE_LIVE_INDEX=1` for a worktree-aware, incrementally-updated `live` code-intelligence tool. All of these are opt-in; the default binary stays dependency-light and the loop byte-identical when they are absent.
 
 **Model selection** is `provider:model` via `NILCORE_MODEL` (default `claude-sonnet-4-6`; a bare name → Anthropic, e.g. `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`). Selecting the OpenRouter provider with no model — `openrouter` or `openrouter:` — defaults to **`openrouter/fusion`**, OpenRouter's multi-model panel that fuses several frontier models into one answer (it bills the cumulative cost of the panel).
 **Every step** is appended to a hash‑chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Plaintext secrets never hit disk, logs, or prompts; on a headless host they are sealed in an encrypted-file vault (AES‑256‑GCM, owner‑only key).
@@ -187,7 +189,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 3. **No ambient authority.** Secrets via env only; never on disk, in logs, in prompts, or in code.
 4. **Model-emitted execution is sandboxed.** Shell commands and delegated CLIs run in the container; the structured file/git tools run host-side but stay confined to the worktree — the model can't run an arbitrary program on the host.
 5. **The audit log is append‑only** — hash‑chained, redacted, replayable. History is never mutated.
-6. **Zero‑dependency core** — standard library only; the sanctioned exceptions are pure‑Go SQLite and `golang.org/x/sys` (Go's own extended stdlib, for the Linux namespace sandbox).
+6. **Zero‑dependency core** — standard library only; the sanctioned exceptions are pure‑Go SQLite, `golang.org/x/sys` (Go's own extended stdlib, for the Linux namespace sandbox), and the Charm TUI stack (behind `//go:build tui`, so the default binary links none). The MCP client is not a module — it's JSON‑RPC over the stdlib.
 7. **Untrusted input is data, never instructions.**
 
 ---
