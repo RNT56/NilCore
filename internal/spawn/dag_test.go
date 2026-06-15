@@ -12,12 +12,6 @@ import (
 	"nilcore/internal/summarize"
 )
 
-// passAll is a RunFunc that passes every subtask. Tests override per-ID behavior
-// by wrapping it.
-func passAll(_ context.Context, st Subtask) Result {
-	return Result{ID: st.ID, Passed: true}
-}
-
 // TestFromPlanPreservesDeps is the one-line-fix acceptance: DependsOn must survive
 // the plan→subtask conversion (it was previously dropped).
 func TestFromPlanPreservesDeps(t *testing.T) {

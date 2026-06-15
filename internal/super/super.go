@@ -249,7 +249,7 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 		streamer, canStream := s.Model.(model.Streamer)
 		if s.Out != nil && canStream {
 			var streamCtx context.Context
-			resp, err, steerAtFinish, streamCtx = s.streamTurn(ctx, i, streamer, systemPrompt, msgs, toolset)
+			resp, steerAtFinish, streamCtx, err = s.streamTurn(ctx, i, streamer, systemPrompt, msgs, toolset)
 			if err != nil {
 				switch loopctl.ClassifyCancel(ctx, streamCtx) {
 				case loopctl.Steer:
@@ -667,7 +667,7 @@ func holdProposedTools(content []model.Block) []model.Block {
 // caller ORs into the post-completion CV-T01 pause so the steer is never dropped.
 // The returned context is the per-round child, handed back so the caller can
 // classify the cancel cause without any shared mutable state.
-func (s *Supervisor) streamTurn(ctx context.Context, round int, streamer model.Streamer, system string, msgs []model.Message, toolset []model.Tool) (model.Response, error, bool, context.Context) {
+func (s *Supervisor) streamTurn(ctx context.Context, round int, streamer model.Streamer, system string, msgs []model.Message, toolset []model.Tool) (model.Response, bool, context.Context, error) {
 	// INTERRUPT-BUT-PRESERVE: wrap ONLY the Stream call in a cancel-cause child of the
 	// TASK ctx. A steer cancels it with ErrSteer; a shutdown cancels the parent (and so
 	// the child) with no cause. The watcher is torn down deterministically below.
@@ -713,7 +713,7 @@ func (s *Supervisor) streamTurn(ctx context.Context, round int, streamer model.S
 	close(stop)
 	cancelCause(nil)
 	<-done
-	return resp, err, steerFired, streamCtx
+	return resp, steerFired, streamCtx, err
 }
 
 // textBlocks returns only the text blocks of a content slice, dropping any tool_use
