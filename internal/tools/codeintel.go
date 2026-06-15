@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"nilcore/internal/codeintel/graph"
+	"nilcore/internal/codeintel/lsp"
 	"nilcore/internal/codeintel/retrieve"
 )
 
@@ -102,6 +104,18 @@ func (CodeintelTool) Run(ctx context.Context, workdir string, input json.RawMess
 	}
 
 	r := &retrieve.Retriever{Graph: g} // Semantic nil → lexical entry-point fallback
+
+	// Optional precise lens: an operator-configured language server (e.g. gopls)
+	// adds compiler-grade symbol matches. Opt-in via NILCORE_LSP_COMMAND (server +
+	// args, space-separated); the binary is operator-trusted, never model-emitted.
+	// Absent or unavailable, retrieval degrades silently to the graph-native lenses.
+	if cmd := strings.Fields(os.Getenv("NILCORE_LSP_COMMAND")); len(cmd) > 0 {
+		if client, stop, lerr := lsp.Spawn(ctx, cmd, "file://"+workdir); lerr == nil {
+			r.LSP = client
+			defer stop()
+		}
+	}
+
 	bundle, err := r.Retrieve(ctx, in.Query, budget)
 	if err != nil {
 		return "", fmt.Errorf("codeintel: retrieve: %w", err)

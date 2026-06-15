@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"nilcore/internal/codeintel/graph"
+	"nilcore/internal/codeintel/lsp"
 	"nilcore/internal/codeintel/repomap"
 	"nilcore/internal/codeintel/semantic"
 )
@@ -20,7 +21,7 @@ import (
 type Item struct {
 	Symbol     string
 	File       string
-	Provenance string // "semantic" | "lexical" | "graph-neighbor" | "repomap"
+	Provenance string // "precise" | "semantic" | "lexical" | "graph-neighbor" | "repomap"
 	Rationale  string
 	Score      float64
 }
@@ -32,14 +33,18 @@ type Bundle struct {
 }
 
 // Retriever fuses the lenses. Semantic is optional (lexical fallback over the
-// graph's node names when absent).
+// graph's node names when absent). LSP is optional too: when wired, a language
+// server contributes compiler-grade "precise" symbol matches; when nil, retrieval
+// degrades to the graph-native lenses (byte-identical to before).
 type Retriever struct {
 	Graph    *graph.Graph
 	Semantic *semantic.Index
+	LSP      *lsp.Client
 }
 
-// provRank orders provenances when scores tie (most-relevant lens first).
-var provRank = map[string]int{"semantic": 0, "lexical": 1, "graph-neighbor": 2, "repomap": 3}
+// provRank orders provenances when scores tie (most-relevant lens first). "precise"
+// (language-server, compiler-grade) ranks above the heuristic lenses.
+var provRank = map[string]int{"precise": -1, "semantic": 0, "lexical": 1, "graph-neighbor": 2, "repomap": 3}
 
 // Retrieve assembles a Context Bundle for need, bounded to budget items.
 func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bundle, error) {
@@ -62,7 +67,19 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 		fileOf[n.ID] = n.File
 	}
 
-	// 1. Entry points: semantic search, else lexical over node names.
+	// 1a. Precise entry points: a language server's global symbol search — exact,
+	// cross-language, compiler-grade. Best-effort: a server error degrades silently
+	// to the heuristic lenses below. Precise hits are standalone items (their names
+	// need not be graph node ids), ranked highest.
+	if r.LSP != nil {
+		if hits, lerr := r.LSP.Symbol(ctx, need); lerr == nil {
+			for _, h := range hits {
+				add(h.Name, uriToPath(h.Location.URI), "precise", "language-server symbol match", 1.5)
+			}
+		}
+	}
+
+	// 1b. Entry points: semantic search, else lexical over node names.
 	var leads []string
 	if r.Semantic != nil {
 		if hits, serr := r.Semantic.Search(ctx, need, 5); serr == nil {
@@ -116,4 +133,11 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 		b.Items = b.Items[:budget]
 	}
 	return b, nil
+}
+
+// uriToPath strips a file:// scheme from an LSP URI so a precise item carries the
+// same plain path shape as the graph-derived items (the renderer makes it
+// worktree-relative). A non-file URI is returned unchanged.
+func uriToPath(uri string) string {
+	return strings.TrimPrefix(uri, "file://")
 }
