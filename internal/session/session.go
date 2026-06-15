@@ -57,11 +57,17 @@ type Session struct {
 	// and reused across drives so a mid-work Turn always has somewhere to push.
 	Inbox *inbox.Box
 
-	mu      sync.Mutex      // guards Phase + History
+	mu      sync.Mutex      // guards Phase + History + driveCancel
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
 	State   WorkState       // bounded carry-over (never raw transcripts)
 	drives  sync.WaitGroup  // tracks the in-flight drive goroutine (test sync)
+
+	// driveCancel cancels the CURRENT drive's context — the Routing model call and
+	// the running loop — so Cancel() aborts the in-flight run while leaving the
+	// conversation alive. Set under mu when a drive launches; cleared on every
+	// return to Idle. nil ⇒ no drive in flight.
+	driveCancel context.CancelFunc
 }
 
 // Drivers is the route→machine table the Session launches into. Each field is an
@@ -137,9 +143,47 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 	s.Phase = Routing
 	st := s.State
 	history := s.snapshotHistory()
+	// Wrap the conversation ctx in a per-drive cancellable context so Cancel() can
+	// abort THIS run (the routing call + the loop) without tearing down the
+	// conversation. Cleared on return to Idle (drive completion / routing failure).
+	driveCtx, cancel := context.WithCancel(ctx)
+	s.driveCancel = cancel
 	s.mu.Unlock()
 
-	return s.route(ctx, text, st, history)
+	return s.route(driveCtx, text, st, history)
+}
+
+// Cancel aborts the in-flight drive (if any) and waits for it to unwind, leaving
+// the conversation in Idle so the principal can immediately issue a new
+// instruction. It is the third mid-work operation alongside queue and steer:
+// queue folds at the next step, steer pauses-and-reconsiders, Cancel STOPS the
+// current run. The loops honor the cancelled drive context — the in-flight model
+// call (and any sandboxed tool/exec under it) unwinds to a clean interrupted
+// result and the throwaway worktree is discarded. Returns true if a run was
+// cancelled, false if the session was already Idle.
+func (s *Session) Cancel() bool {
+	s.mu.Lock()
+	if s.Phase == Idle || s.driveCancel == nil {
+		s.mu.Unlock()
+		return false
+	}
+	cancel := s.driveCancel
+	s.mu.Unlock()
+
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_cancel"})
+	cancel()        // cancel the drive ctx → the loop unwinds to a clean interrupt
+	s.drives.Wait() // block until the drive goroutine has returned to Idle
+	return true
+}
+
+// clearDriveCancelLocked releases the current drive's cancel func; it is called
+// with s.mu held on every return to Idle. Calling the func after the drive has
+// already ended is a harmless no-op that frees the context's resources.
+func (s *Session) clearDriveCancelLocked() {
+	if s.driveCancel != nil {
+		s.driveCancel()
+		s.driveCancel = nil
+	}
 }
 
 // route runs the injected Router, logs the decision, and launches the chosen
@@ -225,6 +269,7 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 		s.State.LastOutcome = res.Outcome
 	}
 	s.Phase = Idle
+	s.clearDriveCancelLocked()
 	folded := s.State
 	s.mu.Unlock()
 
@@ -281,6 +326,7 @@ func (s *Session) driverFor(r Route, st WorkState) Driver {
 func (s *Session) toIdle() {
 	s.mu.Lock()
 	s.Phase = Idle
+	s.clearDriveCancelLocked()
 	s.mu.Unlock()
 }
 

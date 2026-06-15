@@ -200,6 +200,41 @@ func TestTurnWhileIdleRoutesAndLaunches(t *testing.T) {
 	}
 }
 
+// --- Cancel: abort the in-flight run, stay in the conversation ------------------
+
+func TestSessionCancelAbortsInFlightDrive(t *testing.T) {
+	rt := &fakeRouter{route: RouteNative}
+	drv := newFakeDriver(DriveResult{Summary: summarize.ContextSummary{Goal: "x"}})
+	s := New("chat-local", "local", "/repo", nil)
+	s.Router = rt
+	s.Drivers = Drivers{Native: drv}
+
+	if err := s.Turn(context.Background(), "build the whole thing"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	waitClosed(t, drv.started)
+	waitPhase(t, s, Working)
+
+	// Cancel aborts the in-flight drive and returns only after it unwinds to Idle:
+	// the drive's ctx is cancelled (the fakeDriver returns ctx.Err()), so a new run
+	// can start immediately. Distinct from queue/steer, which fold a turn instead.
+	if !s.Cancel() {
+		t.Fatal("Cancel should report it aborted an in-flight run")
+	}
+	if p := s.PhaseNow(); p != Idle {
+		t.Fatalf("after Cancel the session must be Idle, got %v", p)
+	}
+	// A cancelled drive's result is NOT folded (Drive returned an error), so State
+	// stays empty — the conversation is ready for a fresh instruction.
+	if s.State.Summary.Goal != "" {
+		t.Errorf("a cancelled drive must not fold State, got Summary.Goal=%q", s.State.Summary.Goal)
+	}
+	// Cancel on an Idle session is a no-op.
+	if s.Cancel() {
+		t.Error("Cancel on an Idle session should return false (nothing to cancel)")
+	}
+}
+
 // --- Working Turn: pushes to the inbox (queue vs steer per the prefix) ----------
 
 func TestTurnWhileWorkingPushesToInbox(t *testing.T) {

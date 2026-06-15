@@ -13,9 +13,10 @@
 // Inbox + Emitter injected so a mid-work steer/queue reaches the running loop and
 // live reasoning streams to stdout. A stdin reader goroutine reads lines WHILE the
 // agent works and feeds each to Session.Turn: a plain line QUEUEs (folded at the
-// next loop boundary), a '!'/'/steer' line STEERs (cancels the in-flight model
-// call now). Ctrl-C cancels the conversation ctx — shutdown dominates any pending
-// steer (loopctl.ClassifyCancel).
+// next loop boundary), a '!'/'/steer' line STEERs (the agent pauses at the next
+// step, takes the feedback in, then resumes or changes course — it never discards
+// in-flight work). A '/cancel' (or '/stop') aborts the current run but stays in
+// the conversation; Ctrl-C cancels the conversation ctx and exits.
 //
 // run/build/serve/init/doctor are untouched: this is a new dispatch case plus this
 // file, and the native/supervisor loops stay byte-identical with a nil Inbox/
@@ -116,9 +117,9 @@ func chatMain(args []string) {
 		fatal(err)
 	}
 
-	// Ctrl-C / SIGTERM cancels the conversation ctx; shutdown STRICTLY dominates any
-	// pending steer (loopctl.ClassifyCancel checks taskCtx.Err() first), so the in-
-	// flight drive unwinds to a clean interrupted result rather than continuing.
+	// Ctrl-C / SIGTERM cancels the whole conversation ctx, so the in-flight drive
+	// unwinds to a clean interrupted result and the REPL exits. (To abort only the
+	// current run and keep talking, use /cancel — see runChatCommand.)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -136,7 +137,8 @@ func chatMain(args []string) {
 // without reading docs.
 const chatBanner = `nilcore chat — talk to the agent; it picks the machine and works while you type.
   <text>            queue a message (folded in at the next step)
-  !<text> /steer …  steer now (interrupts the current model call)
+  !<text> /steer …  steer: pause, take your feedback in, then resume or change course
+  /cancel  /stop    abort the current run (and stay in the conversation)
   /status           show what the agent is working on
   /quit  (Ctrl-D)   leave`
 
@@ -447,6 +449,7 @@ const chatPromptGlyph = "» "
 type chatSession interface {
 	Turn(ctx context.Context, text string) error
 	PhaseNow() session.Phase
+	Cancel() bool
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).
@@ -458,6 +461,8 @@ func parseChatLine(line string) (cmd string, handled bool) {
 	switch strings.TrimSpace(line) {
 	case "/quit", "/exit":
 		return "quit", true
+	case "/cancel", "/stop":
+		return "cancel", true
 	case "/status":
 		return "status", true
 	case "/help", "/?":
@@ -475,6 +480,18 @@ func runChatCommand(_ context.Context, sess chatSession, cmd string, out io.Writ
 	case "quit":
 		fmt.Fprintln(out, "bye.")
 		return true
+	case "cancel":
+		// Abort the current run but stay in the conversation (distinct from queue /
+		// steer and from Ctrl-C, which exits). Cancel blocks until the drive unwinds.
+		if sess.PhaseNow() == session.Idle {
+			fmt.Fprintln(out, "  nothing running.")
+			return false
+		}
+		fmt.Fprintln(out, "  cancelling current run…")
+		if sess.Cancel() {
+			fmt.Fprintln(out, "  cancelled — back to you.")
+		}
+		return false
 	case "status":
 		fmt.Fprintf(out, "  status: %s\n", sess.PhaseNow())
 		return false

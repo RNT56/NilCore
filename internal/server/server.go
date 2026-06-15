@@ -33,6 +33,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"nilcore/internal/channel"
@@ -144,6 +145,21 @@ func (s *Server) intake(ctx context.Context, req channel.TaskRequest) {
 		_ = s.Channel.Update(ctx, req.ThreadID, "Starting: "+req.Goal)
 	}
 
+	// A /cancel (or /stop) from the principal aborts the in-flight run but keeps the
+	// conversation — it is NOT a Turn (never folded as queue/steer). Run it off the
+	// serve loop so a slow-to-unwind drive cannot block intake of other threads.
+	if isCancelCommand(req.Goal) {
+		thread := th
+		go func() {
+			if thread.sess.Cancel() {
+				_ = s.Channel.Update(ctx, req.ThreadID, "Cancelled the current run.")
+			} else {
+				_ = s.Channel.Update(ctx, req.ThreadID, "Nothing is running.")
+			}
+		}()
+		return
+	}
+
 	// Turn is the single principal entry point: Idle ⇒ route + launch a drive;
 	// Working ⇒ queue/steer into the running loop. It returns immediately either
 	// way, so intake (and the serve loop) never blocks until a drive completes.
@@ -153,6 +169,13 @@ func (s *Server) intake(ctx context.Context, req channel.TaskRequest) {
 		}
 		_ = s.Channel.Update(ctx, req.ThreadID, "Failed to route: "+err.Error())
 	}
+}
+
+// isCancelCommand reports whether a message is the abort-the-run control verb
+// (mirrors the chat REPL's /cancel and /stop) rather than a task / queue / steer.
+func isCancelCommand(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	return t == "/cancel" || t == "/stop"
 }
 
 // threadFor finds-or-creates the thread (Session + surface sink) under s.mu. On
