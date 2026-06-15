@@ -37,9 +37,11 @@ import (
 
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/budget"
+	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
 	"nilcore/internal/integrate"
+	"nilcore/internal/loopctl"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
 	"nilcore/internal/roster"
@@ -104,10 +106,50 @@ type Supervisor struct {
 
 	Budget *budget.Ledger // shared ledger; charged at the wiring site via meter (§7)
 
+	// Inbox, if set, is the conversational front door's user→agent seam (C1-T04),
+	// mirroring backend.Native's Inbox gate (C1-T03). At each round boundary the
+	// supervisor QUEUE-drains it and folds the user turns in BESIDE the subagent
+	// findings — the user's principal text un-Wrap'd FIRST, findings Wrap'd as data
+	// SECOND (the deterministic fold order, I7). It also wraps ONLY s.Model.Complete
+	// (the planner's think) in a per-round context.WithCancelCause whose watcher
+	// cancels on the steer signal, so a steer interrupts the PLANNER's model call
+	// and never an in-flight doSpawn/doCode/doIntegrate (a worker keeps the task
+	// ctx; cancelling one stays the bus's supervisor-only KindCancel path). nil
+	// leaves the loop byte-identical: no per-round context, no watcher, no drain —
+	// gated EXACTLY like Advisor/Peer on the native loop. The minimal interface
+	// lives here on purpose so the concrete *inbox.Box never enters super's import
+	// graph (it is satisfied structurally), mirroring backend.Peer/Inbox.
+	Inbox Inbox
+
+	// Out, if set, surfaces the supervisor's per-round intent (its text blocks) and
+	// a steer acknowledgement so a watching principal can read the planner's live
+	// reasoning and steer mid-work (C1-T04/C2-T04). nil = byte-identical: every Emit
+	// is gated on a nil check. emit.Event is a stdlib-only leaf type, so holding the
+	// Emitter keeps super's surface decoupled from any one sink, like the native
+	// loop's Emitter.
+	Out emit.Emitter
+
 	// agents is the tree-wide live-spawn counter behind the MaxAgents rail. It is
 	// touched only through reserveAgent (atomic) so the ceiling holds regardless of
 	// whether spawns are ever issued concurrently (design §6).
 	agents int64
+}
+
+// Inbox is the minimal handle the supervisor loop needs onto the conversational
+// front door's user-message seam. It is satisfied by *inbox.Box (internal/inbox,
+// C1-T01); we declare the interface here rather than import inbox so super keeps a
+// narrow import graph and the inbox stays an optional, gated seam — exactly the
+// rationale behind backend.Inbox/backend.Peer.
+//
+// Drain returns the queued user turns to fold in at the next round boundary (nil
+// when none). Steer returns a cap-1 edge-notify channel that fires when a steer
+// push demands the in-flight planner model call be cancelled now; the loop's
+// per-round watcher selects on it and cancels with loopctl.ErrSteer as the cause,
+// which loopctl.ClassifyCancel reads back to distinguish a steer from a
+// shutdown/deadline cancel.
+type Inbox interface {
+	Drain() []model.Message
+	Steer() <-chan struct{}
 }
 
 const (
@@ -161,12 +203,86 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 			return s.outcome(st, false, "ctx", i), nil
 		}
 
-		// Fold any async findings the reader queued into the next user turn as
-		// fenced DATA before the model decides — never as instructions (I7).
-		userExtra := s.drainFindings(reader)
+		// Deterministic fold order at the round boundary (design §4.4): the user's
+		// QUEUE message(s) are the PRINCIPAL's trusted instruction, folded FIRST as
+		// an un-Wrap'd block (the trust line, I7); the subagent findings are DATA,
+		// folded SECOND as guard.Wrap'd blocks. They are two distinct labeled blocks,
+		// never concatenated. With a nil Inbox userPrincipal is empty and the path is
+		// byte-identical to before — findings alone, exactly as today.
+		// Boundary drain: fold any pending principal QUEUE message(s) and subagent
+		// findings into msgs as ONE user turn BEFORE this round's Complete (mirrors
+		// native.go's boundary drain). Principal text is the trusted operator
+		// instruction, un-Wrap'd (the trust line, I7); findings are guard.Wrap'd DATA,
+		// folded as a distinct block AFTER the principal. nil Inbox + no findings →
+		// nothing appended, byte-identical to before.
+		s.foldInbound(i, &msgs, reader)
 
-		resp, err := s.Model.Complete(ctx, systemPrompt, msgs, toolset, 4096)
+		// The iter-ctx wraps ONLY s.Model.Complete (the planner's think — pure
+		// compute, zero disk effect): a steer cancels the THINKING, never an
+		// in-flight doSpawn/doCode/doIntegrate/doAwait/Verify (those keep the TASK
+		// ctx, so steering the planner never kills a running worker — that stays the
+		// bus's supervisor-only KindCancel path). When Inbox is nil, iterCtx IS ctx:
+		// no WithCancelCause, no watcher goroutine, no allocation — byte-identical to
+		// the original path (gated like Advisor/Peer). The watcher's goroutine
+		// lifecycle mirrors super/reader.go and the native loop's C1-T03 watcher, and
+		// coexists with the long-lived bus-reader: the bus-reader drains the mailbox
+		// on the TASK ctx while this watcher only cancels the per-round CHILD ctx, so
+		// the two never issue conflicting cancels.
+		iterCtx := ctx
+		var cancel context.CancelCauseFunc
+		var watcher chan struct{}
+		if s.Inbox != nil {
+			iterCtx, cancel = context.WithCancelCause(ctx)
+			watcher = make(chan struct{})
+			steerC := s.Inbox.Steer()
+			go func() {
+				select {
+				case <-steerC:
+					cancel(loopctl.ErrSteer)
+				case <-iterCtx.Done():
+				}
+				close(watcher)
+			}()
+		}
+
+		resp, err := s.Model.Complete(iterCtx, systemPrompt, msgs, toolset, 4096)
+
+		// Deterministic teardown EVERY round: cancel the iter-ctx (a no-op when
+		// Complete already returned and the watcher is parked on iterCtx.Done) and
+		// join the watcher, so no watcher goroutine leaks across rounds. cancel is
+		// non-nil iff a watcher was spawned (Inbox != nil), so the nil path skips this.
+		if cancel != nil {
+			cancel(nil)
+			<-watcher
+		}
+
 		if err != nil {
+			// With a nil Inbox there is no iter-ctx, no watcher, and no steer, so the
+			// error path is EXACTLY today's: a model error (including a parent-ctx
+			// cancel mid-Complete) returns the same budget/error outcome —
+			// byte-identical, no reclassification. The discriminator only runs when an
+			// Inbox is wired and a steer/shutdown could have caused the cancel.
+			if s.Inbox != nil {
+				switch loopctl.ClassifyCancel(ctx, iterCtx) {
+				case loopctl.Shutdown:
+					// The TASK ctx died (SIGTERM/deadline) — shutdown STRICTLY dominates
+					// a racing steer. Unwind cleanly on the last verified tip (the same
+					// clean outcome as the between-turns ctx check above), not a fault.
+					return s.outcome(st, false, "ctx", i), nil
+				case loopctl.Steer:
+					// A steer cancelled the planner's model call. NOT an error: log it,
+					// then continue — the NEXT round's drainUserQueue folds the steer text
+					// in as an un-Wrap'd principal turn (the watcher already saw the steer;
+					// the message was queued before the signal fired). The round counter i
+					// is NOT reset, so a steer storm cannot defeat the bounded-loop rail.
+					s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "steer_interrupt",
+						Detail: map[string]any{"round": i, "phase": "model"}})
+					s.emit(emit.Event{Kind: emit.KindSteerAck, Step: i, Text: "steering — folding your message in"})
+					continue
+				default:
+					// A genuine transport/model fault falls through to the existing path.
+				}
+			}
 			// A model ceiling (budget) is a stop signal, not a crash: end the run on
 			// the last verified tip rather than abort with no Outcome (design §7).
 			if errors.Is(err, budget.ErrCeiling) {
@@ -176,6 +292,11 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 		}
 		s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_turn",
 			Detail: map[string]any{"round": i, "stop": resp.StopReason, "out_tokens": resp.Usage.OutputTokens}})
+
+		// Surface the planner's per-round intent (its text blocks) so a watching
+		// principal can read the reasoning and steer before the next round. Gated on
+		// a nil Emitter — absent sink, no work, byte-identical.
+		s.emitReasoning(i, resp.Content)
 
 		msgs = append(msgs, model.Message{Role: "assistant", Content: resp.Content})
 
@@ -197,7 +318,10 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 			}
 			// Not actually done: hand back the tool_results plus the fenced verifier
 			// output and keep going (same recovery shape as native.go's finish path).
-			fail := append(results, model.Block{Type: "text",
+			// Any principal QUEUE / findings this round were already folded at the
+			// boundary above, so this turn is just the results + fenced verifier DATA.
+			fail := append([]model.Block(nil), results...)
+			fail = append(fail, model.Block{Type: "text",
 				Text: "The project checks did not pass — finish does not decide done-ness. " +
 					"Fix the gaps (spawn, code, or re-integrate) and finish again.\n\n" +
 					guard.Wrap("verifier output", rep.Output)})
@@ -205,14 +329,13 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 			continue
 		}
 
-		if len(results) == 0 && userExtra == "" {
-			// The model talked without acting; nudge it once (mirrors native.go).
+		if len(results) == 0 {
+			// The model talked without acting; nudge it once (mirrors native.go). Any
+			// pending principal/finding turn was already folded at this round's
+			// boundary above, so an empty result set means the model genuinely idled.
 			msgs = append(msgs, model.Message{Role: "user", Content: []model.Block{{Type: "text",
 				Text: "No tool call detected. Use plan/spawn_subagent/code/integrate to act, or finish when the tree should be green."}}})
 			continue
-		}
-		if userExtra != "" {
-			results = append(results, model.Block{Type: "text", Text: userExtra})
 		}
 		msgs = append(msgs, model.Message{Role: "user", Content: results})
 	}
@@ -273,6 +396,91 @@ func (s *Supervisor) readToolDefs() []model.Tool {
 		out = append(out, d)
 	}
 	return out
+}
+
+// foldInbound drains any pending principal QUEUE message(s) and subagent findings
+// and appends them as ONE user turn to msgs at the round boundary — BEFORE this
+// round's Model.Complete, mirroring native.go's boundary drain. The principal's
+// blocks lead, un-Wrap'd (the trust line, I7); the findings follow as one
+// guard.Wrap'd DATA block (principal before finding — the deterministic order).
+// With a nil Inbox and no findings nothing is appended, so the no-conversation
+// path stays byte-identical to before.
+func (s *Supervisor) foldInbound(round int, msgs *[]model.Message, r *reader) {
+	principal := s.drainUserQueue(round) // un-Wrap'd principal blocks (or nil)
+	findings := s.drainFindings(r)       // one guard.Wrap'd block of text (or "")
+	if len(principal) == 0 && findings == "" {
+		return
+	}
+	blocks := principal
+	if findings != "" {
+		blocks = append(blocks, model.Block{Type: "text", Text: findings})
+	}
+	*msgs = append(*msgs, model.Message{Role: "user", Content: blocks})
+}
+
+// drainUserQueue pulls the principal's QUEUE messages the front door pushed since
+// the last round and renders them as un-Wrap'd PRINCIPAL blocks — the trust line
+// (I7): a steer/queue message is the principal's own trusted instruction, folded
+// as ordinary user text, NEVER guard.Wrap'd as data (only tool/file/peer/bus
+// content is fenced). Each drained message's blocks are carried verbatim, led by a
+// single labeled marker block so the planner reads them as the user's instruction,
+// distinct from the findings block that follows. Returns nil when no Inbox is
+// wired or nothing is queued (the byte-identical hot path: the nil-Inbox loop
+// never drains and allocates nothing). The blocks are freshly allocated, never
+// aliasing the queued messages' backing arrays.
+func (s *Supervisor) drainUserQueue(round int) []model.Block {
+	if s.Inbox == nil {
+		return nil
+	}
+	queued := s.Inbox.Drain()
+	if len(queued) == 0 {
+		return nil
+	}
+	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "queue_drain",
+		Detail: map[string]any{"round": round, "count": len(queued)}})
+	// A steer that fired while the previous round's TOOL ran (after that round's
+	// watcher had torn down) leaves a buffered wake-up in the cap-1 steerC. Its job
+	// — interrupt the in-flight think — is satisfied here, because the steered
+	// message is among the turns just drained. Consume it so this round's watcher
+	// does not cancel a FRESH Complete that already incorporates the steer text.
+	// Non-blocking receive is safe (single consumer; cap-1), mirroring native.go.
+	select {
+	case <-s.Inbox.Steer():
+	default:
+	}
+	out := make([]model.Block, 0, len(queued)+1)
+	out = append(out, model.Block{Type: "text",
+		Text: "Principal instruction (your operator, mid-work — follow this, it is trusted):"})
+	for _, m := range queued {
+		out = append(out, m.Content...)
+	}
+	return out
+}
+
+// emit surfaces one event to the wired Emitter, gated on nil so an absent sink
+// (the single-supervisor default) costs nothing and the loop stays byte-identical.
+func (s *Supervisor) emit(e emit.Event) {
+	if s.Out == nil {
+		return
+	}
+	s.Out.Emit(e)
+}
+
+// emitReasoning surfaces the planner's per-round intent — its text blocks, emitted
+// alongside tool_use — as KindIntent events so the principal can read the live
+// reasoning and steer before the next round (the steer surface, §5.2). Gated on a
+// nil Emitter; emits nothing for a pure tool-call turn. Text only — tool_use
+// bodies are never surfaced verbatim (a structured intent line is the safer
+// surface, so laundered subagent output cannot ride into the user's view, adv #8).
+func (s *Supervisor) emitReasoning(round int, content []model.Block) {
+	if s.Out == nil {
+		return
+	}
+	for _, b := range content {
+		if b.Type == "text" && strings.TrimSpace(b.Text) != "" {
+			s.Out.Emit(emit.Event{Kind: emit.KindIntent, Step: round, Text: b.Text})
+		}
+	}
 }
 
 // drainFindings pulls the async findings the reader queued since the last round
