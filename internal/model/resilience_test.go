@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -50,6 +51,63 @@ func (f *fakeProvider) callCount() int {
 	defer f.mu.Unlock()
 	return f.calls
 }
+
+// streamingFakeProvider is a controllable Streamer (and Provider) for the
+// streaming resilience tests. Like fakeProvider it fails its first failUntil
+// calls; each call forwards a fixed sequence of deltas to onChunk BEFORE
+// returning, so a test can prove that a failed attempt's chunks are discarded
+// (no double-emit) while only the winning attempt's chunks reach the caller.
+type streamingFakeProvider struct {
+	model      string
+	mu         sync.Mutex
+	calls      int
+	failUntil  int
+	alwaysFail bool
+	deltas     []string
+}
+
+func (f *streamingFakeProvider) Complete(ctx context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
+	// Streaming providers still implement Complete; route it through the same
+	// failure model so a non-Stream caller behaves identically.
+	return f.Stream(ctx, "", nil, nil, 0, nil)
+}
+
+func (f *streamingFakeProvider) Stream(ctx context.Context, _ string, _ []Message, _ []Tool, _ int, onChunk func(Chunk)) (Response, error) {
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.mu.Unlock()
+
+	var b strings.Builder
+	for _, d := range f.deltas {
+		b.WriteString(d)
+		if onChunk != nil {
+			onChunk(Chunk{Text: d})
+		}
+	}
+	if f.alwaysFail || n <= f.failUntil {
+		// Even a failed attempt may have pushed deltas to its (buffering) callback;
+		// the wrapper must NOT have committed them.
+		return Response{}, errFail
+	}
+	return Response{
+		Content:    []Block{{Type: "text", Text: b.String()}},
+		StopReason: "end_turn",
+		Usage:      Usage{InputTokens: 1, OutputTokens: 1},
+	}, nil
+}
+
+func (f *streamingFakeProvider) Model() string { return f.model }
+
+func (f *streamingFakeProvider) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// compile-time assertion: Resilient is itself a Streamer, so the loop sees a
+// streamer through the resilience wrapper (ST-T05).
+var _ Streamer = (*Resilient)(nil)
 
 // newTestResilient wires a Resilient whose sleep is a no-op so retries are
 // instant. The breaker clock is a controllable fake.
@@ -338,6 +396,180 @@ func TestBackoff_JitterWithinBounds(t *testing.T) {
 			t.Fatalf("backoff with jitter = %v, want [10ms, 15ms)", got)
 		}
 	}
+}
+
+// TestStream_RetrySucceedsNoDoubleEmit is the core streaming acceptance: a
+// provider that fails its first two attempts then succeeds must (a) recover via
+// retry and (b) emit ONLY the winning attempt's chunks — the discarded attempts'
+// deltas never reach onChunk, so no double-emit.
+func TestStream_RetrySucceedsNoDoubleEmit(t *testing.T) {
+	p := &streamingFakeProvider{model: "p", failUntil: 2, deltas: []string{"Hel", "lo"}}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  3,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var got []string
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if resp.Content[0].Text != "Hello" {
+		t.Fatalf("assembled = %q, want Hello", resp.Content[0].Text)
+	}
+	if p.callCount() != 3 {
+		t.Fatalf("calls = %d, want 3", p.callCount())
+	}
+	// Two failed attempts each pushed 2 deltas to their buffers; only the winning
+	// attempt's 2 deltas may have been committed.
+	if strings.Join(got, "|") != "Hel|lo" {
+		t.Fatalf("emitted %q, want exactly \"Hel|lo\" (no double-emit)", strings.Join(got, "|"))
+	}
+}
+
+// TestStream_FailoverNoDoubleEmit asserts that on failover only the winning
+// (fallback) provider's chunks are emitted — the failed primary's deltas are
+// discarded.
+func TestStream_FailoverNoDoubleEmit(t *testing.T) {
+	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"X", "Y"}}
+	fallback := &streamingFakeProvider{model: "fallback", deltas: []string{"a", "b"}}
+	r := newTestResilient(t, []Provider{primary, fallback}, Options{
+		MaxRetries:  1,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var got []string
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if resp.Content[0].Text != "ab" {
+		t.Fatalf("assembled = %q, want ab", resp.Content[0].Text)
+	}
+	if primary.callCount() != 2 { // initial + 1 retry, both failed
+		t.Fatalf("primary calls = %d, want 2", primary.callCount())
+	}
+	// Only the fallback's deltas — none of the primary's failed "X","Y".
+	if strings.Join(got, "|") != "a|b" {
+		t.Fatalf("emitted %q, want exactly \"a|b\" (primary's discarded)", strings.Join(got, "|"))
+	}
+}
+
+// TestStream_NonStreamerFallbackOneChunk asserts a provider that implements only
+// Provider (no Streamer) is driven via Complete and its reply replayed as one
+// chunk — so streaming inherits resilience even over a non-streaming provider.
+func TestStream_NonStreamerFallbackOneChunk(t *testing.T) {
+	// fakeProvider (the non-streaming one) returns Content[0].Text = "p-ok".
+	p := &fakeProvider{model: "p"}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  0,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var got []Chunk
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c) })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if len(got) != 1 || got[0].Text != "p-ok" {
+		t.Fatalf("chunks = %+v, want one chunk \"p-ok\"", got)
+	}
+	if resp.Content[0].Text != "p-ok" {
+		t.Fatalf("resp text = %q, want p-ok", resp.Content[0].Text)
+	}
+}
+
+// TestStream_AllProvidersFail asserts an all-down streaming run surfaces the
+// wrapped errFail and emits nothing.
+func TestStream_AllProvidersFail(t *testing.T) {
+	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"x"}}
+	fallback := &streamingFakeProvider{model: "fallback", alwaysFail: true, deltas: []string{"y"}}
+	r := newTestResilient(t, []Provider{primary, fallback}, Options{
+		MaxRetries:  0,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var emitted int
+	_, err := r.Stream(context.Background(), "", nil, nil, 16, func(Chunk) { emitted++ })
+	if err == nil || !errors.Is(err, errFail) {
+		t.Fatalf("err = %v, want wrapped errFail", err)
+	}
+	if emitted != 0 {
+		t.Fatalf("emitted %d chunks on total failure, want 0", emitted)
+	}
+}
+
+// TestStream_BreakerSkipsToFallback asserts the breaker also governs streaming:
+// once the primary's breaker is open it is skipped and the fallback streams.
+func TestStream_BreakerSkipsToFallback(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"x"}}
+	fallback := &streamingFakeProvider{model: "fallback", deltas: []string{"a", "b"}}
+	r := newTestResilient(t, []Provider{primary, fallback}, Options{
+		MaxRetries:       0,
+		BaseBackoff:      time.Millisecond,
+		BreakerThreshold: 1,
+		BreakerCooldown:  time.Minute,
+	}, clock.Now)
+
+	if resp, err := r.Stream(context.Background(), "", nil, nil, 16, nil); err != nil {
+		t.Fatalf("first Stream: %v", err)
+	} else if resp.Content[0].Text != "ab" {
+		t.Fatalf("got %q, want ab", resp.Content[0].Text)
+	}
+	primaryCalls := primary.callCount()
+
+	// Second Stream: primary skipped (breaker open), fallback serves again.
+	if resp, err := r.Stream(context.Background(), "", nil, nil, 16, nil); err != nil {
+		t.Fatalf("second Stream: %v", err)
+	} else if resp.Content[0].Text != "ab" {
+		t.Fatalf("got %q, want ab", resp.Content[0].Text)
+	}
+	if primary.callCount() != primaryCalls {
+		t.Fatalf("primary streamed while breaker open: %d, want %d", primary.callCount(), primaryCalls)
+	}
+}
+
+// TestStream_ContextCancelledStopsRetries asserts a cancelled parent ctx stops
+// the streaming walk just like Complete's.
+func TestStream_ContextCancelledStopsRetries(t *testing.T) {
+	p := &streamingFakeProvider{model: "p", alwaysFail: true, deltas: []string{"x"}}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  5,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := r.Stream(ctx, "", nil, nil, 16, nil); err == nil {
+		t.Fatal("want error from cancelled context")
+	}
+	if p.callCount() > 1 {
+		t.Fatalf("provider streamed %d times after cancel, want <= 1", p.callCount())
+	}
+}
+
+// TestStream_ConcurrentRace exercises the streaming wrapper under -race: many
+// goroutines streaming through one Resilient (shared breakers) must be race-free.
+func TestStream_ConcurrentRace(t *testing.T) {
+	p := &streamingFakeProvider{model: "p", deltas: []string{"a", "b"}}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  1,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.Stream(context.Background(), "", nil, nil, 16, func(Chunk) {}); err != nil {
+				t.Errorf("Stream: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // fakeClock is a deterministic, controllable clock for breaker timing.

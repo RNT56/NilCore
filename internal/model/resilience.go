@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 )
@@ -170,6 +171,129 @@ func (r *Resilient) Complete(ctx context.Context, system string, msgs []Message,
 		return Response{}, fmt.Errorf("all providers skipped (breakers open): %w", errors.Join(errs...))
 	}
 	return Response{}, fmt.Errorf("all providers failed: %w", errors.Join(errs...))
+}
+
+// Stream is the streaming counterpart to Complete: it applies the exact same
+// retry/backoff/failover/breaker logic, but around each provider's Stream (or a
+// non-streaming provider's Complete replayed as one chunk), so streaming inherits
+// resilience and the loop sees a model.Streamer through the wrapper regardless of
+// what the underlying providers support.
+//
+// No double-emit on the winning attempt: chunks are NOT forwarded live. Each
+// attempt buffers its deltas; only when an attempt ultimately SUCCEEDS is the
+// buffer flushed to onChunk in order. A failed attempt's buffered chunks are
+// discarded, so a retried-then-succeeded (or failed-over) stream emits exactly
+// one committed sequence — never the chunks of an attempt that was thrown away.
+// (The contract still holds: the concatenation of the forwarded chunks equals the
+// returned Response's output text, just delivered after that attempt commits.)
+func (r *Resilient) Stream(ctx context.Context, system string, msgs []Message, tools []Tool, maxTokens int, onChunk func(Chunk)) (Response, error) {
+	var errs []error
+	skipped := 0
+	for i, p := range r.providers {
+		if !r.breakers[i].allow(r.now(), r.opts.BreakerThreshold) {
+			skipped++
+			errs = append(errs, fmt.Errorf("provider %d (%s): breaker open", i, p.Model()))
+			continue
+		}
+		resp, err := r.streamWithRetry(ctx, p, r.breakers[i], system, msgs, tools, maxTokens, onChunk)
+		if err == nil {
+			return resp, nil
+		}
+		errs = append(errs, fmt.Errorf("provider %d (%s): %w", i, p.Model(), err))
+		// If the context is done, stop walking the list — no provider will help.
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if skipped == len(r.providers) {
+		return Response{}, fmt.Errorf("all providers skipped (breakers open): %w", errors.Join(errs...))
+	}
+	return Response{}, fmt.Errorf("all providers failed: %w", errors.Join(errs...))
+}
+
+// streamWithRetry is the streaming twin of callWithRetry: same retry/backoff and
+// breaker bookkeeping, but it commits buffered chunks to onChunk only on the
+// attempt that succeeds.
+func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker, system string, msgs []Message, tools []Tool, maxTokens int, onChunk func(Chunk)) (Response, error) {
+	var lastErr error
+	for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
+		if attempt > 0 {
+			if err := r.sleep(ctx, r.backoff(attempt)); err != nil {
+				return Response{}, fmt.Errorf("backoff interrupted: %w", err)
+			}
+		}
+		resp, err := r.streamOnce(ctx, p, system, msgs, tools, maxTokens, onChunk)
+		if err == nil {
+			b.recordSuccess()
+			return resp, nil
+		}
+		lastErr = err
+		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
+		// A cancelled/expired parent context is terminal — do not keep retrying.
+		if ctx.Err() != nil {
+			return Response{}, fmt.Errorf("attempt %d: %w", attempt+1, err)
+		}
+		// If this provider's breaker just opened, stop spending its retry budget.
+		if !b.allow(r.now(), r.opts.BreakerThreshold) {
+			return Response{}, fmt.Errorf("attempt %d (breaker opened): %w", attempt+1, err)
+		}
+	}
+	return Response{}, fmt.Errorf("exhausted %d attempts: %w", r.opts.MaxRetries+1, lastErr)
+}
+
+// streamOnce runs a single streaming attempt with the optional per-call timeout.
+// It buffers the attempt's chunks and flushes them to onChunk ONLY on success, so
+// a failed attempt never emits to the caller (the no-double-emit guarantee). A
+// non-streaming provider is driven via Complete and its assembled reply replayed
+// as a single buffered chunk, so it satisfies the streaming contract too.
+func (r *Resilient) streamOnce(ctx context.Context, p Provider, system string, msgs []Message, tools []Tool, maxTokens int, onChunk func(Chunk)) (Response, error) {
+	cctx := ctx
+	if r.opts.CallTimeout > 0 {
+		var cancel context.CancelFunc
+		cctx, cancel = context.WithTimeout(ctx, r.opts.CallTimeout)
+		defer cancel()
+	}
+
+	// Buffer this attempt's chunks; commit to the real callback only on success.
+	var buf []Chunk
+	collect := func(c Chunk) { buf = append(buf, c) }
+
+	var (
+		resp Response
+		err  error
+	)
+	if s, ok := p.(Streamer); ok {
+		resp, err = s.Stream(cctx, system, msgs, tools, maxTokens, collect)
+	} else {
+		// Non-streaming provider: complete, then stage the whole reply as one chunk.
+		resp, err = p.Complete(cctx, system, msgs, tools, maxTokens)
+		if err == nil {
+			collect(Chunk{Text: responseText(resp)})
+		}
+	}
+	if err != nil {
+		// This attempt is being discarded; its buffered chunks are never emitted.
+		return Response{}, err
+	}
+	// Winning attempt: flush its chunks to the caller in order, exactly once.
+	if onChunk != nil {
+		for _, c := range buf {
+			onChunk(c)
+		}
+	}
+	return resp, nil
+}
+
+// responseText concatenates a response's text blocks — the output prose a front
+// end paints — so a non-streaming provider's reply can be replayed as one Chunk.
+func responseText(resp Response) string {
+	var b strings.Builder
+	for _, blk := range resp.Content {
+		if blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	return b.String()
 }
 
 // callWithRetry runs one provider with retry/backoff and updates its breaker on
