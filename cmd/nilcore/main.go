@@ -95,6 +95,8 @@ func main() {
 		configMain(args[1:])
 	case "secret":
 		secretMain(args[1:])
+	case "inspect":
+		inspectMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -120,6 +122,7 @@ Usage:
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
+  nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
   nilcore version                       print the build version
 
 Run 'nilcore <command> -h' for a command's flags.
