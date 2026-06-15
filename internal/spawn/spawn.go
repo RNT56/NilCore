@@ -17,19 +17,39 @@ import (
 	"nilcore/internal/summarize"
 )
 
-// Subtask is one unit of work, seeded with the context it needs.
+// Subtask is one unit of work, seeded with the context it needs. DependsOn names
+// the IDs whose merged work this subtask is built on top of; the DAGScheduler
+// holds a node back until every dependency has Passed (and been integrated).
 type Subtask struct {
-	ID      string
-	Goal    string
-	Summary summarize.ContextSummary
+	ID        string
+	Goal      string
+	DependsOn []string
+	Summary   summarize.ContextSummary
 }
 
+// State is a node's single terminal outcome under DAG scheduling. Every node
+// ends in exactly one of these (termination by construction). The flat Spawner
+// leaves it Pending — it has no dependency notion — and reports via Passed/Err.
+type State string
+
+const (
+	StatePending State = ""        // not yet (or never) resolved by the DAG
+	StatePassed  State = "passed"  // ran and Passed==true
+	StateFailed  State = "failed"  // ran and Passed==false (or Err set)
+	StateSkipped State = "skipped" // a dependency failed/was skipped/cyclic
+	StateCycle   State = "cycle"   // part of (or downstream of) a dependency cycle
+)
+
 // Result is a subworker's outcome. Err is set when the subworker failed or
-// panicked — isolated, not propagated.
+// panicked — isolated, not propagated. Branch is the task branch the subworker's
+// verified commit lives on (set by the run func; consumed by the integrator).
+// State is the DAG terminal outcome (Pending for the flat Spawner).
 type Result struct {
 	ID      string
 	Summary string
+	Branch  string
 	Passed  bool
+	State   State
 	Err     error
 }
 
@@ -81,7 +101,9 @@ func (s *Spawner) Spawn(ctx context.Context, subtasks []Subtask) []Result {
 }
 
 // FromPlan converts a planner.Tree into subtasks, each seeded with a base summary
-// whose goal is set to the subtask's goal.
+// whose goal is set to the subtask's goal. DependsOn is carried verbatim so the
+// DAGScheduler can honor the plan's ordering (previously dropped — the deps were
+// lost between planning and spawning).
 func FromPlan(tree planner.Tree, base summarize.ContextSummary) []Subtask {
 	out := make([]Subtask, 0, len(tree.Tasks))
 	for _, t := range tree.Tasks {
@@ -90,7 +112,12 @@ func FromPlan(tree planner.Tree, base summarize.ContextSummary) []Subtask {
 		if t.Acceptance != "" {
 			s.Remaining = "Acceptance: " + t.Acceptance
 		}
-		out = append(out, Subtask{ID: t.ID, Goal: t.Goal, Summary: s})
+		// Copy the dependency slice so callers cannot mutate the plan through it.
+		var deps []string
+		if len(t.DependsOn) > 0 {
+			deps = append(deps, t.DependsOn...)
+		}
+		out = append(out, Subtask{ID: t.ID, Goal: t.Goal, DependsOn: deps, Summary: s})
 	}
 	return out
 }
