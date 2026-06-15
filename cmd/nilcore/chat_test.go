@@ -15,6 +15,8 @@ import (
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
 	"nilcore/internal/session"
+	"nilcore/internal/termui"
+	"nilcore/internal/verb"
 )
 
 // chat_test.go is the hermetic test of the `nilcore chat` REPL wiring (C3-T01). It
@@ -148,7 +150,7 @@ func TestChatREPLQueuesAndSteers(t *testing.T) {
 
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, &out) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(&out), nil) }()
 
 	// Line 1 routes a drive; wait for Working.
 	r.next()
@@ -214,7 +216,7 @@ func TestChatREPLShutsDownOnCtxCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, io.Discard) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(io.Discard), nil) }()
 
 	// Cancel (Ctrl-C) and require a prompt return.
 	cancel()
@@ -240,7 +242,7 @@ func TestChatREPLStatusAndQuit(t *testing.T) {
 	r := newScriptReader("/status", "/quit")
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(context.Background(), sess, r, &out) }()
+	go func() { done <- chatREPL(context.Background(), sess, r, termui.New(&out), nil) }()
 
 	r.next() // /status — reads phase, returns to prompt
 	r.next() // /quit — returns nil
@@ -278,6 +280,7 @@ func TestBuildChatSessionWiring(t *testing.T) {
 		boot:     boot{cred: func(string) string { return "" }},
 		log:      log,
 		baseRepo: repo,
+		emitter:  termui.NewEmitter(termui.New(io.Discard), verb.General),
 	})
 	if err != nil {
 		t.Fatalf("buildChatSession: %v", err)

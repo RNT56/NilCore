@@ -33,6 +33,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
@@ -45,7 +46,9 @@ import (
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
 	"nilcore/internal/summarize"
+	"nilcore/internal/termui"
 	"nilcore/internal/tools"
+	"nilcore/internal/verb"
 	"nilcore/internal/verify"
 )
 
@@ -106,12 +109,20 @@ func chatMain(args []string) {
 			"the %q backend has no native model — use `nilcore serve` for a delegated-backend channel", *cf.common.backendName))
 	}
 
+	// The styled terminal renderer: a Console owns the live spinner / streaming
+	// line, and a ConsoleEmitter (wired as the session's reasoning sink) turns the
+	// loops' live events into the animated surface. On a non-TTY both degrade to
+	// clean plain lines (SSH / piped / dumb terminal), invariant I6.
+	console := termui.New(os.Stdout)
+	emitter := termui.NewEmitter(console, verb.General)
+
 	sess, err := buildChatSession(chatDeps{
 		flags:    cf,
 		provider: prov,
 		boot:     b,
 		log:      log,
 		baseRepo: absDir,
+		emitter:  emitter,
 	})
 	if err != nil {
 		fatal(err)
@@ -123,8 +134,8 @@ func chatMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintln(os.Stdout, chatBanner)
-	if err := chatREPL(ctx, sess, os.Stdin, os.Stdout); err != nil && err != io.EOF {
+	console.Line(console.Style().Dim(chatBanner))
+	if err := chatREPL(ctx, sess, os.Stdin, console, emitter); err != nil && err != io.EOF {
 		fatal(err)
 	}
 	// Let any in-flight drive unwind on the cancelled ctx before we exit, so its
@@ -153,6 +164,7 @@ type chatDeps struct {
 	boot     boot
 	log      *eventlog.Log
 	baseRepo string
+	emitter  *termui.ConsoleEmitter // the styled reasoning sink (nil ⇒ no live surface)
 }
 
 // buildChatSession assembles the one conversation Session for the terminal front
@@ -178,8 +190,12 @@ func buildChatSession(d chatDeps) (*session.Session, error) {
 	metered := meterProvider(d.provider, ledger, chatConvoID)
 
 	sess := session.New(chatConvoID, chatPrincipal, d.baseRepo, d.log)
-	// Live reasoning/intent streams to stdout (the steer surface, §5.3).
-	sess.Out = emit.NewWriter(os.Stdout)
+	// Live reasoning/tokens render through the styled Console (the steer surface,
+	// §5.3). A nil emitter leaves Out unset — the loops gate on it and stay
+	// byte-identical, so the hermetic test wires no sink.
+	if d.emitter != nil {
+		sess.Out = d.emitter
+	}
 	sess.Budget = ledger
 
 	sess.Router = &session.SupervisorFirstRouter{
@@ -253,7 +269,27 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		emitDriveResult(in.Emitter, out.Verified, out.Summary)
 		return session.DriveOutcome{Summary: out.Summary, Verified: out.Verified}, nil
+	}
+}
+
+// emitDriveResult surfaces a drive's terminal outcome through the live emitter as
+// a verify line (✓/✗ by content) — the session folds the result into State but
+// does not itself emit it, so the conversation would otherwise not show the
+// conclusion. nil emitter (the non-conversational paths) ⇒ no-op.
+func emitDriveResult(out emit.Emitter, verified bool, summary string) {
+	if out == nil {
+		return
+	}
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		s = "done"
+	}
+	if verified {
+		out.Emit(emit.Event{Kind: emit.KindVerify, Text: "verified — " + s})
+	} else {
+		out.Emit(emit.Event{Kind: emit.KindVerify, Text: "not verified — " + s})
 	}
 }
 
@@ -304,7 +340,7 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 // tree under the conversation budget, and its outcome folds back into the
 // conversation exactly like a native drive.
 func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFunc {
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal))
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -313,6 +349,7 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		emitDriveResult(outEmitter, o.Done, o.Summary)
 		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
 	}
 }
@@ -324,7 +361,7 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 // planner's Inbox/Out wiring is a documented follow-on; the drive itself runs
 // bounded, verifier-gated, and charged against the conversation wall.
 func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal))
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -333,6 +370,7 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		emitDriveResult(outEmitter, o.Done, o.Summary)
 		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
 	}
 }
@@ -385,7 +423,7 @@ const (
 // blocked on a closed session. It is split out (reader + writer injected) so the
 // hermetic test drives it with scripted input and a fake session, asserting the
 // queue-vs-steer routing without a live model run.
-func chatREPL(ctx context.Context, sess chatSession, in io.Reader, out io.Writer) error {
+func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.Console, em *termui.ConsoleEmitter) error {
 	lines := make(chan string)
 	readErr := make(chan error, 1)
 
@@ -406,42 +444,74 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, out io.Writer
 		readErr <- sc.Err()
 	}()
 
-	fmt.Fprint(out, chatPromptGlyph)
+	// The bottom line is EITHER the prompt (Idle, awaiting input) OR the live
+	// spinner/stream (Working). `working` tracks which: a drive going Working starts
+	// the thinking spinner and hides the prompt; settling stops the spinner and
+	// re-offers it. Only this goroutine touches `working`.
+	working := false
+	prompt := func() { con.Prompt(con.Style().Info(chatPromptGlyph)) }
+	settle := func() {
+		if working {
+			working = false
+			em.End()
+		}
+	}
+	// reconcile shows the spinner for a fresh drive or the prompt when idle, after
+	// every line/command that may have changed the phase.
+	reconcile := func() {
+		if sess.PhaseNow() == session.Working {
+			if !working {
+				working = true
+				em.Begin(verb.General)
+			}
+			return
+		}
+		settle()
+		prompt()
+	}
+
+	prompt()
+	// A slow tick catches a drive that finishes asynchronously (the REPL is parked
+	// on the select, not on the drive) so the prompt returns promptly after work.
+	tick := time.NewTicker(120 * time.Millisecond)
+	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(out, "\nshutting down…")
+			settle()
+			con.Line("shutting down…")
 			return nil
 		case err := <-readErr:
-			fmt.Fprintln(out)
+			settle()
+			con.Line("")
 			return err // nil on clean EOF (Ctrl-D)
+		case <-tick.C:
+			if working && sess.PhaseNow() == session.Idle {
+				settle()
+				prompt()
+			}
 		case line := <-lines:
-			cmd, handled := parseChatLine(line)
-			if handled {
-				if quit := runChatCommand(ctx, sess, cmd, out); quit {
+			if cmd, handled := parseChatLine(line); handled {
+				if quit := runChatCommand(ctx, sess, cmd, con); quit {
+					settle()
 					return nil
 				}
-				fmt.Fprint(out, chatPromptGlyph)
-				continue
+			} else if strings.TrimSpace(line) != "" {
+				// Ack the mode BEFORE Turn dispatches (it may launch a streaming drive).
+				ackChatMode(con, line)
+				if err := sess.Turn(ctx, line); err != nil {
+					con.Line(con.Style().Dim("  (routing failed: " + err.Error() + ")"))
+				}
 			}
-			if strings.TrimSpace(line) == "" {
-				fmt.Fprint(out, chatPromptGlyph)
-				continue
-			}
-			// Echo a short ack so the user always knows which mode was understood,
-			// BEFORE Turn dispatches (Turn may launch a drive that streams reasoning).
-			ackChatMode(out, line)
-			if err := sess.Turn(ctx, line); err != nil {
-				fmt.Fprintf(out, "  (routing failed: %v)\n", err)
-			}
-			fmt.Fprint(out, chatPromptGlyph)
+			reconcile()
 		}
 	}
 }
 
 // chatPromptGlyph is the input prompt. Kept short so agent reasoning lines (which
-// carry their own glyphs from the WriterEmitter) read cleanly interleaved.
-const chatPromptGlyph = "» "
+// carry their own glyphs) read cleanly interleaved; styled cyan by the Console.
+const chatPromptGlyph = "❯ "
 
 // chatSession is the minimal Session surface the REPL drives, so the hermetic test
 // can substitute a fake that records Turn calls (line + classified mode) without
@@ -475,28 +545,29 @@ func parseChatLine(line string) (cmd string, handled bool) {
 // runChatCommand executes a local control verb and reports whether the REPL should
 // quit. It touches the session only through the read-only PhaseNow accessor (a
 // status read never mutates conversation state).
-func runChatCommand(_ context.Context, sess chatSession, cmd string, out io.Writer) (quit bool) {
+func runChatCommand(_ context.Context, sess chatSession, cmd string, con *termui.Console) (quit bool) {
+	st := con.Style()
 	switch cmd {
 	case "quit":
-		fmt.Fprintln(out, "bye.")
+		con.Line("bye.")
 		return true
 	case "cancel":
 		// Abort the current run but stay in the conversation (distinct from queue /
 		// steer and from Ctrl-C, which exits). Cancel blocks until the drive unwinds.
 		if sess.PhaseNow() == session.Idle {
-			fmt.Fprintln(out, "  nothing running.")
+			con.Line(st.Dim("  nothing running."))
 			return false
 		}
-		fmt.Fprintln(out, "  cancelling current run…")
+		con.Line(st.Warn("  cancelling current run…"))
 		if sess.Cancel() {
-			fmt.Fprintln(out, "  cancelled — back to you.")
+			con.Line(st.Warn("  cancelled — back to you."))
 		}
 		return false
 	case "status":
-		fmt.Fprintf(out, "  status: %s\n", sess.PhaseNow())
+		con.Line(st.Dim(fmt.Sprintf("  status: %s", sess.PhaseNow())))
 		return false
 	case "help":
-		fmt.Fprintln(out, chatBanner)
+		con.Line(st.Dim(chatBanner))
 		return false
 	default:
 		return false
@@ -507,12 +578,13 @@ func runChatCommand(_ context.Context, sess chatSession, cmd string, out io.Writ
 // is dispatched, so the user always knows which mode was understood (§5.3). It
 // reuses the session's own queue-vs-steer rule via chatIsSteer so the ack can never
 // drift from what Turn actually does.
-func ackChatMode(out io.Writer, line string) {
+func ackChatMode(con *termui.Console, line string) {
+	st := con.Style()
 	if chatIsSteer(line) {
-		fmt.Fprintln(out, "  steering — interrupting the current step…")
+		con.Line(st.Warn("  steering — interrupting the current step…"))
 		return
 	}
-	fmt.Fprintln(out, "  queued (delivered after this step)")
+	con.Line(st.Dim("  queued (delivered after this step)"))
 }
 
 // chatIsSteer mirrors session.classifyInterrupt's prefix rule (a leading '!' or a
