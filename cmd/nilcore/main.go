@@ -76,6 +76,8 @@ func main() {
 		fmt.Println(versionString())
 	case "chat":
 		chatMain(args[1:])
+	case "tui":
+		tuiMain(args[1:])
 	case "serve":
 		serveMain(args[1:])
 	case "build":

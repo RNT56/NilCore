@@ -43,7 +43,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~19,700 lines of Go with one dependency** — a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. |
+| **"The framework is too big to trust."** | The entire agent is **~19,700 lines of Go with one dependency** — a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — is the one exception: it links the Charm stack under a build tag, so the default binary stays one‑dependency and `internal/` never imports it.)* |
 
 ---
 
@@ -233,7 +233,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           chat · init · run · build · serve · doctor · config · secret · version
+cmd/nilcore/           chat · tui · init · run · build · serve · doctor · config · secret · version
 internal/
   model, provider      canonical message format + Anthropic/OpenAI/OpenRouter
   backend              CodingBackend contract + native / codex / claude-code

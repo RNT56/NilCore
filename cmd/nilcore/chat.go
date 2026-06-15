@@ -164,7 +164,18 @@ type chatDeps struct {
 	boot     boot
 	log      *eventlog.Log
 	baseRepo string
-	emitter  *termui.ConsoleEmitter // the styled reasoning sink (nil ⇒ no live surface)
+	emitter  emit.Emitter    // the reasoning sink (REPL: a termui.ConsoleEmitter; TUI: its own; nil ⇒ none)
+	approver policy.Approver // irreversible-action gate (nil ⇒ the console approver)
+}
+
+// approverOr returns the wired approver, or the console approver when none is set
+// (the line-REPL default). The TUI injects its own modal approver so a gate never
+// fights the alt-screen for stdin.
+func (d chatDeps) approverOr() policy.Approver {
+	if d.approver != nil {
+		return d.approver
+	}
+	return policy.NewConsoleApprover(os.Stdin, os.Stdout)
 }
 
 // buildChatSession assembles the one conversation Session for the terminal front
@@ -262,7 +273,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			Log:      d.log,
 			Router:   agent.SingleRouter{},
 			Spawner:  agent.NoSpawner{},
-			Approver: policy.NewConsoleApprover(os.Stdin, os.Stdout),
+			Approver: d.approverOr(),
 		}
 
 		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: in.Goal})
@@ -400,7 +411,7 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
 		executor: d.provider,
 		strong:   strong,
 		log:      d.log,
-		approver: policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		approver: d.approverOr(),
 		ledger:   ledger, // pin the conversation wall (§6)
 	}
 }
