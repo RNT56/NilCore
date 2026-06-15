@@ -58,7 +58,11 @@ var version = "dev"
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		usage(os.Stdout)
+		// The conversational front door is the natural default: bare `nilcore`
+		// launches the interactive chat REPL (docs/CONVERSATIONAL.md §7). The
+		// flag-prefixed `nilcore -goal …` and the explicit subcommands below keep
+		// their existing behavior unchanged.
+		chatMain(nil)
 		return
 	}
 	switch args[0] {
@@ -66,6 +70,8 @@ func main() {
 		usage(os.Stdout)
 	case "-v", "--version", "version":
 		fmt.Println(versionString())
+	case "chat":
+		chatMain(args[1:])
 	case "serve":
 		serveMain(args[1:])
 	case "build":
@@ -94,6 +100,8 @@ func main() {
 const usageText = `NilCore — a tiny, robust coding agent. The harness is small; the model is the engine.
 
 Usage:
+  nilcore                               start the interactive chat front door (same as 'nilcore chat')
+  nilcore chat [-dir ./repo]            talk to the agent: it picks the machine and works while you type
   nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
   nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
