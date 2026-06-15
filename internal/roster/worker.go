@@ -84,6 +84,18 @@ func NewWorker(p Profile, box sandbox.Sandbox, v verify.Verifier, log *eventlog.
 		reg = writeToolset()
 	}
 
+	// The sandboxed web_fetch tool (CV-T04) must bind to THIS worker's box, which
+	// only exists now — so it is wired here, not in the static catalog. We clone the
+	// resolved registry into a fresh per-worker one and add the box-bound tool, so
+	// the shared profile registry is never mutated (every worker of a role would
+	// otherwise race to overwrite a single shared web_fetch with a different box).
+	// The tool is read-only/non-mutating (it reads a URL inside the box and fences
+	// the body), so it never re-introduces a write surface on a read-only role.
+	if p.WantsWebFetch {
+		reg = tools.NewRegistry(reg.Tools()...)
+		reg.Register(tools.WebFetchTool{Box: box})
+	}
+
 	// Each worker gets its OWN advisor over the role's strong provider (per-ID
 	// ceiling). The provider is shared and stateless; the *Advisor wrapper that
 	// holds the non-atomic call count is per-subagent (§2). A nil role provider
@@ -153,16 +165,24 @@ func hasWriteTool(reg *tools.Registry) bool {
 func NewDefault(executor, advisorProvider model.Provider, research policy.Egress) *Roster {
 	return New(map[Role]Profile{
 		RoleResearcher: {
-			System:   researcherSystem,
-			Tools:    readToolset(),
-			Model:    advisorProvider,
-			Egress:   research, // research allowlist, intersected with the tree
-			ReadOnly: true,
-			MaxSteps: 40,
+			System: researcherSystem,
+			Tools:  readToolset(),
+			Model:  advisorProvider,
+			Egress: research, // research allowlist, intersected with the tree
+			// The sandboxed web_fetch tool is wired into THIS role's registry at
+			// NewWorker time (it must bind to the worker's box, which does not exist
+			// yet here). It fetches inside the box under the research egress — never a
+			// host-side fetch (I4) — and fences the body as untrusted data (I7).
+			WantsWebFetch: true,
+			ReadOnly:      true,
+			MaxSteps:      40,
 		},
 		RoleUnderstander: {
-			System:   understanderSystem,
-			Tools:    readToolset(),
+			System: understanderSystem,
+			// The understander gets the codeintel tool on top of read/search: a host-
+			// side, read-only code-intelligence bundle over the worktree (CV-T04). It
+			// is non-mutating, so the write-free read-only guarantee still holds.
+			Tools:    understanderToolset(),
 			Model:    advisorProvider,
 			Egress:   policy.Egress{}, // deny-all → --network none
 			ReadOnly: true,

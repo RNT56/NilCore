@@ -56,6 +56,22 @@ func (r *Registry) Has(name string) bool {
 	return ok
 }
 
+// Tools returns the registered Tool values in registration order. It lets a
+// caller derive a NEW registry from an existing one (e.g. a per-worker clone
+// that adds a box-bound tool) without aliasing the original's map — important
+// for the read-only roles, whose curated registry is shared across workers and
+// must never be mutated in place.
+func (r *Registry) Tools() []Tool {
+	if r == nil {
+		return nil
+	}
+	out := make([]Tool, 0, len(r.order))
+	for _, name := range r.order {
+		out = append(out, r.tools[name])
+	}
+	return out
+}
+
 // Defs returns the tool definitions to advertise to the model, in order.
 func (r *Registry) Defs() []model.Tool {
 	if r == nil {
