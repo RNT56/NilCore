@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,15 +52,31 @@ type Bot struct {
 	askSeq  atomic.Int64
 	pending []channel.TaskRequest
 
+	mu     sync.Mutex             // guards drafts
+	drafts map[string]*slackDraft // per-thread in-place streaming message (chat.update)
+
 	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
 	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
 }
 
-var _ channel.Channel = (*Bot)(nil)
+// slackDraft is the in-place message a thread is currently streaming into: Slack
+// has no ephemeral draft, so a "draft" is a real message posted once and edited
+// via chat.update. draftID lets a new turn start a fresh message rather than edit
+// the finalized prior one.
+type slackDraft struct {
+	ts      string
+	draftID int64
+}
+
+var (
+	_ channel.Channel       = (*Bot)(nil)
+	_ channel.DraftStreamer = (*Bot)(nil)
+)
 
 // New returns a bot for the given SLACK_APP_TOKEN (socket) and SLACK_BOT_TOKEN.
 func New(appToken, botToken string) *Bot {
-	b := &Bot{appToken: appToken, botToken: botToken, apiBase: defaultAPIBase, http: &http.Client{Timeout: 30 * time.Second}}
+	b := &Bot{appToken: appToken, botToken: botToken, apiBase: defaultAPIBase,
+		http: &http.Client{Timeout: 30 * time.Second}, drafts: map[string]*slackDraft{}}
 	b.connect = b.dialSocket
 	return b
 }
@@ -110,6 +127,80 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 // Update posts a progress line to the thread (channel).
 func (b *Bot) Update(ctx context.Context, threadID, message string) error {
 	return b.postMessage(ctx, map[string]any{"channel": threadID, "text": message})
+}
+
+// StreamDraft streams a drive's live reasoning into ONE message edited in place:
+// the first call for a draftID posts the message (capturing its ts), and each later
+// call with the same draftID edits it via chat.update. Slack has no ephemeral
+// draft, so the streamed message IS the message; a new draftID starts a fresh one.
+// Implements channel.DraftStreamer for serve-mode token streaming.
+func (b *Bot) StreamDraft(ctx context.Context, threadID string, draftID int64, text string) error {
+	b.mu.Lock()
+	cur := b.drafts[threadID]
+	b.mu.Unlock()
+	if cur == nil || cur.draftID != draftID {
+		ts, err := b.postMessageTS(ctx, map[string]any{"channel": threadID, "text": escapeSlack(text)})
+		if err != nil {
+			return err
+		}
+		b.mu.Lock()
+		b.drafts[threadID] = &slackDraft{ts: ts, draftID: draftID}
+		b.mu.Unlock()
+		return nil
+	}
+	return b.updateMessage(ctx, threadID, cur.ts, escapeSlack(text))
+}
+
+// FinalizeRich commits the streamed message: it edits the active draft to the final
+// text and forgets it (so the next turn posts fresh). With no active draft it
+// simply posts the message. Implements channel.DraftStreamer.
+func (b *Bot) FinalizeRich(ctx context.Context, threadID, text string) error {
+	b.mu.Lock()
+	cur := b.drafts[threadID]
+	delete(b.drafts, threadID)
+	b.mu.Unlock()
+	if cur == nil {
+		return b.postMessage(ctx, map[string]any{"channel": threadID, "text": escapeSlack(text)})
+	}
+	return b.updateMessage(ctx, threadID, cur.ts, escapeSlack(text))
+}
+
+// postMessageTS posts a message and returns its ts, so later chat.update calls can
+// edit it in place (the Slack streaming primitive).
+func (b *Bot) postMessageTS(ctx context.Context, body map[string]any) (string, error) {
+	var r struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+		TS    string `json:"ts"`
+	}
+	if err := b.apiPost(ctx, "chat.postMessage", b.botToken, body, &r); err != nil {
+		return "", err
+	}
+	if !r.OK {
+		return "", fmt.Errorf("chat.postMessage: %s", r.Error)
+	}
+	return r.TS, nil
+}
+
+// updateMessage edits a posted message in place via chat.update.
+func (b *Bot) updateMessage(ctx context.Context, chanID, ts, text string) error {
+	var r struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := b.apiPost(ctx, "chat.update", b.botToken, map[string]any{"channel": chanID, "ts": ts, "text": text}, &r); err != nil {
+		return err
+	}
+	if !r.OK {
+		return fmt.Errorf("chat.update: %s", r.Error)
+	}
+	return nil
+}
+
+// escapeSlack escapes the three characters Slack treats specially in message text
+// (& < >), so arbitrary model prose renders safely.
+func escapeSlack(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 // Ask posts a gate question with Yes/No buttons and blocks for the answer.

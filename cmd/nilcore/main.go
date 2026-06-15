@@ -33,9 +33,11 @@ import (
 	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
+	"nilcore/internal/budget"
 	"nilcore/internal/channel"
 	"nilcore/internal/channel/slack"
 	"nilcore/internal/channel/telegram"
+	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/memory"
 	"nilcore/internal/model"
@@ -46,7 +48,9 @@ import (
 	"nilcore/internal/sandbox"
 	"nilcore/internal/secrets"
 	"nilcore/internal/server"
+	"nilcore/internal/session"
 	"nilcore/internal/store"
+	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
@@ -58,7 +62,11 @@ var version = "dev"
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		usage(os.Stdout)
+		// The conversational front door is the natural default: bare `nilcore`
+		// launches the interactive chat REPL (docs/CONVERSATIONAL.md §7). The
+		// flag-prefixed `nilcore -goal …` and the explicit subcommands below keep
+		// their existing behavior unchanged.
+		chatMain(nil)
 		return
 	}
 	switch args[0] {
@@ -66,6 +74,10 @@ func main() {
 		usage(os.Stdout)
 	case "-v", "--version", "version":
 		fmt.Println(versionString())
+	case "chat":
+		chatMain(args[1:])
+	case "tui":
+		tuiMain(args[1:])
 	case "serve":
 		serveMain(args[1:])
 	case "build":
@@ -94,6 +106,8 @@ func main() {
 const usageText = `NilCore — a tiny, robust coding agent. The harness is small; the model is the engine.
 
 Usage:
+  nilcore                               start the interactive chat front door (same as 'nilcore chat')
+  nilcore chat [-dir ./repo]            talk to the agent: it picks the machine and works while you type
   nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
   nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
@@ -493,10 +507,16 @@ func runMain(args []string) {
 	}
 }
 
-// serveMain listens on a chat channel and dispatches tasks until interrupted.
+// serveMain listens on a chat channel and gives every thread the SAME
+// conversational Session the terminal front door uses (C3-T02): Telegram/Slack thus
+// get queue+steer and auto-routing. It builds the deny-all channel gate, a per-
+// thread Session factory wired to the full machinery (router + drivers, metered per
+// CONVERSATION = threadID against a per-conversation budget wall), and runs the
+// server's concurrent Permit-gated intake until interrupted.
 func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	channelName := fs.String("channel", "", "telegram | slack (default: config, else telegram)")
+	budgetCeil := fs.Float64("budget", chatDefaultBudget, "global dollar ceiling per conversation (a hard wall via the meter)")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -510,6 +530,13 @@ func serveMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
+	if prov == nil {
+		// A delegated backend (codex/claude-code) has no model.Provider to route,
+		// classify, or converse with — the conversational front door is a native-loop
+		// experience. The legacy one-task-per-message serve is gone; require native.
+		fatal(fmt.Errorf("nilcore serve requires the native backend (a model provider to route and converse with); "+
+			"the %q backend has no native model", *c.backendName))
+	}
 	allow := principalAllowlist(b.cfg)
 	if len(allow) == 0 {
 		fatal(fmt.Errorf("serve refuses to start with an empty principal allowlist (no ambient authority): " +
@@ -517,44 +544,202 @@ func serveMain(args []string) {
 			"or add \"allow\" to the channel section of config.json"))
 	}
 	chName := channelSpec(*channelName, b.cfg)
-	ch, err := buildChannel(chName, b.cred, allow, log)
+	rawCh, auth, err := buildChannel(chName, b.cred, allow, log)
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log)
-	newEnv := envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir)
 
-	run := func(ctx context.Context, t backend.Task, approver policy.Approver) (string, error) {
-		orch := &agent.Orchestrator{
-			BaseRepo:   absDir,
-			NewEnv:     newEnv,
-			Log:        log,
-			Router:     agent.SingleRouter{},
-			Spawner:    agent.NoSpawner{},
-			Approver:   approver, // gate questions route back to this thread
-			OnSuccess:  memWriteBack(mem, absDir),
-			Checkpoint: cp,
-		}
-		out, err := orch.Execute(ctx, t)
-		if err != nil {
-			return "", err
-		}
-		if !out.Verified {
-			return "❌ checks did not pass:\n" + out.Detail, nil
-		}
-		return "✅ verified — " + out.Summary, nil
-	}
+	factory := serveSessionFactory(serveDeps{
+		flags:    c,
+		provider: prov,
+		boot:     b,
+		log:      log,
+		baseRepo: absDir,
+		budget:   *budgetCeil,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := &server.Server{Channel: ch, Log: log, Run: run}
+	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	if err := srv.Serve(ctx); err != nil {
 		fatal(err)
 	}
-	if cp != nil {
-		_ = cp.Interrupt(context.Background()) // SIGTERM: checkpoint in-flight before exit (P6-T03)
+}
+
+// serveDeps is the resolved input to the serve Session factory: everything a per-
+// thread Session needs after flags + boot resolve. It mirrors chatDeps but carries
+// the serve-mode budget ceiling and is keyed per CONVERSATION (the channel
+// threadID) rather than the single "chat-local".
+type serveDeps struct {
+	flags    commonFlags
+	provider model.Provider
+	boot     boot
+	log      *eventlog.Log
+	baseRepo string
+	budget   float64
+}
+
+// serveSessionFactory returns the server.SessionFactory that builds one wired
+// conversational Session per thread. Each thread is its OWN conversation: it gets
+// its own budget.Ledger with the global ceiling (the per-conversation wall, §6),
+// one metered provider keyed by the threadID so N back-to-back drives in that
+// thread share ONE ceiling (never N×ceiling), the SupervisorFirstRouter, and the
+// four drivers running the EXISTING native/supervisor/project machinery with the
+// thread's Inbox + channel Emitter + channel Approver wired in. The Emitter and
+// Approver are supplied by the server (transport-bound: Update for reasoning, Ask
+// for gates); the factory owns only the machinery assembly.
+func serveSessionFactory(d serveDeps) server.SessionFactory {
+	return func(ctx context.Context, threadID, sender string, out emit.Emitter, approver policy.Approver) *session.Session {
+		// One conversation = one ledger + one global ceiling = one metered provider
+		// keyed by the threadID. Routing, drives, chat replies, and the summarize
+		// fold-back all charge this single wall (§6).
+		ledger := budget.New()
+		ledger.SetGlobalCeiling(d.budget)
+		metered := meterProvider(d.provider, ledger, threadID)
+
+		sess := session.New(threadID, sender, d.baseRepo, d.log)
+		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
+		sess.Budget = ledger
+
+		sess.Router = &session.SupervisorFirstRouter{
+			Classifier:      metered,
+			ShouldSupervise: chatShouldSupervise,
+			Log:             d.log,
+			ID:              threadID,
+		}
+		sess.Drivers = session.Drivers{
+			Native:    session.NewNativeDriver(serveNativeRun(d, metered, approver, threadID), metered, threadID),
+			Supervise: session.NewSuperviseDriver(serveSuperviseRun(d, ledger, approver), metered),
+			Project:   session.NewProjectDriver(serveProjectRun(d, ledger, approver), metered),
+			Chat:      session.NewChatDriver(metered),
+		}
+		return sess
+	}
+}
+
+// serveNativeRun is the serve-mode RunNativeFunc: it runs ONE native drive through
+// the orchestrator's single-task path with the session's Inbox + Seed (prior
+// History — continue, not restart) + Emitter wired onto backend.Native, the per-
+// drive worktree keyed by TaskID, and the thread's channel Approver routing gates
+// back over chat. The loop runs with the conversation-metered provider so spend
+// keys by the threadID, never the per-drive task id (§6). It mirrors chatNativeRun
+// but with the channel approver in place of the console one.
+func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approver, threadID string) session.RunNativeFunc {
+	adv := resolveAdvisor(*d.flags.backendName, d.boot, d.flags)
+	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
+		newEnv := func(dir string) agent.Env {
+			box := sandbox.NewContainer(*d.flags.runtime, *d.flags.image, dir)
+			v := verify.New(box, *d.flags.checkCmd)
+			n := serveNativeBackend(d, metered, adv, box, v, in)
+			return agent.Env{Backend: n, Verifier: v}
+		}
+		orch := &agent.Orchestrator{
+			BaseRepo: d.baseRepo,
+			NewEnv:   newEnv,
+			Log:      d.log,
+			Router:   agent.SingleRouter{},
+			Spawner:  agent.NoSpawner{},
+			Approver: approver, // gates route back to this thread (Channel.Ask)
+		}
+		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: in.Goal})
+		if err != nil {
+			return session.DriveOutcome{}, err
+		}
+		return session.DriveOutcome{Summary: out.Summary, Verified: out.Verified}, nil
+	}
+}
+
+// serveNativeBackend builds the backend.Native for one serve drive with the
+// conversational seams attached: the session Inbox (steer/queue), Seed (prior
+// History — continue, not restart), and Emitter (live reasoning over Channel.Update).
+// It mirrors chatNativeBackend but is fed by the serve deps.
+func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, in session.NativeRun) *backend.Native {
+	n := &backend.Native{
+		Model:        prov,
+		Box:          box,
+		Verifier:     v,
+		Log:          d.log,
+		Tools:        tools.Default(),
+		CommandGuard: policy.DefaultCommandPolicy().Check,
+		MaxSteps:     *d.flags.maxSteps,
+		Seed:         in.Seed,
+	}
+	if in.Inbox != nil {
+		n.Inbox = in.Inbox
+	}
+	if in.Emitter != nil {
+		n.Emitter = in.Emitter
+	}
+	if adv.prov != nil {
+		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+		n.EscalateAfter = adv.escalateAfter
+	}
+	return n
+}
+
+// serveSuperviseRun / serveProjectRun assemble the multi-agent stack for one serve
+// drive via buildStack, pinning the thread's shared conversation ledger (§6) and the
+// channel approver (the single human promote routes back over chat). Like the chat
+// path, the planner's own Inbox/Out wiring is a documented follow-on; the supervised/
+// project drive itself runs bounded, verifier-gated, and charged against the per-
+// conversation wall, and its outcome folds back exactly like a native drive.
+func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver) session.RunSuperviseFunc {
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter) (session.DriveOutcome, error) {
+		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal))
+		if err != nil {
+			return session.DriveOutcome{}, err
+		}
+		o, err := stack.loop.Run(ctx)
+		if err != nil {
+			return session.DriveOutcome{}, err
+		}
+		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
+	}
+}
+
+func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver) session.RunProjectFunc {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter) (session.DriveOutcome, error) {
+		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal))
+		if err != nil {
+			return session.DriveOutcome{}, err
+		}
+		o, err := stack.loop.Run(ctx)
+		if err != nil {
+			return session.DriveOutcome{}, err
+		}
+		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
+	}
+}
+
+// serveBuildDeps adapts the serve deps to a buildDeps for buildStack, pinning the
+// shared conversation ledger (so the supervised/project drive charges the SAME
+// per-conversation ceiling, §6) and the channel approver (the gate routes back over
+// chat). It mirrors chatBuildDeps' interactive rail sizing.
+func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver, goal string) buildDeps {
+	adv := resolveAdvisor("native", d.boot, d.flags)
+	strong := adv.prov
+	if strong == nil {
+		strong = d.provider
+	}
+	return buildDeps{
+		goal:     goal,
+		dir:      d.baseRepo,
+		runtime:  *d.flags.runtime,
+		image:    *d.flags.image,
+		verify:   *d.flags.checkCmd,
+		maxIter:  defaultChatMaxIter,
+		maxFan:   defaultChatMaxFanout,
+		maxAgent: defaultChatMaxAgents,
+		maxDepth: 1,
+		maxSteps: *d.flags.maxSteps,
+		budget:   d.budget,
+		executor: d.provider,
+		strong:   strong,
+		log:      d.log,
+		approver: approver,
+		ledger:   ledger, // pin the per-conversation wall (§6)
 	}
 }
 
@@ -699,27 +884,34 @@ type authChannel interface {
 // answer an irreversible-action gate (Ask). Wiring both sides closes audit H2/H3
 // — a freshly-deployed bot is inert to whoever merely finds it. A missing token
 // is reported with the remedy rather than a bare requirement.
-func buildChannel(name string, cred func(string) string, allow []string, log *eventlog.Log) (channel.Channel, error) {
+// buildChannel returns the RAW transport plus the deny-all-by-default Authorized
+// gate over it. Serve mode (C3-T02) drives Receive/Update/Ask on the raw transport
+// and does its OWN per-message Permit check in the intake path via the returned
+// Authorized — it deliberately does NOT consume Authorized.Receive, whose internal
+// filtering loop would swallow an unauthorized message before the server's per-
+// thread intake could log and refuse it (docs/CONVERSATIONAL.md §5.4). The gate-
+// button authorizer is still wired to Permit, so a gate answer stays gated.
+func buildChannel(name string, cred func(string) string, allow []string, log *eventlog.Log) (channel.Channel, *channel.Authorized, error) {
 	var bot authChannel
 	switch name {
 	case "telegram":
 		tok := cred("TELEGRAM_BOT_TOKEN")
 		if tok == "" {
-			return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required for the telegram channel; run `nilcore init` or set it in the environment")
+			return nil, nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required for the telegram channel; run `nilcore init` or set it in the environment")
 		}
 		bot = telegram.New(tok)
 	case "slack":
 		app, bt := cred("SLACK_APP_TOKEN"), cred("SLACK_BOT_TOKEN")
 		if app == "" || bt == "" {
-			return nil, fmt.Errorf("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required for the slack channel; run `nilcore init` or set them in the environment")
+			return nil, nil, fmt.Errorf("SLACK_APP_TOKEN and SLACK_BOT_TOKEN are required for the slack channel; run `nilcore init` or set them in the environment")
 		}
 		bot = slack.New(app, bt)
 	default:
-		return nil, fmt.Errorf("unknown channel %q (want telegram | slack)", name)
+		return nil, nil, fmt.Errorf("unknown channel %q (want telegram | slack)", name)
 	}
-	auth := channel.NewAuthorized(bot, allow, log) // filters inbound commands
-	bot.SetAuthorizer(auth.Permit, log)            // and gate-button answers
-	return auth, nil
+	auth := channel.NewAuthorized(bot, allow, log) // the per-message Permit gate
+	bot.SetAuthorizer(auth.Permit, log)            // gate-button answers stay gated
+	return bot, auth, nil
 }
 
 // principalAllowlist is the set of principals permitted to command the agent and

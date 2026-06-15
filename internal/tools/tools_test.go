@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -170,6 +172,131 @@ func TestSymlinkEscapeRejected(t *testing.T) {
 	if got, _ := run(t, ReadTool{}, dir, `{"path":"sub/ok.txt"}`); got != "fine" {
 		t.Errorf("legit read round-trip = %q", got)
 	}
+}
+
+// TestWriteIsAtomicNewInode proves overwrites never truncate-in-place: an atomic
+// temp+rename produces a NEW inode for the destination, whereas an in-place
+// O_TRUNC write would keep the same inode (and would be observable as truncated
+// mid-write). A changed inode is the structural signature of rename-over-write.
+func TestWriteIsAtomicNewInode(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run(t, WriteTool{}, dir, `{"path":"a.txt","content":"first version"}`); err != nil {
+		t.Fatalf("write1: %v", err)
+	}
+	p := filepath.Join(dir, "a.txt")
+	ino1 := inodeOf(t, p)
+
+	if _, err := run(t, WriteTool{}, dir, `{"path":"a.txt","content":"second, longer, version of the file"}`); err != nil {
+		t.Fatalf("write2: %v", err)
+	}
+	ino2 := inodeOf(t, p)
+	if ino1 == ino2 {
+		t.Fatalf("inode unchanged across overwrite (%d): write truncated in place, not atomic", ino1)
+	}
+	if got, _ := run(t, ReadTool{}, dir, `{"path":"a.txt"}`); got != "second, longer, version of the file" {
+		t.Fatalf("after atomic overwrite = %q", got)
+	}
+
+	// edit must also be atomic (it routes through the same writeNoFollow).
+	if _, err := run(t, EditTool{}, dir, `{"path":"a.txt","old":"second","new":"third"}`); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if inodeOf(t, p) == ino2 {
+		t.Fatal("edit kept the same inode: edit truncated in place, not atomic")
+	}
+}
+
+// TestWriteNoPartialContentObservable hammers a file with overwrites from one
+// goroutine while another goroutine reads it concurrently. Because the write is a
+// temp+rename, every read must observe a COMPLETE prior version — never an empty
+// or truncated file. An in-place O_TRUNC write would let a reader catch the file
+// after truncation but before the bytes land. Run with -race.
+func TestWriteNoPartialContentObservable(t *testing.T) {
+	dir := t.TempDir()
+	const small = "short content"
+	const large = "a much, much longer content string that would be observably truncated mid-write if writes were not atomic — repeated to be big enough to matter: " +
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+	// Seed so the path always exists for the reader.
+	if _, err := run(t, WriteTool{}, dir, `{"path":"hot.txt","content":"`+small+`"}`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	p := filepath.Join(dir, "hot.txt")
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() { // writer: alternate small/large bodies until told to stop
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			body := small
+			if i%2 == 0 {
+				body = large
+			}
+			if err := writeNoFollow(p, []byte(body)); err != nil {
+				t.Errorf("write %d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// reader: every observed content must be a COMPLETE version, never torn.
+	for i := 0; i < 4000; i++ {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("read %d: %v", i, err)
+		}
+		if s := string(b); s != small && s != large {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("read %d observed a PARTIAL/torn file (len=%d): atomicity broken", i, len(b))
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// TestWriteNoTempFileLeak asserts the temp file used for the atomic rename does
+// not linger after a successful write (no .nilcore-tmp-* droppings).
+func TestWriteNoTempFileLeak(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if _, err := run(t, WriteTool{}, dir, `{"path":"f.txt","content":"v"}`); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".nilcore-tmp-") {
+			t.Fatalf("leaked temp file: %s", e.Name())
+		}
+	}
+	if len(entries) != 1 || entries[0].Name() != "f.txt" {
+		t.Fatalf("unexpected dir contents after atomic writes: %v", entries)
+	}
+}
+
+func inodeOf(t *testing.T, p string) uint64 {
+	t.Helper()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", p, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("inode introspection unsupported on this platform")
+	}
+	return uint64(st.Ino)
 }
 
 func TestGitDiffArgInjectionNeutralized(t *testing.T) {

@@ -3,6 +3,9 @@ package roster
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"nilcore/internal/eventlog"
@@ -341,6 +344,132 @@ func TestNewCopiesProfiles(t *testing.T) {
 		t.Errorf("roster reflected post-construction mutation: %q", p.System)
 	}
 }
+
+// --- CV-T04: read-only roles get real tools, still write-free ---------------
+
+// The understander's registry carries the codeintel tool on top of read/search,
+// and codeintel returns a real bundle over a temp repo (hermetic, host-side).
+func TestUnderstanderHasCodeintelTool(t *testing.T) {
+	r := defaultRoster()
+	p, ok := r.Resolve(RoleUnderstander)
+	if !ok {
+		t.Fatal("understander not resolvable")
+	}
+	w := NewWorker(p, fakeBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+	if !w.Tools.Has("codeintel") {
+		t.Fatal("understander registry is missing the codeintel tool")
+	}
+	for _, rt := range []string{"read", "search"} {
+		if !w.Tools.Has(rt) {
+			t.Errorf("understander lost base read tool %q", rt)
+		}
+	}
+
+	// The tool returns a structurally-coherent bundle over a temp repo.
+	dir := t.TempDir()
+	src := "package p\nfunc helper() {}\nfunc Run() { helper() }\n"
+	if err := os.WriteFile(filepath.Join(dir, "p.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := w.Tools.Dispatch(context.Background(), "codeintel", dir, json.RawMessage(`{"query":"Run"}`))
+	if err != nil {
+		t.Fatalf("codeintel dispatch: %v", err)
+	}
+	if !strings.Contains(out, "Run") || !strings.Contains(out, "helper") {
+		t.Errorf("bundle should include Run and its neighbor helper:\n%s", out)
+	}
+}
+
+// The researcher's worker carries the sandboxed web_fetch tool, bound to ITS box —
+// and dispatching it runs through that box (never a host-side fetch, I4).
+func TestResearcherHasSandboxedWebFetch(t *testing.T) {
+	r := defaultRoster()
+	p, ok := r.Resolve(RoleResearcher)
+	if !ok {
+		t.Fatal("researcher not resolvable")
+	}
+	box := &recordingBox{}
+	w := NewWorker(p, box, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+	if !w.Tools.Has("web_fetch") {
+		t.Fatal("researcher registry is missing the web_fetch tool")
+	}
+
+	out, err := w.Tools.Dispatch(context.Background(), "web_fetch", "/work", json.RawMessage(`{"url":"https://docs.example.com/x"}`))
+	if err != nil {
+		t.Fatalf("web_fetch dispatch: %v", err)
+	}
+	if box.lastCmd == "" {
+		t.Fatal("web_fetch did not run through the worker's box (host-side bypass — I4 regression)")
+	}
+	if !strings.Contains(box.lastCmd, "https://docs.example.com/x") {
+		t.Errorf("web_fetch did not fetch the requested URL in the box: %q", box.lastCmd)
+	}
+	if !strings.Contains(out, "UNTRUSTED DATA") {
+		t.Errorf("web_fetch result was not fenced as untrusted (I7):\n%s", out)
+	}
+}
+
+// Only the researcher gets web_fetch — the other read-only roles (deny-all egress)
+// must NOT carry it, and none of the read-only roles ever gains a write tool.
+func TestWebFetchOnlyOnResearcherAndNoWriteTools(t *testing.T) {
+	r := defaultRoster()
+	for _, role := range r.Roles() {
+		p, _ := r.Resolve(role)
+		w := NewWorker(p, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+
+		hasFetch := w.Tools.Has("web_fetch")
+		if role == RoleResearcher && !hasFetch {
+			t.Errorf("researcher must carry web_fetch")
+		}
+		if role != RoleResearcher && hasFetch {
+			t.Errorf("non-researcher role %q must NOT carry web_fetch", role)
+		}
+		// The structural guarantee: read-only roles carry NO write/git-write tools,
+		// even after the new codeintel/web_fetch tools were wired in.
+		if role.ReadOnly() {
+			for _, wt := range []string{"write", "edit", "git"} {
+				if w.Tools.Has(wt) {
+					t.Errorf("read-only role %q gained a write tool %q after CV-T04 wiring", role, wt)
+				}
+			}
+		}
+	}
+}
+
+// The shared profile registry is never mutated when a per-worker web_fetch is
+// wired: two researcher workers get distinct registries, and the catalog's own
+// registry never sees web_fetch (otherwise every worker would race on one box).
+func TestWebFetchDoesNotMutateSharedRegistry(t *testing.T) {
+	r := defaultRoster()
+	p, _ := r.Resolve(RoleResearcher)
+	// The static profile registry must NOT carry web_fetch (it is wired per-worker).
+	if p.Tools.Has("web_fetch") {
+		t.Error("the catalog profile registry leaked a web_fetch tool (should be per-worker)")
+	}
+	w1 := NewWorker(p, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+	w2 := NewWorker(p, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+	if w1.Tools == w2.Tools {
+		t.Error("two researcher workers share one registry — the per-worker clone is broken")
+	}
+	// And the shared profile registry STILL has no web_fetch after constructing
+	// workers (in-place mutation would have leaked it onto the catalog).
+	if p.Tools.Has("web_fetch") {
+		t.Error("constructing a worker mutated the shared profile registry")
+	}
+}
+
+// recordingBox is a hermetic sandbox.Sandbox that records the last command it ran,
+// so a roster test can prove web_fetch dispatched THROUGH the worker's box.
+type recordingBox struct{ lastCmd string }
+
+func (b *recordingBox) Exec(_ context.Context, cmd string) (sandbox.Result, error) {
+	b.lastCmd = cmd
+	return sandbox.Result{Stdout: "<html>ok</html>", ExitCode: 0}, nil
+}
+func (b *recordingBox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
+	return b.Exec(ctx, cmd)
+}
+func (b *recordingBox) Workdir() string { return "/work" }
 
 // containsExact reports whether xs contains s verbatim.
 func containsExact(xs []string, s string) bool {

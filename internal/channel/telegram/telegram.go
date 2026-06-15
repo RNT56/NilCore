@@ -140,6 +140,110 @@ func (b *Bot) Update(ctx context.Context, threadID, message string) error {
 	return b.call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": message}, nil)
 }
 
+// telegramTextLimit is the Bot API per-message character cap (after entity parsing).
+const telegramTextLimit = 4096
+
+var _ channel.DraftStreamer = (*Bot)(nil)
+
+// StreamDraft updates the ephemeral, in-place draft for a drive's live reasoning
+// via sendMessageDraft (Bot API 9.5+): successive calls with the same non-zero
+// draftID animate the draft smoothly — a 30-second preview the operator sees being
+// "typed". The text is PLAIN (no parse_mode): partial MarkdownV2 mid-stream would
+// be invalid, so the stream carries plain tokens and FinalizeRich applies markup
+// once. Draft streaming is a private-chat feature; on a non-private thread the API
+// errors and the serve sink falls back to Update.
+func (b *Bot) StreamDraft(ctx context.Context, threadID string, draftID int64, text string) error {
+	chatID, err := strconv.ParseInt(threadID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad thread id %q: %w", threadID, err)
+	}
+	if draftID == 0 {
+		draftID = 1 // the API requires a non-zero draft_id
+	}
+	return b.call(ctx, "sendMessageDraft", map[string]any{
+		"chat_id": chatID, "draft_id": draftID, "text": clipText(text),
+	}, nil)
+}
+
+// FinalizeRich persists the completed message to the thread (replacing the
+// ephemeral draft) in MarkdownV2 mode. text is PLAIN — it is escaped here so
+// arbitrary model prose renders safely without the sink (which is generic over
+// channel.Channel) needing to know any transport-specific markup; structural
+// markup is a future enhancement layered on top. Sending a normal message is what
+// finalizes a draft (Bot API), so this both renders and commits.
+func (b *Bot) FinalizeRich(ctx context.Context, threadID, text string) error {
+	chatID, err := strconv.ParseInt(threadID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("bad thread id %q: %w", threadID, err)
+	}
+	return b.call(ctx, "sendMessage", map[string]any{
+		"chat_id": chatID, "text": clipEscapeMarkdownV2(text), "parse_mode": "MarkdownV2",
+	}, nil)
+}
+
+// markdownV2Special is the set of MarkdownV2 reserved characters that must be
+// backslash-escaped in body text. It INCLUDES the backslash itself: MarkdownV2 uses
+// '\' as its escape char, so a literal '\' in model prose (a Windows path, a regex
+// like \d+) must become '\\' or Telegram rejects the message with "can't parse
+// entities".
+const markdownV2Special = "\\_*[]()~`>#+-=|{}.!"
+
+// EscapeMarkdownV2 escapes the MarkdownV2 reserved characters so arbitrary text
+// (model output, a tool name) is safe inside a MarkdownV2 message without breaking
+// its formatting. The renderer escapes the text PARTS and wraps them in its own
+// markup (* _ ` >).
+func EscapeMarkdownV2(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + 8)
+	for _, r := range s {
+		if strings.ContainsRune(markdownV2Special, r) {
+			out.WriteByte('\\')
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// clipEscapeMarkdownV2 escapes s for MarkdownV2 AND bounds the RESULT to the Bot
+// API character cap, cutting only on whole escape pairs. Escaping must precede a
+// length check (it can nearly double the length), but clipping the escaped string
+// blindly can sever a "\x" pair and leave a dangling backslash — an invalid escape
+// Telegram rejects, losing the whole finalized message. So this escapes rune by
+// rune, stops before a pair would breach the cap (reserving one rune for the
+// ellipsis, itself non-reserved so it stays valid), and never emits a lone '\'.
+func clipEscapeMarkdownV2(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + 8)
+	count := 0
+	for _, r := range s {
+		w := 1
+		if strings.ContainsRune(markdownV2Special, r) {
+			w = 2 // a reserved char emits "\<r>", two runes
+		}
+		if count+w > telegramTextLimit-1 { // keep one rune of headroom for the ellipsis
+			out.WriteString("…")
+			return out.String()
+		}
+		if w == 2 {
+			out.WriteByte('\\')
+		}
+		out.WriteRune(r)
+		count += w
+	}
+	return out.String()
+}
+
+// clipText bounds a PLAIN message (no escaping) to the Bot API character cap,
+// cutting on a rune boundary so a clipped message never carries invalid UTF-8. Used
+// by the plain draft stream; the rich finalize uses clipEscapeMarkdownV2.
+func clipText(s string) string {
+	r := []rune(s)
+	if len(r) <= telegramTextLimit {
+		return s
+	}
+	return string(r[:telegramTextLimit-1]) + "…"
+}
+
 // Ask poses a gate question with inline Yes/No buttons and blocks for the answer.
 func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) {
 	chatID, err := strconv.ParseInt(threadID, 10, 64)

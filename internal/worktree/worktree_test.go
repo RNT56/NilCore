@@ -218,6 +218,130 @@ func TestCommitDirtyTree(t *testing.T) {
 	}
 }
 
+// DiffStat reports what changed in the worktree since it was created: the
+// changed-file name-status list and the --stat summary, bounded, between the
+// pinned create-time baseline and the worker's committed HEAD. A new file added
+// and committed must show up; an unchanged worktree reports "".
+func TestDiffStat(t *testing.T) {
+	requireGit(t)
+	repo := initRepo(t)
+
+	wt, err := Create(context.Background(), repo, "diff-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	// A fresh worktree off HEAD with no work done: nothing changed.
+	empty, err := wt.DiffStat(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("DiffStat (clean): %v", err)
+	}
+	if empty != "" {
+		t.Errorf("DiffStat on an unchanged worktree = %q, want empty", empty)
+	}
+
+	// Add a file and commit it; the diff (baseline → HEAD) must name it.
+	if err := os.WriteFile(filepath.Join(wt.Path(), "feature.go"), []byte("package x\n\nfunc F() {}\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, changed, err := wt.Commit(context.Background(), "add feature"); err != nil || !changed {
+		t.Fatalf("Commit: changed=%v err=%v", changed, err)
+	}
+
+	report, err := wt.DiffStat(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("DiffStat: %v", err)
+	}
+	if !strings.Contains(report, "feature.go") {
+		t.Errorf("DiffStat missing the changed file:\n%s", report)
+	}
+	if !strings.Contains(report, "Changed files:") {
+		t.Errorf("DiffStat missing the changed-file header:\n%s", report)
+	}
+	// The --stat summary carries an insertions count for the new file.
+	if !strings.Contains(report, "insertion") && !strings.Contains(report, "+") {
+		t.Errorf("DiffStat missing the --stat summary:\n%s", report)
+	}
+}
+
+// DiffStat is bounded: a worktree with many large changed files yields a report
+// no larger than the byte cap, ending with the truncation marker — never a raw,
+// unbounded dump.
+func TestDiffStatBounded(t *testing.T) {
+	requireGit(t)
+	repo := initRepo(t)
+
+	wt, err := Create(context.Background(), repo, "diff-bound")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	// Many files so the name-status list alone overflows a small cap.
+	body := strings.Repeat("x", 200)
+	for i := 0; i < 50; i++ {
+		name := filepath.Join(wt.Path(), "file_"+strings.Repeat("a", i+1)+".txt")
+		if err := os.WriteFile(name, []byte(body), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if _, _, err := wt.Commit(context.Background(), "many files"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	const cap = 256
+	report, err := wt.DiffStat(context.Background(), cap)
+	if err != nil {
+		t.Fatalf("DiffStat: %v", err)
+	}
+	// The cap is on the diff body; the truncation marker is a small bounded suffix.
+	if len(report) > cap+len("\n… (diff truncated)") {
+		t.Errorf("DiffStat report len %d exceeds cap %d (+marker)", len(report), cap)
+	}
+	if !strings.Contains(report, "truncated") {
+		t.Errorf("a bounded report over the cap must carry the truncation marker:\n%s", report)
+	}
+}
+
+// DiffStat is taken against the create-time baseline, not the moving HEAD: even
+// after a commit advances the branch, the report still reflects everything done
+// since the worktree was cut (so a multi-commit worker's full change is reported).
+func TestDiffStatAgainstCreateBaseline(t *testing.T) {
+	requireGit(t)
+	repo := initRepo(t)
+
+	wt, err := Create(context.Background(), repo, "diff-baseline")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	// Two separate commits in the worktree.
+	if err := os.WriteFile(filepath.Join(wt.Path(), "one.txt"), []byte("1"), 0o644); err != nil {
+		t.Fatalf("write one: %v", err)
+	}
+	if _, _, err := wt.Commit(context.Background(), "first"); err != nil {
+		t.Fatalf("Commit one: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt.Path(), "two.txt"), []byte("2"), 0o644); err != nil {
+		t.Fatalf("write two: %v", err)
+	}
+	if _, _, err := wt.Commit(context.Background(), "second"); err != nil {
+		t.Fatalf("Commit two: %v", err)
+	}
+
+	report, err := wt.DiffStat(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("DiffStat: %v", err)
+	}
+	// Both files (across both commits) must appear: the baseline is the create
+	// point, not the previous commit.
+	if !strings.Contains(report, "one.txt") || !strings.Contains(report, "two.txt") {
+		t.Errorf("DiffStat did not span both commits since create:\n%s", report)
+	}
+}
+
 // The hardening clamp must keep a repo-authored .git/hooks/post-checkout from
 // executing on the host: CreateFrom runs `worktree add` (which would fire
 // post-checkout) under HardenArgs core.hooksPath=/dev/null. We plant a hook that

@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"nilcore/internal/tools"
 )
@@ -30,6 +31,7 @@ type Worktree struct {
 	branch   string
 	baseRepo string
 	tmpBase  string // the temp dir holding the worktree, removed on Cleanup
+	baseSHA  string // the resolved start-point commit, for a since-create diff
 }
 
 // Path is the absolute worktree directory the task operates in.
@@ -74,10 +76,14 @@ func CreateFrom(ctx context.Context, baseRepo, branch, leaf, startPoint string) 
 
 	// Resolve the start-point up front so an unresolvable committish (unknown SHA,
 	// or an empty-HEAD greenfield repo) is a clear error, not a confusing
-	// `worktree add` failure or a panic downstream.
-	if _, err := git(ctx, baseRepo, "rev-parse", "--verify", "--quiet", startPoint+"^{commit}"); err != nil {
+	// `worktree add` failure or a panic downstream. The resolved SHA is pinned on
+	// the Worktree so DiffStat can report what changed since this exact baseline,
+	// even after later commits advance the worktree's HEAD.
+	baseSHA, err := git(ctx, baseRepo, "rev-parse", "--verify", "--quiet", startPoint+"^{commit}")
+	if err != nil {
 		return nil, fmt.Errorf("worktree: start-point %q does not resolve in %s (need an initial commit for a greenfield repo): %w", startPoint, baseRepo, err)
 	}
+	baseSHA = strings.TrimSpace(baseSHA)
 
 	tmpBase, err := os.MkdirTemp("", "nilcore-wt-")
 	if err != nil {
@@ -90,7 +96,7 @@ func CreateFrom(ctx context.Context, baseRepo, branch, leaf, startPoint string) 
 		_ = os.RemoveAll(tmpBase) // no leaked worktree on partial create
 		return nil, fmt.Errorf("create worktree %s off %s: %w (%s)", branch, startPoint, err, strings.TrimSpace(out))
 	}
-	return &Worktree{path: path, branch: branch, baseRepo: baseRepo, tmpBase: tmpBase}, nil
+	return &Worktree{path: path, branch: branch, baseRepo: baseRepo, tmpBase: tmpBase, baseSHA: baseSHA}, nil
 }
 
 // Head returns the commit SHA the worktree currently points at.
@@ -137,6 +143,88 @@ func (w *Worktree) Commit(ctx context.Context, message string) (sha string, chan
 		return "", false, herr
 	}
 	return head, true, nil
+}
+
+// DiffStat reports WHAT CHANGED in this worktree since it was created: the
+// changed-file name-status list plus the `git diff --stat` summary, taken
+// between the pinned create-time start-point (baseSHA) and the worktree's
+// current committed state. It is a bounded, host-side report the orchestrator
+// can hand a supervisor as a concise "here is what the subagent did" — never a
+// transcript. The whole report is truncated to at most maxBytes bytes (on a
+// line boundary where possible) so a large refactor cannot bloat the prompt; a
+// non-positive maxBytes applies defaultDiffStatBytes. An empty diff (the worker
+// changed nothing) returns "" with a nil error.
+//
+// It diffs the pinned commit against HEAD (the worker's verified, committed
+// state), so it must be called after Commit; it never reads the working tree, so
+// it is deterministic regardless of any uncommitted scratch the worker left.
+func (w *Worktree) DiffStat(ctx context.Context, maxBytes int) (string, error) {
+	if w == nil {
+		return "", nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultDiffStatBytes
+	}
+	base := w.baseSHA
+	if base == "" {
+		base = "HEAD" // no pinned baseline: degrade to "nothing since HEAD" (empty)
+	}
+
+	// name-status: a compact per-file changed-file list (A/M/D + path).
+	names, err := git(ctx, w.path, "diff", "--name-status", base, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("worktree diff name-status: %w", err)
+	}
+	// --stat: the per-file insertion/deletion summary + the totals line.
+	stat, err := git(ctx, w.path, "diff", "--stat", base, "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("worktree diff stat: %w", err)
+	}
+
+	names, stat = strings.TrimSpace(names), strings.TrimSpace(stat)
+	if names == "" && stat == "" {
+		return "", nil // the worker changed nothing
+	}
+
+	var b strings.Builder
+	if names != "" {
+		b.WriteString("Changed files:\n")
+		b.WriteString(names)
+	}
+	if stat != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(stat)
+	}
+	return clampBytes(b.String(), maxBytes), nil
+}
+
+// defaultDiffStatBytes bounds a DiffStat report when the caller passes a
+// non-positive cap. It is generous enough for a real changed-file list and stat
+// summary, but small enough that a sprawling refactor cannot bloat a prompt.
+const defaultDiffStatBytes = 4096
+
+// clampBytes truncates s to at most n bytes, preferring to cut on the last
+// newline within the budget so the report never ends mid-line, and appends a
+// short, bounded elision marker so a reader knows the report was clipped. It
+// operates on bytes (not runes) but never splits a multi-byte rune at the cut
+// because it backs up to a newline; if no newline fits it cuts at a rune
+// boundary so the result stays valid UTF-8.
+func clampBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := strings.LastIndexByte(s[:n], '\n')
+	if cut <= 0 {
+		// No newline in budget: back up to a rune boundary so we never emit a
+		// half-encoded rune.
+		cut = n
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+	}
+	return s[:cut] + "\n… (diff truncated)"
 }
 
 // Cleanup removes the worktree and deletes its branch. It is idempotent (safe to

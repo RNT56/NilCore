@@ -18,6 +18,7 @@ package meter
 
 import (
 	"context"
+	"strings"
 
 	"nilcore/internal/budget"
 	"nilcore/internal/model"
@@ -72,6 +73,83 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 		return resp, cerr
 	}
 	return resp, nil
+}
+
+// Stream makes the metering decorator transparent to the streaming loop: whether
+// the wrapped provider can stream or not, the loop always sees a model.Streamer
+// through the wrapper, and every assembled Response is charged to the ledger
+// exactly as Complete charges — so the budget ceiling stays a real wall on the
+// streaming path too.
+//
+// Two cases, one charging rule:
+//
+//   - Inner is a model.Streamer: delegate straight to Inner.Stream, passing
+//     onChunk through untouched so every output-text delta still reaches the
+//     caller live. The returned (assembled) Response is then charged.
+//
+//   - Inner is NOT a Streamer: fall back to Inner.Complete and replay the whole
+//     assembled reply as ONE Chunk — the response's concatenated text in a single
+//     onChunk(model.Chunk{Text}) — so a non-streaming provider still satisfies the
+//     Streamer contract (the concatenation of forwarded chunks equals the output
+//     text, just delivered as one big chunk). The Response is then charged.
+//
+// Charging mirrors Complete: tokens = input+output and the priced dollar cost of
+// resp.Usage, charged under p.Task with ctx threaded into Charge. ErrCeiling (or
+// a ctx error from Charge) propagates so the orchestrating loop aborts.
+//
+// Partial-on-cancel: if the inner stream is cut short (ctx cancelled mid-stream),
+// Inner.Stream returns the partial Response together with ctx.Err(); we STILL
+// charge whatever Usage came back — the tokens already produced are billable —
+// and then surface the inner error. The inner transport/cancel error takes
+// precedence over a ceiling breach in that case; a ceiling breach only surfaces
+// when the inner call itself succeeded.
+func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, onChunk func(model.Chunk)) (model.Response, error) {
+	var (
+		resp    model.Response
+		callErr error
+	)
+	if s, ok := p.Inner.(model.Streamer); ok {
+		// Streaming provider: deltas flow through onChunk as they arrive.
+		resp, callErr = s.Stream(ctx, system, msgs, tools, maxTokens, onChunk)
+	} else {
+		// Non-streaming provider: complete, then replay the whole reply as one
+		// chunk so the contract (forwarded chunks concatenate to output text) holds.
+		resp, callErr = p.Inner.Complete(ctx, system, msgs, tools, maxTokens)
+		if callErr == nil && onChunk != nil {
+			onChunk(model.Chunk{Text: responseText(resp)})
+		}
+	}
+
+	// Charge whatever usage came back — including a partial-on-cancel response —
+	// because the tokens it reports were genuinely produced and are billable.
+	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
+	dollars := p.Price.Price(p.Inner.Model(), resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars)
+
+	if callErr != nil {
+		// The inner call already failed (transport fault or partial-on-cancel);
+		// that is the authoritative reason — surface it, charge recorded above.
+		return resp, callErr
+	}
+	if cerr != nil {
+		// Inner call succeeded but the charge breached a ceiling (or ctx is done):
+		// propagate so the caller aborts; the response must not be used.
+		return resp, cerr
+	}
+	return resp, nil
+}
+
+// responseText concatenates the text of a response's text blocks — the output
+// prose a front end would paint — so the non-streaming fallback can replay it as
+// a single Chunk.
+func responseText(resp model.Response) string {
+	var b strings.Builder
+	for _, blk := range resp.Content {
+		if blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	return b.String()
 }
 
 // Model delegates to the inner provider so a metered provider is a drop-in for

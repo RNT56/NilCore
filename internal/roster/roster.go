@@ -58,14 +58,21 @@ const (
 //   - ReadOnly marks the structural read-only roles (an assertion NewWorker
 //     enforces by handing them a write-free registry).
 //   - MaxSteps is the per-worker tool-call ceiling (a termination rail, §6).
+//   - WantsWebFetch wires the sandboxed web_fetch tool (tools.WebFetchTool) into
+//     this role's registry at NewWorker time. The fetch runs INSIDE the worker's
+//     box under the role's egress (never a host-side fetch, I4), so the tool must
+//     be bound to the box — which does not exist when the static catalog is built.
+//     Only the researcher sets it (the only read-only role with research egress).
+//     The tool is read-only/non-mutating, so the write-free guarantee still holds.
 type Profile struct {
-	System   string
-	Tools    *tools.Registry
-	Model    model.Provider
-	Command  func(string) (allowed bool, reason string)
-	Egress   policy.Egress
-	ReadOnly bool
-	MaxSteps int
+	System        string
+	Tools         *tools.Registry
+	Model         model.Provider
+	Command       func(string) (allowed bool, reason string)
+	Egress        policy.Egress
+	ReadOnly      bool
+	MaxSteps      int
+	WantsWebFetch bool
 }
 
 // Roster is the immutable catalog of role profiles. Build it with New (or
@@ -122,6 +129,18 @@ func (role Role) ReadOnly() bool {
 // git diff, git log), which the tightened CommandPolicy still permits.
 func readToolset() *tools.Registry {
 	return tools.NewRegistry(tools.ReadTool{}, tools.SearchTool{})
+}
+
+// understanderToolset is the read-only set for the code-understanding role: the
+// read/search pair PLUS the codeintel tool (CV-T04). codeintel is a host-side,
+// read-only adapter over internal/codeintel — it parses the worktree into an
+// ephemeral in-memory graph and returns a structurally-coherent context bundle,
+// with no write, no execution, and no network. It is NOT a write/edit/git tool, so
+// adding it keeps the role's write-free structural guarantee intact (NewWorker's
+// hasWriteTool check still passes). The web_fetch tool is deliberately absent here:
+// the understander has deny-all egress, and codeintel is purely local.
+func understanderToolset() *tools.Registry {
+	return tools.NewRegistry(tools.ReadTool{}, tools.SearchTool{}, tools.CodeintelTool{})
 }
 
 // writeToolset is the implementer's full set: the standard read/write/edit/

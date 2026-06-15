@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"nilcore/internal/backend"
@@ -193,6 +195,53 @@ func (c *Checkpoint) LoadRunState(ctx context.Context, taskID string) (RunState,
 		return RunState{}, err
 	}
 	return UnmarshalRunState(t.Detail)
+}
+
+// ---------------------------------------------------------------------------
+// Conversation durability (C4-T01)
+//
+// A conversational front-door Session (internal/session) survives restart by
+// persisting its BOUNDED work-state — never a raw transcript — through the same
+// single-UpsertTask write path as the multi-agent snapshot above. The Session
+// owns the work-state⇄JSON mapping; these helpers are the opaque detail carrier
+// so internal/session never imports store/backend (it stays a leaf and depends
+// only on the narrow interface these two methods satisfy).
+//
+// A conversation is recorded with a DISTINCT status ("conversation") so it never
+// collides with the backend-task resume path: InFlight / Resume look only at
+// "running"/"interrupted", so a conversation pointer is never re-run as a coding
+// task. The write is one UpsertTask — the same crash-atomic discipline as
+// SaveRunState — so a SIGTERM mid-conversation leaves either the prior bounded
+// state or this one, never a torn record.
+// ---------------------------------------------------------------------------
+
+// ConversationStatus is the store status under which a conversation's bounded
+// work-state is recorded — distinct from the backend-task statuses so the resume
+// path never mistakes a conversation pointer for a runnable coding task.
+const ConversationStatus = "conversation"
+
+// SaveConversation durably records a conversation's bounded work-state (opaque
+// JSON the caller owns; the store never parses it) under the conversation ID. It
+// is one UpsertTask write, crash-atomic like SaveRunState. id is the conversation
+// key (s.ID); goal is a short human label (the work-state goal, for the store's
+// goal column); detail is the bounded-state JSON — NEVER a raw transcript.
+func (c *Checkpoint) SaveConversation(ctx context.Context, id, goal, detail string) error {
+	return c.store.UpsertTask(ctx, store.Task{ID: id, Goal: goal, Status: ConversationStatus, Detail: detail})
+}
+
+// LoadConversation reads back a conversation's bounded work-state by ID. found is
+// false (with a nil error) when the conversation has no prior record — a fresh
+// conversation, restored as the zero work-state. A store miss (sql.ErrNoRows) is
+// reported as not-found, not an error, so a first-ever Session restore is clean.
+func (c *Checkpoint) LoadConversation(ctx context.Context, id string) (detail string, found bool, err error) {
+	t, err := c.store.GetTask(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("load conversation %q: %w", id, err)
+	}
+	return t.Detail, true, nil
 }
 
 // ResumePlan is the partition Resume hands the integration layer after a restart.
