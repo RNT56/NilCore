@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -63,9 +64,8 @@ func tuiMain(args []string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	events := make(chan emit.Event, 256)
 	gates := make(chan gateReq)
-	em := &tuiEmitter{events: events}
+	em := newTUIEmitter()
 	ap := &tuiApprover{ctx: ctx, gates: gates}
 
 	sess, err := buildChatSession(chatDeps{
@@ -81,7 +81,7 @@ func tuiMain(args []string) {
 		fatal(err)
 	}
 
-	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), events, gates), tea.WithAltScreen())
+	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), em, gates), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)
 	}
@@ -89,24 +89,59 @@ func tuiMain(args []string) {
 	sess.Wait()
 }
 
-// tuiEmitter is the session's reasoning sink for the TUI: it forwards each emit
-// event to the Bubble Tea program over a buffered channel, never blocking the loop
-// (drop-oldest under backpressure, like the serve sink — the UI drains every frame
-// so this almost never fires).
-type tuiEmitter struct{ events chan emit.Event }
+// tuiEmitter is the session's reasoning sink for the TUI. Like the serve sink it is
+// an ORDERED, bounded, non-blocking queue: Emit appends and signals; the model
+// drains the whole queue per wake. Under backpressure it coalesces by dropping the
+// oldest TOKEN, NEVER a framed event — a dropped frame is a lost turn boundary that
+// would merge two turns in the transcript. (The loop must never block on the UI, so
+// the queue sheds rather than waits; tokens are coalescible, frames are not.)
+type tuiEmitter struct {
+	mu   sync.Mutex
+	buf  []emit.Event
+	wake chan struct{} // cap-1 edge: signals the model that buf changed
+}
+
+// tuiEmitBuffer bounds the queue; generous because the model drains every frame, so
+// this only trips if the loop sprints far ahead of the render between frames.
+const tuiEmitBuffer = 256
+
+func newTUIEmitter() *tuiEmitter { return &tuiEmitter{wake: make(chan struct{}, 1)} }
 
 func (e *tuiEmitter) Emit(ev emit.Event) {
-	for {
-		select {
-		case e.events <- ev:
+	e.mu.Lock()
+	e.buf = append(e.buf, ev)
+	if len(e.buf) > tuiEmitBuffer {
+		e.coalesce()
+	}
+	e.mu.Unlock()
+	select {
+	case e.wake <- struct{}{}:
+	default: // a wake is already pending; the model drains the whole queue per wake
+	}
+}
+
+// coalesce drops the oldest pending KindToken (never a frame) to stay bounded; see
+// the serve sink's coalesce for the full rationale. Caller holds e.mu.
+func (e *tuiEmitter) coalesce() {
+	for i, ev := range e.buf {
+		if ev.Kind == emit.KindToken {
+			e.buf = append(e.buf[:i], e.buf[i+1:]...)
 			return
-		default:
-			select {
-			case <-e.events:
-			default:
-			}
 		}
 	}
+	e.buf = e.buf[1:]
+}
+
+// drain removes and returns every pending event in order (nil if empty).
+func (e *tuiEmitter) drain() []emit.Event {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.buf) == 0 {
+		return nil
+	}
+	out := e.buf
+	e.buf = nil
+	return out
 }
 
 // gateReq is one irreversible-action approval request routed to the modal.
@@ -144,17 +179,18 @@ func (a *tuiApprover) Approve(action string) bool {
 // --- model ---
 
 type tuiModel struct {
-	ctx    context.Context
-	sess   *session.Session
-	model  string // provider:model, for the header
-	events chan emit.Event
-	gates  chan gateReq
+	ctx     context.Context
+	sess    *session.Session
+	model   string // provider:model, for the header
+	emitter *tuiEmitter
+	gates   chan gateReq
 
 	vp viewport.Model
 	ta textarea.Model
 
-	lines  []string        // committed transcript lines
-	stream strings.Builder // the in-progress streamed reasoning line (uncommitted)
+	lines      []string        // committed transcript lines
+	stream     strings.Builder // the in-progress streamed reasoning line (uncommitted)
+	streamStep int             // loop step of the tokens currently in stream
 
 	working bool
 	start   time.Time
@@ -167,7 +203,7 @@ type tuiModel struct {
 	ready         bool
 }
 
-func newTUIModel(ctx context.Context, sess *session.Session, model string, events chan emit.Event, gates chan gateReq) tuiModel {
+func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq) tuiModel {
 	ta := textarea.New()
 	ta.Placeholder = "talk to the agent — it picks the machine and works while you type"
 	ta.Prompt = "❯ "
@@ -176,24 +212,31 @@ func newTUIModel(ctx context.Context, sess *session.Session, model string, event
 	ta.SetHeight(1)
 	ta.Focus()
 	return tuiModel{
-		ctx: ctx, sess: sess, model: model, events: events, gates: gates,
+		ctx: ctx, sess: sess, model: model, emitter: emitter, gates: gates,
 		ta:   ta,
 		spin: verb.New(1, verb.General),
 	}
 }
 
 type (
-	emitMsg emit.Event
-	gateMsg gateReq
-	tickMsg time.Time
+	emitMsg      emit.Event   // a single event (direct injection in tests)
+	emitBatchMsg []emit.Event // a drained batch from the emitter (the live path)
+	gateMsg      gateReq
+	tickMsg      time.Time
 )
 
 func (m tuiModel) Init() tea.Cmd {
 	return tea.Batch(m.listenEvents(), m.listenGates(), m.tick(), textarea.Blink)
 }
 
+// listenEvents blocks until the emitter signals, then drains the WHOLE queue as one
+// batch (so a single wake never strands later events). One listener is in flight at
+// a time, re-armed after each batch is folded.
 func (m tuiModel) listenEvents() tea.Cmd {
-	return func() tea.Msg { return emitMsg(<-m.events) }
+	return func() tea.Msg {
+		<-m.emitter.wake
+		return emitBatchMsg(m.emitter.drain())
+	}
 }
 func (m tuiModel) listenGates() tea.Cmd {
 	return func() tea.Msg { return gateMsg(<-m.gates) }
@@ -215,6 +258,13 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case emitMsg:
 		m.onEvent(emit.Event(msg))
+		m.refresh()
+		return m, m.listenEvents()
+
+	case emitBatchMsg:
+		for _, ev := range msg {
+			m.onEvent(ev)
+		}
 		m.refresh()
 		return m, m.listenEvents()
 
@@ -319,6 +369,15 @@ func (m tuiModel) submit(line string) (tea.Model, tea.Cmd) {
 func (m *tuiModel) onEvent(ev emit.Event) {
 	switch ev.Kind {
 	case emit.KindToken:
+		// A token whose step differs from the open stream's is a new turn whose framed
+		// boundary was (defensively) lost: commit the prior line first so two turns
+		// never merge. Frames are never coalesced away, so this is belt-and-suspenders.
+		if m.stream.Len() > 0 && ev.Step != m.streamStep {
+			m.commitStream()
+		}
+		if m.stream.Len() == 0 {
+			m.streamStep = ev.Step
+		}
 		m.stream.WriteString(ev.Text)
 		m.tokens += len(ev.Text) / 4
 	case emit.KindIntent:
