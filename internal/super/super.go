@@ -41,6 +41,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
 	"nilcore/internal/integrate"
+	"nilcore/internal/loopctl"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
 	"nilcore/internal/roster"
@@ -219,29 +220,98 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 		// nothing appended, byte-identical to before.
 		s.foldInbound(i, &msgs, reader)
 
-		// s.Model.Complete runs under the TASK ctx (CV-T01): a steer NEVER cancels the
-		// planner's in-flight think — its reasoning is preserved. The task ctx still
-		// cancels on shutdown/deadline (SIGTERM, a parent timeout), unchanged. When
-		// Inbox is nil there is no steer to check at all — byte-identical to before.
-		resp, err := s.Model.Complete(ctx, systemPrompt, msgs, toolset, 4096)
+		// The planner's turn has two shapes, chosen per-round (ST-T07, mirroring
+		// native.go's ST-T06 streaming seam):
+		//
+		//   - STREAMING (conversational): Out is wired AND s.Model is a model.Streamer.
+		//     We Stream the planner's think and forward each text delta to Out as a live
+		//     KindToken, wrapping ONLY the Stream call in a PER-ROUND cancellable child of
+		//     the TASK ctx so a steer can INTERRUPT-BUT-PRESERVE the partial planner
+		//     reasoning. The per-round child is the ONLY thing the stream-watcher cancels —
+		//     never the task ctx the dedicated bus-reader drains under, so the reader keeps
+		//     answering subagent Asks across the steer (the two goroutines coexist cleanly).
+		//   - NON-STREAMING (the default): no Out or a non-streaming provider → Complete
+		//     under the TASK ctx, byte-identical to before (CV-T01). Out==nil keeps the
+		//     single-supervisor path exactly as it was.
+		//
+		// In both shapes a steer NEVER aborts the planner: streaming folds the partial
+		// reasoning + feedback and continues; non-streaming preserves the full think and
+		// the post-Complete CV-T01 pause handles the steer at the boundary.
+		var resp model.Response
+		var err error
+		// steerAtFinish records a steer the stream-watcher consumed AFTER Stream had
+		// already returned normally (a steer landing exactly at the finish line). The
+		// watcher's blind receive on the cap-1 steer channel would otherwise swallow that
+		// token, so the post-completion CV-T01 pause below would miss it. We carry it
+		// forward and OR it into that check so a finish-line steer still pauses-and-
+		// reconsiders the full planner turn. Always false on the non-streaming path.
+		var steerAtFinish bool
+		streamer, canStream := s.Model.(model.Streamer)
+		if s.Out != nil && canStream {
+			var streamCtx context.Context
+			resp, err, steerAtFinish, streamCtx = s.streamTurn(ctx, i, streamer, systemPrompt, msgs, toolset)
+			if err != nil {
+				switch loopctl.ClassifyCancel(ctx, streamCtx) {
+				case loopctl.Steer:
+					// INTERRUPT-BUT-PRESERVE: the planner was steered mid-stream. Keep the
+					// partial reasoning it produced — but ONLY its TEXT blocks. Any tool_use
+					// in the partial is incomplete (the planner was mid-call), so we DROP it:
+					// appending a half-built tool_use with no matching tool_result would
+					// corrupt the conversation, and the orchestration action it proposed must
+					// not run anyway. The kept text becomes the assistant turn; the steered
+					// feedback folds as an un-Wrap'd PRINCIPAL turn (the trust line, I7) via
+					// drainUserQueue; the planner re-thinks next round with both in view.
+					kept := textBlocks(resp.Content)
+					if len(kept) > 0 {
+						msgs = append(msgs, model.Message{Role: "assistant", Content: kept})
+					}
+					if principal := s.drainUserQueue(i); len(principal) > 0 {
+						msgs = append(msgs, model.Message{Role: "user", Content: principal})
+					}
+					s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "steer_interrupt",
+						Detail: map[string]any{"round": i, "phase": "stream", "kept_text": len(kept)}})
+					s.emit(emit.Event{Kind: emit.KindSteerAck, Step: i, Text: "interrupted — kept your partial reasoning, folding your message"})
+					continue
+				case loopctl.Shutdown:
+					// The task ctx died (SIGTERM, deadline): a clean shutdown, unwound on the
+					// last verified tip — the same clean "ctx" outcome as the non-streaming
+					// shutdown path and the between-turns ctx check above.
+					return s.outcome(st, false, "ctx", i), nil
+				default:
+					// Fault: a genuine transport/decode error — the existing error path. A
+					// budget ceiling surfaced through the metered Stream is a stop signal, not
+					// a crash: end on the last verified tip (design §7), mirroring Complete.
+					if errors.Is(err, budget.ErrCeiling) {
+						return s.outcome(st, false, "budget", i), nil
+					}
+					return s.outcome(st, false, "error", i), fmt.Errorf("supervisor model turn %d: %w", i, err)
+				}
+			}
+		} else {
+			// s.Model.Complete runs under the TASK ctx (CV-T01): a steer NEVER cancels the
+			// planner's in-flight think — its reasoning is preserved. The task ctx still
+			// cancels on shutdown/deadline (SIGTERM, a parent timeout), unchanged. When
+			// Inbox is nil there is no steer to check at all — byte-identical to before.
+			resp, err = s.Model.Complete(ctx, systemPrompt, msgs, toolset, 4096)
 
-		if err != nil {
-			// Steer no longer cancels the model call (CV-T01), so the only context
-			// that can cancel Complete is the TASK ctx — a genuine shutdown/deadline.
-			// Detect that directly (no loopctl discriminator now): a done task ctx is a
-			// clean shutdown, unwound on the last verified tip (the same clean outcome
-			// as the between-turns ctx check above), not a fault. Gated on Inbox != nil
-			// so the single-supervisor path keeps its original budget/error outcome
-			// byte-for-byte.
-			if s.Inbox != nil && ctx.Err() != nil {
-				return s.outcome(st, false, "ctx", i), nil
+			if err != nil {
+				// Steer no longer cancels the model call (CV-T01), so the only context
+				// that can cancel Complete is the TASK ctx — a genuine shutdown/deadline.
+				// Detect that directly (no loopctl discriminator now): a done task ctx is a
+				// clean shutdown, unwound on the last verified tip (the same clean outcome
+				// as the between-turns ctx check above), not a fault. Gated on Inbox != nil
+				// so the single-supervisor path keeps its original budget/error outcome
+				// byte-for-byte.
+				if s.Inbox != nil && ctx.Err() != nil {
+					return s.outcome(st, false, "ctx", i), nil
+				}
+				// A model ceiling (budget) is a stop signal, not a crash: end the run on
+				// the last verified tip rather than abort with no Outcome (design §7).
+				if errors.Is(err, budget.ErrCeiling) {
+					return s.outcome(st, false, "budget", i), nil
+				}
+				return s.outcome(st, false, "error", i), fmt.Errorf("supervisor model turn %d: %w", i, err)
 			}
-			// A model ceiling (budget) is a stop signal, not a crash: end the run on
-			// the last verified tip rather than abort with no Outcome (design §7).
-			if errors.Is(err, budget.ErrCeiling) {
-				return s.outcome(st, false, "budget", i), nil
-			}
-			return s.outcome(st, false, "error", i), fmt.Errorf("supervisor model turn %d: %w", i, err)
 		}
 		s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_turn",
 			Detail: map[string]any{"round": i, "stop": resp.StopReason, "out_tokens": resp.Usage.OutputTokens}})
@@ -264,7 +334,10 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 		// emit a steer_ack, and continue. The planner reconsiders next round with its
 		// held action's paused results + the feedback in view. The round counter STILL
 		// advances, so a steer storm stays bounded. nil Inbox ⇒ no check, byte-identical.
-		if s.Inbox != nil && steerPending(s.Inbox) {
+		// steerAtFinish folds in a steer the stream-watcher consumed at the finish line
+		// (only ever set on the streaming path), so it is honored here exactly like a
+		// freshly-pending steer.
+		if s.Inbox != nil && (steerAtFinish || steerPending(s.Inbox)) {
 			held := holdProposedTools(resp.Content)
 			if len(held) > 0 {
 				msgs = append(msgs, model.Message{Role: "user", Content: held})
@@ -572,6 +645,92 @@ func holdProposedTools(content []model.Block) []model.Block {
 			Content: "Paused before this ran: the operator steered. Reconsider whether to proceed, then re-issue this action or adjust."})
 	}
 	return held
+}
+
+// streamTurn runs ONE planner turn over s.Model's Streamer, forwarding each
+// output-text delta to Out as a live KindToken and returning the assembled (or
+// partial-on-cancel) Response. It is the supervisor's INTERRUPT-BUT-PRESERVE seam
+// (ST-T07), mirroring native.go's inline ST-T06 stream block.
+//
+// Only the Stream call is wrapped in a PER-ROUND context.WithCancelCause child of
+// the TASK ctx — never the task ctx itself, so the dedicated bus-reader (which
+// drains the supervisor mailbox under the task ctx for the WHOLE run) keeps
+// answering subagent Asks across a steer, and a steer never tears it down. A steer
+// cancels the child with loopctl.ErrSteer as the cause; a shutdown cancels the
+// parent (and so the child) with no cause. ClassifyCancel(taskCtx, streamCtx) — the
+// returned child — reads the cause back out at the call site.
+//
+// The watcher goroutine is torn down deterministically every round (close(stop) +
+// cancel(nil) + join on done), so nothing outlives the round (no leak, design
+// risk #6). The returned bool is steerAtFinish: true iff the watcher consumed a
+// steer AFTER Stream had already returned cleanly (the finish-line race), which the
+// caller ORs into the post-completion CV-T01 pause so the steer is never dropped.
+// The returned context is the per-round child, handed back so the caller can
+// classify the cancel cause without any shared mutable state.
+func (s *Supervisor) streamTurn(ctx context.Context, round int, streamer model.Streamer, system string, msgs []model.Message, toolset []model.Tool) (model.Response, error, bool, context.Context) {
+	// INTERRUPT-BUT-PRESERVE: wrap ONLY the Stream call in a cancel-cause child of the
+	// TASK ctx. A steer cancels it with ErrSteer; a shutdown cancels the parent (and so
+	// the child) with no cause. The watcher is torn down deterministically below.
+	streamCtx, cancelCause := context.WithCancelCause(ctx)
+	stop := make(chan struct{}) // closed to tear the watcher down this round
+	done := make(chan struct{}) // watcher signals exit (deterministic join)
+	var steerFired bool         // watcher consumed a steer; read-after-join (no race)
+	go func() {
+		defer close(done)
+		var steerC <-chan struct{}
+		if s.Inbox != nil {
+			steerC = s.Inbox.Steer()
+		}
+		select {
+		case <-steerC:
+			// A steer fired: consume it and cancel the Stream with ErrSteer as the cause
+			// so ClassifyCancel reads it back as a Steer (not a fault or a shutdown).
+			// Record that the watcher consumed it so that, if Stream had ALREADY returned
+			// cleanly by the time we cancelled (a finish-line steer), the loop still pauses
+			// on it rather than dropping a token it consumed. A nil steerC (no Inbox) is
+			// never ready, so this case can only fire when an Inbox is wired.
+			steerFired = true
+			cancelCause(loopctl.ErrSteer)
+		case <-streamCtx.Done():
+			// The parent (task ctx) died, or Stream finished and we cancelled below —
+			// either way nothing to do; just exit. The bus-reader is NOT affected: it runs
+			// under the task ctx, which this child cancel never touches.
+		case <-stop:
+			// Round teardown: Stream returned normally; exit the watcher.
+		}
+	}()
+
+	streamRound := round // capture for the onChunk closure
+	resp, err := streamer.Stream(streamCtx, system, msgs, toolset, 4096, func(c model.Chunk) {
+		if c.Text != "" {
+			s.emit(emit.Event{Kind: emit.KindToken, Step: streamRound, Text: c.Text})
+		}
+	})
+	// Deterministic teardown: signal the watcher, cancel the child (no-op if already
+	// cancelled, with a nil cause so it never masks a real steer cause), and JOIN so
+	// no goroutine outlives the round (no leak). The join publishes steerFired to this
+	// goroutine (a happens-before edge), so the finish-line fallback reads it race-free.
+	close(stop)
+	cancelCause(nil)
+	<-done
+	return resp, err, steerFired, streamCtx
+}
+
+// textBlocks returns only the text blocks of a content slice, dropping any tool_use
+// (or other) block. It is the INTERRUPT-BUT-PRESERVE filter (ST-T07): when a steer
+// cancels an in-flight Stream, the partial Response may carry a half-built tool_use
+// (the planner was mid-call). Appending that as the assistant turn would leave a
+// tool_use with no matching tool_result and corrupt the conversation, so we keep
+// ONLY the reasoning TEXT and drop the incomplete tool_use. Returns nil for a
+// partial with no text. Mirrors native.go's textBlocks.
+func textBlocks(content []model.Block) []model.Block {
+	var out []model.Block
+	for _, b := range content {
+		if b.Type == "text" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // ok / errf build a tool_result block (success / structured error), matching
