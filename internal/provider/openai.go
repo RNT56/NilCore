@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,11 +78,17 @@ type oaiTool struct {
 	} `json:"function"`
 }
 
+type oaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type oaiRequest struct {
-	Model     string       `json:"model"`
-	MaxTokens int          `json:"max_tokens,omitempty"`
-	Messages  []oaiMessage `json:"messages"`
-	Tools     []oaiTool    `json:"tools,omitempty"`
+	Model         string            `json:"model"`
+	MaxTokens     int               `json:"max_tokens,omitempty"`
+	Messages      []oaiMessage      `json:"messages"`
+	Tools         []oaiTool         `json:"tools,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	StreamOptions *oaiStreamOptions `json:"stream_options,omitempty"`
 }
 
 type oaiResponse struct {
@@ -97,25 +105,42 @@ type oaiResponse struct {
 	} `json:"usage"`
 }
 
-// Complete translates, calls /chat/completions, and translates the reply back.
-func (o *OpenAI) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
+// newRequest marshals the canonical inputs into the chat-completions request body
+// and builds the authenticated POST. stream toggles SSE delivery (and asks for a
+// trailing usage chunk); the body is otherwise identical between Complete and
+// Stream. The API key rides a per-request header and never touches disk
+// (invariant I3).
+func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, stream bool) (*http.Request, error) {
 	reqBody := oaiRequest{
 		Model:     o.model,
 		MaxTokens: maxTokens,
 		Messages:  toOpenAIMessages(system, msgs),
 		Tools:     toOpenAITools(tools),
+		Stream:    stream,
+	}
+	if stream {
+		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return model.Response{}, fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return model.Response{}, fmt.Errorf("new request: %w", err)
+		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("authorization", "Bearer "+o.key)
+	return req, nil
+}
+
+// Complete translates, calls /chat/completions, and translates the reply back.
+func (o *OpenAI) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
+	req, err := o.newRequest(ctx, system, msgs, tools, maxTokens, false)
+	if err != nil {
+		return model.Response{}, err
+	}
 
 	resp, err := o.http.Do(req)
 	if err != nil {
@@ -192,6 +217,198 @@ func toOpenAITools(tools []model.Tool) []oaiTool {
 	return out
 }
 
+// oaiStreamChunk is one chat-completions SSE frame. The delta carries incremental
+// text and/or tool-call fragments; finish_reason lands on the last choice frame;
+// the trailing usage-only frame (requested via stream_options.include_usage) has
+// an empty choices array. Only the fields the assembler reads are decoded; the
+// frame is parsed as data, never executed (invariant I7).
+type oaiStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content   string             `json:"content"`
+			ToolCalls []oaiToolCallDelta `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// oaiToolCallDelta is a streamed tool-call fragment. id and function.name arrive
+// on the opening fragment for a given index; function.arguments arrives in pieces
+// across later fragments. index ties the fragments of one call together.
+type oaiToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// oaiStreamToolCall accumulates one streamed tool call across its fragments. The
+// argument fragments are concatenated and parsed into Input at assembly time.
+type oaiStreamToolCall struct {
+	id      string
+	name    string
+	argsBuf []byte
+}
+
+// Stream POSTs the same chat-completions body as Complete with "stream":true (and
+// stream_options.include_usage so a trailing usage frame is sent), decodes the SSE
+// frames with bufio, forwards each content delta to onChunk as it arrives, and
+// assembles the identical model.Response Complete would return (text + tool_use
+// blocks, Usage, StopReason from finish_reason). It honors ctx: on cancellation
+// mid-stream it stops reading and returns the partial Response plus ctx.Err()
+// (interrupt-but-preserve). onChunk may be nil. OpenRouter inherits this verbatim
+// — it is the same adapter on a different base URL.
+func (o *OpenAI) Stream(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, onChunk func(model.Chunk)) (model.Response, error) {
+	req, err := o.newRequest(ctx, system, msgs, tools, maxTokens, true)
+	if err != nil {
+		return model.Response{}, err
+	}
+	req.Header.Set("accept", "text/event-stream")
+
+	resp, err := o.http.Do(req)
+	if err != nil {
+		// A ctx cancellation before any byte arrives yields no partial; surface
+		// the context error so the caller sees the interrupt.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return model.Response{}, ctxErr
+		}
+		return model.Response{}, fmt.Errorf("chat completions stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return model.Response{}, fmt.Errorf("openai api: %s: %s", resp.Status, tail(string(raw), 1000))
+	}
+
+	return assembleOpenAIStream(ctx, resp.Body, onChunk)
+}
+
+// assembleOpenAIStream drives the SSE read loop and builds the Response. It is
+// split out from Stream so it is unit-testable against any io.Reader.
+func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(model.Chunk)) (model.Response, error) {
+	var (
+		out       model.Response
+		textBuf   []byte
+		hasText   bool
+		finish    string
+		toolCalls = map[int]*oaiStreamToolCall{}
+		toolOrder []int // tool-call indices in first-seen order, for stable assembly
+	)
+
+	assemble := func() model.Response {
+		var r model.Response
+		if hasText {
+			r.Content = append(r.Content, model.Block{Type: "text", Text: string(textBuf)})
+		}
+		for _, idx := range toolOrder {
+			tc := toolCalls[idx]
+			r.Content = append(r.Content, model.Block{
+				Type:  "tool_use",
+				ID:    tc.id,
+				Name:  tc.name,
+				Input: json.RawMessage(orEmptyObj(string(tc.argsBuf))),
+			})
+		}
+		r.StopReason = stopReasonFromFinish(finish)
+		r.Usage = out.Usage
+		return r
+	}
+
+	sc := bufio.NewScanner(body)
+	// A content delta or tool-call argument fragment can exceed the 64 KiB default
+	// scanner token size; raise the cap to match the non-stream read limit.
+	sc.Buffer(make([]byte, 0, 64<<10), 8<<20)
+
+	for sc.Scan() {
+		// Interrupt-but-preserve: a cancelled ctx stops the read loop and returns
+		// whatever has been assembled so far, paired with the context error.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return assemble(), ctxErr
+		}
+
+		line := sc.Bytes()
+		// SSE frames are "data:" lines separated by blank lines; skip everything
+		// else (event:, id:, :comments, blank separators).
+		data, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
+		data = bytes.TrimSpace(data)
+		if len(data) == 0 {
+			continue
+		}
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return assemble(), nil
+		}
+
+		var chunk oaiStreamChunk
+		if err := json.Unmarshal(data, &chunk); err != nil {
+			return assemble(), fmt.Errorf("decode stream chunk: %w", err)
+		}
+
+		// The trailing usage-only frame carries no choices.
+		if chunk.Usage != nil {
+			out.Usage = model.Usage{
+				InputTokens:  chunk.Usage.PromptTokens,
+				OutputTokens: chunk.Usage.CompletionTokens,
+			}
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			finish = choice.FinishReason
+		}
+		if choice.Delta.Content != "" {
+			hasText = true
+			textBuf = append(textBuf, choice.Delta.Content...)
+			if onChunk != nil {
+				onChunk(model.Chunk{Text: choice.Delta.Content})
+			}
+		}
+		for _, tcd := range choice.Delta.ToolCalls {
+			tc, seen := toolCalls[tcd.Index]
+			if !seen {
+				tc = &oaiStreamToolCall{}
+				toolCalls[tcd.Index] = tc
+				toolOrder = append(toolOrder, tcd.Index)
+			}
+			if tcd.ID != "" {
+				tc.id = tcd.ID
+			}
+			if tcd.Function.Name != "" {
+				tc.name = tcd.Function.Name
+			}
+			tc.argsBuf = append(tc.argsBuf, tcd.Function.Arguments...)
+		}
+	}
+
+	if err := sc.Err(); err != nil {
+		// A read error caused by ctx cancellation is reported as the context error
+		// with the partial Response, honoring interrupt-but-preserve.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return assemble(), ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return assemble(), err
+		}
+		return assemble(), fmt.Errorf("read stream: %w", err)
+	}
+
+	// Clean EOF without an explicit [DONE]: return what we assembled.
+	return assemble(), nil
+}
+
 func fromOpenAI(r oaiResponse) model.Response {
 	var out model.Response
 	if len(r.Choices) == 0 {
@@ -209,16 +426,22 @@ func fromOpenAI(r oaiResponse) model.Response {
 			Input: json.RawMessage(orEmptyObj(tc.Function.Arguments)),
 		})
 	}
-	switch ch.FinishReason {
-	case "tool_calls":
-		out.StopReason = "tool_use"
-	case "stop":
-		out.StopReason = "end_turn"
-	default:
-		out.StopReason = ch.FinishReason
-	}
+	out.StopReason = stopReasonFromFinish(ch.FinishReason)
 	out.Usage = model.Usage{InputTokens: r.Usage.PromptTokens, OutputTokens: r.Usage.CompletionTokens}
 	return out
+}
+
+// stopReasonFromFinish maps OpenAI's finish_reason onto the canonical StopReason.
+// Shared by the non-stream and stream paths so both assemble an identical reply.
+func stopReasonFromFinish(finish string) string {
+	switch finish {
+	case "tool_calls":
+		return "tool_use"
+	case "stop":
+		return "end_turn"
+	default:
+		return finish
+	}
 }
 
 func rawOrEmptyObj(r json.RawMessage) string { return orEmptyObj(string(r)) }
