@@ -11,7 +11,6 @@ import (
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
-	"nilcore/internal/loopctl"
 	"nilcore/internal/model"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/summarize"
@@ -60,10 +59,13 @@ type Native struct {
 	Peer Peer
 
 	// Inbox, if set, is the conversational front door's user→agent seam (C1-T03):
-	// the running loop drains it for queued user turns at each boundary and selects
-	// on its Steer signal to cancel an in-flight model call. nil leaves the loop
-	// byte-identical — gated EXACTLY like Advisor/Peer above, so the single-task
-	// path allocates no per-iteration context, spawns no watcher, and never drains.
+	// the running loop drains it for queued user turns at each boundary and checks
+	// its Steer signal to PAUSE-AND-RECONSIDER (CV-T01). A steer NEVER cancels an
+	// in-flight Model.Complete — its thinking is preserved; instead, after Complete
+	// returns the loop HOLDS the proposed tool_use blocks (it does not execute them),
+	// folds the steered feedback in as a user turn, and lets the model reconsider on
+	// the next step. nil leaves the loop byte-identical — gated EXACTLY like
+	// Advisor/Peer above, so the single-task path never drains and never checks Steer.
 	// The minimal interface lives here on purpose: the concrete *inbox.Box (C1-T01)
 	// is not a build dependency of the frozen-contract backend package, mirroring
 	// the Peer gate, so inbox/session machinery never leaks into backend's graph.
@@ -93,11 +95,12 @@ type Native struct {
 // an optional, gated seam — exactly the rationale behind the Peer interface above.
 //
 // Drain returns the queued user turns to fold in at the next loop boundary
-// (nil when none). Steer returns a cap-1 edge-notify channel that fires when a
-// steer push demands the in-flight model call be cancelled now; the loop's
-// per-iteration watcher selects on it and cancels with loopctl.ErrSteer as the
-// cause, which loopctl.ClassifyCancel reads back to distinguish a steer from a
-// shutdown/deadline cancel.
+// (nil when none). Steer returns a cap-1 edge-notify channel that signals a
+// PENDING steer (CV-T01): after Model.Complete returns, the loop does a
+// non-blocking receive on it and, if a steer is pending, HOLDS the proposed
+// tool_use blocks (pausing before they run) and folds the steered feedback in so
+// the model reconsiders. The signal never cancels the model call — shutdown is
+// the task ctx's job — so the model's thinking is always preserved.
 type Inbox interface {
 	Drain() []model.Message
 	Steer() <-chan struct{}
@@ -207,14 +210,14 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				msgs = append(msgs, queued...)
 				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "queue_drain",
 					Detail: map[string]any{"step": i, "count": len(queued)}})
-				// Consume any steer signal already pending: a steer that fired while
-				// the previous step's TOOL was running (after that step's watcher had
-				// torn down) leaves a buffered wake-up in the cap-1 steerC. Its job —
-				// interrupt the in-flight think — is satisfied here, because the
-				// steered message is among the turns just drained and folded in. If we
-				// left it pending, this iteration's watcher would observe it and cancel
-				// a FRESH Complete that already incorporates the steer text — a wasted
-				// model call. A non-blocking receive is safe (single consumer; cap-1).
+				// Consume any steer signal already pending: a steer that fired during
+				// the previous step's TOOL run (after that step's post-Complete steer
+				// check passed) leaves a buffered wake-up in the cap-1 steerC. Its job
+				// — make the model reconsider — is satisfied here, because the steered
+				// message is among the turns just drained and folded in. If we left it
+				// pending, this iteration's post-Complete check would observe it and
+				// HOLD a FRESH proposal that already incorporates the steer text — a
+				// wasted hold. A non-blocking receive is safe (single consumer; cap-1).
 				select {
 				case <-n.Inbox.Steer():
 				default:
@@ -222,79 +225,26 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			}
 		}
 
-		// The iter-ctx wraps ONLY Model.Complete (pure compute, zero disk effect):
-		// a steer cancels the THINKING, never an in-flight Box.Exec/Tools.Dispatch/
-		// Peer.Dispatch/Verifier.Check (those keep the TASK ctx below, so a steer
-		// mid-tool is buffered and applied at the next boundary — no half-applied
-		// host state). When Inbox is nil, iterCtx IS ctx: no WithCancelCause, no
-		// watcher goroutine, no allocation — byte-identical to the original path.
-		iterCtx := ctx
-		var cancel context.CancelCauseFunc
-		var watcher chan struct{}
-		if n.Inbox != nil {
-			iterCtx, cancel = context.WithCancelCause(ctx)
-			watcher = make(chan struct{})
-			steerC := n.Inbox.Steer()
-			go func() {
-				// Lifecycle mirrors super/reader.go: the watcher either observes a
-				// steer (cancel with the ErrSteer cause so ClassifyCancel can tell a
-				// steer from a shutdown) or the iter-ctx ending on its own (Complete
-				// returned, the loop called cancel) — either way it exits and closes
-				// `watcher`, so the deterministic `cancel(nil); <-watcher` teardown
-				// below joins it every iteration. No goroutine outlives its step.
-				select {
-				case <-steerC:
-					cancel(loopctl.ErrSteer)
-				case <-iterCtx.Done():
-				}
-				close(watcher)
-			}()
-		}
-
-		resp, err := n.Model.Complete(iterCtx, systemPrompt, msgs, toolDefs, 4096)
-
-		// Deterministic teardown EVERY iteration: cancel the iter-ctx (a no-op when
-		// Complete already returned and the watcher is parked on iterCtx.Done) and
-		// join the watcher, so no watcher goroutine leaks across iterations. cancel
-		// is non-nil iff a watcher was spawned (Inbox != nil), so the nil path skips
-		// this entirely.
-		if cancel != nil {
-			cancel(nil)
-			<-watcher
-		}
+		// Model.Complete runs under the TASK ctx (CV-T01): a steer NEVER cancels the
+		// in-flight think — its reasoning is preserved. The task ctx still cancels on
+		// shutdown/deadline (SIGTERM, a parent timeout), unchanged. When Inbox is nil
+		// there is no steer to check at all — byte-identical to the original path.
+		resp, err := n.Model.Complete(ctx, systemPrompt, msgs, toolDefs, 4096)
 
 		if err != nil {
-			// With a nil Inbox there is no iter-ctx, no watcher, and no steer, so
-			// the error path is EXACTLY today's: a model error (including a
-			// parent-ctx cancel mid-Complete) returns the same `model step %d`
-			// fault — byte-identical, no reclassification (the seam adds nothing to
-			// the frozen single-task path). The discriminator only runs when an
-			// Inbox is wired and a steer/shutdown could have caused the cancel.
-			if n.Inbox != nil {
-				switch loopctl.ClassifyCancel(ctx, iterCtx) {
-				case loopctl.Shutdown:
-					// The TASK ctx died (SIGTERM/deadline) — shutdown STRICTLY
-					// dominates a racing steer. Unwind cleanly: a shutdown is not a
-					// fault.
-					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "task_cancel",
-						Detail: map[string]any{"step": i, "cause": "shutdown"}})
-					return Result{Backend: n.Name(), Summary: "interrupted: " + ctx.Err().Error()}, nil
-				case loopctl.Steer:
-					// A steer cancelled the model call. NOT an error: log it, then
-					// continue — the next iteration's Drain() folds the steer text in
-					// as a user turn (the watcher already saw the steer; the message
-					// was queued before the signal fired). The step counter i is NOT
-					// reset, so a steer storm cannot defeat the bounded-loop budget.
-					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "steer_interrupt",
-						Detail: map[string]any{"step": i, "phase": "model"}})
-					n.emit(emit.Event{Kind: emit.KindSteerAck, Step: i, Text: "steering — folding your message in"})
-					continue
-				default:
-					// A genuine transport/model fault falls through to the existing
-					// error path below.
-				}
+			// Steer no longer cancels the model call (CV-T01), so the only context
+			// that can cancel Complete is the TASK ctx — a genuine shutdown/deadline.
+			// We detect that directly (no loopctl discriminator needed now): a done
+			// task ctx is a clean shutdown, unwound as an interrupted Result, not a
+			// fault. Gated on Inbox != nil so the single-task path keeps its original
+			// `model step %d` fault byte-for-byte (a `run`/`build` ctx cancel there is
+			// surfaced as the model error it always was).
+			if n.Inbox != nil && ctx.Err() != nil {
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "task_cancel",
+					Detail: map[string]any{"step": i, "cause": "shutdown"}})
+				return Result{Backend: n.Name(), Summary: "interrupted: " + ctx.Err().Error()}, nil
 			}
-			// The existing error path, unchanged.
+			// The existing error path, unchanged: a genuine transport/model fault.
 			return Result{Backend: n.Name()}, fmt.Errorf("model step %d: %w", i, err)
 		}
 		n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "model_call",
@@ -307,6 +257,33 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 		// Record the assistant turn verbatim so the conversation stays coherent.
 		msgs = append(msgs, model.Message{Role: "assistant", Content: resp.Content})
+
+		// PAUSE-AND-RECONSIDER (CV-T01): the model's thinking is done and its
+		// proposed actions are in resp.Content, but NOTHING has run yet. A steer
+		// pending at THIS instant must pause those actions before they take effect,
+		// not after. So, before dispatching any tool, non-blocking check the steer
+		// signal: if one fired, HOLD every proposed tool_use — append a "paused"
+		// tool_result for each (the action is held, never executed) — then Drain the
+		// inbox and fold the steered feedback as a user turn so the model reconsiders
+		// with its held action's paused results in view. Emit a steer_ack and
+		// continue; the step counter STILL advances, so a steer storm stays bounded.
+		// nil Inbox ⇒ no check, byte-identical.
+		if n.Inbox != nil && steerPending(n.Inbox) {
+			held := holdProposedTools(resp.Content)
+			if len(held) > 0 {
+				msgs = append(msgs, model.Message{Role: "user", Content: held})
+			}
+			// Fold the steered feedback (and any co-queued messages) as a user turn.
+			if queued := n.Inbox.Drain(); len(queued) > 0 {
+				msgs = append(msgs, queued...)
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "queue_drain",
+					Detail: map[string]any{"step": i, "count": len(queued)}})
+			}
+			n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "steer_interrupt",
+				Detail: map[string]any{"step": i, "phase": "model", "held": len(held)}})
+			n.emit(emit.Event{Kind: emit.KindSteerAck, Step: i, Text: "paused — folding your feedback; reconsidering"})
+			continue
+		}
 
 		// The API requires a tool_result for every tool_use block, so we build
 		// one per block — including "finish" — before deciding what to do next.
@@ -469,6 +446,41 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 func errorResult(id, msg string) model.Block {
 	return model.Block{Type: "tool_result", ToolUseID: id, Content: msg, IsError: true}
+}
+
+// steerPending non-blocking checks the inbox's steer signal: true iff a steer is
+// pending (the cap-1 edge-notify fired since it was last consumed). It is the
+// CV-T01 pause gate — the loop calls it AFTER Model.Complete returns and BEFORE it
+// dispatches any proposed tool, so a steer pauses the held action before it runs.
+// A receive consumes the signal (single consumer; cap-1), so a coalesced storm of
+// steers triggers exactly one pause — the whole batch folds via the Drain that
+// follows. The caller guards the nil-Inbox case, so the seam stays byte-identical.
+func steerPending(ib Inbox) bool {
+	select {
+	case <-ib.Steer():
+		return true
+	default:
+		return false
+	}
+}
+
+// holdProposedTools turns the model's proposed tool_use blocks into "paused"
+// tool_results WITHOUT executing any of them (CV-T01): the model steered after the
+// think but before any side effect, so each action is HELD, not run. The API
+// requires a tool_result for every tool_use block in the just-appended assistant
+// turn, so we build one per block; the model reads these next step alongside the
+// folded feedback and re-issues or adjusts. Returns nil for a pure-text turn (no
+// tool_use), so a steer that lands on a talk-only turn folds the feedback alone.
+func holdProposedTools(content []model.Block) []model.Block {
+	var held []model.Block
+	for _, b := range content {
+		if b.Type != "tool_use" {
+			continue
+		}
+		held = append(held, model.Block{Type: "tool_result", ToolUseID: b.ID,
+			Content: "Paused before this ran: the operator steered. Reconsider whether to proceed, then re-issue this action or adjust."})
+	}
+	return held
 }
 
 // emit surfaces one event to the wired Emitter, gated on nil so an absent sink

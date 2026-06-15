@@ -229,39 +229,55 @@ func TestNativeQueuedMessageFoldedAtBoundary(t *testing.T) {
 	}
 }
 
-// TestNativeSteerCancelsInFlightModelCall is the core acceptance test: a steer
-// cancels a BLOCKING Model.Complete now (not at the next boundary), the cancel is
-// reclassified as a steer (NOT a fault → Run does not error), and the steer text
-// is folded in as the next user turn. A steer_ack is emitted.
-func TestNativeSteerCancelsInFlightModelCall(t *testing.T) {
+// TestNativeSteerPausesAndReconsiders is the core CV-T01 acceptance test:
+// PAUSE-AND-RECONSIDER. A steer that lands while a blocking Model.Complete is in
+// flight does NOT cancel it — the think completes normally and the proposed action
+// is returned. But BEFORE that action runs, the loop sees the pending steer, HOLDS
+// the proposed tool_use (a "paused" tool_result, never executed), folds the steered
+// feedback as a user turn, emits a steer_ack, and continues with no error. The model
+// reconsiders next step seeing its held action's paused result + the feedback.
+func TestNativeSteerPausesAndReconsiders(t *testing.T) {
+	box := &recordingBox{}
 	m := &blockingModel{
 		release: make(chan struct{}),
 		entered: make(chan int, 4),
 		responses: []model.Response{
-			// step 0 is steered (cancelled) before it can return; on the SECOND
-			// call after the steer fold the model finishes.
-			{Content: []model.Block{toolUse("u1", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+			// step 0 proposes a run; the steer HOLDS it (it must never execute). On
+			// the SECOND call after the steer fold the model reconsiders and finishes.
+			{Content: []model.Block{toolUse("u1", "run", map[string]string{"cmd": "echo from-cmd"})}, StopReason: "tool_use"},
 			{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
 		},
 	}
 	ib := inbox.New(nil, "conv")
 	em := &recordingEmitter{}
-	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, Inbox: ib, Emitter: em, MaxSteps: 5}
+	n := &Native{Model: m, Box: box, Verifier: okVerifier{}, Inbox: ib, Emitter: em, MaxSteps: 5}
 
 	done := make(chan error, 1)
 	go func() { _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); done <- err }()
 
 	<-m.entered // step 0 parked inside Complete
+	// Steer while the model thinks; it must NOT cancel the call. Push the steer
+	// BEFORE releasing so the signal is pending when the post-Complete check runs.
 	ib.Push(userText("use ./service not ./cmd"), inbox.Steer)
-	// The steer cancels step 0's Complete; the loop reclassifies it as a steer and
-	// continues to step 1, which Drains the steer text and then parks.
-	<-m.entered // step 1 parked → its Drain folded the steer message
-	if !hasUserText(m.history(), "use ./service not ./cmd") {
-		t.Error("steer text not folded as a user turn after the cancel")
+	m.release <- struct{}{} // release step 0 → Complete returns the `run` proposal
+	// The loop holds the proposed run, folds the steer text, and continues to step 1.
+	<-m.entered // step 1 parked → its history shows the held action + folded steer
+	hist := m.history()
+	if !hasUserText(hist, "use ./service not ./cmd") {
+		t.Error("steer text not folded as a user turn after the pause")
+	}
+	if !hasToolResult(hist, "Paused before this ran") {
+		t.Error("proposed action was not HELD with a paused tool_result")
 	}
 	m.release <- struct{}{} // release step 1 (finish)
 	if err := <-done; err != nil {
 		t.Fatalf("Run errored on a steer (steer misread as fault): %v", err)
+	}
+	// The held `run` must NEVER have executed — pause-and-reconsider holds the action.
+	for _, c := range box.execed {
+		if strings.Contains(c, "echo from-cmd") {
+			t.Errorf("held command executed despite the steer: %q", c)
+		}
 	}
 	// A steer_ack must have been surfaced.
 	var sawAck bool
@@ -273,6 +289,18 @@ func TestNativeSteerCancelsInFlightModelCall(t *testing.T) {
 	if !sawAck {
 		t.Error("no steer_ack emitted after a steer fold")
 	}
+}
+
+// hasToolResult reports whether any tool_result block in the history carries text.
+func hasToolResult(msgs []model.Message, text string) bool {
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == "tool_result" && strings.Contains(b.Content, text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestNativeParentCancelAbortsNotSteer asserts a parent-ctx cancel (shutdown /

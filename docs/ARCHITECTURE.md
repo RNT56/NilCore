@@ -104,7 +104,7 @@ The native loop, Codex, and Claude Code are interchangeable behind this. Adding 
 
 **Optional bus seam on the native loop (additive, contract-untouched).** `backend.Native` carries one optional field `Peer backend.Peer` alongside the existing optional `Advisor`. When nil — the single-agent default — the loop is byte-identical: no bus tools are registered and no bus code runs (gated exactly like `Advisor`). When set (multi-agent mode), it registers three bus tools — `ask_supervisor` (blocking Ask, `KindQuestion`), `share_finding` (async Send, `KindFinding`), and `request_review` (blocking Ask, `KindReviewRequest`) — and routes each call through `Peer.Dispatch`. The `Peer` interface (`Tools() []model.Tool`; `Dispatch(ctx, name, input) (string, error)`) is declared in `backend` itself, not imported from `internal/agent/bus`, so the frozen-contract package keeps a leaf import graph; the concrete `*bus.AgentPeer` satisfies it. Every peer reply is `guard.Wrap`-fenced before it becomes a `tool_result` (I7), identical to the advisor and shell-output paths — a peer body is data, never instructions. `Task`, `Result`, and the `CodingBackend` interface are untouched (I1); this is an additive field, mirroring the `Advisor` gate.
 
-**Optional inbox + emit seam on the native loop (conversational front door, additive, contract-untouched).** `backend.Native` carries three further optional fields alongside `Advisor`/`Peer`: `Inbox backend.Inbox` (the user→agent message seam), `Seed []model.Message` (prior conversation history to continue on), and `Emitter backend.Emitter` (the live reasoning/intent sink). When all three are nil — the single-task `run`/`build`/`serve` default — the loop is **byte-identical**: no per-iteration context is allocated, no watcher goroutine is spawned, the inbox is never drained, and nothing is emitted (gated exactly like `Advisor`/`Peer`). When `Inbox` is set, at each loop boundary the loop **QUEUE-drains** the inbox and folds the messages in as ordinary user turns; and it wraps **only** `Model.Complete` in a per-iteration `context.WithCancelCause(ctx)` whose watcher goroutine cancels with `loopctl.ErrSteer` when the inbox's steer signal fires. `Box.Exec`/`Tools.Dispatch`/`Peer.Dispatch`/`Verifier.Check` keep the **task** ctx — so a **STEER cancels the in-flight think only, never a running tool**, making "no half-applied tool state" true by construction (a SIGKILL of a sandbox mid-write would tear the RW-bind-mounted `/work`). On a cancelled `Complete`, `loopctl.ClassifyCancel(taskCtx, iterCtx)` discriminates — `taskCtx.Err()` first ⇒ a shutdown/deadline that dominates and unwinds cleanly; else an `ErrSteer` cause ⇒ a steer that is logged and folded (`continue`), never an error; else a genuine fault on the existing `model step %d` path. The watcher is torn down deterministically every iteration (`cancel(nil); <-watcher`) so none leaks. The `Inbox` interface (`Drain() []model.Message`; `Steer() <-chan struct{}`) and `Emitter` interface (`Emit(emit.Event)`) are declared in `backend` itself (the concrete `*inbox.Box` and `internal/emit` sinks satisfy them), keeping the frozen-contract package a leaf — `internal/emit` is a stdlib-only leaf with no channel/session imports. A steer is the **principal's** trusted instruction folded as an un-`Wrap`'d user turn (the trust line, I7); only authorization at the channel boundary promotes a message to principal-trust. `Task`, `Result`, and the `CodingBackend` interface are untouched (I1); these are additive fields, mirroring the `Advisor`/`Peer` gate.
+**Optional inbox + emit seam on the native loop (conversational front door, additive, contract-untouched).** `backend.Native` carries three further optional fields alongside `Advisor`/`Peer`: `Inbox backend.Inbox` (the user→agent message seam), `Seed []model.Message` (prior conversation history to continue on), and `Emitter backend.Emitter` (the live reasoning/intent sink). When all three are nil — the single-task `run`/`build`/`serve` default — the loop is **byte-identical**: the inbox is never drained, the steer signal is never checked, and nothing is emitted (gated exactly like `Advisor`/`Peer`). When `Inbox` is set, at each loop boundary the loop **QUEUE-drains** the inbox and folds the messages in as ordinary user turns. `Model.Complete` runs under the **task** ctx — a **STEER never cancels the in-flight think**; its reasoning is preserved (the task ctx still cancels on shutdown/deadline, unchanged). Instead the loop **pauses-and-reconsiders** (CV-T01): after `Complete` returns and the assistant turn is appended, but BEFORE any tool dispatches, a non-blocking receive on the steer signal decides — if a steer is pending, the loop **HOLDS** every proposed `tool_use` (one "paused" `tool_result` per block, never executed), `Drain`s the inbox and folds the steered feedback as a user turn, emits a `steer_ack`, and `continue`s. The step counter still advances, so a steer storm stays bounded; the model reconsiders next step with its held action's paused results plus the feedback in view. `Box.Exec`/`Tools.Dispatch`/`Peer.Dispatch`/`Verifier.Check` already keep the **task** ctx, so a steer mid-tool is simply buffered and folded at the next boundary — "no half-applied tool state" is true by construction (a SIGKILL of a sandbox mid-write would tear the RW-bind-mounted `/work`). A `Complete` error with `Inbox` set and the task ctx done is a clean shutdown (`interrupted` Result); otherwise it is the existing `model step %d` fault. The `Inbox` interface (`Drain() []model.Message`; `Steer() <-chan struct{}`) and `Emitter` interface (`Emit(emit.Event)`) are declared in `backend` itself (the concrete `*inbox.Box` and `internal/emit` sinks satisfy them), keeping the frozen-contract package a leaf — `internal/emit` is a stdlib-only leaf with no channel/session imports. A steer is the **principal's** trusted instruction folded as an un-`Wrap`'d user turn (the trust line, I7); only authorization at the channel boundary promotes a message to principal-trust. `Task`, `Result`, and the `CodingBackend` interface are untouched (I1); these are additive fields, mirroring the `Advisor`/`Peer` gate.
 
 ### I2 — The verifier is the only authority on "done"
 `Result.SelfClaimed` is advisory. After **any** backend runs, the orchestrator re-runs the project's checks (`verify.Verifier.Check`) and that boolean decides whether work ships. This is what makes delegating to black-box agents safe: their self-report never governs.
@@ -160,7 +160,7 @@ yes/no reply. Concrete transports live in `internal/channel/<name>`; sender
 authorization is P2-T07. `serve` mode (P1-T07) feeds `TaskRequest`s into
 `agent.Execute` and routes gates back through `Ask`.
 
-## The conversational front door (session · inbox · emit · loopctl)
+## The conversational front door (session · inbox · emit)
 
 One conversational entrypoint sits above the machinery: the user opens a chat —
 the interactive terminal REPL (`nilcore chat`) or an existing serve channel — and
@@ -177,10 +177,9 @@ additive and nil-gated (nil = byte-identical), exactly like `Advisor`/`Peer`:
 |---|---|---|
 | `internal/emit` | live reasoning/intent sink (`Emitter`, `Event`, `WriterEmitter`, `NopEmitter`) | stdlib only |
 | `internal/inbox` | the user→agent message seam (`Box`: `Push`/`Drain`/`Steer`, `Queue`/`Steer` modes) | `model`, `eventlog` |
-| `internal/loopctl` | the shared cancel-cause discriminator (`ErrSteer`, `ClassifyCancel`) | stdlib only |
 | `internal/session` | state container + auto-router + drivers (`Session`, `Turn`, `WorkState`, `Phase`, `SupervisorFirstRouter`, `Driver`s) | composes `agent`, `backend`, `super`, `project`, `summarize`, `model`, `eventlog`, `policy`, `inbox`, `emit`, `store` |
 
-`emit`, `inbox`, and `loopctl` are leaves the frozen `backend` leaf can hold the
+`emit` and `inbox` are leaves the frozen `backend` leaf can hold the
 same way it holds `Advisor`/`Peer`; `session` is the orchestrating package above
 `agent` (it composes the machinery, never the reverse — the dependency direction is
 preserved).
@@ -196,28 +195,34 @@ affordance), QUEUE otherwise.
   ordinary user turn at the next loop boundary** (`Drain` at the top of each
   iteration, logged `queue_drain`). The drive keeps running.
 - **STEER**: in addition to queuing, it fires the `Box`'s cap-1 edge-notify steer
-  signal. A per-iteration watcher cancels **only `Model.Complete`** with the
-  `loopctl.ErrSteer` cause; the in-flight think returns, the loop unwinds to the
-  boundary, and the steer text folds in as the next user turn — so the user can
-  correct course after reading the agent's live reasoning.
+  signal. This triggers **pause-and-reconsider** — it **never cancels the in-flight
+  work**. After `Model.Complete` returns and the assistant turn is appended, but
+  BEFORE any proposed tool runs, the loop checks the steer signal; if a steer is
+  pending it **HOLDS** every proposed `tool_use` (one "paused" `tool_result` per
+  block, never executed), folds the steered feedback in as the next user turn,
+  emits a `steer_ack`, and continues — so the model reconsiders its held action in
+  light of the user's correction after reading the agent's live reasoning.
 
-**Steer cancels the model call, never an in-flight tool.** This is load-bearing and
-is stated in invariant I1's inbox/emit seam note above: the per-iteration
-cancellable `iterCtx` wraps **only** `Model.Complete` (and cheap read-only Asks);
-`Box.Exec` / `Tools.Dispatch` / `Peer.Dispatch` / `Verifier.Check` always receive
-the **task** ctx. A steer that arrives mid-tool is buffered and applied at the next
+**Pause-and-reconsider — a steer never cancels in-flight work.** This is
+load-bearing and is stated in invariant I1's inbox/emit seam note above:
+`Model.Complete` runs under the **task** ctx, so a steer leaves the think intact —
+its reasoning is preserved, not discarded. The steer instead lands at the
+**post-think gate**: the loop holds the proposed actions (they are paused, never
+dispatched) and re-prompts the model with the feedback. `Box.Exec` /
+`Tools.Dispatch` / `Peer.Dispatch` / `Verifier.Check` already run under the task
+ctx, so a steer that arrives mid-tool is simply buffered and folded at the next
 boundary; it never SIGKILLs a sandbox command (which would tear the RW-bind-mounted
 `/work`). This makes "no half-applied tool state" true by construction — there is
-never a dangling `tool_use`. The cancel discrimination is one shared function,
-`loopctl.ClassifyCancel(taskCtx, iterCtx)`, so the native and supervisor loops
-cannot drift: `taskCtx.Err()` is checked **first** (a SIGTERM/deadline dominates a
-racing steer and unwinds cleanly), then an `ErrSteer` cause (a steer — logged
-`steer_interrupt`, folded, never an error), else a genuine fault on the existing
-`model step %d` path. The cause travels inside the context (no shared mutable
-`steered` bool), so `go test -race` is green by construction. The watcher is torn
-down deterministically every iteration (`cancel(nil); <-watcher`) so none leaks.
-nil `Inbox` ⇒ `iterCtx := ctx` with no `WithCancelCause`, no watcher, no `Drain` —
-byte-identical to the pre-conversational loop.
+never a dangling, half-run `tool_use`. The hold is logged `steer_interrupt` and the
+step counter still advances, so a steer storm cannot loop forever (the bounded-loop
+rail holds). There is no per-iteration cancellable context and no watcher goroutine:
+the steer signal is a plain cap-1 edge-notify the loop polls non-blocking after the
+think, so the native and supervisor loops share the same tiny shape and `go test
+-race` is green by construction. **Shutdown** is handled by the task ctx as before:
+a `Complete` cancelled by a SIGTERM/deadline returns cleanly (`interrupted` Result /
+`ctx` outcome), never confused with a steer (a steer no longer cancels `Complete` at
+all). nil `Inbox` ⇒ no `Drain`, no steer check — byte-identical to the
+pre-conversational loop.
 
 ### The trust line (I7)
 
@@ -313,13 +318,12 @@ policy  (leaf, imported by agent)
 | `internal/policy` | reversibility classifier + gate | stdlib only |
 | `internal/backend` | `CodingBackend` + native/codex/claude-code | `model`, `sandbox`, `verify`, `eventlog` |
 | `internal/emit` | live reasoning/intent sink (conversational) | stdlib only |
-| `internal/loopctl` | shared steer/shutdown cancel-cause discriminator | stdlib only |
 | `internal/inbox` | user→agent message seam (queue/steer) | `model`, `eventlog` |
 | `internal/agent` | orchestrator (run backend, final verify) | `backend`, `verify`, `eventlog`, `policy` |
 | `internal/session` | conversational state container + auto-router + drivers | `agent`, `backend`, `super`, `project`, `summarize`, `inbox`, `emit`, `model`, `eventlog`, `policy`, `store` |
 | `cmd/nilcore` | wiring from flags/env | all of the above |
 
-**Rule:** `backend` must never import `agent`. `model`/`sandbox`/`eventlog`/`policy` import nothing internal except, for `verify`, `sandbox`. `emit` and `loopctl` are stdlib-only leaves the frozen `backend` leaf may hold (like `Advisor`/`Peer`); `session` sits above `agent` and composes the machinery — nothing below it imports `session`.
+**Rule:** `backend` must never import `agent`. `model`/`sandbox`/`eventlog`/`policy` import nothing internal except, for `verify`, `sandbox`. `emit` is a stdlib-only leaf the frozen `backend` leaf may hold (like `Advisor`/`Peer`); `session` sits above `agent` and composes the machinery — nothing below it imports `session`.
 
 ## Data flow
 
@@ -351,7 +355,7 @@ Each is owned by a specific task in `docs/TASKS.md`. The contract above does not
 | 4 | `internal/store` (SQLite), `internal/memory` | event log graduates to the store; memory retrieved into native context assembly, written back after tasks |
 | 5 | `internal/skills` (Agent Skills + native plugins), `internal/selfimprove`, `eval/` | plugin capabilities in both formats; gated self-edits scoped to prompts/skills/tools only; the eval harness that earns routing data |
 | 6 | `internal/budget`, `internal/scheduler`, `internal/maint`, `internal/inspect`; resilience in `model`, durability in `agent`, auto-detect in `verify` | runtime resilience & operations — provider retry/failover, metered budgets, crash-safe resumption, concurrent-task scheduling, verify auto-detection, resource GC, operator inspect/health. Config validation/migration now lives in `internal/onboard` (the live config schema). Full design: `docs/OPERATIONS.md` |
-| C | `internal/emit`, `internal/inbox`, `internal/loopctl`, `internal/session`; nil-gated `Inbox`/`Seed`/`Emitter` seam on `backend.Native` + `super.Supervisor`; per-thread `Session` map in `internal/server`; `nilcore chat` in `cmd/nilcore` | the conversational front door — one chat where the agent auto-routes (native / supervisor / project), the conversation persists (continue, not restart), and the user queues or steers mid-work. Steer cancels only `Model.Complete`; the principal's message is an un-`Wrap`'d user turn, tool/bus stays fenced. Full design: `docs/CONVERSATIONAL.md` |
+| C | `internal/emit`, `internal/inbox`, `internal/session`; nil-gated `Inbox`/`Seed`/`Emitter` seam on `backend.Native` + `super.Supervisor`; per-thread `Session` map in `internal/server`; `nilcore chat` in `cmd/nilcore` | the conversational front door — one chat where the agent auto-routes (native / supervisor / project), the conversation persists (continue, not restart), and the user queues or steers mid-work. Steer is pause-and-reconsider (never cancels in-flight work): it holds the proposed action and folds the feedback in so the model reconsiders; the principal's message is an un-`Wrap`'d user turn, tool/bus stays fenced. Full design: `docs/CONVERSATIONAL.md` |
 
 ## Security model (summary)
 

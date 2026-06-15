@@ -196,16 +196,30 @@ func TestSuperQueuedMessageFoldedAtBoundary(t *testing.T) {
 	}
 }
 
-// TestSuperSteerCancelsInFlightModelCall is the core acceptance test: a steer
-// cancels a BLOCKING planner Model.Complete now, the cancel is reclassified as a
-// steer (NOT a fault → Run does not error), and the steer text is folded in as the
-// next principal user turn. A steer_ack is emitted.
-func TestSuperSteerCancelsInFlightModelCall(t *testing.T) {
+// TestSuperSteerPausesAndReconsiders is the core CV-T01 acceptance test for the
+// supervisor: PAUSE-AND-RECONSIDER. A steer that lands while a blocking planner
+// Model.Complete is in flight does NOT cancel it — the think completes and the
+// proposed orchestration action is returned. But BEFORE it runs, the loop sees the
+// pending steer, HOLDS the proposed tool_use (a "paused" tool_result; the spawn
+// never runs), folds the steered feedback as a principal turn, emits a steer_ack,
+// and continues with no error. The planner reconsiders next round.
+func TestSuperSteerPausesAndReconsiders(t *testing.T) {
+	var spawnCalled bool
+	var smu sync.Mutex
+	spawnFn := func(_ context.Context, spec SubagentSpec) spawn.Result {
+		smu.Lock()
+		spawnCalled = true
+		smu.Unlock()
+		return spawn.Result{ID: spec.ID, Passed: true, Branch: "task/" + spec.ID}
+	}
+
 	m := &blockingSuperModel{
 		release: make(chan struct{}),
 		entered: make(chan int, 4),
 		responses: []model.Response{
-			textResp(toolUse("u1", "finish", map[string]string{"summary": "done"})),
+			// round 0 proposes a spawn; the steer HOLDS it (it must never run). On the
+			// SECOND call after the steer fold the planner reconsiders and finishes.
+			textResp(toolUse("u1", "spawn_subagent", SubagentSpec{ID: "super.t1", Role: roster.RoleImplementer, Goal: "build"})),
 			textResp(toolUse("u2", "finish", map[string]string{"summary": "done"})),
 		},
 	}
@@ -214,19 +228,35 @@ func TestSuperSteerCancelsInFlightModelCall(t *testing.T) {
 	s := baseSup(m, passVerifier{})
 	s.Inbox = ib
 	s.Out = em
+	s.Spawn = spawnFn
 
 	done := make(chan error, 1)
 	go func() { _, err := s.Run(context.Background(), "goal"); done <- err }()
 
 	<-m.entered // round 0 parked inside Complete
+	// Steer while the planner thinks; it must NOT cancel the call. Push BEFORE the
+	// release so the signal is pending when the post-Complete check runs.
 	ib.Push(userText("use ./service not ./cmd"), inbox.Steer)
-	<-m.entered // round 1 parked → its drain folded the steer message
-	if !hasUserText(m.history(), "use ./service not ./cmd") {
-		t.Error("steer text not folded as a user turn after the cancel")
+	m.release <- struct{}{} // release round 0 → Complete returns the spawn proposal
+	<-m.entered             // round 1 parked → its history shows the held action + folded steer
+	hist := m.history()
+	if !hasUserText(hist, "use ./service not ./cmd") {
+		t.Error("steer text not folded as a user turn after the pause")
+	}
+	if !hasToolResult(hist, "Paused before this ran") {
+		t.Error("proposed action was not HELD with a paused tool_result")
 	}
 	m.release <- struct{}{} // release round 1 (finish)
 	if err := <-done; err != nil {
 		t.Fatalf("Run errored on a steer (steer misread as fault): %v", err)
+	}
+	// The held spawn must NEVER have run — pause-and-reconsider holds the action.
+	smu.Lock()
+	if spawnCalled {
+		smu.Unlock()
+		t.Error("held spawn executed despite the steer")
+	} else {
+		smu.Unlock()
 	}
 	var sawAck bool
 	for _, k := range em.kinds() {
@@ -237,6 +267,18 @@ func TestSuperSteerCancelsInFlightModelCall(t *testing.T) {
 	if !sawAck {
 		t.Error("no steer_ack emitted after a steer fold")
 	}
+}
+
+// hasToolResult reports whether any tool_result block in the history carries text.
+func hasToolResult(msgs []model.Message, text string) bool {
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == "tool_result" && strings.Contains(b.Content, text) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestSuperParentCancelDominatesSteer asserts a parent-ctx cancel (shutdown /
