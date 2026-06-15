@@ -54,7 +54,6 @@ import (
 	"nilcore/internal/spawn"
 	"nilcore/internal/summarize"
 	"nilcore/internal/super"
-	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -588,7 +587,7 @@ func buildCodeFunc(d buildDeps, repo string, exec model.Provider, newEnv func(di
 		env := newEnv(wt.Path())
 		worker := roster.NewWorker(roster.Profile{
 			System:   "You are the supervisor writing code directly. Make the smallest change that satisfies the goal; run the checks.",
-			Tools:    tools.Default(),
+			Tools:    loopTools(),
 			Model:    nil, // no advisor escalation for the supervisor's own pass
 			ReadOnly: false,
 			MaxSteps: d.maxSteps,
@@ -791,7 +790,7 @@ func bootstrapGreenfield(ctx context.Context, d buildDeps, repo string, exec mod
 			env := buildEnvForScaffold(d, t.Dir)
 			w := roster.NewWorker(roster.Profile{
 				System:   "You scaffold a new project: a minimal skeleton plus a runnable, currently-RED verifier. No feature code.",
-				Tools:    tools.Default(),
+				Tools:    loopTools(),
 				ReadOnly: false,
 				MaxSteps: d.maxSteps,
 			}, env.Box, env.Verifier, d.log, exec, nil)

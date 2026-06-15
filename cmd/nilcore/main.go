@@ -51,7 +51,6 @@ import (
 	"nilcore/internal/session"
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
-	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
 
@@ -671,7 +670,7 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 		Box:          box,
 		Verifier:     v,
 		Log:          d.log,
-		Tools:        tools.Default(),
+		Tools:        loopTools(),
 		CommandGuard: policy.DefaultCommandPolicy().Check,
 		MaxSteps:     *d.flags.maxSteps,
 		Seed:         in.Seed,
@@ -894,7 +893,7 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			Box:          box,
 			Verifier:     v,
 			Log:          log,
-			Tools:        tools.Default(),
+			Tools:        loopTools(),
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
 		}
