@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"nilcore/internal/advisor"
 	"nilcore/internal/agent/bus"
@@ -480,8 +481,88 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 				Err: fmt.Errorf("spawn: commit: %w", cerr)}
 		}
 		_ = sha
-		return spawn.Result{ID: spec.ID, Summary: res.Summary, Branch: branch, Passed: true, State: spawn.StatePassed}
+		// Richer work report (CV-T03): distill WHAT CHANGED — the host-side, bounded
+		// diff-stat over this worker's own worktree (computed via the hardened worktree
+		// git helper) plus the verifier's verdict — alongside the model's own prose, so
+		// the supervisor's await_results sees a real "here is what the subagent did"
+		// report, not only the backend's self-description. The supervisor fences this
+		// whole Summary as DATA (renderReport → guard.Wrap), so it is never instructions
+		// (I7); the diff is byte-capped so it is never a raw transcript.
+		summary := workReport(ctx, wt, true, res.Summary)
+		return spawn.Result{ID: spec.ID, Summary: summary, Branch: branch, Passed: true, State: spawn.StatePassed}
 	}
+}
+
+// maxReportDiffBytes bounds the diff-stat slice of a subagent work report so a
+// sprawling change can never balloon the supervisor's prompt (or, fenced as data,
+// the context the supervisor reads). It is a hard cap distinct from the model
+// prose, which workReport clips separately.
+const maxReportDiffBytes = 4096
+
+// maxReportProseBytes bounds the backend's own prose tail inside a work report.
+// The model's self-description is useful intent but must stay bounded — the
+// authoritative "what changed" is the diff-stat, computed host-side.
+const maxReportProseBytes = 2048
+
+// workReport distills a finished subagent's branch into a concise, BOUNDED report
+// of what it actually did: the verifier verdict (the only done-authority, I2), the
+// host-side diff-stat over its own worktree (changed files + insertions/deletions,
+// via the hardened worktree git helper), and the backend's own prose summary
+// (clipped). It is plain text the caller stores in spawn.Result.Summary; the
+// supervisor renders that field guard.Wrap-fenced as DATA (I7), so nothing here is
+// ever obeyed. A diff-stat error degrades gracefully to a note — the report is a
+// best-effort observation, never a hard failure of the (already verified) branch.
+func workReport(ctx context.Context, wt *worktree.Worktree, passed bool, prose string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "verify: %s\n", passVerdict(passed))
+
+	if diff, err := wt.DiffStat(ctx, maxReportDiffBytes); err != nil {
+		fmt.Fprintf(&b, "changes: (diff-stat unavailable: %s)\n", oneLine(err.Error()))
+	} else if diff == "" {
+		b.WriteString("changes: none\n")
+	} else {
+		b.WriteString("changes:\n")
+		b.WriteString(diff)
+		b.WriteByte('\n')
+	}
+
+	if p := strings.TrimSpace(prose); p != "" {
+		b.WriteString("\nworker notes:\n")
+		b.WriteString(clipBytes(p, maxReportProseBytes))
+	}
+	return b.String()
+}
+
+// clipBytes truncates s to at most n bytes, backing up to a rune boundary so the
+// clipped prose never ends with a half-encoded rune (which would be invalid UTF-8
+// in the report the supervisor reads). It is the byte-budget companion to the
+// rune-count truncate used for short commit subjects.
+func clipBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// passVerdict renders a verifier boolean as a stable, single-word verdict for a
+// work report (the supervisor reads the typed Passed field for control; this is
+// the human-/model-readable echo of the same fact).
+func passVerdict(passed bool) string {
+	if passed {
+		return "PASSED"
+	}
+	return "FAILED"
+}
+
+// oneLine collapses an error string to a single bounded line so a multi-line git
+// failure cannot break the report's line structure or bloat it.
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return truncate(s, 200)
 }
 
 // buildCodeFunc returns the supervisor's CodeFunc: it lets the supervisor write
