@@ -2,6 +2,7 @@
 //
 //	nilcore init                          guided setup (keys, runtime, backend, channel, allowlist)
 //	nilcore -goal "..." [-dir ./repo] ... run one task to completion (default)
+//	nilcore build -goal "..." -new ./svc  drive a whole project to a verifier-green tree (multi-agent)
 //	nilcore serve -channel telegram ...   listen on a chat channel and dispatch
 //	nilcore doctor                        check whether this host is ready to run/serve
 //	nilcore config show                   print the active configuration (secret-free)
@@ -67,6 +68,8 @@ func main() {
 		fmt.Println(versionString())
 	case "serve":
 		serveMain(args[1:])
+	case "build":
+		buildMain(args[1:])
 	case "init":
 		initMain(args[1:])
 	case "doctor":
@@ -93,6 +96,7 @@ const usageText = `NilCore — a tiny, robust coding agent. The harness is small
 Usage:
   nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
+  nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
   nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
