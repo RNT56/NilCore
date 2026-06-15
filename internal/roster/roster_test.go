@@ -2,6 +2,7 @@ package roster
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"nilcore/internal/eventlog"
@@ -10,6 +11,16 @@ import (
 	"nilcore/internal/sandbox"
 	"nilcore/internal/verify"
 )
+
+// stubPeer satisfies backend.Peer (Tools + Dispatch) without a real bus, so a
+// worker-construction test can pass a non-nil peer and assert the sandbox is never
+// traded away for it. It is the smallest valid Peer; it exercises no bus traffic.
+type stubPeer struct{}
+
+func (stubPeer) Tools() []model.Tool { return nil }
+func (stubPeer) Dispatch(context.Context, string, json.RawMessage) (string, error) {
+	return "", nil
+}
 
 // --- hermetic fakes (no network, no container) ----------------------------
 
@@ -66,6 +77,29 @@ func TestNewWorkerNeverNilBox(t *testing.T) {
 		}
 		if w.CommandGuard == nil {
 			t.Errorf("role %q: worker has a nil CommandGuard", role)
+		}
+	}
+}
+
+// A peer-equipped worker (the multi-agent spawn shape: a subagent that can talk to
+// the supervisor on the bus) must STILL be sandboxed — wiring a bus peer never
+// trades away the Box. This guards the adversary R1 path for the on-bus worker
+// specifically: there is no constructor that yields a Native with a nil Box, peer
+// or no peer. The peer surface is the bus tools only (asymmetry lives in the peer,
+// tested in internal/agent/bus); here we assert the sandbox is never dropped.
+func TestPeerWorkerStillSandboxed(t *testing.T) {
+	r := defaultRoster()
+	for _, role := range r.Roles() {
+		p, _ := r.Resolve(role)
+		w := NewWorker(p, fakeBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, stubPeer{})
+		if w.Box == nil {
+			t.Errorf("role %q: a peer-equipped worker has a nil Box — R1 regression", role)
+		}
+		if w.Peer == nil {
+			t.Errorf("role %q: the peer was dropped during construction", role)
+		}
+		if w.CommandGuard == nil {
+			t.Errorf("role %q: a peer-equipped worker has a nil CommandGuard", role)
 		}
 	}
 }

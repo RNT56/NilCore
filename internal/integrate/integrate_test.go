@@ -452,6 +452,150 @@ func TestEmptyOrderReturnsBaseTip(t *testing.T) {
 	}
 }
 
+// --- adversary regressions (P6-T01) --------------------------------------
+
+// erroringVerifier returns an ERROR (not a red verdict) for any tree containing a
+// poison marker file — modeling a branch that tries to crash the verifier (e.g. a
+// sandbox fault) to slip its unverified work onto the tip. The integrator must
+// treat a verifier error as not-green and roll back, never keep the merge.
+type erroringVerifier struct {
+	dir    string
+	poison string
+}
+
+func (v *erroringVerifier) Check(context.Context) (verify.Report, error) {
+	if _, err := os.Stat(filepath.Join(v.dir, v.poison)); err == nil {
+		return verify.Report{}, context.DeadlineExceeded // a verifier fault, not a red verdict
+	}
+	return verify.Report{Passed: true, Output: "ok"}, nil
+}
+
+// TestVerifierErrorRollsBackNeverPoisonsTip is the adversary form of the
+// convergence invariant: a branch whose merged tree makes the verifier ERROR
+// (distinct from returning Passed:false) must be rolled back to the exact verified
+// pre-merge SHA, with Escalate set — the integrator must not let a verifier crash
+// be a path onto the tip. The first (green) branch stays; the poison branch is
+// reverted and the tip equals the first merge's SHA (a verified state).
+func TestVerifierErrorRollsBackNeverPoisonsTip(t *testing.T) {
+	repo := baseRepo(t)
+	branchFrom(t, repo, "task/good", map[string]string{"good.txt": "1\n"})
+	branchFrom(t, repo, "task/poison", map[string]string{"poison": "x\n"})
+
+	log, readEvents := testLog(t)
+	it := &Integrator{
+		BaseRepo: repo,
+		NewEnv:   func(dir string) Env { return Env{Verifier: &erroringVerifier{dir: dir, poison: "poison"}} },
+		Log:      log,
+	}
+	wt, results, err := it.Integrate(context.Background(), []MergeItem{
+		{ID: "good", Branch: "task/good"},
+		{ID: "poison", Branch: "task/poison"},
+	})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	defer wt.Cleanup()
+
+	if !results[0].Verified {
+		t.Fatalf("the good branch should merge green first: %+v", results[0])
+	}
+	// The poison branch made the verifier error → it must NOT be verified, must
+	// escalate, and must carry the verifier error for the audit trail.
+	if results[1].Verified {
+		t.Error("a verifier error must not be treated as a green verdict")
+	}
+	if !results[1].Escalate {
+		t.Error("a verifier error must escalate for a re-plan")
+	}
+	if results[1].Err == nil {
+		t.Error("the verifier error should be surfaced on the result")
+	}
+	// THE invariant: the tip is the verified pre-merge SHA, never the poison merge.
+	tip, _ := wt.Head(context.Background())
+	if tip != results[1].PreSHA {
+		t.Errorf("tip after a verifier error = %s, want the verified pre-merge SHA %s", tip, results[1].PreSHA)
+	}
+	if tip != results[0].SHA {
+		t.Errorf("tip should remain the good branch's verified SHA %s, got %s", results[0].SHA, tip)
+	}
+	// The poison file must NOT be present on the tip — its merge was fully reverted.
+	if _, err := os.Stat(filepath.Join(wt.Path(), "poison")); err == nil {
+		t.Error("the poison file is still on the integration tip — the rollback did not restore the verified tree")
+	}
+	if !hasKind(readEvents(), "integration_rollback") {
+		t.Error("missing integration_rollback for the verifier-error branch")
+	}
+}
+
+// TestTipAlwaysVerifiedAcrossInterleavedReds hardens the convergence invariant
+// across a sequence that interleaves green and red branches: only the green ones
+// may ever be the tip, and after every step the worktree HEAD equals the last
+// kept (verified) SHA — there is no moment where an unverified merge is the tip.
+// This is the "no unverified tip" property under an adversarial merge order.
+func TestTipAlwaysVerifiedAcrossInterleavedReds(t *testing.T) {
+	repo := baseRepo(t)
+	// Each branch adds a unit in its own file (conflict-free merges); the verifier
+	// caps the running sum at 2. So: g1=1(green), r1=+1 alone but together=... we
+	// craft values so the tip stays the max green prefix while reds bounce off.
+	branchFrom(t, repo, "task/g1", map[string]string{"count_g1": "1\n"}) // sum 1 ok
+	branchFrom(t, repo, "task/r1", map[string]string{"count_r1": "5\n"}) // sum 6 red → rollback
+	branchFrom(t, repo, "task/g2", map[string]string{"count_g2": "1\n"}) // sum 2 ok
+	branchFrom(t, repo, "task/r2", map[string]string{"count_r2": "9\n"}) // sum 11 red → rollback
+
+	log, _ := testLog(t)
+	it := &Integrator{
+		BaseRepo: repo,
+		NewEnv:   func(dir string) Env { return Env{Verifier: &sumVerifier{dir: dir, max: 2}} },
+		Log:      log,
+	}
+	wt, results, err := it.Integrate(context.Background(), []MergeItem{
+		{ID: "g1", Branch: "task/g1"},
+		{ID: "r1", Branch: "task/r1"},
+		{ID: "g2", Branch: "task/g2"},
+		{ID: "r2", Branch: "task/r2"},
+	})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	defer wt.Cleanup()
+
+	wantVerified := map[string]bool{"g1": true, "r1": false, "g2": true, "r2": false}
+	lastVerifiedSHA := ""
+	for _, r := range results {
+		if r.Verified != wantVerified[r.ID] {
+			t.Errorf("branch %s: Verified=%t, want %t", r.ID, r.Verified, wantVerified[r.ID])
+		}
+		if r.Verified {
+			lastVerifiedSHA = r.SHA
+		} else {
+			// A rejected branch must roll the tip back to its verified pre-merge SHA.
+			if r.SHA != r.PreSHA {
+				t.Errorf("branch %s rejected but SHA %s != PreSHA %s (tip not restored)", r.ID, r.SHA, r.PreSHA)
+			}
+			if r.PreSHA != lastVerifiedSHA {
+				t.Errorf("branch %s pre-merge SHA %s != last verified tip %s (an unverified merge was the tip!)", r.ID, r.PreSHA, lastVerifiedSHA)
+			}
+		}
+	}
+	// Final tip must be the last GREEN branch's SHA — g2, not r2.
+	tip, _ := wt.Head(context.Background())
+	if tip != lastVerifiedSHA {
+		t.Errorf("final tip %s != last verified SHA %s", tip, lastVerifiedSHA)
+	}
+	// The red branches' files must be absent from the converged tip.
+	for _, red := range []string{"count_r1", "count_r2"} {
+		if _, err := os.Stat(filepath.Join(wt.Path(), red)); err == nil {
+			t.Errorf("red branch file %s survived on the verified tip", red)
+		}
+	}
+	// The green branches' files must be present.
+	for _, green := range []string{"count_g1", "count_g2"} {
+		if _, err := os.Stat(filepath.Join(wt.Path(), green)); err != nil {
+			t.Errorf("green branch file %s missing from the tip: %v", green, err)
+		}
+	}
+}
+
 // TestConfig guards the setup-error contract: a missing NewEnv or BaseRepo is a
 // program fault returned as an error (not a silent nil-worktree).
 func TestConfig(t *testing.T) {
