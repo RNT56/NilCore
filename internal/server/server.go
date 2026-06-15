@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"nilcore/internal/channel"
 	"nilcore/internal/emit"
@@ -247,29 +248,36 @@ type channelEmitter struct {
 	ch     channel.Channel
 	thread string
 
-	once sync.Once
-	q    chan string
-	wg   sync.WaitGroup
+	once     sync.Once
+	q        chan emit.Event
+	wg       sync.WaitGroup
+	throttle time.Duration // draft update interval (0 ⇒ draftThrottle); set short in tests
 }
 
 // emitBuffer bounds the per-thread surface queue. Small on purpose: under
 // backpressure the loop races ahead of a rate-limited channel and we coalesce to
-// the freshest few lines rather than backlog stale ones.
+// the freshest few events rather than backlog stale ones.
 const emitBuffer = 32
 
-// Emit enqueues one rendered surface line for this thread without ever blocking the
-// caller (the loop goroutine). It lazily starts the per-thread sender goroutine on
-// first use. When the buffer is full it drops the oldest pending line and enqueues
-// the new one (drop-oldest coalescing) — the loop stays free to steer.
+// draftThrottle is how often the streaming sink pushes the growing draft to the
+// channel — bounded to stay within the chat rate limits (Telegram edits/drafts
+// share a per-message bucket; ~1/s is the documented-safe cadence).
+const draftThrottle = 900 * time.Millisecond
+
+// Emit enqueues one surface EVENT for this thread without ever blocking the caller
+// (the loop goroutine). It lazily starts the per-thread sender goroutine on first
+// use. When the buffer is full it drops the oldest pending event and enqueues the
+// new one (drop-oldest coalescing) — the loop stays free to steer. (Carrying the
+// event, not a pre-rendered line, lets the sender accumulate streamed tokens into
+// one animated draft rather than one message per token.)
 func (e *channelEmitter) Emit(ev emit.Event) {
 	e.once.Do(e.start)
-	line := surfaceLine(ev)
 	for {
 		select {
-		case e.q <- line:
+		case e.q <- ev:
 			return
 		default:
-			// Full: discard the oldest pending line, then retry the enqueue. The
+			// Full: discard the oldest pending event, then retry the enqueue. The
 			// drain is non-blocking too, so this can never spin against a live drainer.
 			select {
 			case <-e.q:
@@ -279,24 +287,87 @@ func (e *channelEmitter) Emit(ev emit.Event) {
 	}
 }
 
-// start launches the per-thread sender goroutine. It drains the queue and performs
-// the blocking Channel.Update off the loop's path, exiting cleanly when the serve
-// ctx is cancelled — so the goroutine is bounded by the serve lifetime and joined
-// at shutdown (no leak).
+// start launches the per-thread sender goroutine off the loop's critical path,
+// exiting cleanly when the serve ctx is cancelled (bounded by the serve lifetime,
+// joined at shutdown — no leak). A transport that can stream (channel.DraftStreamer
+// — Telegram sendMessageDraft) gets live token streaming; any other channel keeps
+// the plain per-line Update behaviour, byte-identical.
 func (e *channelEmitter) start() {
-	e.q = make(chan string, emitBuffer)
+	e.q = make(chan emit.Event, emitBuffer)
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		for {
-			select {
-			case <-e.ctx.Done():
-				return
-			case line := <-e.q:
-				_ = e.ch.Update(e.ctx, e.thread, line)
-			}
+		if ds, ok := e.ch.(channel.DraftStreamer); ok {
+			e.runStream(ds)
+		} else {
+			e.runPlain()
 		}
 	}()
+}
+
+// runPlain drains events and renders each as one progress line via Channel.Update —
+// the original sink behaviour, unchanged, for a transport that cannot stream.
+func (e *channelEmitter) runPlain() {
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case ev := <-e.q:
+			_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+		}
+	}
+}
+
+// runStream gives a DraftStreamer transport live token streaming: KindToken deltas
+// accumulate into a growing buffer pushed as one animated, in-place draft on a
+// throttle (never one message per token); any framed event (or shutdown) finalizes
+// the streamed reasoning as a persistent message and then emits the framed line.
+// Tokens are never dropped by the sender — only the bounded intake queue coalesces
+// under extreme backpressure.
+func (e *channelEmitter) runStream(ds channel.DraftStreamer) {
+	interval := e.throttle
+	if interval <= 0 {
+		interval = draftThrottle
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	var buf strings.Builder
+	dirty := false
+	draftID := int64(1)
+
+	flush := func() {
+		if dirty && buf.Len() > 0 {
+			_ = ds.StreamDraft(e.ctx, e.thread, draftID, buf.String())
+			dirty = false
+		}
+	}
+	finalize := func() {
+		if buf.Len() > 0 {
+			_ = ds.FinalizeRich(e.ctx, e.thread, buf.String())
+			buf.Reset()
+			draftID++ // a fresh draft id for the next streamed turn
+		}
+		dirty = false
+	}
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			finalize()
+			return
+		case <-tick.C:
+			flush()
+		case ev := <-e.q:
+			if ev.Kind == emit.KindToken {
+				buf.WriteString(ev.Text)
+				dirty = true
+				continue
+			}
+			finalize() // commit the streamed reasoning before the framed line
+			_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+		}
+	}
 }
 
 // wait blocks until the per-thread sender goroutine has exited. It is safe to call

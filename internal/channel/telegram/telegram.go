@@ -165,16 +165,19 @@ func (b *Bot) StreamDraft(ctx context.Context, threadID string, draftID int64, t
 	}, nil)
 }
 
-// FinalizeRich persists the completed message to the thread with MarkdownV2
-// markup, replacing the ephemeral draft. richText must already be MarkdownV2 —
-// the renderer escapes the text parts (EscapeMarkdownV2) and adds its own markup.
-func (b *Bot) FinalizeRich(ctx context.Context, threadID, richText string) error {
+// FinalizeRich persists the completed message to the thread (replacing the
+// ephemeral draft) in MarkdownV2 mode. text is PLAIN — it is escaped here so
+// arbitrary model prose renders safely without the sink (which is generic over
+// channel.Channel) needing to know any transport-specific markup; structural
+// markup is a future enhancement layered on top. Sending a normal message is what
+// finalizes a draft (Bot API), so this both renders and commits.
+func (b *Bot) FinalizeRich(ctx context.Context, threadID, text string) error {
 	chatID, err := strconv.ParseInt(threadID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("bad thread id %q: %w", threadID, err)
 	}
 	return b.call(ctx, "sendMessage", map[string]any{
-		"chat_id": chatID, "text": clipText(richText), "parse_mode": "MarkdownV2",
+		"chat_id": chatID, "text": clipText(EscapeMarkdownV2(text)), "parse_mode": "MarkdownV2",
 	}, nil)
 }
 

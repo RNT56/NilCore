@@ -56,10 +56,12 @@ func TestFinalizeRich(t *testing.T) {
 	var got map[string]any
 	b := captureBot(t, "sendMessage", &got)
 
-	if err := b.FinalizeRich(context.Background(), "99", "*done* `code`"); err != nil {
+	// FinalizeRich takes PLAIN text and escapes it for MarkdownV2, so arbitrary
+	// prose (with reserved chars) renders safely.
+	if err := b.FinalizeRich(context.Background(), "99", "done: 2+2!"); err != nil {
 		t.Fatalf("FinalizeRich: %v", err)
 	}
-	if got["parse_mode"] != "MarkdownV2" || got["text"] != "*done* `code`" || got["chat_id"].(float64) != 99 {
+	if got["parse_mode"] != "MarkdownV2" || got["text"] != `done: 2\+2\!` || got["chat_id"].(float64) != 99 {
 		t.Errorf("finalize payload = %v", got)
 	}
 }
