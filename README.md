@@ -230,7 +230,8 @@ internal/
   store, memory        SQLite backbone + cross-project memory
   secrets              keychain / encrypted vault / env / external
   skills, selfimprove  Agent Skills + plugins + gated self-edit
-  budget, scheduler, maint, inspect, config   runtime resilience & ops
+  budget, scheduler, maint, inspect   runtime resilience & ops
+  onboard, paths       `nilcore init` wizard + versioned config + per-OS dirs
 eval/                  measure-first eval harness
 ```
 

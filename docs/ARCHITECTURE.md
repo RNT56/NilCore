@@ -211,7 +211,7 @@ Each is owned by a specific task in `docs/TASKS.md`. The contract above does not
 | 3 | `internal/codeintel/{ast,graph,repomap,lsp,semantic,retrieve,impact,live}` | semantic codebase understanding — four lenses + fusion pipeline returning Context Bundles; Impact Set drives the verifier and the gate. Full design: `docs/CODE-INTELLIGENCE.md` |
 | 4 | `internal/store` (SQLite), `internal/memory` | event log graduates to the store; memory retrieved into native context assembly, written back after tasks |
 | 5 | `internal/skills` (Agent Skills + native plugins), `internal/selfimprove`, `eval/` | plugin capabilities in both formats; gated self-edits scoped to prompts/skills/tools only; the eval harness that earns routing data |
-| 6 | `internal/budget`, `internal/scheduler`, `internal/maint`, `internal/inspect`, `internal/config`; resilience in `model`, durability in `agent`, auto-detect in `verify` | runtime resilience & operations — provider retry/failover, metered budgets, crash-safe resumption, concurrent-task scheduling, verify auto-detection, resource GC, operator inspect/health, config validation. Full design: `docs/OPERATIONS.md` |
+| 6 | `internal/budget`, `internal/scheduler`, `internal/maint`, `internal/inspect`; resilience in `model`, durability in `agent`, auto-detect in `verify` | runtime resilience & operations — provider retry/failover, metered budgets, crash-safe resumption, concurrent-task scheduling, verify auto-detection, resource GC, operator inspect/health. Config validation/migration now lives in `internal/onboard` (the live config schema). Full design: `docs/OPERATIONS.md` |
 
 ## Security model (summary)
 

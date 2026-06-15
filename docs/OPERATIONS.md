@@ -39,7 +39,7 @@ Long-running unattended operation accumulates state. A maintenance pass **garbag
 Beyond the audit trail, the operator needs to **see and debug**. `nilcore` subcommands **inspect and replay** the event log, show **task status** and **spend**, and `serve` exposes a **health/readiness** check for the supervisor. Built on the hash-chained log (P2-T06).
 
 ### 9. Config integrity (P6-T08)
-`nilcore init` writes config; something must load it safely every run. A **versioned schema** with **validation** (clear errors, sane defaults) and **migration** across versions turns a malformed config into a precise message instead of a confusing runtime failure.
+`nilcore init` writes config; something must load it safely every run. A **versioned schema** with **validation** (clear errors, sane defaults) and **migration** across versions turns a malformed config into a precise message instead of a confusing runtime failure. This now lives in `internal/onboard` — the live `Config`'s `Load` decodes strictly (unknown fields rejected), migrates by `version`, and `Validate`s — so there is one config schema, not two. (The standalone `internal/config` package was retired: it was never wired into boot and its schema had diverged from the live one.)
 
 ## A note on context assembly (deliberately *not* a task)
 
@@ -61,4 +61,4 @@ All store-backed state (budget ledger, task state, spend history) lives in the *
 | P6-T05 | `internal/verify/` | verification auto-detection (build/test/lint plan) |
 | P6-T06 | `internal/maint/` | GC of worktrees/containers, log rotation, bounded disk |
 | P6-T07 | `internal/inspect/` | inspect/replay log, status, spend, health endpoint |
-| P6-T08 | `internal/config/` | versioned config schema, validation, migration |
+| P6-T08 | `internal/onboard/` | versioned config schema, validation, migration (retired the standalone `internal/config`) |

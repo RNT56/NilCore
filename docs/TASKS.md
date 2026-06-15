@@ -69,7 +69,7 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 | P6-T05 | 6 | Verification auto-detection | P0-T02, P3-T09 | `internal/verify/` | |
 | P6-T06 | 6 | Resource cleanup / GC (worktrees, containers, logs) | P1-T01, P0-T03 | `internal/maint/` | |
 | P6-T07 | 6 | Operator observability + health | P2-T06, P6-T02, P6-T03 | `internal/inspect/` | |
-| P6-T08 | 6 | Config schema + validation + migration | P1-T12 | `internal/config/` | |
+| P6-T08 | 6 | Config schema + validation + migration | P1-T12 | `internal/config/` | **retired** — folded into `internal/onboard` (the live config) |
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
 
@@ -506,6 +506,7 @@ The seams that let NilCore run **unattended** without losing work, overspending,
 - **Depends on:** P1-T12  **Owns:** `internal/config/`
 - **Acceptance criteria:** a **versioned schema** with **validation** (clear errors, sane defaults) and **migration** across versions; `nilcore init` output validates; an unknown/old config is migrated or rejected with guidance.
 - **Verify:** `make verify`; tests for valid/invalid configs and a version migration.
+- **Status (retired):** the standalone `internal/config` package was built and tested in isolation but never wired into boot, and its schema (`executor`/`runtime`/`model`/`max_steps`) diverged from the live `onboard.Config` (providers, channel, backend, …). The acceptance criteria are now met by `internal/onboard.Config` itself — `Load` decodes strictly (unknown fields rejected), migrates by `version`, and `Validate`s, so a malformed `config.json` fails loudly at boot. The dead, divergent package was removed to keep one source of truth.
 
 ---
 
