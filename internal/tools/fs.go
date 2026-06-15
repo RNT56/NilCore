@@ -3,8 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,8 +19,9 @@ import (
 // outside the worktree. A lexical check alone is not enough: an in-tree symlink
 // (e.g. `evil -> /etc`) would otherwise let a write escape. We therefore resolve
 // the worktree root and the deepest existing ancestor of the target through
-// EvalSymlinks and re-check containment. (Writes additionally use O_NOFOLLOW to
-// close the TOCTOU window on the final component — see writeNoFollow.)
+// EvalSymlinks and re-check containment. (Writes additionally go through an
+// atomic temp-file + O_NOFOLLOW open + rename to close the TOCTOU window on the
+// final component — see writeNoFollow.)
 func safePath(workdir, rel string) (string, error) {
 	if rel == "" {
 		return "", fmt.Errorf("empty path")
@@ -63,22 +66,80 @@ func within(root, p string) bool {
 	return p == root || strings.HasPrefix(p, root+string(os.PathSeparator))
 }
 
-// writeNoFollow writes content to p, refusing to follow a symlink at the final
-// path component (defends against a symlink swapped in after safePath's check).
+// writeNoFollow writes content to p atomically and without following a symlink
+// at the destination.
+//
+// Atomicity: we never truncate-in-place. Instead we write the full content into
+// a freshly-created temp file in the SAME directory (so os.Rename stays on one
+// filesystem and is therefore atomic on POSIX), fsync it so the bytes are durable
+// before the rename, then os.Rename it over p. A kill of the harness at any point
+// leaves either the old file untouched (rename never happened) or the complete
+// new file (rename committed) — never a half-applied, truncated file.
+//
+// Symlink safety: the temp file is opened with O_CREATE|O_EXCL|O_NOFOLLOW under a
+// random, not-yet-existing name, so a symlink swapped in at the temp path cannot
+// be followed or clobbered. os.Rename does not follow a symlink at the
+// destination — it replaces p (even if p was swapped to a symlink after
+// safePath's check) rather than writing through it — so this is at least as
+// strong as the previous O_NOFOLLOW-on-final-component TOCTOU defense, and
+// safePath already rejects a destination that resolves outside the worktree.
 func writeNoFollow(p string, content []byte) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
-	if err != nil {
-		return err
+
+	// Preserve the destination's existing permissions on overwrite; default 0644
+	// for a new file. Lstat (not Stat) so a symlink at p is not followed here.
+	perm := os.FileMode(0o644)
+	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+		perm = fi.Mode().Perm()
 	}
+
+	// O_EXCL guarantees a brand-new file under a unique name; O_NOFOLLOW refuses a
+	// symlink swapped in at the temp path. os.CreateTemp can't set these flags, so
+	// retry on the (vanishingly rare) name collision ourselves.
+	var f *os.File
+	var tmp string
+	for i := 0; ; i++ {
+		tmp = filepath.Join(dir, fmt.Sprintf(".nilcore-tmp-%d-%d", os.Getpid(), randUint()))
+		var err error
+		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL|syscall.O_NOFOLLOW, perm)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, fs.ErrExist) && i < 1000 {
+			continue
+		}
+		return fmt.Errorf("create temp file: %w", err)
+	}
+
+	// From here on, ensure the temp file never lingers if anything fails.
 	if _, err := f.Write(content); err != nil {
 		f.Close()
-		return err
+		os.Remove(tmp)
+		return fmt.Errorf("write temp file: %w", err)
 	}
-	return f.Close()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("fsync temp file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	return nil
 }
+
+// randUint returns a random uint64 for temp-file naming. It is only used to avoid
+// name collisions, not for any security property — O_EXCL is what actually
+// guarantees a fresh file — so the stdlib math/rand/v2 source is fine.
+func randUint() uint64 { return rand.Uint64() }
 
 // ReadTool returns the contents of a file in the worktree.
 type ReadTool struct{}
