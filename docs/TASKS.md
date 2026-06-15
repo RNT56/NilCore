@@ -533,7 +533,7 @@ every backend gets a swappable sandbox without any code change.
 - **Depends on:** P7-T01  **Owns:** `internal/sandbox/`
 - **Acceptance criteria:** a conservative syscall policy that doesn't break common toolchains (compilers, test runners); applied fail-closed; ABI-aware; covered by the `sandbox-linux` job (a denied syscall is blocked, an allowed one runs).
 - **Verify:** `make verify`; the `sandbox-linux` job asserts a denied syscall fails and normal builds/tests still pass under the filter.
-- **Status:** deliberately split out of P7-T01 to keep the first security PR small and individually CI-verifiable; P7-T01's namespaces + Landlock + `no_new_privs` already satisfy I4 on their own.
+- **Status (shipped):** `internal/sandbox/seccomp_linux.go` installs a classic-BPF **denylist** (arch-validated; blocks `mount`/`umount2`/`pivot_root`/`chroot`/`setns`/`unshare`/`ptrace`/`kexec_load`/module-load/`reboot`/`swap`/`bpf`/`perf_event_open`/keyring/`acct`/clock-set/`quotactl`/`process_vm_*` with EPERM, allows the rest) via `seccomp(2)` + `SECCOMP_FILTER_FLAG_TSYNC`, applied in the re-exec child after Landlock and before `execve`. Per-arch `AUDIT_ARCH` lives in `seccomp_linux_{amd64,arm64,other}.go`; an arch NilCore doesn't target (or a kernel without seccomp filtering) degrades gracefully to namespaces + Landlock (still I4). Fail-closed on a malformed filter. The `sandbox-linux` job asserts the filter is active (`/proc/self/status` Seccomp mode 2), that a denied syscall fails (`chroot` EPERMs), and that normal work still runs; a hermetic `TestSeccompProgramShape` checks the BPF jump arithmetic. Cross-compiles + `go vet` clean for amd64/arm64; `golangci-lint` 0 issues.
 
 ---
 

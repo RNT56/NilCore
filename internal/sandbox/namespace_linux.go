@@ -3,11 +3,12 @@
 // The namespace backend confines a model-emitted command (invariant I4) with
 // Linux kernel primitives instead of a container runtime: it is born inside
 // fresh user/mount/pid/net/ipc/uts namespaces, then — in the re-exec'd child,
-// before the command runs — sets no_new_privs and a Landlock ruleset that maps
-// read-only-everywhere + read-write-under-the-worktree, exactly mirroring the
-// container backend's read-only rootfs + writable /work + tmpfs + no-egress.
-// No daemon, no image, no root: it runs wherever the kernel has Landlock
-// (5.13+) and unprivileged user namespaces, which is the whole portability win.
+// before the command runs — sets no_new_privs, a Landlock ruleset that maps
+// read-only-everywhere + read-write-under-the-worktree (mirroring the container
+// backend's read-only rootfs + writable /work + tmpfs + no-egress), and a
+// seccomp-bpf syscall denylist (seccomp_linux.go — defense-in-depth). No daemon,
+// no image, no root: it runs wherever the kernel has Landlock (5.13+) and
+// unprivileged user namespaces, which is the whole portability win.
 //
 // The mechanism is a re-exec: ExecWithEnv runs THIS binary again with a marker
 // env var and the namespace clone flags; MaybeRunInit (called first in main)
@@ -180,6 +181,14 @@ func sandboxInit(workdir string) error {
 	}
 	if err := applyLandlock(rules); err != nil {
 		return fmt.Errorf("apply landlock: %w", err)
+	}
+
+	// seccomp-bpf is the last layer, applied after Landlock and just before the
+	// execve so the filter is carried into the command. Defense-in-depth on top of
+	// the namespaces + Landlock that already satisfy I4; a kernel without seccomp
+	// filtering degrades gracefully (applySeccomp returns nil).
+	if err := applySeccomp(); err != nil {
+		return fmt.Errorf("apply seccomp: %w", err)
 	}
 	return nil
 }
