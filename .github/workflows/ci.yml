@@ -14,6 +14,17 @@ jobs:
   verify:
     name: make verify
     runs-on: ubuntu-latest
+    # internal/integrate exercises real git merges; a hosted runner has no ambient
+    # git identity, and those tests run git under a hardened env that ignores config
+    # files (GIT_CONFIG_GLOBAL=/dev/null), so `git config` won't help — the identity
+    # must come from these env vars, which git honors over config and HardenedEnv
+    # preserves. Without them, merge commits fail with "Committer identity unknown"
+    # (a pre-existing, change-independent failure).
+    env:
+      GIT_AUTHOR_NAME: nilcore-ci
+      GIT_AUTHOR_EMAIL: ci@nilcore.local
+      GIT_COMMITTER_NAME: nilcore-ci
+      GIT_COMMITTER_EMAIL: ci@nilcore.local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -36,3 +47,27 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
+
+  # The real verifier for the namespace sandbox (P7-T01): its Landlock + user-
+  # namespace confinement can only be exercised on Linux, never on the maintainer's
+  # macOS host. This job enables unprivileged user namespaces on the runner and runs
+  # the confinement suite with NILCORE_SANDBOX_MUST_RUN=1, so the security tests
+  # FAIL rather than silently skip if the backend is unavailable — no false green.
+  sandbox-linux:
+    name: namespace sandbox (linux confinement)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sudo sysctl -w user.max_user_namespaces=15000 || true
+      - name: Confinement tests must run (not skip)
+        env:
+          NILCORE_SANDBOX_MUST_RUN: "1"
+        run: go test -v -run 'TestNamespace|TestPick|TestNew|TestAvailable' ./internal/sandbox/

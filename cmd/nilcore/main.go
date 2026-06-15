@@ -60,6 +60,11 @@ import (
 var version = "dev"
 
 func main() {
+	// If this process is a re-exec'd namespace-sandbox child, apply confinement
+	// and exec the command now — this never returns. A no-op (one getenv) for
+	// every normal invocation and on every non-Linux host.
+	sandbox.MaybeRunInit()
+
 	args := os.Args[1:]
 	if len(args) == 0 {
 		// The conversational front door is the natural default: bare `nilcore`
@@ -251,6 +256,7 @@ func doctorMain(args []string) {
 	}
 	report, ready := diagnose(b.cfg, b.cred, checker)
 	fmt.Print(report)
+	fmt.Print(sandboxReport(b.cfg.Runtime))
 	if dir, derr := paths.ConfigDir(); derr == nil && passphraseInUse(dir) && os.Getenv("NILCORE_VAULT_PASSPHRASE") == "" {
 		fmt.Println("\nnote: this host uses a passphrase-sealed vault but NILCORE_VAULT_PASSPHRASE is not set — stored keys will not resolve.")
 	}
@@ -439,8 +445,8 @@ func secretMain(args []string) {
 
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
-	dir, backendName, runtime, image, checkCmd, logPath, config *string
-	maxSteps, advisorMaxCalls, escalateAfter                    *int
+	dir, backendName, runtime, image, checkCmd, logPath, config, sandboxPref *string
+	maxSteps, advisorMaxCalls, escalateAfter                                 *int
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
@@ -449,6 +455,7 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		backendName:     fs.String("backend", "native", "native | codex | claude-code"),
 		runtime:         fs.String("runtime", "podman", "container runtime: podman | docker"),
 		image:           fs.String("image", onboard.DefaultImage, "sandbox image"),
+		sandboxPref:     fs.String("sandbox", "auto", "sandbox backend: auto | namespace | container"),
 		checkCmd:        fs.String("verify", "make verify", "command that returns 0 when the task is done"),
 		logPath:         fs.String("log", "nilcore.events.jsonl", "append-only event log path"),
 		config:          fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)"),
@@ -630,7 +637,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 	adv := resolveAdvisor(*d.flags.backendName, d.boot, d.flags)
 	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
 		newEnv := func(dir string) agent.Env {
-			box := sandbox.NewContainer(*d.flags.runtime, *d.flags.image, dir)
+			box := selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir)
 			v := verify.New(box, *d.flags.checkCmd)
 			n := serveNativeBackend(d, metered, adv, box, v, in)
 			return agent.Env{Backend: n, Verifier: v}
@@ -801,10 +808,70 @@ func resolveAdvisor(backendName string, b boot, c commonFlags) advisorCfg {
 	return adv
 }
 
+// sandboxReport renders which sandbox backend `nilcore` will use on this host:
+// the namespace backend (no container runtime needed) when the kernel supports
+// it, else a container. It probes the live host, so it lives here rather than in
+// the pure, host-independent diagnose().
+func sandboxReport(runtime string) string {
+	if runtime == "" {
+		runtime = "podman"
+	}
+	ns, reason, container := sandbox.Available(runtime)
+
+	var b strings.Builder
+	mark := func(c bool) string {
+		if c {
+			return "✓"
+		}
+		return "✗"
+	}
+	b.WriteString("\nSandbox (model-emitted execution, I4):\n")
+	if ns {
+		b.WriteString("  ✓ namespace backend available (user namespaces + Landlock) — no container runtime needed\n")
+	} else {
+		fmt.Fprintf(&b, "  · namespace backend unavailable: %s\n", reason)
+	}
+	fmt.Fprintf(&b, "  %s container runtime %q on PATH\n", mark(container), runtime)
+	switch {
+	case ns:
+		b.WriteString("  → auto: the namespace backend will be preferred\n")
+	case container:
+		b.WriteString("  → auto: the container backend will be used\n")
+	default:
+		b.WriteString("  ✗ no usable sandbox — install podman/docker, or run on a Landlock-capable Linux kernel\n")
+	}
+	return b.String()
+}
+
+// selectSandbox builds the sandbox for one worktree, preferring the namespace
+// backend (no container runtime, image, or daemon needed) when the kernel
+// supports it and the operator hasn't pinned a choice. prefer is the -sandbox
+// flag ("auto" by default); "auto"/"" also honors the NILCORE_SANDBOX env
+// override. A namespace request the host can't satisfy is reported and degraded
+// to a container rather than aborting the run — sandboxing still holds (I4).
+func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
+	if prefer == "" || prefer == string(sandbox.Auto) {
+		if env := os.Getenv("NILCORE_SANDBOX"); env != "" {
+			prefer = env
+		}
+	}
+	box, err := sandbox.New(sandbox.Options{
+		Prefer:  sandbox.Backend(prefer),
+		Runtime: runtime,
+		Image:   image,
+		HostDir: dir,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox: %v; using the container backend\n", err)
+		return sandbox.NewContainer(runtime, image, dir)
+	}
+	return box
+}
+
 // envFactory builds the per-worktree backend+verifier factory.
 func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
 	return func(dir string) agent.Env {
-		box := sandbox.NewContainer(*c.runtime, *c.image, dir)
+		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
 		v := verify.New(box, *c.checkCmd)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project)
 		return agent.Env{Backend: be, Verifier: v}

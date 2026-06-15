@@ -1,8 +1,12 @@
 // Package sandbox runs commands inside an isolated boundary (invariant I4). It
-// ships the container backend (docker or podman); a microVM or namespace backend
-// can satisfy the same interface later without touching any caller. Containers
-// run hardened by default: dropped capabilities, no new privileges, a read-only
-// rootfs with writable tmpfs, and the worktree mapped to the host user.
+// ships two backends behind the Sandbox interface: a container (docker/podman)
+// and a host-native namespace backend (Linux user/mount/pid/net namespaces +
+// Landlock) that needs no runtime, image, or daemon. New auto-detects and
+// prefers the namespace backend wherever the kernel supports it, falling back to
+// a container otherwise. Both run hardened: dropped privileges, a read-only view
+// of everything outside the worktree, writable scratch, and default-deny egress.
+// A microVM backend can satisfy the same interface later without touching any
+// caller.
 package sandbox
 
 import (

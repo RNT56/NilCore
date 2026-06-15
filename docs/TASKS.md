@@ -510,6 +510,33 @@ The seams that let NilCore run **unattended** without losing work, overspending,
 
 ---
 
+## Phase 7 — Portability & efficiency
+
+Drop the hard dependencies that pin NilCore to a container host, so the sandboxed
+loop (I4) runs wherever a modern Linux kernel does — a cheap VPS, a Pi, a
+locked-down CI runner — without giving up confinement. Built entirely around the
+frozen `sandbox.Sandbox` interface and the `backend.CodingBackend` contract (I1):
+every backend gets a swappable sandbox without any code change.
+
+### P7-T01 — Host-native namespace + Landlock sandbox backend
+- **Goal:** a second `sandbox.Sandbox` implementation that confines a model-emitted command with Linux user/mount/pid/net namespaces + Landlock, needing **no container runtime, image, or daemon**, plus a `sandbox.New` factory that auto-detects and prefers it over a container when the kernel supports it.
+- **Depends on:** P0-T03 (the `sandbox` package), P2 sandbox hardening  **Owns:** `internal/sandbox/`, `cmd/nilcore/` (sandbox wiring only), `.github/workflows/ci.yml`, `docs/ARCHITECTURE.md`, `go.mod`
+- **Acceptance criteria:**
+  - `sandbox.Namespace` satisfies `Sandbox` and confines via a re-exec: the command is born in fresh namespaces, and the re-exec'd child sets `no_new_privs` + a Landlock domain (read+exec the host toolchain; read+write **only** the worktree + a `/tmp` scratch + the usual char devices) before `execve`ing `/bin/sh -c <cmd>` — so I4 holds (no arbitrary program on the host; FS confined; `CLONE_NEWNET` = default-deny egress).
+  - `sandbox.New(Options)` auto-detects: prefer namespace where Landlock + unprivileged userns are usable, else fall back to a container; an explicit, unsatisfiable preference errors. `-sandbox auto|namespace|container` + `NILCORE_SANDBOX` select; `auto` is the default. The probe is **conservative** (an AppArmor/sysctl-restricted userns reads as unsupported) so `auto` never picks a backend that would `EPERM`.
+  - Additive only: the container backend and all callers are unchanged (the factory returns the existing interface); the package builds on darwin via a `//go:build !linux` stub; `golang.org/x/sys` is promoted to a direct dependency (I6 exception, scoped to `internal/sandbox`, justified in the PR + CHANGELOG).
+  - A dedicated `sandbox-linux` CI job runs the confinement/escape tests with `NILCORE_SANDBOX_MUST_RUN=1` (fail, not skip) — the security property is only observable on Linux, so CI is its authoritative verifier.
+- **Verify:** `make verify` (darwin + linux); `GOOS=linux go build/vet ./...`; the `sandbox-linux` job proves a command runs confined, a write outside the worktree is denied (Landlock), `/dev/null` + `/tmp` scratch work, per-run env reaches the command, and egress is denied.
+
+### P7-T02 — seccomp-bpf syscall filter for the namespace backend (follow-up)
+- **Goal:** add a defense-in-depth seccomp-bpf allow/deny syscall filter to `sandbox.Namespace`, applied in the same re-exec child (TSYNC, after `no_new_privs`, before `execve`), shrinking the kernel attack surface beyond namespaces + Landlock.
+- **Depends on:** P7-T01  **Owns:** `internal/sandbox/`
+- **Acceptance criteria:** a conservative syscall policy that doesn't break common toolchains (compilers, test runners); applied fail-closed; ABI-aware; covered by the `sandbox-linux` job (a denied syscall is blocked, an allowed one runs).
+- **Verify:** `make verify`; the `sandbox-linux` job asserts a denied syscall fails and normal builds/tests still pass under the filter.
+- **Status:** deliberately split out of P7-T01 to keep the first security PR small and individually CI-verifiable; P7-T01's namespaces + Landlock + `no_new_privs` already satisfy I4 on their own.
+
+---
+
 ## Done-with-everything
 
 When all tasks are merged: tag a release, move `[Unreleased]` in `CHANGELOG.md` into the version section, and NilCore is the agent described in `CLAUDE.md` — a small, verifying, sandboxed, bounded core that plans, parallelizes across three coding backends, remembers across projects, and improves itself under a human gate — and that runs unattended with authorized control, metered budgets, durable resumption, and bounded resources.

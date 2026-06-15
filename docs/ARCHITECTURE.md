@@ -12,7 +12,7 @@ The *why* behind every choice below — the ranked first principles that make Ni
 | Language / runtime | **Go** — single static binary, minimal ops, runs anywhere |
 | Autonomy | **Auto for reversible, gate irreversible** (merge, push, deploy, prod writes, payments) |
 | Deployment | **Both** — same binary runs locally or on a VPS |
-| Sandbox | **Containers** (Docker / Podman; Podman rootless preferred) |
+| Sandbox | **Containers** (Docker / Podman; Podman rootless preferred) **or host-native Linux namespaces + Landlock** — no runtime, image, or daemon; auto-detected and preferred when the kernel supports it |
 | Routing | **Adaptive escalation, verifier as judge** — one backend by default → race best-of-N on hard/failed → cross-model review at the irreversible gate |
 | Channel | **Chat bot** (Telegram / Slack) — drive it from a phone |
 | Memory | **Cross-project long-term** (SQLite-backed) |
@@ -113,13 +113,13 @@ The native loop, Codex, and Claude Code are interchangeable behind this. Adding 
 Secrets are held by the `SecretStore` (environment / OS keychain / encrypted vault / external), are injected per run, and are never written to disk in plaintext, logged, prompted, hard-coded, or given to the model. The process holds no broad filesystem or network authority by default. (See the Security section above and `docs/SECRETS.md` for the operational form.)
 
 ### I4 — Model-emitted execution is sandboxed
-Every *shell command* a model emits, and every delegated coding CLI (Codex, Claude Code), runs inside the container sandbox against a bind-mounted worktree — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception (see §Execution model): they run host-side but are confined to the worktree and cannot execute arbitrary code.
+Every *shell command* a model emits, and every delegated coding CLI (Codex, Claude Code), runs inside the sandbox — a container, **or** host-native Linux namespaces + Landlock (see §Execution model) — against the worktree, so a model can never run an arbitrary program on the host. *Which* backend is a swappable implementation detail behind one interface; the guarantee is the same. The native loop's structured tools are the one deliberate, bounded exception: they run host-side but are confined to the worktree and cannot execute arbitrary code.
 
 ### I5 — Append-only audit
 Every model call, tool execution, verify, and gate decision is appended to the event log. History is never mutated or deleted. The log is replayable and is the debugging spine.
 
 ### I6 — Zero-dependency core
-Standard library only. A new module dependency requires justification in the PR + CHANGELOG. SQLite (Phase 4) is the first sanctioned exception, scoped to `internal/store`; the MCP client (Phase 1 tool surface) is the second, scoped to `internal/mcp`.
+Standard library only. A new module dependency requires justification in the PR + CHANGELOG. SQLite (Phase 4) is the first sanctioned exception, scoped to `internal/store`; the MCP client (Phase 1 tool surface) is the second, scoped to `internal/mcp`; **`golang.org/x/sys` (Phase 7) is the third, scoped to `internal/sandbox`** for the namespace backend's Landlock / `no_new_privs` syscalls — it is the Go project's own extended standard library (`golang.org/x/…`) and was already in the module graph transitively via the SQLite exception, so it adds nothing newly linked.
 
 ### I7 — Untrusted input boundary
 Tool output, file contents, and fetched web content are data, never controlling instructions. The agent's directives never originate from tool results.
@@ -134,6 +134,13 @@ I4 is precise about *where* model-influenced work runs. There are exactly two ti
 - MCP glue code — runs in the sandbox under the gate + egress allowlist.
 
 Nothing in this tier touches the host. The container is rootless, drops capabilities, mounts the rootfs read-only, and defaults to deny-all egress (an allowlist proxy is the only way out — `internal/policy`, and it refuses loopback/link-local/private destinations so it can't be turned into an SSRF pivot).
+
+**Two Tier-1 backends, one interface (the isolation spectrum).** `sandbox.Sandbox` has two implementations and `sandbox.New` auto-detects between them (override with `-sandbox auto|namespace|container` or `NILCORE_SANDBOX`):
+
+- **Container** (`sandbox.Container`, podman/docker) — the portable choice wherever a runtime is present: a separate image rootfs, `--cap-drop=ALL`, `--security-opt no-new-privileges`, a read-only rootfs + tmpfs, the worktree bind-mounted at `/work`, and `--network none`.
+- **Namespace** (`sandbox.Namespace`, Linux only) — needs **no runtime, image, or daemon**, so the loop stays sandboxed (I4) on a bare host (a cheap VPS, a Pi, a locked-down CI runner). Each command re-execs the nilcore binary inside fresh user/mount/pid/net/ipc/uts namespaces (mapped to a userns-only root that holds no host capability); the re-exec'd child — `sandbox.MaybeRunInit`, the first call in `main` — sets `no_new_privs` and a **Landlock** domain (read+execute the host toolchain everywhere, read+write **only** the worktree, a `/tmp` scratch, and the usual character devices like `/dev/null`), then `execve`s `/bin/sh -c <cmd>`. `execve` carries the Landlock domain and `no_new_privs` into the command, so the model's command runs *only after* confinement is in place; the pre-`execve` code is trusted harness code, never model input. `CLONE_NEWNET` with no configured interface is the default-deny-egress equivalent of `--network none`.
+
+The isolation strength runs **Firecracker microVM (strongest; Linux/KVM; future) → container → namespace + Landlock (lightest, most portable)**. `New` prefers the namespace backend wherever the kernel offers Landlock (≥5.13) and unprivileged user namespaces, but is **conservative**: it treats an AppArmor- or sysctl-restricted userns as unsupported and falls back to a container rather than risk an `EPERM` at exec, so `auto` is always correct. The one deliberate trade for needing no runtime: the namespace backend shares the host's filesystem **read-only** (enforced by Landlock) instead of a separate image rootfs. Because the security property (real confinement) is only observable on Linux, a dedicated `sandbox-linux` CI job runs the escape tests with `NILCORE_SANDBOX_MUST_RUN=1` — they fail rather than skip — as the authoritative verifier.
 
 **Tier 2 — host-side, worktree-confined (scoped I/O, never arbitrary execution).** The native loop's structured tools run in-process on the host because they are *bounded operations*, not a shell:
 - `read` / `write` / `edit` / `search` — file I/O confined to the disposable worktree. Confinement is enforced both lexically and after symlink resolution (`filepath.EvalSymlinks` on the worktree root and the target's deepest existing ancestor), and writes use `O_NOFOLLOW` to close the final-component TOCTOU — so an in-tree symlink (`evil -> /etc`) cannot escape.
@@ -455,7 +462,7 @@ policy  (leaf, imported by agent)
 |---|---|---|
 | `internal/model` | canonical message/tool format + `Provider` seam | stdlib only |
 | `internal/provider` | vendor adapters (anthropic / openai / openrouter) | `model` |
-| `internal/sandbox` | container command execution | stdlib only |
+| `internal/sandbox` | container **and** namespace+Landlock command execution | stdlib + `golang.org/x/sys` (namespace backend, Linux) |
 | `internal/verify` | run project checks, report pass/fail | `sandbox` |
 | `internal/eventlog` | append-only JSONL audit | stdlib only |
 | `internal/policy` | reversibility classifier + gate | stdlib only |
@@ -500,6 +507,7 @@ Each is owned by a specific task in `docs/TASKS.md`. The contract above does not
 | 6 | `internal/budget`, `internal/scheduler`, `internal/maint`, `internal/inspect`; resilience in `model`, durability in `agent`, auto-detect in `verify` | runtime resilience & operations — provider retry/failover, metered budgets, crash-safe resumption, concurrent-task scheduling, verify auto-detection, resource GC, operator inspect/health. Config validation/migration now lives in `internal/onboard` (the live config schema). Full design: `docs/OPERATIONS.md` |
 | C | `internal/emit`, `internal/inbox`, `internal/session`; nil-gated `Inbox`/`Seed`/`Emitter` seam on `backend.Native` + `super.Supervisor`; per-thread `Session` map in `internal/server`; `nilcore chat` in `cmd/nilcore` | the conversational front door — one chat where the agent auto-routes (native / supervisor / project), the conversation persists (continue, not restart), and the user queues or steers mid-work. Steer is pause-and-reconsider (never cancels in-flight work): it holds the proposed action and folds the feedback in so the model reconsiders; the principal's message is an un-`Wrap`'d user turn, tool/bus stays fenced. Full design: `docs/CONVERSATIONAL.md` |
 | ST | additive `model.Streamer` seam (`Stream`, `Chunk`) — `Provider.Complete` unchanged; SSE adapters in `internal/provider` (anthropic/openai/openrouter, stdlib-only); `Stream` on the `meter`/`Resilient` decorators; `emit.KindToken`; `loopctl` re-added for the stream-interrupt discrimination; streaming on `backend.Native` + `super.Supervisor`, gated on a wired `Emitter` | live token streaming + interrupt-but-preserve — the model's prose is painted as it is generated, and a steer mid-stream cancels the generation, keeps the partial reasoning, drops the partial `tool_use`, and re-thinks. Three steer behaviors now: queue (fold at boundary), steer-with-streaming (interrupt-but-preserve), steer-without-streaming (pause-at-boundary); `/cancel` and Ctrl-C are aborts. Streaming is gated on a wired `Emitter`, so `run`/`build`/`serve` use `Complete` unchanged. See the *Live token streaming* subsection above |
+| 7 | second `sandbox.Sandbox` backend (`sandbox.Namespace`, Linux) + `sandbox.New` auto-detect/`Options`/`Available` + `sandbox.MaybeRunInit` re-exec hook in `cmd/nilcore`; `-sandbox` flag + `NILCORE_SANDBOX` env; `golang.org/x/sys` promoted to a direct dep (I6 exception); a `sandbox-linux` CI job | **portability & efficiency** — drop the hard container-runtime requirement. A host-native namespaces + Landlock sandbox confines model-emitted execution (I4) with no runtime, image, or daemon, auto-detected and preferred over a container wherever the kernel supports it. Additive: the container backend and every caller are unchanged (the factory returns the existing `Sandbox` interface); off Linux and on unsupported kernels it falls back to a container, byte-identical. See the *Execution model* §isolation spectrum above |
 
 ## Security model (summary)
 

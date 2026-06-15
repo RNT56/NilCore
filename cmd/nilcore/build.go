@@ -69,40 +69,42 @@ var buildSeq atomic.Uint64
 // in a sandbox image the same way (it drives a whole project), but it reuses the
 // same boot/persistence/provider wiring. Defaults match §9.
 type buildFlags struct {
-	goal     *string
-	dir      *string
-	fresh    *string
-	verify   *string
-	runtime  *string
-	image    *string
-	logPath  *string
-	config   *string
-	maxIter  *int
-	maxFan   *int
-	maxAgent *int
-	maxDepth *int
-	budget   *float64
-	deadline *time.Duration
-	maxSteps *int
+	goal        *string
+	dir         *string
+	fresh       *string
+	verify      *string
+	runtime     *string
+	image       *string
+	sandboxPref *string
+	logPath     *string
+	config      *string
+	maxIter     *int
+	maxFan      *int
+	maxAgent    *int
+	maxDepth    *int
+	budget      *float64
+	deadline    *time.Duration
+	maxSteps    *int
 }
 
 func registerBuildFlags(fs *flag.FlagSet) buildFlags {
 	return buildFlags{
-		goal:     fs.String("goal", "", "the high-level project goal, in plain language"),
-		dir:      fs.String("dir", "", "existing git repo to build in (a disposable integration worktree is cut from it)"),
-		fresh:    fs.String("new", "", "create a fresh greenfield project at this path (mutually exclusive with -dir)"),
-		verify:   fs.String("verify", "", "override the project's done command (default: auto-detect, or advisor-chosen on greenfield)"),
-		runtime:  fs.String("runtime", "podman", "container runtime: podman | docker"),
-		image:    fs.String("image", defaultBuildImage, "sandbox image"),
-		logPath:  fs.String("log", "nilcore.events.jsonl", "append-only event log path"),
-		config:   fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)"),
-		maxIter:  fs.Int("max-iterations", 12, "outer project-loop iteration ceiling"),
-		maxFan:   fs.Int("max-fanout", 8, "subagents per single decomposition wave"),
-		maxAgent: fs.Int("max-agents", 64, "tree-wide spawn ceiling"),
-		maxDepth: fs.Int("max-depth", 1, "spawn depth ceiling (1 = only the top supervisor spawns)"),
-		budget:   fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
-		deadline: fs.Duration("deadline", 2*time.Hour, "wall-clock ceiling for the whole run"),
-		maxSteps: fs.Int("max-steps", 80, "tool-call budget for each role-worker and the supervisor's own coding pass"),
+		goal:        fs.String("goal", "", "the high-level project goal, in plain language"),
+		dir:         fs.String("dir", "", "existing git repo to build in (a disposable integration worktree is cut from it)"),
+		fresh:       fs.String("new", "", "create a fresh greenfield project at this path (mutually exclusive with -dir)"),
+		verify:      fs.String("verify", "", "override the project's done command (default: auto-detect, or advisor-chosen on greenfield)"),
+		runtime:     fs.String("runtime", "podman", "container runtime: podman | docker"),
+		image:       fs.String("image", defaultBuildImage, "sandbox image"),
+		sandboxPref: fs.String("sandbox", "auto", "sandbox backend: auto | namespace | container"),
+		logPath:     fs.String("log", "nilcore.events.jsonl", "append-only event log path"),
+		config:      fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)"),
+		maxIter:     fs.Int("max-iterations", 12, "outer project-loop iteration ceiling"),
+		maxFan:      fs.Int("max-fanout", 8, "subagents per single decomposition wave"),
+		maxAgent:    fs.Int("max-agents", 64, "tree-wide spawn ceiling"),
+		maxDepth:    fs.Int("max-depth", 1, "spawn depth ceiling (1 = only the top supervisor spawns)"),
+		budget:      fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
+		deadline:    fs.Duration("deadline", 2*time.Hour, "wall-clock ceiling for the whole run"),
+		maxSteps:    fs.Int("max-steps", 80, "tool-call budget for each role-worker and the supervisor's own coding pass"),
 	}
 }
 
@@ -152,22 +154,23 @@ func buildMain(args []string) {
 	_, _ = setupPersistence(log)
 
 	stack, err := buildStack(buildDeps{
-		goal:     *bf.goal,
-		dir:      *bf.dir,
-		fresh:    *bf.fresh,
-		verify:   *bf.verify,
-		runtime:  *bf.runtime,
-		image:    *bf.image,
-		maxIter:  *bf.maxIter,
-		maxFan:   *bf.maxFan,
-		maxAgent: *bf.maxAgent,
-		maxDepth: *bf.maxDepth,
-		maxSteps: *bf.maxSteps,
-		budget:   *bf.budget,
-		executor: exec,
-		strong:   strong,
-		log:      log,
-		approver: policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		goal:        *bf.goal,
+		dir:         *bf.dir,
+		fresh:       *bf.fresh,
+		verify:      *bf.verify,
+		runtime:     *bf.runtime,
+		image:       *bf.image,
+		sandboxPref: *bf.sandboxPref,
+		maxIter:     *bf.maxIter,
+		maxFan:      *bf.maxFan,
+		maxAgent:    *bf.maxAgent,
+		maxDepth:    *bf.maxDepth,
+		maxSteps:    *bf.maxSteps,
+		budget:      *bf.budget,
+		executor:    exec,
+		strong:      strong,
+		log:         log,
+		approver:    policy.NewConsoleApprover(os.Stdin, os.Stdout),
 	})
 	if err != nil {
 		fatal(err)
@@ -201,6 +204,7 @@ var (
 type buildDeps struct {
 	goal, dir, fresh, verify string
 	runtime, image           string
+	sandboxPref              string
 	maxIter, maxFan          int
 	maxAgent, maxDepth       int
 	maxSteps                 int
@@ -357,7 +361,7 @@ func advisorFor(strong model.Provider) *advisor.Advisor {
 // runs verifyCmd inside that sandbox: the sole done-authority (I2).
 func buildEnvFactory(d buildDeps, verifyCmd string) func(dir string) buildEnv {
 	return func(dir string) buildEnv {
-		box := sandbox.NewContainer(d.runtime, d.image, dir)
+		box := selectSandbox(d.sandboxPref, d.runtime, d.image, dir)
 		v := verify.New(box, verifyCmd)
 		return buildEnv{Box: box, Verifier: v}
 	}
@@ -802,7 +806,7 @@ func bootstrapGreenfield(ctx context.Context, d buildDeps, repo string, exec mod
 // verifier auto-detects over the scaffolded tree — the scaffold task's own MaxSteps
 // bounds it. Kept separate so bootstrap does not depend on the final verifyCmd.
 func buildEnvForScaffold(d buildDeps, dir string) buildEnv {
-	box := sandbox.NewContainer(d.runtime, d.image, dir)
+	box := selectSandbox(d.sandboxPref, d.runtime, d.image, dir)
 	cmd := d.verify
 	if cmd == "" {
 		cmd = verify.Detect(dir)

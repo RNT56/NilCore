@@ -10,7 +10,7 @@ NilCore borrows intelligence instead of re‑encoding it — so the whole agent 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
-[![Dependencies](https://img.shields.io/badge/dependencies-1%20(pure--Go%20SQLite)-2ea44f)](go.mod)
+[![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
 [![Agent size](https://img.shields.io/badge/agent-~19.7k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
@@ -43,7 +43,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~19,700 lines of Go with one dependency** — a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — is the one exception: it links the Charm stack under a build tag, so the default binary stays one‑dependency and `internal/` never imports it.)* |
+| **"The framework is too big to trust."** | The entire agent is **~19,700 lines of Go with two small dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
 
 ---
 
@@ -113,7 +113,7 @@ Provider retry/failover, cost ceilings, durable resume on restart, resource GC, 
 
 ## Quickstart
 
-**Requires** Go 1.25+ and a container runtime (`podman` rootless preferred, or `docker`).
+**Requires** Go 1.25+. On Linux with a Landlock‑capable kernel (5.13+) and unprivileged user namespaces, NilCore sandboxes the loop with **no container runtime at all** — the auto‑detected host‑native namespace backend. Otherwise (or with `-sandbox container`) it uses a container runtime (`podman` rootless preferred, or `docker`).
 
 ```sh
 # Install (or grab a binary from Releases)
@@ -187,7 +187,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 3. **No ambient authority.** Secrets via env only; never on disk, in logs, in prompts, or in code.
 4. **Model-emitted execution is sandboxed.** Shell commands and delegated CLIs run in the container; the structured file/git tools run host-side but stay confined to the worktree — the model can't run an arbitrary program on the host.
 5. **The audit log is append‑only** — hash‑chained, redacted, replayable. History is never mutated.
-6. **Zero‑dependency core** — standard library only. (SQLite, pure‑Go, is the single sanctioned exception.)
+6. **Zero‑dependency core** — standard library only; the sanctioned exceptions are pure‑Go SQLite and `golang.org/x/sys` (Go's own extended stdlib, for the Linux namespace sandbox).
 7. **Untrusted input is data, never instructions.**
 
 ---
@@ -222,7 +222,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 | **~19,700** | lines of Go — *the agent itself* (~8k core · multi‑agent · conversational front door) |
 | ~14,000 | lines including its tests (58 test files) |
 | **46** | small, single‑responsibility packages |
-| **1** | external dependency (pure‑Go SQLite) |
+| **2** | sanctioned deps — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib) |
 | **7 / 7** | invariants held |
 | **56 / 56** | build tasks shipped (Phases 0–6) · `v0.1.0` |
 

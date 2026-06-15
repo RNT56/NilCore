@@ -261,7 +261,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 		// loop and reasoning surfaces. Everything else is exactly the run path's
 		// envFactory (sandbox over the worktree, the project verifier, the advisor).
 		newEnv := func(dir string) agent.Env {
-			box := sandbox.NewContainer(*d.flags.common.runtime, *d.flags.common.image, dir)
+			box := selectSandbox(*d.flags.common.sandboxPref, *d.flags.common.runtime, *d.flags.common.image, dir)
 			v := verify.New(box, *d.flags.common.checkCmd)
 			n := chatNativeBackend(d, metered, adv, box, v, in)
 			return agent.Env{Backend: n, Verifier: v}
