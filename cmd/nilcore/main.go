@@ -129,20 +129,39 @@ func initMain(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	nonInteractive := fs.Bool("non-interactive", false, "assemble config from environment without prompting")
 	allowEmpty := fs.Bool("allow-empty", false, "write the config even with no captured provider key (env-only setup)")
+	vault := fs.String("vault", "key-file", "secret vault master key (headless, no keychain): key-file | passphrase")
 	configPath := fs.String("config", "", "config output path (default: <config-dir>/config.json)")
 	_ = fs.Parse(args)
 
-	path := *configPath
-	if path == "" {
-		dir, derr := paths.ConfigDir()
-		if derr != nil {
-			fatal(derr)
-		}
-		path = filepath.Join(dir, "config.json")
+	if *vault != "key-file" && *vault != "passphrase" {
+		fatal(fmt.Errorf("unknown -vault %q (want key-file | passphrase)", *vault))
 	}
 
-	store := detectStore(true)
+	secretDir, derr := paths.ConfigDir()
+	if derr != nil {
+		fatal(derr)
+	}
+	path := *configPath
+	if path == "" {
+		path = filepath.Join(secretDir, "config.json")
+	}
+
+	// Refuse to mix master-key modes on one vault: re-sealing existing entries
+	// under a different key would leave them undecryptable.
+	if *vault == "passphrase" && !passphraseInUse(secretDir) {
+		if _, err := os.Stat(filepath.Join(secretDir, "secrets.key")); err == nil {
+			fatal(fmt.Errorf("a key-file vault already exists at %s; remove secrets.key and secrets.vault to switch to a passphrase vault", secretDir))
+		}
+	}
+	if *vault == "key-file" && passphraseInUse(secretDir) {
+		fatal(fmt.Errorf("a passphrase vault already exists at %s; pass -vault passphrase, or remove secrets.salt and secrets.vault to switch to a key-file vault", secretDir))
+	}
+
+	store := writeStore(secretDir, *vault == "passphrase", !*nonInteractive)
 	if store.Name() == "env" {
+		if *vault == "passphrase" || passphraseInUse(secretDir) {
+			fatal(fmt.Errorf("passphrase vault selected but no passphrase available — set NILCORE_VAULT_PASSPHRASE, or run `nilcore init` interactively"))
+		}
 		fatal(fmt.Errorf("no writable secret backend: no OS keychain found and the encrypted vault under the " +
 			"config dir could not be created — fix the config-dir permissions, or provide a keychain"))
 	}
@@ -178,6 +197,9 @@ func initMain(args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "wrote config to %s (secrets stored in the %s backend)\n", path, store.Name())
 	printNextSteps(os.Stderr, cfg)
+	if passphraseInUse(secretDir) {
+		fmt.Fprintln(os.Stderr, "  vault is passphrase-sealed: export NILCORE_VAULT_PASSPHRASE before run/serve/doctor")
+	}
 }
 
 // printNextSteps closes onboarding with a concrete on-ramp instead of a flat
@@ -201,19 +223,28 @@ func printNextSteps(w io.Writer, cfg onboard.Config) {
 func doctorMain(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	configPath := fs.String("config", "", "config file from `nilcore init` (default: <config-dir>/config.json)")
+	check := fs.Bool("check", false, "make a minimal live API call per model to verify the keys actually authenticate (network)")
 	_ = fs.Parse(args)
 
 	b := loadBoot(*configPath)
-	report, ready := diagnose(b.cfg, b.cred)
+	var checker func(string) error
+	if *check {
+		checker = liveChecker(b.cred)
+	}
+	report, ready := diagnose(b.cfg, b.cred, checker)
 	fmt.Print(report)
+	if dir, derr := paths.ConfigDir(); derr == nil && passphraseInUse(dir) && os.Getenv("NILCORE_VAULT_PASSPHRASE") == "" {
+		fmt.Println("\nnote: this host uses a passphrase-sealed vault but NILCORE_VAULT_PASSPHRASE is not set — stored keys will not resolve.")
+	}
 	if !ready {
 		os.Exit(1)
 	}
 }
 
 // diagnose renders the doctor report and reports run-readiness. It is pure over
-// (config, credential resolver), so it is testable without touching the host.
-func diagnose(cfg onboard.Config, cred func(string) string) (string, bool) {
+// (config, credential resolver), so it is testable without touching the host; the
+// optional check verifies a model spec authenticates with a live call (nil skips).
+func diagnose(cfg onboard.Config, cred func(string) string, check func(string) error) (string, bool) {
 	var b strings.Builder
 	ok := func(c bool) string {
 		if c {
@@ -257,7 +288,57 @@ func diagnose(cfg onboard.Config, cred func(string) string) (string, bool) {
 		allow := principalAllowlist(cfg)
 		fmt.Fprintf(&b, "  %s serve allowlist resolves (%d) — required to serve\n", ok(len(allow) > 0), len(allow))
 	}
+
+	// Optional live check: prove the configured model actually authenticates,
+	// not merely that a key is present. A failure makes the host not-ready.
+	if check != nil {
+		b.WriteString("\nLive model check:\n")
+		specs := liveSpecs(cfg)
+		if len(specs) == 0 {
+			b.WriteString("  - skipped (no native model to probe for this backend)\n")
+		}
+		for _, spec := range specs {
+			err := check(spec)
+			fmt.Fprintf(&b, "  %s %s responds\n", ok(err == nil), spec)
+			if err != nil {
+				fmt.Fprintf(&b, "      %v\n", err)
+				ready = false
+			}
+		}
+	}
 	return b.String(), ready
+}
+
+// liveSpecs returns the provider:model specs `doctor -check` verifies with a live
+// call: the native executor (and a distinct advisor). Delegated backends use a
+// CLI key with no model.Provider to probe, so they are presence-checked only.
+func liveSpecs(cfg onboard.Config) []string {
+	if cfg.Backend != "" && cfg.Backend != "native" {
+		return nil
+	}
+	var specs []string
+	if cfg.Executor != "" {
+		specs = append(specs, cfg.Executor)
+	}
+	if cfg.Advisor != "" && cfg.Advisor != cfg.Executor {
+		specs = append(specs, cfg.Advisor)
+	}
+	return specs
+}
+
+// liveChecker verifies a provider:model spec can authenticate, with a minimal
+// one-token request and a short timeout. Used by `nilcore doctor -check`.
+func liveChecker(cred func(string) string) func(string) error {
+	return func(spec string) error {
+		prov, err := provider.ResolveWith(spec, cred)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		_, err = prov.Complete(ctx, "", []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "ping"}}}}, nil, 1)
+		return err
+	}
 }
 
 // backendKeyEnv returns the credential env-var the configured backend needs:
@@ -314,8 +395,15 @@ func secretMain(args []string) {
 		fatal(fmt.Errorf("usage: nilcore secret set <name>"))
 	}
 	name := args[1]
-	store := detectStore(true)
+	secretDir, derr := paths.ConfigDir()
+	if derr != nil {
+		fatal(derr)
+	}
+	store := writeStore(secretDir, false, true) // auto-detect passphrase mode; prompt if needed
 	if store.Name() == "env" {
+		if passphraseInUse(secretDir) {
+			fatal(fmt.Errorf("passphrase vault in use but no passphrase available — set NILCORE_VAULT_PASSPHRASE or run interactively"))
+		}
 		fatal(fmt.Errorf("no writable secret backend: no OS keychain and no encrypted vault could be created"))
 	}
 	val, err := onboard.PromptSecret("Value for "+name, os.Stdin, os.Stdout)
@@ -727,14 +815,19 @@ func assembleStore(dir string, forWrite bool, keychain secrets.SecretStore) secr
 	if hasKeychain {
 		stores = append(stores, keychain)
 	}
-	// Include the file vault only when BOTH the vault and its key already exist,
-	// so a read never provisions a fresh key (which could not decrypt an existing
-	// vault) and a pure-environment host creates no files.
-	_, vaultErr := os.Stat(filepath.Join(dir, "secrets.vault"))
-	_, keyErr := os.Stat(filepath.Join(dir, "secrets.key"))
-	if vaultErr == nil && keyErr == nil {
-		if v := fileVault(dir); v.Name() == "file" {
-			stores = append(stores, v)
+	// Include the file vault only when the vault and its key-source already exist,
+	// so a read never provisions a fresh key/salt and a pure-environment host
+	// creates no files. Key-file mode needs secrets.key; passphrase mode needs the
+	// salt plus NILCORE_VAULT_PASSPHRASE (env only on the read path — no prompt).
+	if _, err := os.Stat(filepath.Join(dir, "secrets.vault")); err == nil {
+		if passphraseInUse(dir) {
+			if v := passphraseVault(dir, vaultPassphrase(false), false); v.Name() == "file" {
+				stores = append(stores, v)
+			}
+		} else if _, err := os.Stat(filepath.Join(dir, "secrets.key")); err == nil {
+			if v := fileVault(dir); v.Name() == "file" {
+				stores = append(stores, v)
+			}
 		}
 	}
 	stores = append(stores, secrets.EnvStore{})
@@ -799,6 +892,62 @@ func fileVault(dir string) secrets.SecretStore {
 		return secrets.EnvStore{}
 	}
 	return vault
+}
+
+// vaultSaltFile marks a passphrase-sealed vault: when it is present the vault's
+// master key is derived from NILCORE_VAULT_PASSPHRASE + this salt, not a key file.
+const vaultSaltFile = "secrets.salt"
+
+// passphraseInUse reports whether dir holds a passphrase-sealed vault (vs. the
+// key-file default) — detected by the presence of the salt file.
+func passphraseInUse(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, vaultSaltFile))
+	return err == nil
+}
+
+// passphraseVault opens the passphrase-sealed file vault in dir, deriving the key
+// from pass + the stored salt. With create set (first-time setup), a missing salt
+// is generated. Returns the read-only EnvStore when pass is empty or the vault
+// cannot be sealed, so callers degrade rather than crash.
+func passphraseVault(dir, pass string, create bool) secrets.SecretStore {
+	if pass == "" {
+		return secrets.EnvStore{}
+	}
+	salt, err := secrets.ReadOrCreateSalt(filepath.Join(dir, vaultSaltFile), create)
+	if err != nil {
+		return secrets.EnvStore{}
+	}
+	key := secrets.MasterKeyFromPassphrase(pass, salt, 0)
+	vault, err := secrets.OpenFileVault(filepath.Join(dir, "secrets.vault"), key)
+	if err != nil {
+		return secrets.EnvStore{}
+	}
+	return vault
+}
+
+// vaultPassphrase resolves the vault passphrase: NILCORE_VAULT_PASSPHRASE first
+// (the unattended path — inject it via systemd EnvironmentFile and the like),
+// then an interactive prompt with echo off. Empty when neither is available.
+func vaultPassphrase(interactive bool) string {
+	if p := os.Getenv("NILCORE_VAULT_PASSPHRASE"); p != "" {
+		return p
+	}
+	if !interactive {
+		return ""
+	}
+	p, _ := onboard.PromptSecret("Vault passphrase", os.Stdin, os.Stdout)
+	return p
+}
+
+// writeStore selects the writable secret backend for init / secret-set. Passphrase
+// mode is used when explicitly requested (`init -vault passphrase`) or already set
+// up (a salt file exists); otherwise the default keychain→key-file selection
+// applies. interactive permits prompting for the passphrase when it is not in env.
+func writeStore(dir string, requestPassphrase, interactive bool) secrets.SecretStore {
+	if requestPassphrase || passphraseInUse(dir) {
+		return passphraseVault(dir, vaultPassphrase(interactive), true)
+	}
+	return detectStoreIn(dir, true)
 }
 
 // loadConfig reads config.json (from configPath or the default location). A
