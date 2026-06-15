@@ -73,11 +73,11 @@ At run time NilCore resolves each credential **environment-first, then the Secre
 
 On a bare Linux VPS there is no keychain, so the encrypted vault needs a master key available at boot. Options, least to most operationally convenient:
 
-- **Startup passphrase** — prompted on launch. Most secure; not unattended.
-- **systemd-creds / cloud KMS** — platform-managed; unattended and strong. Recommended for production.
-- **Key-file (`0600`, owner-only)** — default. Unattended and simple; only as strong as the host's filesystem and access controls.
+- **Startup passphrase** — `nilcore init -vault passphrase`. Derives the master key from a passphrase + a per-vault random salt (PBKDF2-HMAC-SHA256, 200k iterations; the salt is stored at `secrets.salt`, the key never is). Most secure; for unattended run/serve the passphrase is supplied via `NILCORE_VAULT_PASSPHRASE` (e.g. a systemd `EnvironmentFile`), otherwise `init` prompts for it. No master-key file sits on disk.
+- **systemd-creds / cloud KMS** — platform-managed; unattended and strong. Recommended for production (constructed directly / external store).
+- **Key-file (`0600`, owner-only)** — `nilcore init` default. Unattended and simple; only as strong as the host's filesystem and access controls.
 
-`nilcore init` selects the backend automatically: the OS keychain when its CLI is present, otherwise the encrypted-file vault sealed with the **key-file** master key (the headless default above). The passphrase and KMS strategies are constructed directly (`MasterKeyFromPassphrase` / external) and are not yet wizard-selectable.
+`nilcore init` selects the backend automatically: the OS keychain when its CLI is present, otherwise the encrypted-file vault. The vault's master-key strategy defaults to the **key-file**; pass `-vault passphrase` to seal it with a passphrase instead. Switching modes on an existing vault is refused (it would leave prior entries undecryptable) — remove `secrets.key`/`secrets.salt` + `secrets.vault` to start over. `nilcore doctor` warns when a passphrase vault is in use but `NILCORE_VAULT_PASSPHRASE` is unset.
 
 ## 9. Provider & CLI auth reference
 

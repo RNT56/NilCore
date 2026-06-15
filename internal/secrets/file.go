@@ -191,6 +191,33 @@ func MasterKeyFromFile(keyPath string) ([]byte, error) {
 	return b[:32], nil
 }
 
+// ReadOrCreateSalt returns the PBKDF2 salt stored at path. When create is set and
+// the file is absent, it generates a fresh random 16-byte salt and persists it
+// (0600). The salt is not secret — it only needs to be stable across runs so the
+// same passphrase derives the same key — but a per-vault random salt defeats
+// precomputation. With create false, a missing file is an error (boot must not
+// silently mint a new salt that would derive a key unable to decrypt the vault).
+func ReadOrCreateSalt(path string, create bool) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err == nil {
+		return b, nil
+	}
+	if !create || !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	salt := make([]byte, 16)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, salt, 0o600); err != nil {
+		return nil, fmt.Errorf("write salt: %w", err)
+	}
+	return salt, nil
+}
+
 // MasterKeyFromPassphrase derives a 32-byte key via PBKDF2-HMAC-SHA256 (stdlib).
 // salt must be stable across runs (store it next to the vault; it is not secret).
 func MasterKeyFromPassphrase(passphrase string, salt []byte, iterations int) []byte {

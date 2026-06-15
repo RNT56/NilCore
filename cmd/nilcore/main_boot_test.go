@@ -263,6 +263,61 @@ func TestAssembleStoreWriteThenReadHandshake(t *testing.T) {
 	}
 }
 
+func TestPassphraseVaultRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	w := passphraseVault(dir, "pw", true) // first-time: generates the salt
+	if w.Name() != "file" {
+		t.Fatalf("write store = %q, want file", w.Name())
+	}
+	if err := w.Set("k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if !passphraseInUse(dir) {
+		t.Error("salt file should mark passphrase mode")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "secrets.key")); !os.IsNotExist(err) {
+		t.Error("passphrase mode must not write a key file")
+	}
+	if got, err := passphraseVault(dir, "pw", false).Get("k"); err != nil || got != "v" {
+		t.Fatalf("read-back = %q, %v", got, err)
+	}
+	if _, err := passphraseVault(dir, "wrong", false).Get("k"); err == nil {
+		t.Error("a wrong passphrase must fail to decrypt")
+	}
+	if passphraseVault(dir, "", false).Name() != "env" {
+		t.Error("empty passphrase must degrade to the env store")
+	}
+}
+
+func TestWriteStoreSelectsPassphrase(t *testing.T) {
+	t.Setenv("NILCORE_VAULT_PASSPHRASE", "pw")
+	dir := t.TempDir()
+	if s := writeStore(dir, true, false); s.Name() != "file" || !passphraseInUse(dir) {
+		t.Fatalf("requested passphrase: store=%q salt=%v", s.Name(), passphraseInUse(dir))
+	}
+	// Once the salt exists the mode is auto-detected, even without re-requesting it.
+	if s := writeStore(dir, false, false); s.Name() != "file" {
+		t.Errorf("auto-detected passphrase: store=%q", s.Name())
+	}
+}
+
+func TestAssembleStoreReadsPassphraseVault(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("NILCORE_VAULT_PASSPHRASE", "pw")
+	w := passphraseVault(dir, "pw", true)
+	if err := w.Set("anthropic_api_key", "sk"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := assembleStore(dir, false, secrets.EnvStore{}).Get("anthropic_api_key"); err != nil || got != "sk" {
+		t.Fatalf("read path should resolve the passphrase vault: %q, %v", got, err)
+	}
+	// Without the passphrase the vault is skipped → env-only (no silent decrypt failure path).
+	t.Setenv("NILCORE_VAULT_PASSPHRASE", "")
+	if s := assembleStore(dir, false, secrets.EnvStore{}); s.Name() != "env" {
+		t.Errorf("no passphrase → vault skipped, got %q", s.Name())
+	}
+}
+
 func TestChainStore(t *testing.T) {
 	miss := secrets.EnvStore{} // read-only: Get misses, Set is rejected
 	hit := &writableStore{m: map[string]string{"x": "1"}}
