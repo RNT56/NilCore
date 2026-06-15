@@ -98,6 +98,10 @@ func main() {
 		inspectMain(args[1:])
 	case "mcp-call":
 		mcpCallMain(args[1:])
+	case "propose-edit":
+		proposeEditMain(args[1:])
+	case "watch":
+		watchMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -120,6 +124,8 @@ Usage:
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
   nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
   nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
+  nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
+  nilcore propose-edit -goal "..." -paths ...  gated self-edit of the agent's own prompts/skills/tools
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
@@ -517,6 +523,30 @@ func runMain(args []string) {
 	if !out.Verified {
 		fmt.Printf("\nchecks did not pass:\n%s\n", out.Detail)
 		os.Exit(1)
+	}
+}
+
+// buildRunOrchestrator constructs the single-task orchestrator the run-style
+// commands share (run / propose-edit / watch): the native backend via envFactory,
+// the console gate, persistence, and memory write-back. It mirrors runMain's wiring
+// so a self-started or self-edit task runs through the EXACT same verified path —
+// the verifier remains the sole authority on done (I2), the gate on irreversible
+// actions (I3/policy).
+func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string) *agent.Orchestrator {
+	prov, err := resolveProvider(*c.backendName, b)
+	if err != nil {
+		fatal(err)
+	}
+	mem, cp := setupPersistence(log)
+	return &agent.Orchestrator{
+		BaseRepo:   absDir,
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir),
+		Log:        log,
+		Router:     agent.SingleRouter{},
+		Spawner:    agent.NoSpawner{},
+		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		OnSuccess:  memWriteBack(mem, absDir),
+		Checkpoint: cp,
 	}
 }
 
