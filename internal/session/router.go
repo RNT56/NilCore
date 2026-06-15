@@ -273,9 +273,14 @@ func wordSet(s string) map[string]bool {
 	return out
 }
 
-// isWordBreak splits on anything that is not a letter or digit.
+// isWordBreak splits on anything that is not an ASCII letter or digit.
 func isWordBreak(r rune) bool {
-	return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return false
+	default:
+		return true
+	}
 }
 
 // firstTextBlock returns the first non-empty text block — the same defensive read

@@ -159,6 +159,10 @@ func TestSteerSentinelIsStable(t *testing.T) {
 	if errors.Is(ErrSteer, context.Canceled) {
 		t.Fatal("ErrSteer must not match context.Canceled")
 	}
+	// Intentionally the reversed direction: this mirrors the loop's real check,
+	// errors.Is(cause, ErrSteer) where cause is an ordinary context.Canceled, which
+	// must stay false. SA1032's "wrong order" heuristic is a false positive here.
+	//nolint:staticcheck // SA1032: reversed direction is the point of this assertion
 	if errors.Is(context.Canceled, ErrSteer) {
 		t.Fatal("context.Canceled must not match ErrSteer")
 	}

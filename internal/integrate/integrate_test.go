@@ -224,7 +224,7 @@ func TestGreenAloneRedCombined(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	if len(results) != 2 {
 		t.Fatalf("want 2 results, got %d", len(results))
@@ -294,7 +294,7 @@ func TestConflictAbortsCleanly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	if !results[0].Verified {
 		t.Fatalf("branch a should merge green first: %+v", results[0])
@@ -356,7 +356,7 @@ func TestNeverLandsToBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	for _, r := range results {
 		if !r.Verified {
@@ -399,7 +399,7 @@ func TestAllGreenSequential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	prev := ""
 	for i, r := range results {
@@ -439,7 +439,7 @@ func TestEmptyOrderReturnsBaseTip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 	if len(results) != 0 {
 		t.Errorf("want 0 results for empty order, got %d", len(results))
 	}
@@ -494,7 +494,7 @@ func TestVerifierErrorRollsBackNeverPoisonsTip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	if !results[0].Verified {
 		t.Fatalf("the good branch should merge green first: %+v", results[0])
@@ -557,7 +557,7 @@ func TestTipAlwaysVerifiedAcrossInterleavedReds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 
 	wantVerified := map[string]bool{"g1": true, "r1": false, "g2": true, "r2": false}
 	lastVerifiedSHA := ""
