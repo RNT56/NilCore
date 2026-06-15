@@ -102,6 +102,8 @@ type CodingBackend interface {
 ```
 The native loop, Codex, and Claude Code are interchangeable behind this. Adding a backend is additive and parallel-safe. Changing `Task`/`Result`/the interface is a dedicated serialized task and ripples to every backend at once.
 
+**Optional bus seam on the native loop (additive, contract-untouched).** `backend.Native` carries one optional field `Peer backend.Peer` alongside the existing optional `Advisor`. When nil — the single-agent default — the loop is byte-identical: no bus tools are registered and no bus code runs (gated exactly like `Advisor`). When set (multi-agent mode), it registers three bus tools — `ask_supervisor` (blocking Ask, `KindQuestion`), `share_finding` (async Send, `KindFinding`), and `request_review` (blocking Ask, `KindReviewRequest`) — and routes each call through `Peer.Dispatch`. The `Peer` interface (`Tools() []model.Tool`; `Dispatch(ctx, name, input) (string, error)`) is declared in `backend` itself, not imported from `internal/agent/bus`, so the frozen-contract package keeps a leaf import graph; the concrete `*bus.AgentPeer` satisfies it. Every peer reply is `guard.Wrap`-fenced before it becomes a `tool_result` (I7), identical to the advisor and shell-output paths — a peer body is data, never instructions. `Task`, `Result`, and the `CodingBackend` interface are untouched (I1); this is an additive field, mirroring the `Advisor` gate.
+
 ### I2 — The verifier is the only authority on "done"
 `Result.SelfClaimed` is advisory. After **any** backend runs, the orchestrator re-runs the project's checks (`verify.Verifier.Check`) and that boolean decides whether work ships. This is what makes delegating to black-box agents safe: their self-report never governs.
 
