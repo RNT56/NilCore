@@ -90,6 +90,51 @@ func TestChannelEmitterStreams(t *testing.T) {
 	e.wait() // clean join, no leak
 }
 
+// TestCoalesceKeepsFrames proves the bounded queue sheds the OLDEST TOKEN under
+// backpressure but never a framed event (a dropped frame would lose a turn boundary
+// and merge two turns into one draft). Order among survivors is preserved.
+func TestCoalesceKeepsFrames(t *testing.T) {
+	e := &channelEmitter{}
+	e.buf = []emit.Event{
+		{Kind: emit.KindToken, Text: "a"},
+		{Kind: emit.KindTool, Text: "frame"},
+		{Kind: emit.KindToken, Text: "b"},
+	}
+	e.coalesce()
+	if len(e.buf) != 2 || e.buf[0].Kind != emit.KindTool || e.buf[1].Text != "b" {
+		t.Fatalf("coalesce must drop the oldest token and keep the frame: %+v", e.buf)
+	}
+	// Pathological all-frames backlog: drop the oldest event so it stays bounded.
+	e.buf = []emit.Event{{Kind: emit.KindTool, Text: "1"}, {Kind: emit.KindTool, Text: "2"}}
+	e.coalesce()
+	if len(e.buf) != 1 || e.buf[0].Text != "2" {
+		t.Fatalf("all-frames coalesce must drop the oldest: %+v", e.buf)
+	}
+}
+
+// TestStreamFinalizesOnStepChange proves that two turns never merge even when the
+// framed boundary between them is missing: a token carrying a new step closes the
+// prior turn as its own finalized message first. It also proves the shutdown path
+// persists the in-flight reasoning on a detached context (the serve ctx is dead).
+func TestStreamFinalizesOnStepChange(t *testing.T) {
+	fake := &draftFake{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := &channelEmitter{ctx: ctx, ch: fake, thread: "t", throttle: 5 * time.Millisecond}
+
+	// Step 1's tokens, then step 2's tokens with NO framed boundary between them
+	// (as if the boundary were coalesced away). The step change must finalize step 1.
+	e.Emit(emit.Event{Kind: emit.KindToken, Step: 1, Text: "alpha"})
+	e.Emit(emit.Event{Kind: emit.KindToken, Step: 2, Text: "beta"})
+	waitSaw(t, fake, func(f *draftFake) []string { return f.finals }, "alpha", "step-change finalize")
+
+	cancel() // shutdown with "beta" still in flight
+	e.wait()
+	if !fake.saw(func(f *draftFake) []string { return f.finals }, "beta") {
+		t.Error("shutdown must persist the in-flight reasoning via a detached ctx")
+	}
+}
+
 // A non-DraftStreamer channel keeps the plain per-line behaviour (no drafts).
 func TestChannelEmitterPlainFallback(t *testing.T) {
 	plain := &plainOnly{}

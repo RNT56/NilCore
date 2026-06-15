@@ -57,10 +57,16 @@ func tuiMain(args []string) {
 		fatal(fmt.Errorf("nilcore tui requires the native backend (a model provider to route and converse with)"))
 	}
 
+	// The conversation ctx is created BEFORE the approver so the approver can select
+	// on it: a quit/shutdown then unblocks any gate the drive is parked on, instead
+	// of wedging the drive goroutine and hanging sess.Wait() forever.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	events := make(chan emit.Event, 256)
 	gates := make(chan gateReq)
 	em := &tuiEmitter{events: events}
-	ap := &tuiApprover{gates: gates}
+	ap := &tuiApprover{ctx: ctx, gates: gates}
 
 	sess, err := buildChatSession(chatDeps{
 		flags:    cf,
@@ -74,9 +80,6 @@ func tuiMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), events, gates), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -114,13 +117,28 @@ type gateReq struct {
 
 // tuiApprover renders gates as a modal: Approve hands the request to the UI and
 // blocks (the drive goroutine is meant to wait for the human) until the user
-// answers. The blocking send is correct — the gate IS a blocking decision.
-type tuiApprover struct{ gates chan gateReq }
+// answers. The gate IS a blocking decision — but BOTH the handoff and the wait
+// select on a.ctx so a quit/shutdown can never wedge the drive goroutine (which
+// would hang sess.Wait() forever and leak the goroutine). A cancelled ctx
+// default-DENIES, honouring the same contract as the production approvers.
+type tuiApprover struct {
+	ctx   context.Context
+	gates chan gateReq
+}
 
 func (a *tuiApprover) Approve(action string) bool {
 	reply := make(chan bool, 1)
-	a.gates <- gateReq{action: action, reply: reply}
-	return <-reply
+	select {
+	case a.gates <- gateReq{action: action, reply: reply}:
+	case <-a.ctx.Done():
+		return false // torn down before the UI could pose the gate
+	}
+	select {
+	case ans := <-reply:
+		return ans
+	case <-a.ctx.Done():
+		return false // torn down while the modal was pending
+	}
 }
 
 // --- model ---
@@ -235,6 +253,13 @@ func (m tuiModel) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.gate.reply <- false
 			m.append(styleErr.Render("  ✗ denied: ") + m.gate.action)
 			m.gate = nil
+		case "ctrl+c":
+			// ^C must escape a pending gate too (otherwise it is swallowed here and
+			// the only way out is to answer). Deny it — the reply channel is buffered
+			// so the send never blocks — then quit.
+			m.gate.reply <- false
+			m.gate = nil
+			return m, tea.Quit
 		}
 		m.refresh()
 		return m, nil

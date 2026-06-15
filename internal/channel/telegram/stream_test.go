@@ -73,6 +73,11 @@ func TestEscapeMarkdownV2(t *testing.T) {
 	if EscapeMarkdownV2("plain text with spaces") != "plain text with spaces" {
 		t.Error("text with no specials must be unchanged")
 	}
+	// A literal backslash (a Windows path, a regex) must itself be escaped — '\' is
+	// MarkdownV2's escape char, so an unescaped one breaks the next reserved char.
+	if got := EscapeMarkdownV2(`C:\d+`); got != `C:\\d\+` {
+		t.Errorf("backslash escape = %q, want %q", got, `C:\\d\+`)
+	}
 }
 
 func TestClipText(t *testing.T) {
@@ -83,4 +88,38 @@ func TestClipText(t *testing.T) {
 	if clipText("short") != "short" {
 		t.Error("short text must be unchanged")
 	}
+}
+
+// TestClipEscapeMarkdownV2 proves the rich finalize never produces a dangling
+// backslash: a long, reserved-char-dense payload (whose escaped form exceeds the
+// cap) is clipped on a whole escape pair, stays within the limit, and ends in a
+// valid (non-reserved) ellipsis — so Telegram accepts it instead of 400-rejecting
+// and losing the finalized message.
+func TestClipEscapeMarkdownV2(t *testing.T) {
+	// 5000 dots: each escapes to "\." so the escaped form is ~10000 runes, well over
+	// the 4096 cap — exactly the boundary the naive escape-then-clip got wrong.
+	got := clipEscapeMarkdownV2(strings.Repeat(".", 5000))
+	if n := len([]rune(got)); n > telegramTextLimit {
+		t.Fatalf("clipped escaped len = %d, want <= %d", n, telegramTextLimit)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("clipped output must end in the ellipsis, got tail %q", lastRunes(got, 4))
+	}
+	// No dangling backslash: every '\' must be followed by the char it escapes, so
+	// the count of backslashes equals the count of escape pairs (one '\.' each).
+	if bs := strings.Count(got, "\\"); bs != strings.Count(got, `\.`) {
+		t.Errorf("dangling backslash: %d backslashes vs %d escape pairs", bs, strings.Count(got, `\.`))
+	}
+	// Short reserved text is escaped fully, unclipped (no ellipsis).
+	if g := clipEscapeMarkdownV2("a.b!"); g != `a\.b\!` {
+		t.Errorf("short escape = %q, want %q", g, `a\.b\!`)
+	}
+}
+
+func lastRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
 }

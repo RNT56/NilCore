@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -87,5 +88,27 @@ func TestTUIEmitterNonBlocking(t *testing.T) {
 	e := &tuiEmitter{events: make(chan emit.Event, 2)}
 	for i := 0; i < 10; i++ { // far past the buffer — must not block
 		e.Emit(emit.Event{Kind: emit.KindToken, Text: "x"})
+	}
+}
+
+// TestTUIApproverUnblocksOnCancel proves a quit/shutdown can never wedge the drive
+// goroutine in a pending gate: a cancelled ctx releases Approve with a default-deny,
+// even though no UI receiver ever takes the gateReq. Without the ctx select this
+// hangs forever (and hangs sess.Wait() at shutdown).
+func TestTUIApproverUnblocksOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ap := &tuiApprover{ctx: ctx, gates: make(chan gateReq)} // unbuffered, no receiver
+
+	done := make(chan bool, 1)
+	go func() { done <- ap.Approve("git push origin main") }()
+
+	cancel() // tear down with the gate still pending
+	select {
+	case got := <-done:
+		if got {
+			t.Error("a cancelled gate must default-deny")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Approve did not return after ctx cancel — the shutdown hang is not fixed")
 	}
 }

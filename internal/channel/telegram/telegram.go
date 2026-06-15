@@ -177,20 +177,26 @@ func (b *Bot) FinalizeRich(ctx context.Context, threadID, text string) error {
 		return fmt.Errorf("bad thread id %q: %w", threadID, err)
 	}
 	return b.call(ctx, "sendMessage", map[string]any{
-		"chat_id": chatID, "text": clipText(EscapeMarkdownV2(text)), "parse_mode": "MarkdownV2",
+		"chat_id": chatID, "text": clipEscapeMarkdownV2(text), "parse_mode": "MarkdownV2",
 	}, nil)
 }
+
+// markdownV2Special is the set of MarkdownV2 reserved characters that must be
+// backslash-escaped in body text. It INCLUDES the backslash itself: MarkdownV2 uses
+// '\' as its escape char, so a literal '\' in model prose (a Windows path, a regex
+// like \d+) must become '\\' or Telegram rejects the message with "can't parse
+// entities".
+const markdownV2Special = "\\_*[]()~`>#+-=|{}.!"
 
 // EscapeMarkdownV2 escapes the MarkdownV2 reserved characters so arbitrary text
 // (model output, a tool name) is safe inside a MarkdownV2 message without breaking
 // its formatting. The renderer escapes the text PARTS and wraps them in its own
 // markup (* _ ` >).
 func EscapeMarkdownV2(s string) string {
-	const special = "_*[]()~`>#+-=|{}.!"
 	var out strings.Builder
 	out.Grow(len(s) + 8)
 	for _, r := range s {
-		if strings.ContainsRune(special, r) {
+		if strings.ContainsRune(markdownV2Special, r) {
 			out.WriteByte('\\')
 		}
 		out.WriteRune(r)
@@ -198,8 +204,38 @@ func EscapeMarkdownV2(s string) string {
 	return out.String()
 }
 
-// clipText bounds a message to the Bot API character cap, cutting on a rune
-// boundary so a clipped message never carries invalid UTF-8.
+// clipEscapeMarkdownV2 escapes s for MarkdownV2 AND bounds the RESULT to the Bot
+// API character cap, cutting only on whole escape pairs. Escaping must precede a
+// length check (it can nearly double the length), but clipping the escaped string
+// blindly can sever a "\x" pair and leave a dangling backslash — an invalid escape
+// Telegram rejects, losing the whole finalized message. So this escapes rune by
+// rune, stops before a pair would breach the cap (reserving one rune for the
+// ellipsis, itself non-reserved so it stays valid), and never emits a lone '\'.
+func clipEscapeMarkdownV2(s string) string {
+	var out strings.Builder
+	out.Grow(len(s) + 8)
+	count := 0
+	for _, r := range s {
+		w := 1
+		if strings.ContainsRune(markdownV2Special, r) {
+			w = 2 // a reserved char emits "\<r>", two runes
+		}
+		if count+w > telegramTextLimit-1 { // keep one rune of headroom for the ellipsis
+			out.WriteString("…")
+			return out.String()
+		}
+		if w == 2 {
+			out.WriteByte('\\')
+		}
+		out.WriteRune(r)
+		count += w
+	}
+	return out.String()
+}
+
+// clipText bounds a PLAIN message (no escaping) to the Bot API character cap,
+// cutting on a rune boundary so a clipped message never carries invalid UTF-8. Used
+// by the plain draft stream; the rich finalize uses clipEscapeMarkdownV2.
 func clipText(s string) string {
 	r := []rune(s)
 	if len(r) <= telegramTextLimit {

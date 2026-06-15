@@ -233,23 +233,33 @@ func (s *Server) drainShutdown() {
 // The sink is NON-BLOCKING from the loop's perspective (docs/CONVERSATIONAL.md
 // §5.2): Channel.Update is a remote HTTP call (Telegram/Slack rate limits, 429
 // retry-after) and the loop must never block on it — the steer that unblocks the
-// loop must always be deliverable. So Emit only enqueues onto a buffered,
-// drop-oldest channel; a dedicated per-thread sender goroutine drains it and makes
-// the actual Update call off the loop's critical path. A full buffer drops the
-// OLDEST pending line (coalescing under backpressure) rather than blocking the
-// loop or unboundedly growing — the latest intent is the one worth showing.
+// loop must always be deliverable. So Emit only appends to an in-memory queue and
+// signals a dedicated per-thread sender goroutine, which makes the actual Update /
+// StreamDraft call off the loop's critical path.
+//
+// The queue is an ORDERED slice bounded by emitBuffer. Under backpressure (the loop
+// racing ahead of a rate-limited channel) it coalesces by dropping the OLDEST
+// pending TOKEN — never a FRAMED event (intent/tool/verify/steer_ack). That
+// distinction is load-bearing: a framed event is a turn boundary that finalizes the
+// streamed draft and bumps its id, so silently dropping one would merge two turns
+// into a single draft under a stale id and erase a tool/steer line. Tokens are
+// coalescible (the sender concatenates them into one animated draft), so shedding
+// the oldest just skips the animation ahead — exactly the freshest-wins intent.
+// Order is preserved, so tokens never reorder across a boundary.
 //
 // Lifecycle: the sender goroutine starts on the first Emit and exits when the serve
 // ctx is cancelled (shutdown) — bounded, joinable via the WaitGroup, no leak. Emit
 // is safe for concurrent calls from the loop goroutine (sync.Once guards the lazy
-// start; the channel send/drain is inherently concurrent-safe).
+// start; e.mu guards the queue; the wake signal is a buffered, lossless edge).
 type channelEmitter struct {
 	ctx    context.Context
 	ch     channel.Channel
 	thread string
 
 	once     sync.Once
-	q        chan emit.Event
+	mu       sync.Mutex    // guards buf
+	buf      []emit.Event  // ordered pending queue; coalesced by dropping the oldest token
+	wake     chan struct{} // cap-1 edge: signals the sender that buf changed
 	wg       sync.WaitGroup
 	throttle time.Duration // draft update interval (0 ⇒ draftThrottle); set short in tests
 }
@@ -264,27 +274,56 @@ const emitBuffer = 32
 // share a per-message bucket; ~1/s is the documented-safe cadence).
 const draftThrottle = 900 * time.Millisecond
 
+// finalizeGrace bounds the best-effort final FinalizeRich made at shutdown on a
+// DETACHED context (the serve ctx is already cancelled), so the last in-flight
+// reasoning is still persisted instead of evaporating with the ephemeral draft.
+const finalizeGrace = 2 * time.Second
+
 // Emit enqueues one surface EVENT for this thread without ever blocking the caller
 // (the loop goroutine). It lazily starts the per-thread sender goroutine on first
-// use. When the buffer is full it drops the oldest pending event and enqueues the
-// new one (drop-oldest coalescing) — the loop stays free to steer. (Carrying the
-// event, not a pre-rendered line, lets the sender accumulate streamed tokens into
-// one animated draft rather than one message per token.)
+// use, appends under e.mu, coalesces if over budget (dropping the oldest TOKEN,
+// never a framed turn boundary), and signals the sender with a non-blocking wake.
+// (Carrying the event, not a pre-rendered line, lets the sender accumulate streamed
+// tokens into one animated draft rather than one message per token.)
 func (e *channelEmitter) Emit(ev emit.Event) {
 	e.once.Do(e.start)
-	for {
-		select {
-		case e.q <- ev:
+	e.mu.Lock()
+	e.buf = append(e.buf, ev)
+	if len(e.buf) > emitBuffer {
+		e.coalesce()
+	}
+	e.mu.Unlock()
+	select {
+	case e.wake <- struct{}{}:
+	default: // a wake is already pending; the sender drains the whole queue per wake
+	}
+}
+
+// coalesce drops the oldest pending KindToken to keep the queue within emitBuffer
+// WITHOUT discarding a framed event (a dropped frame would lose a turn boundary and
+// merge two turns). Order is otherwise preserved. As a last resort, if there is no
+// token to shed (a pathological all-frames backlog), it drops the oldest event so
+// the queue can never grow unbounded. Caller holds e.mu.
+func (e *channelEmitter) coalesce() {
+	for i, ev := range e.buf {
+		if ev.Kind == emit.KindToken {
+			e.buf = append(e.buf[:i], e.buf[i+1:]...)
 			return
-		default:
-			// Full: discard the oldest pending event, then retry the enqueue. The
-			// drain is non-blocking too, so this can never spin against a live drainer.
-			select {
-			case <-e.q:
-			default:
-			}
 		}
 	}
+	e.buf = e.buf[1:]
+}
+
+// dequeue pops the next pending event in order, or reports empty. Concurrent-safe.
+func (e *channelEmitter) dequeue() (emit.Event, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.buf) == 0 {
+		return emit.Event{}, false
+	}
+	ev := e.buf[0]
+	e.buf = e.buf[1:]
+	return ev, true
 }
 
 // start launches the per-thread sender goroutine off the loop's critical path,
@@ -293,7 +332,7 @@ func (e *channelEmitter) Emit(ev emit.Event) {
 // — Telegram sendMessageDraft) gets live token streaming; any other channel keeps
 // the plain per-line Update behaviour, byte-identical.
 func (e *channelEmitter) start() {
-	e.q = make(chan emit.Event, emitBuffer)
+	e.wake = make(chan struct{}, 1)
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -312,8 +351,14 @@ func (e *channelEmitter) runPlain() {
 		select {
 		case <-e.ctx.Done():
 			return
-		case ev := <-e.q:
-			_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+		case <-e.wake:
+			for {
+				ev, ok := e.dequeue()
+				if !ok {
+					break
+				}
+				_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+			}
 		}
 	}
 }
@@ -335,6 +380,7 @@ func (e *channelEmitter) runStream(ds channel.DraftStreamer) {
 	var buf strings.Builder
 	dirty := false
 	draftID := int64(1)
+	curStep := 0 // the loop step whose tokens buf currently holds
 
 	flush := func() {
 		if dirty && buf.Len() > 0 {
@@ -354,18 +400,44 @@ func (e *channelEmitter) runStream(ds channel.DraftStreamer) {
 	for {
 		select {
 		case <-e.ctx.Done():
-			finalize()
+			// Shutdown: persist the in-flight reasoning on a short DETACHED context.
+			// e.ctx is already cancelled, so finalizing through it would be a no-op
+			// (the http call returns context.Canceled at once) and the last draft
+			// would evaporate. The shutdown join (drainShutdown→wait) already waits
+			// for this goroutine, so the bounded extra call cannot outlive Serve.
+			if buf.Len() > 0 {
+				fctx, fcancel := context.WithTimeout(context.Background(), finalizeGrace)
+				_ = ds.FinalizeRich(fctx, e.thread, buf.String())
+				fcancel()
+			}
 			return
 		case <-tick.C:
 			flush()
-		case ev := <-e.q:
-			if ev.Kind == emit.KindToken {
-				buf.WriteString(ev.Text)
-				dirty = true
-				continue
+		case <-e.wake:
+			for {
+				ev, ok := e.dequeue()
+				if !ok {
+					break
+				}
+				if ev.Kind == emit.KindToken {
+					// A token whose step differs from the buffer's is a new turn whose
+					// framed boundary was (defensively) lost: finalize the prior turn
+					// first so two turns never merge into one draft under a stale id.
+					// Frames are never coalesced away, so this is belt-and-suspenders —
+					// but tokens carry a monotonic step, making the boundary recoverable.
+					if buf.Len() > 0 && ev.Step != curStep {
+						finalize()
+					}
+					if buf.Len() == 0 {
+						curStep = ev.Step
+					}
+					buf.WriteString(ev.Text)
+					dirty = true
+					continue
+				}
+				finalize() // commit the streamed reasoning before the framed line
+				_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
 			}
-			finalize() // commit the streamed reasoning before the framed line
-			_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
 		}
 	}
 }
