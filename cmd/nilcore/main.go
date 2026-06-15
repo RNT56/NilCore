@@ -530,6 +530,7 @@ func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	channelName := fs.String("channel", "", "telegram | slack (default: config, else telegram)")
 	budgetCeil := fs.Float64("budget", chatDefaultBudget, "global dollar ceiling per conversation (a hard wall via the meter)")
+	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -563,6 +564,15 @@ func serveMain(args []string) {
 		fatal(err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// One shared concurrency gate caps how many drives run at once across ALL
+	// threads, so a burst of conversations queues rather than overrunning the host's
+	// sandbox/model capacity. Drained and stopped after the serve loop returns.
+	gate := newDriveGate(ctx, *maxConcurrent)
+	defer gate.close()
+
 	factory := serveSessionFactory(serveDeps{
 		flags:    c,
 		provider: prov,
@@ -570,10 +580,8 @@ func serveMain(args []string) {
 		log:      log,
 		baseRepo: absDir,
 		budget:   *budgetCeil,
+		gate:     gate,
 	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
@@ -593,6 +601,7 @@ type serveDeps struct {
 	log      *eventlog.Log
 	baseRepo string
 	budget   float64
+	gate     *driveGate // shared serve drive-concurrency cap
 }
 
 // serveSessionFactory returns the server.SessionFactory that builds one wired
@@ -624,9 +633,9 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 			ID:              threadID,
 		}
 		sess.Drivers = session.Drivers{
-			Native:    session.NewNativeDriver(serveNativeRun(d, metered, approver, threadID), metered, threadID),
-			Supervise: session.NewSuperviseDriver(serveSuperviseRun(d, ledger, approver), metered),
-			Project:   session.NewProjectDriver(serveProjectRun(d, ledger, approver), metered),
+			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID)), metered, threadID),
+			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver)), metered),
+			Project:   session.NewProjectDriver(gateProject(d.gate, serveProjectRun(d, ledger, approver)), metered),
 			Chat:      session.NewChatDriver(metered),
 		}
 		return sess
