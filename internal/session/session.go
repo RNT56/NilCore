@@ -46,6 +46,13 @@ type Session struct {
 	Mem    *memory.Memory // optional, nil-safe
 	Budget *budget.Ledger // CONVERSATION-scoped ledger (keyed by ID)
 
+	// Store is the optional persistence seam (C4-T01): the bounded WorkState is
+	// restored at Restore and written back on each terminal drive so a
+	// conversation continues across a restart. A nil Store is in-memory only and
+	// never blocks (best-effort). It is *agent.Checkpoint in production; a fake in
+	// tests. See persist.go.
+	Store Store
+
 	// Inbox is the user→agent seam a running drive drains. It is created at New
 	// and reused across drives so a mid-work Turn always has somewhere to push.
 	Inbox *inbox.Box
@@ -218,7 +225,14 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 		s.State.LastOutcome = res.Outcome
 	}
 	s.Phase = Idle
+	folded := s.State
 	s.mu.Unlock()
+
+	// Persist the updated bounded state best-effort on each terminal drive, so a
+	// follow-up after a restart continues from here rather than restarting. A nil
+	// Store is a no-op; a persistence fault is logged and swallowed (durability is
+	// a backstop, not a rail — the verifier and event log remain the authorities).
+	s.persist(ctx, folded)
 
 	detail := map[string]any{
 		"route":    in.Route.String(),
