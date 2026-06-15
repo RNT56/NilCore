@@ -39,7 +39,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
 | **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. |
 | **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
-| **"I have to babysit it / can't course‑correct mid‑run."** | **Just talk to it.** `nilcore chat` is one conversation — it infers whether your message is a quick fix, a feature, or a whole project and pulls the strings itself. While it works you watch its reasoning and can **queue** a follow‑up (folds in at the next step) or **steer** — `!…` makes it **pause** at the next step, take your feedback in, and resume or change course (it never throws away in‑flight work) — to add a forgotten detail or react to a trace. |
+| **"I have to babysit it / can't course‑correct mid‑run."** | **Just talk to it.** `nilcore chat` is one conversation — it infers whether your message is a quick fix, a feature, or a whole project and pulls the strings itself. While it works you watch its reasoning and can **queue** a follow‑up (folds in at the next step) or **steer** — `!…` makes it **pause** at the next step, take your feedback in, and resume or change course (it never throws away in‑flight work) — or `/cancel` to abort the run outright while staying in the conversation. |
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
@@ -88,7 +88,7 @@ Keychain / encrypted‑file vault / env / external hook. The model never sees a 
 `serve` on a VPS; Telegram & Slack. Gates become inline Yes/No.
 
 ▸ **One conversational front door** (`nilcore chat`)
-Just talk — it infers quick‑fix vs feature vs whole‑project and acts. Watch its reasoning; **queue** a follow‑up or **steer** (`!…`) and it pauses, takes it in, then resumes or changes course. Works in the terminal and over Telegram/Slack.
+Just talk — it infers quick‑fix vs feature vs whole‑project and acts. Watch its reasoning; **queue** a follow‑up, **steer** (`!…`) — it pauses, takes it in, then resumes or changes course — or `/cancel` to abort. Works in the terminal and over Telegram/Slack.
 
 </td>
 <td width="50%" valign="top">
