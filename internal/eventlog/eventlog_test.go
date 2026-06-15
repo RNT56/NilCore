@@ -125,6 +125,33 @@ func TestStoreBacking(t *testing.T) {
 	}
 }
 
+// TestStoreErrorSurfaces proves a failed store mirror is surfaced through Err()
+// (not silently swallowed) while the authoritative JSONL stays intact and durable.
+func TestStoreErrorSurfaces(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.UseStore(s)
+	s.Close() // break the second backing: the next InsertEvent now errors
+
+	log.Append(Event{Task: "t1", Kind: "step"})
+	log.Close()
+
+	if log.Err() == nil {
+		t.Error("a failed store mirror must surface through Err(), not be swallowed")
+	}
+	// The authoritative JSONL still holds the event and verifies end to end.
+	if err := Verify(path); err != nil {
+		t.Errorf("JSONL must stay durable + verifiable despite the store failure: %v", err)
+	}
+}
+
 // TestAppendKeepsChainConsistentOnWriteFailure proves a failed write neither
 // advances the hash chain nor corrupts the log: the failure is surfaced via Err,
 // the on-disk chain still verifies, and prev stays anchored to the last durable
