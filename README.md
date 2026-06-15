@@ -5,13 +5,13 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~8,100 lines of Go** you can actually hold in your head, hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~14,800 lines of Go** you can read end to end: a ~8k single‑task core plus an opt‑in **multi‑agent supervisor** that builds whole projects. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-1%20(pure--Go%20SQLite)-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~8.1k%20LOC-1f6feb)](#the-receipts)
+[![Agent size](https://img.shields.io/badge/agent-~14.8k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
@@ -37,10 +37,11 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
 | **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. |
+| **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~8,100 lines of Go with one dependency.** If you can't hold the core in your head, it's too big. |
+| **"The framework is too big to trust."** | The entire agent is **~14,800 lines of Go with one dependency** — a ~8k single‑task core plus an opt‑in multi‑agent layer. If you can't read it end to end, it's too big. |
 
 ---
 
@@ -90,8 +91,8 @@ Keychain / encrypted‑file vault / env / external hook. The model never sees a 
 ▸ **Code intelligence**
 AST · call graph · PageRank repo‑map · LSP · semantic search · Impact Set + SBFL · live worktree‑aware updates.
 
-▸ **Adaptive orchestration**
-Plan complex goals → parallel subworkers in isolated worktrees → race best‑of‑N with the **verifier as judge**.
+▸ **Multi‑agent supervisor** (`nilcore build`)
+A supervisor spawns role‑specialized subagents (research · understand · plan · implement · review) that **communicate back and forth**, integrates their parallel worktrees into one **verifier‑green** tree, and re‑plans to convergence. Greenfield‑capable; the supervisor codes, too.
 
 ▸ **Tamper‑evident audit**
 Append‑only, hash‑chained, secret‑redacted event log. Replay any run.
@@ -122,11 +123,18 @@ nilcore -dir ./repo \
         -goal "fix the failing test in math_test.go" \
         -verify "go build ./... && go test ./..."
 
-# 3) Delegate the same task to Claude Code or Codex — verified the same way
+# 3) Build a WHOLE project from one prompt — a supervisor spawns role-specialized
+#    subagents (research/understand/plan/implement/review) that talk to each other,
+#    integrates their parallel work into one verifier-green tree, and re-plans to
+#    convergence. Greenfield (-new) or an existing repo (-dir). The final promote is
+#    the only human gate; a global budget ceiling is a hard wall.
+nilcore build -goal "Go HTTP service: /health 200 + /orders POST persists to SQLite" -new ./svc
+
+# 4) Delegate a single task to Claude Code or Codex — verified the same way
 nilcore -dir ./repo -goal "..." -backend claude-code
 nilcore -dir ./repo -goal "..." -backend codex
 
-# 4) Drive it from your phone: gates become chat replies
+# 5) Drive it from your phone: gates become chat replies
 nilcore serve -channel telegram          # needs a channel + allowlist (from `nilcore init`)
 
 # Prefer env vars / CI? Skip the wizard and export keys directly:
@@ -200,7 +208,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 | | |
 |--:|:--|
-| **~8,100** | lines of Go — *the agent itself* |
+| **~14,800** | lines of Go — *the agent itself* (~8k single‑task core + opt‑in multi‑agent layer) |
 | ~14,000 | lines including its tests (58 test files) |
 | **46** | small, single‑responsibility packages |
 | **1** | external dependency (pure‑Go SQLite) |
@@ -214,7 +222,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           init · run · serve · doctor · config · secret · version
+cmd/nilcore/           init · run · build · serve · doctor · config · secret · version
 internal/
   model, provider      canonical message format + Anthropic/OpenAI/OpenRouter
   backend              CodingBackend contract + native / codex / claude-code
@@ -222,7 +230,10 @@ internal/
   verify               the source of truth for "done" (+ auto-detection)
   eventlog             append-only, hash-chained, redacted audit trail
   policy               reversibility gate · egress allowlist · tool-call denylist
-  agent                orchestrator · routing · spawn · durability
+  agent                orchestrator · routing · spawn (DAG) · durability · bus (inter-agent)
+  super, project       multi-agent supervisor · autonomous project loop + greenfield bootstrap
+  roster, integrate    role-specialized subagents · parallel-worktree merge + verify-each
+  meter                token/dollar metering → the budget ceiling is a hard wall
   worktree             disposable git worktree per task
   channel              Channel contract · telegram · slack · authorized control
   tools, mcp           structured tools + MCP-as-code

@@ -45,6 +45,32 @@ type Native struct {
 	// consecutive verifier failures. nil leaves the loop unchanged (no escalation).
 	Advisor       *advisor.Advisor
 	EscalateAfter int // consecutive verifier failures before auto-consulting (0 = off)
+
+	// Peer, if set, is this subagent's handle on the inter-agent bus (multi-agent
+	// design §3). It registers the three bus tools (ask_supervisor / share_finding
+	// / request_review) and dispatches them. nil leaves the loop byte-identical —
+	// gated EXACTLY like Advisor above, so the single-agent path never sees a bus.
+	// The minimal interface lives here on purpose: the concrete *bus.AgentPeer
+	// (P1-T03) is not a build dependency of the frozen-contract backend package,
+	// so the bus does not leak into backend's import graph. Peer.Dispatch returns
+	// the raw reply; native.go owns the guard.Wrap fencing (I7), so a peer can
+	// never hand instructions straight into the loop's context.
+	Peer Peer
+}
+
+// Peer is the minimal handle the native loop needs onto the inter-agent bus. It
+// is satisfied by *bus.AgentPeer (internal/agent/bus, P1-T03); we define the
+// interface here rather than import bus so the frozen-contract backend package
+// keeps a leaf import graph and the bus tools stay an optional, gated seam.
+//
+// Tools returns the bus tool definitions to register (registered only when a
+// Peer is wired). Dispatch handles one of those tool calls and returns the raw
+// reply string — UNTRUSTED: the loop guard.Wraps it before it becomes a
+// tool_result, never treating a peer reply as instructions (I7). The blocking
+// (Ask) vs async (Send) distinction is the Peer's concern, not the loop's.
+type Peer interface {
+	Tools() []model.Tool
+	Dispatch(ctx context.Context, name string, input json.RawMessage) (string, error)
 }
 
 func (n *Native) Name() string { return "native" }
@@ -83,6 +109,12 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	// the no-advisor loop is exactly as before.
 	if n.Advisor != nil {
 		toolDefs = append(toolDefs, advisor.Tool())
+	}
+	// The bus tools (ask_supervisor / share_finding / request_review) are
+	// registered only when a Peer is wired, mirroring the advisor gate above, so
+	// the no-peer (single-agent) loop is byte-identical.
+	if n.Peer != nil {
+		toolDefs = append(toolDefs, n.Peer.Tools()...)
 	}
 
 	user := "Goal:\n" + t.Goal
@@ -168,6 +200,27 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				_ = json.Unmarshal(b.Input, &in)
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
 					Content: n.consultAdvisor(ctx, t, recent, in.Question)})
+
+			case "ask_supervisor", "share_finding", "request_review":
+				// Bus tools (multi-agent design §3). ask_supervisor/request_review
+				// block this step on a bus Ask; share_finding is an async Send —
+				// the distinction is the Peer's concern. We only ever fence the
+				// reply: every peer reply is guard.Wrap'd before it becomes a
+				// tool_result, identical to the advisor and shell-output paths, so
+				// an untrusted peer body can never become an instruction (I7).
+				if n.Peer == nil {
+					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
+					continue
+				}
+				reply, err := n.Peer.Dispatch(ctx, b.Name, b.Input)
+				if err != nil {
+					results = append(results, errorResult(b.ID, b.Name+": "+err.Error()))
+					continue
+				}
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "bus_tool",
+					Detail: map[string]any{"tool": b.Name}})
+				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
+					Content: guard.Wrap(b.Name+" reply", reply)})
 
 			default:
 				if n.Tools != nil && n.Tools.Has(b.Name) {

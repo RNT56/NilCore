@@ -10,11 +10,9 @@ import (
 	"fmt"
 
 	"nilcore/internal/backend"
-	"nilcore/internal/blackboard"
 	"nilcore/internal/eventlog"
-	"nilcore/internal/planner"
 	"nilcore/internal/policy"
-	"nilcore/internal/spawn"
+	"nilcore/internal/project"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -64,16 +62,15 @@ type Orchestrator struct {
 	Spawner  Spawner         // defaults to NoSpawner
 	Approver policy.Approver // consulted for irreversible actions; nil denies them
 
-	// Phase 3 adaptive layer (P3-T05) — all optional; when unset, Execute is the
-	// single-task path. When Plan + ShouldPlan are set and a goal is complex,
-	// Execute decomposes it, runs the subtasks in parallel worktrees via RunSub,
-	// records statuses on the Board, and aggregates. The verifier stays the gate
-	// (each subtask verifies its own worktree through RunSub).
-	Plan        func(ctx context.Context, goal string) (planner.Tree, error)
-	RunSub      func(ctx context.Context, st spawn.Subtask) spawn.Result
-	Board       *blackboard.Blackboard
-	ShouldPlan  func(goal string) bool
-	MaxParallel int
+	// Phase 5 supervision seam (P5-T01) — both optional; when unset, Execute is the
+	// single-task path (BYTE-IDENTICAL to today). When Project + ShouldSupervise are
+	// wired and ShouldSupervise judges the goal complex, Execute hands the goal to
+	// the autonomous project loop (plan → slice → integrate → verify → reflect to a
+	// verifier-green tree) instead of running it as one task. The verifier stays the
+	// only authority on "done" inside the loop (I2). This supersedes the retired
+	// mechanical fan-out (executePlanned): there is exactly one fan-out path.
+	Project         *project.Loop
+	ShouldSupervise func(goal string) bool
 
 	// OnSuccess, if set, runs after a verified single-task completion (P4-T05),
 	// so durable conventions/decisions can be written back to memory.
@@ -105,17 +102,41 @@ type Outcome struct {
 	Detail   string // verifier output (tail) when it did not pass
 }
 
-// Execute runs one task. Complex goals are decomposed and parallelized (the
-// adaptive layer); everything else takes the single-task path. Either way the
-// verifier is the final gate.
+// Execute runs one task. When the supervision seam is wired and ShouldSupervise
+// judges the goal complex, the goal is handed to the autonomous project loop;
+// everything else takes the single-task path. Either way the verifier is the
+// final gate. With Project==nil this is byte-identical to the single-task path.
 func (o *Orchestrator) Execute(ctx context.Context, t backend.Task) (Outcome, error) {
-	if o.Plan != nil && o.ShouldPlan != nil && o.ShouldPlan(t.Goal) {
-		if out, handled, err := o.executePlanned(ctx, t); handled || err != nil {
-			return out, err
-		}
-		// planning declined or failed — fall through to the single-task path.
+	if o.Project != nil && o.ShouldSupervise != nil && o.ShouldSupervise(t.Goal) {
+		return o.executeSupervised(ctx, t)
 	}
 	return o.executeSingle(ctx, t)
+}
+
+// executeSupervised hands a complex goal to the autonomous project loop, which
+// drives plan → slice → integrate → verify → reflect to a verifier-green tree.
+// The loop is bounded and the verifier is its only authority on done (I2); the
+// single irreversible promote inside it gates through the loop's own Gate seam.
+// The terminal project.Outcome is folded into the orchestrator's Outcome — Done
+// is the loop's verifier verdict, never a backend self-report.
+func (o *Orchestrator) executeSupervised(ctx context.Context, t backend.Task) (Outcome, error) {
+	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "supervise_start",
+		Detail: map[string]any{"goal": t.Goal}})
+
+	res, err := o.Project.Run(ctx)
+	if err != nil {
+		return Outcome{Backend: "project"}, fmt.Errorf("project loop: %w", err)
+	}
+
+	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "supervise_done",
+		Detail: map[string]any{"done": res.Done, "reason": res.Reason, "iterations": res.Iterations}})
+
+	return Outcome{
+		Backend:  "project",
+		Summary:  res.Summary,
+		Verified: res.Done,
+		Detail:   res.Reason,
+	}, nil
 }
 
 // executeSingle runs one task: create an isolated worktree, run the backend in
