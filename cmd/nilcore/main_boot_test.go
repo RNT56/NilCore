@@ -61,7 +61,7 @@ func TestResolveProviderErrors(t *testing.T) {
 
 func TestBuildChannelErrors(t *testing.T) {
 	empty := func(string) string { return "" }
-	if _, err := buildChannel("telegram", empty, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "TELEGRAM_BOT_TOKEN") {
+	if _, _, err := buildChannel("telegram", empty, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "TELEGRAM_BOT_TOKEN") {
 		t.Errorf("telegram missing token: %v", err)
 	}
 	oneSlack := func(env string) string {
@@ -70,10 +70,10 @@ func TestBuildChannelErrors(t *testing.T) {
 		}
 		return ""
 	}
-	if _, err := buildChannel("slack", oneSlack, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "SLACK_BOT_TOKEN") {
+	if _, _, err := buildChannel("slack", oneSlack, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "SLACK_BOT_TOKEN") {
 		t.Errorf("slack missing bot token: %v", err)
 	}
-	if _, err := buildChannel("irc", empty, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "unknown channel") {
+	if _, _, err := buildChannel("irc", empty, []string{"u"}, nil); err == nil || !strings.Contains(err.Error(), "unknown channel") {
 		t.Errorf("unknown channel: %v", err)
 	}
 }
