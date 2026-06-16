@@ -752,6 +752,7 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -773,6 +774,7 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {
 			return session.DriveOutcome{}, err

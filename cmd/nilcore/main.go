@@ -941,6 +941,7 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -955,6 +956,7 @@ func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approve
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {
 			return session.DriveOutcome{}, err

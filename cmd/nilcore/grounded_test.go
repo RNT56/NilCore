@@ -30,7 +30,8 @@ func TestBuildAnswerFuncGroundsInRunContext(t *testing.T) {
 			{ID: "super.lib", Role: "implementer", State: "passed", Branch: "task/super.lib", Report: "added types.go"},
 			{ID: "super.dead", Role: "implementer", State: "failed"},
 		},
-		Tip: "integrate/tip-7",
+		Tip:  "integrate/tip-7",
+		Tree: "server/main.go\nserver/types.go",
 	}
 
 	if body := answer(context.Background(), q, rc); body == "" {
@@ -43,7 +44,7 @@ func TestBuildAnswerFuncGroundsInRunContext(t *testing.T) {
 
 	// Trusted grounding present: goal, plan digest, both cohort states, the failed dep,
 	// the branch, the tip — all harness-derived control data.
-	for _, want := range []string{"build a JSON API server", "super.lib", "passed", "super.dead", "failed", "task/super.lib", "integrate/tip-7"} {
+	for _, want := range []string{"build a JSON API server", "super.lib", "passed", "super.dead", "failed", "task/super.lib", "integrate/tip-7", "server/main.go"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("grounded prompt missing %q:\n%s", want, prompt)
 		}

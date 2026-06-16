@@ -159,9 +159,9 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	}
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_report",
 		Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
-	// Re-publish the grounding so a concurrent sibling's ask_supervisor sees this
-	// subagent's just-folded state (passed/failed + branch). Single-owner here.
-	s.publishRunContext(s.buildRunContext(st))
+	// Re-point the read tree at the just-verified branch and re-publish so a concurrent
+	// sibling's ask_supervisor sees this subagent's folded state + the live tree.
+	s.refreshAndPublish(ctx, st)
 
 	// The worker's summary is UNTRUSTED data — fence it. We surface only typed
 	// fields (passed/branch) as trusted control data; the prose is fenced (I7).
@@ -362,9 +362,9 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 			Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
 		results[a.idx] = ok(a.toolID, s.renderReport(res))
 	}
-	// Re-publish the grounding once after the whole wave folds (single-owner, after
-	// the pool drained) so a later ask_supervisor sees the full cohort outcome.
-	s.publishRunContext(s.buildRunContext(st))
+	// Re-point the read tree + re-publish once after the whole wave folds (single-owner,
+	// after the pool drained) so a later ask_supervisor sees the full cohort outcome.
+	s.refreshAndPublish(ctx, st)
 	return results
 }
 
@@ -524,9 +524,9 @@ func (s *Supervisor) doIntegrate(ctx context.Context, round int, st *runState, b
 	}
 	if branch != "" {
 		st.branch = branch
-		// Re-publish so the grounded answer's integration-tip countercheck reflects the
-		// freshly-merged tree (single-owner here).
-		s.publishRunContext(s.buildRunContext(st))
+		// Re-point the read tree at the freshly-merged integration tip + re-publish so
+		// the supervisor's reads and the grounded answer reflect the merged tree.
+		s.refreshAndPublish(ctx, st)
 	}
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_integrate",
 		Detail: map[string]any{"items": len(order), "branch": branch}})
@@ -557,9 +557,9 @@ func (s *Supervisor) doCode(ctx context.Context, round int, st *runState, b mode
 	res := s.Code(ctx, in.Goal)
 	if res.Branch != "" {
 		st.branch = res.Branch
-		// Re-publish so the grounded answer's tip reflects the supervisor's own coded
-		// branch too (single-owner here) — every st.branch mutation point publishes.
-		s.publishRunContext(s.buildRunContext(st))
+		// Re-point the read tree + re-publish so the supervisor's reads and the grounded
+		// answer reflect its own coded branch too — every st.branch mutation publishes.
+		s.refreshAndPublish(ctx, st)
 	}
 	// The coder's summary is the supervisor's own loop output (trusted), but we
 	// surface only typed fields plus a fenced prose tail to keep the I7 boundary

@@ -1,6 +1,7 @@
 package super
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -48,6 +49,43 @@ func TestBuildRunContextReflectsState(t *testing.T) {
 	}
 	if rc.Cohort[2].State != "running" {
 		t.Errorf("t3 (not Done) state = %q, want running", rc.Cohort[2].State)
+	}
+}
+
+// refreshAndPublish re-points the read tree via RefreshRead (storing its file-tree on
+// the snapshot) then publishes; with no RefreshRead wired it is just a publish (no
+// tree), and it only refreshes when a tip exists.
+func TestRefreshAndPublish(t *testing.T) {
+	var gotTip string
+	s := &Supervisor{RefreshRead: func(_ context.Context, tip string) string {
+		gotTip = tip
+		return "server/main.go\nserver/handler.go"
+	}}
+	st := &runState{handles: map[string]*Handle{}, goal: "g", branch: "integrate/tip-3"}
+
+	s.refreshAndPublish(context.Background(), st)
+	if gotTip != "integrate/tip-3" {
+		t.Errorf("RefreshRead called with tip %q, want integrate/tip-3", gotTip)
+	}
+	rc := s.loadRunContext()
+	if rc.Tree != "server/main.go\nserver/handler.go" {
+		t.Errorf("snapshot Tree = %q, want the RefreshRead file-tree", rc.Tree)
+	}
+
+	// No RefreshRead wired: just a publish, no tree, no panic.
+	s2 := &Supervisor{}
+	st2 := &runState{handles: map[string]*Handle{}, goal: "g", branch: "tip"}
+	s2.refreshAndPublish(context.Background(), st2)
+	if s2.loadRunContext().Tree != "" {
+		t.Error("no RefreshRead wired must leave Tree empty")
+	}
+
+	// Empty tip: RefreshRead is NOT called (nothing verified yet).
+	called := false
+	s3 := &Supervisor{RefreshRead: func(_ context.Context, _ string) string { called = true; return "x" }}
+	s3.refreshAndPublish(context.Background(), &runState{handles: map[string]*Handle{}, branch: ""})
+	if called {
+		t.Error("RefreshRead must not be called with an empty tip")
 	}
 }
 

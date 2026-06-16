@@ -177,6 +177,49 @@ func (w *Worktree) Merge(ctx context.Context, ref, message string) (conflict boo
 	return false, nil
 }
 
+// Checkout re-points this worktree at ref in DETACHED mode, forcing the working
+// tree to match (discarding any tracked drift). It is how a long-lived READ worktree
+// tracks the moving integration tip: --detach avoids the "branch already checked out
+// in another worktree" conflict, and --force makes it a clean re-sync to the new tip.
+// Hardened (I4): the merged-in tip's repo-authored hooks/config can never execute on
+// the host. The worktree must hold no edits worth keeping (a read tree never does).
+func (w *Worktree) Checkout(ctx context.Context, ref string) error {
+	if w == nil {
+		return fmt.Errorf("worktree checkout: nil worktree")
+	}
+	if ref == "" {
+		return fmt.Errorf("worktree checkout: empty ref")
+	}
+	if out, err := git(ctx, w.path, "checkout", "--detach", "--force", ref); err != nil {
+		return fmt.Errorf("worktree checkout %s: %w (%s)", ref, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// ListFiles returns the worktree's tracked file paths (git ls-files) — a cheap,
+// bounded view of the tree's STRUCTURE (not contents) for grounding the supervisor's
+// answer in "where things are". The result is byte-capped to maxBytes (on a line
+// boundary) so a huge repo can never bloat a prompt; a non-positive maxBytes applies
+// a default. Hardened git (I4). Empty (not an error) when the tree has no tracked
+// files yet.
+func (w *Worktree) ListFiles(ctx context.Context, maxBytes int) (string, error) {
+	if w == nil {
+		return "", nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultListFilesBytes
+	}
+	out, err := git(ctx, w.path, "ls-files")
+	if err != nil {
+		return "", fmt.Errorf("worktree ls-files: %w", err)
+	}
+	return clampBytes(strings.TrimSpace(out), maxBytes), nil
+}
+
+// defaultListFilesBytes bounds a ListFiles report when the caller passes a
+// non-positive cap — enough for a real file tree, small enough not to bloat a prompt.
+const defaultListFilesBytes = 3072
+
 // DiffStat reports WHAT CHANGED in this worktree since it was created: the
 // changed-file name-status list plus the `git diff --stat` summary, taken
 // between the pinned create-time start-point (baseSHA) and the worktree's
