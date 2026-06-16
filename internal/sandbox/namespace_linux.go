@@ -76,11 +76,19 @@ func (n *Namespace) ExecWithEnv(ctx context.Context, cmd string, env map[string]
 	c := exec.CommandContext(ctx, self)
 	c.Stdout = &stdout
 	c.Stderr = &stderr
-	c.Env = append(os.Environ(),
-		envMarker+"=1",
-		envWorkdir+"="+n.HostDir,
-		envCmd+"="+cmd,
-	)
+	// SECURITY (I3): do NOT seed the child from os.Environ(). The host process
+	// holds the operator's secrets (ANTHROPIC_API_KEY, the vault passphrase, the
+	// log-HMAC key) for its whole lifetime, and a model-emitted command must never
+	// see them. The container backend is safe for the same reason — it never
+	// forwards os.Environ() into the container. So the child gets ONLY our control
+	// vars plus the explicitly-injected per-run env (e.g. a delegated CLI's key,
+	// which IS meant for the command); sandboxEnv then assembles the command's real
+	// env from that minimal set + a fixed base (PATH/HOME/Go caches).
+	c.Env = []string{
+		envMarker + "=1",
+		envWorkdir + "=" + n.HostDir,
+		envCmd + "=" + cmd,
+	}
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
 	}
