@@ -660,7 +660,7 @@ func serveMain(args []string) {
 		searchBackend:   searchBackend,
 		searchKey:       searchKey,
 	}
-	factory := serveSessionFactory(d)
+	factory := serveSessionFactory(d, rawCh, ctx)
 
 	// Durable resume: re-drive any native task a prior process left running or
 	// interrupted, BEFORE accepting new traffic. Each runs in a fresh disposable
@@ -799,7 +799,32 @@ func (d serveDeps) webEnabled() bool {
 // thread's Inbox + channel Emitter + channel Approver wired in. The Emitter and
 // Approver are supplied by the server (transport-bound: Update for reasoning, Ask
 // for gates); the factory owns only the machinery assembly.
-func serveSessionFactory(d serveDeps) server.SessionFactory {
+// formatNotification renders a work drive's terminal outcome as a one-line status
+// push to a detached principal's channel thread (notify-on-terminal). Bounded so a
+// sprawling summary can't blow the channel's message limits.
+func formatNotification(n session.Notification) string {
+	var b strings.Builder
+	switch {
+	case n.Failed:
+		b.WriteString("❌ Run errored.")
+	case n.Verified:
+		b.WriteString("✅ Done (verified).")
+	default:
+		b.WriteString("⚠️ Stopped — not verified; may need your input.")
+	}
+	if s := strings.TrimSpace(n.Summary); s != "" {
+		// clipRunes (not byte-truncate): the summary is model-authored prose that is
+		// often multibyte UTF-8, and a mid-rune cut could emit invalid bytes that a
+		// strict transport (Telegram) rejects, dropping the whole notification.
+		b.WriteString(" " + clipRunes(s, 600))
+	}
+	if n.Branch != "" {
+		b.WriteString("\nbranch: " + n.Branch)
+	}
+	return b.String()
+}
+
+func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.Context) server.SessionFactory {
 	return func(ctx context.Context, threadID, sender string, out emit.Emitter, approver policy.Approver) *session.Session {
 		// One conversation = one ledger + one global ceiling = one metered provider
 		// keyed by the threadID. Routing, drives, chat replies, and the summarize
@@ -810,6 +835,17 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 
 		sess := session.New(threadID, sender, d.baseRepo, d.log)
 		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
+		// Terminal-outcome push so a DETACHED principal learns a work drive finished
+		// without re-attaching. Uses the SERVE BASE ctx (not the per-request ctx, which
+		// is dead once the principal detaches) with a short timeout, so the push fires
+		// while serve is alive and never wedges the conversation. nil channel ⇒ no push.
+		if notifyCh != nil {
+			sess.Notify = func(n session.Notification) {
+				nctx, cancel := context.WithTimeout(baseCtx, 30*time.Second)
+				defer cancel()
+				_ = notifyCh.Update(nctx, threadID, formatNotification(n))
+			}
+		}
 		sess.Budget = ledger
 		// Conversation persistence: with a checkpointer, this thread's bounded
 		// WorkState is saved after every drive fold and re-hydrated here on a
