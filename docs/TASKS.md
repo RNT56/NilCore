@@ -70,8 +70,17 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 | P6-T06 | 6 | Resource cleanup / GC (worktrees, containers, logs) | P1-T01, P0-T03 | `internal/maint/` | |
 | P6-T07 | 6 | Operator observability + health | P2-T06, P6-T02, P6-T03 | `internal/inspect/` | |
 | P6-T08 | 6 | Config schema + validation + migration | P1-T12 | `internal/config/` | **retired** — folded into `internal/onboard` (the live config) |
+| P9-T01 | 9 | Multimodal content blocks (model + providers) | — | `internal/model/`, `internal/provider/`, `docs/ARCHITECTURE.md` | **contract · solo** |
+| P9-T02 | 9 | Sandboxed headless-browser tool | P9-T01 | `internal/tools/` | |
+| P9-T03 | 9 | Behavioral verifier (composite + browser check) | P9-T02 | `internal/verify/` | |
+| P9-T04 | 9 | SCM/CI webhook intake → `trigger.Signal` | — | `internal/scmhook/` | ∥ P9-T05/06 |
+| P9-T05 | 9 | Gated PR/push action (`GateAction` + forge) | — | `internal/policy/`, `internal/forge/` | ∥ P9-T04/06 |
+| P9-T06 | 9 | Cron / scheduled trigger source | — | `internal/cron/` | ∥ P9-T04/05 |
+| P9-T07 | 9 | Tier-1 CLI wiring | P9-T02, P9-T03, P9-T04, P9-T05, P9-T06 | `cmd/nilcore/` | shares `cmd/nilcore` |
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
+
+> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** is the multi-agent concurrency workstream, tracked in its own design doc. **Phase 9** (this section) is the behavioral-verification & event-driven-autonomy tier, promoted from `docs/UPGRADE-PATH.md` Tier 1 — which also holds the Tier 2–3 proposals and the file:line sourcing behind every Phase-9 task.
 
 ---
 
@@ -534,6 +543,83 @@ every backend gets a swappable sandbox without any code change.
 - **Acceptance criteria:** a conservative syscall policy that doesn't break common toolchains (compilers, test runners); applied fail-closed; ABI-aware; covered by the `sandbox-linux` job (a denied syscall is blocked, an allowed one runs).
 - **Verify:** `make verify`; the `sandbox-linux` job asserts a denied syscall fails and normal builds/tests still pass under the filter.
 - **Status (shipped):** `internal/sandbox/seccomp_linux.go` installs a classic-BPF **denylist** (arch-validated; blocks `mount`/`umount2`/`pivot_root`/`chroot`/`setns`/`unshare`/`ptrace`/`kexec_load`/module-load/`reboot`/`swap`/`bpf`/`perf_event_open`/keyring/`acct`/clock-set/`quotactl`/`process_vm_*` with EPERM, allows the rest) via `seccomp(2)` + `SECCOMP_FILTER_FLAG_TSYNC`, applied in the re-exec child after Landlock and before `execve`. Per-arch `AUDIT_ARCH` lives in `seccomp_linux_{amd64,arm64,other}.go`; an arch NilCore doesn't target (or a kernel without seccomp filtering) degrades gracefully to namespaces + Landlock (still I4). Fail-closed on a malformed filter. The `sandbox-linux` job asserts the filter is active (`/proc/self/status` Seccomp mode 2), that a denied syscall fails (`chroot` EPERMs), and that normal work still runs; a hermetic `TestSeccompProgramShape` checks the BPF jump arithmetic. Cross-compiles + `go vet` clean for amd64/arm64; `golangci-lint` 0 issues.
+
+---
+
+## Phase 9 — Behavioral verification & event-driven autonomy
+
+Close the two sharpest competitive gaps without breaking an invariant: make the verifier able to exercise a *running* app (a browser/behavioral check feeds the verdict — `verify` stays the sole authority on "done", I2), and let work enter where developers live (SCM/CI events, schedules) through the existing `trigger` + reversibility gate. Promoted from `docs/UPGRADE-PATH.md` Tier 1 (`U1-T01..07` → `P9-T01..07`, same order); that file holds the deep rationale and the file:line sourcing for every task. Every task is additive and nil/flag-gated — the default binary is byte-identical when the feature is off. (Phase 8 is the multi-agent concurrency workstream, tracked separately.)
+
+### P9-T01 — Multimodal content blocks (model + providers)  · contract, runs solo
+- **Goal:** give the canonical message format an **additive** image content block so the agent can reason over a screenshot — the precondition for behavioral verification — without changing `backend.CodingBackend` or `Provider.Complete`.
+- **Depends on:** —  **Owns:** `internal/model/`, `internal/provider/`, `docs/ARCHITECTURE.md`
+- **Acceptance criteria:**
+  - `model.Block` gains an additive image shape (e.g. a nested `Source{Type, MediaType, Data}` under `Type:"image"`); all existing fields/JSON tags unchanged; a text/tool_use/tool_result block marshals byte-identically.
+  - The Anthropic adapter round-trips image blocks; the OpenAI adapter's `toOpenAIMessages` switch gains an explicit `image` case (today only `text`/`tool_use`/`tool_result` — an image block is silently dropped).
+  - `Provider.Complete`/`Streamer.Stream` signatures unchanged (images travel inside the existing `[]Block`); `model.Chunk` stays text-only.
+  - `docs/ARCHITECTURE.md` message-format / I1 text updated in the **same** PR.
+- **Verify:** `make verify`; per-adapter round-trip tests (an image block → the Anthropic and OpenAI wire shapes); a test asserting a text-only `[]Block` is byte-identical to before.
+- **Notes:** touches the vendor-neutral format every adapter implements ⇒ **serialized contract task, runs solo** (no parallel task may read `internal/model` as a stable interface meanwhile); stdlib only (I6). Deep rationale + sourcing: `docs/UPGRADE-PATH.md` §4 (U1-T01).
+
+### P9-T02 — Sandboxed headless-browser tool
+- **Goal:** an agent-facing tool that drives a headless browser **inside the sandbox** to navigate a running app and return a screenshot (a P9-T01 image block) + fenced DOM/console, so the loop can see what it built.
+- **Depends on:** P9-T01  **Owns:** `internal/tools/`
+- **Acceptance criteria:**
+  - A `tools.Tool` (the 4-method interface) holding a `Box sandbox.Sandbox`, running a headless-browser driver via `Box.Exec`/`Box.ExecWithEnv` — **never** a host-side request; refuses when `Box==nil` (mirror `WebFetchTool`).
+  - Returns a screenshot image block (P9-T01) + DOM/console text `guard.Wrap`'d as untrusted data (I7); the tool is **non-mutating** (safe in read-only modes).
+  - Container-only and egress-gated (usable only on `*sandbox.Container` with the target host allowlisted); fails closed on the namespace backend (empty `CLONE_NEWNET`).
+- **Verify:** `make verify`; a unit test driving a local static-file server started in the sandbox (navigate → screenshot + DOM); a test that `Box==nil` and the namespace backend both refuse.
+- **Notes:** needs the browser binary in `images/sandbox/` (still fully self-hosted, not external infra). Distinct from the verifier-side check (P9-T03). I4/I7. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T02).
+
+### P9-T03 — Behavioral verifier (composite + browser check)
+- **Goal:** make a behavioral browser check a first-class input to the verifier's verdict, so a feature that builds+tests green but renders broken ships **red** — keeping `verify` the sole authority (I2).
+- **Depends on:** P9-T02  **Owns:** `internal/verify/`
+- **Acceptance criteria:**
+  - `verify.Composite` ANDs N child `Verifier.Check` reports into one; any red child ⇒ red overall.
+  - `verify.BrowserVerifier{Box, URL, Assertions}` runs a browser-driver command inside the worktree sandbox box (like `CommandVerifier`) and reports `Passed` from the assertions; keeps `verify`'s leaf import graph (imports only `sandbox`).
+  - Opt-in: default is the unchanged `CommandVerifier`; `verify.Pass` stays used **only** for read-only Discuss/Plan drives and never substitutes on an Execute drive.
+- **Verify:** `make verify`; table test — command-pass+browser-fail ⇒ red; both pass ⇒ green; behavioral-off ⇒ byte-identical to `CommandVerifier`.
+- **Notes:** I2 inviolable — the browser result is evidence the verifier consumes; there is no screenshot-bypasses-verify path. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T03).
+
+### P9-T04 — SCM/CI webhook intake → `trigger.Signal`
+- **Goal:** let a labeled issue or a failing CI run become a `trigger.Signal` routed through the **existing** reversible-auto-start / irreversible-gate machinery.
+- **Depends on:** —  **Owns:** `internal/scmhook/`
+- **Acceptance criteria:**
+  - A stdlib `net/http` inbound listener that verifies the webhook HMAC against a `secrets.SecretStore` secret (I3), maps issue / CI-failure events to `trigger.Signal{Source, Goal}`, and calls `trigger.Handle`.
+  - Payloads are untrusted: any text surfaced is `guard.Wrap`'d (I7); an unsigned/invalid request is rejected + logged metadata-only (I5).
+  - Stdlib only — no `go-github`/`go-gitlab` (I6); binds loopback by default (operator terminates TLS at a reverse proxy).
+- **Verify:** `make verify`; tests — a signed `issues.labeled` / `workflow_run.failure` payload yields the expected Signal; a bad signature is 401 + logged + no Signal.
+- **Notes:** adds a **new Signal source**, not a new mechanism — `trigger.Handle` already classifies reversible vs irreversible and logs `trigger_gated`/`trigger_start`. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T04).
+
+### P9-T05 — Gated PR/push action (`GateAction` + forge)
+- **Goal:** let a converged, verified change become a **draft PR** — only through the human gate, never autonomously.
+- **Depends on:** —  **Owns:** `internal/policy/`, `internal/forge/`
+- **Acceptance criteria:**
+  - `policy.GateAction` gains a closed-set `OpenPR` (and/or reuse `Push`) `GateActionType`; `Class()` is `Irreversible`; `GateStructured` consults the approver and a **nil approver default-denies**.
+  - `internal/forge` performs the push + draft-PR open **only after** gate approval — host-side hardened git (`HardenArgs`/`HardenedEnv`) and/or the SCM REST API over stdlib `net/http`, token from `secrets.SecretStore` (I3, never logged / model-visible); **never auto-merges**.
+  - Prefer the structured action over free-text `policy.Classify`; add the SCM API host to egress where the host harness needs it.
+- **Verify:** `make verify`; tests — approve ⇒ forge invoked with the expected push/PR shape (mocked transport); deny ⇒ no call; nil approver ⇒ deny; the token never appears in logs.
+- **Notes:** push/merge are already `Irreversible` in `policy.Classify`; this is **harness code performing a gated irreversible action** (like the integrator's gated promotion, which itself never lands). The git **tool** stays `status|diff|add|commit|log` only. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T05).
+
+### P9-T06 — Cron / scheduled trigger source
+- **Goal:** time-driven autonomy — a maintenance goal that fires on a schedule — built on the existing trigger + gate, pure stdlib.
+- **Depends on:** —  **Owns:** `internal/cron/`
+- **Acceptance criteria:**
+  - A stdlib `time`-based scheduler that emits a `trigger.Signal` into `trigger.Handle` at configured times/intervals.
+  - Reversible scheduled work auto-starts; irreversible scheduled work **deny-defaults and blocks** under an unattended approver (the documented headless posture); a fire logs a metadata-only event (I5); pure stdlib (I6).
+- **Verify:** `make verify`; tests with an injected clock — a due spec fires the Goal; reversible auto-starts; irreversible under a nil/deny approver does not start and is logged.
+- **Notes:** distinct from `internal/scheduler` (a time-agnostic bounded-concurrency pool) and `internal/loopctl` (a cancel-cause discriminator, not a scheduler). Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T06).
+
+### P9-T07 — Tier-1 CLI wiring
+- **Goal:** wire the Phase-9 feature packages into the binary — the single `cmd/nilcore` integration step.
+- **Depends on:** P9-T02, P9-T03, P9-T04, P9-T05, P9-T06  **Owns:** `cmd/nilcore/`
+- **Acceptance criteria:**
+  - Register the browser tool (P9-T02) into `loopTools()`/`readOnlyLoopTools()`, container-and-egress-gated (mirror the web-tool wiring).
+  - Construct `verify.Composite` with `BrowserVerifier` (P9-T03) at the per-worktree verifier sites when behavioral verification is enabled (env/flag; default off ⇒ byte-identical).
+  - `nilcore serve --webhook <addr>` stands up the SCM/CI intake (P9-T04); `nilcore schedule` runs the cron source (P9-T06); a trigger-originated, verified, reversible change can offer a **gated** PR via the forge (P9-T05) when a channel gate is configured, else deny-default.
+  - Every new path nil/flag-gated; the default binary is byte-identical with Phase-9 features off.
+- **Verify:** `make verify`; CLI smoke tests (fake channel + fake orchestrator) — webhook intake dispatches; `schedule` self-starts a reversible task; browser-verify off ⇒ identical verdict path.
+- **Notes:** `cmd/nilcore/` is a shared wiring surface — this task serializes against any other open `cmd/nilcore`-owning task. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T07).
 
 ---
 
