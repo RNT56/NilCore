@@ -479,13 +479,29 @@ sandbox mount is needed). I4 discipline:
 on the Session (principal-only, I7; threaded into each drive at launch). `/add <url>`
 asks the agent to fetch the URL via `web_fetch` (below).
 
-### Web access (`-allow-egress` + `web_fetch`)
+### Web access (`-allow-egress` + `web_fetch` + `web_search`)
 
 Default stays **default-deny**. `-allow-egress host,host` stands up the allowlist proxy
 (`policy.EgressProxy.Start` — the listener/goroutine/shutdown lifecycle around the
 existing `ServeHTTP`) bound to the conversation ctx, and routes a **container** sandbox
 through it via `AllowEgressVia` (using the runtime host alias; `sandbox.Container.ExtraHosts`
-adds `--add-host` for docker-Linux). The `web_fetch` tool is advertised only when egress
-is on AND the box is egress-capable; the fetch runs inside the sandbox and its body is
-`guard.Wrap`'d as untrusted data (I7). The namespace backend has no proxy egress path
-(empty netns), so web access requires the container backend (fail-closed).
+adds `--add-host` for docker-Linux). The `web_fetch` tool (read a URL) and `web_search`
+tool (Brave Search; needs `BRAVE_API_KEY` + `api.search.brave.com` allowlisted) are
+advertised only when egress is on AND the box is egress-capable; both run inside the
+sandbox and `guard.Wrap` their bodies as untrusted data (I7). `web_search` injects its
+key as a per-run env var referenced as `$NILCORE_SEARCH_KEY` in the command, so the key
+never reaches the command string, the model, or the log (I3). The namespace backend has
+no proxy egress path (empty netns), so web access requires the container backend
+(fail-closed) — see `docs/OPERATIONS.md`.
+
+### Control verbs, the gauge, and `/clear` (both front doors)
+
+`session.ParseControl` is the single control-verb parser the REPL and the serve intake
+both call on principal top-level input only (post-`Authorized.Permit`; never on `Turn`/
+inbox/tool text — I7), so `/discuss /plan /execute /auto /add /clear /mode /status
+/context /cancel` work identically over the keyboard and over Telegram/Slack. The REPL
+prompt shows a per-mode glyph (auto ◇, discuss ◆, plan ▣, execute ▶) and a clockwise
+context-usage ring (◔◑◕●, degrading to `context NN%` off a TTY). `meter.CtxWindow` +
+`meter.Provider.OnUsage` feed `Session.ContextUsage`; near 80% of the window the prior
+conversation is auto-summarized into a compact seed (`session_compact`), and `/clear`
+resets History on demand (keeping the pinned mode and attached roots).
