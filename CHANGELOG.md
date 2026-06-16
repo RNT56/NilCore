@@ -18,6 +18,14 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 _All 56 tasks in the `docs/TASKS.md` DAG are merged — see [0.1.0] below._
 
+### Web access made keyless-capable and obvious (onboarding + selectable search)
+
+Closes the two gaps from the web-search review: search needed a key, and web access was a hidden power-user flag.
+
+- **Keyless search default** — `web_search` is now backend-selectable: **`ddg`** (DuckDuckGo Lite, **no key**, best-effort HTML — the new default) or **`brave`** (the keyed JSON upgrade, auto-selected when a key is present). A configured `brave` with no resolvable key falls back to `ddg`, so search never silently dies. `tools.SearchBackend`/`SearchHostFor`. _Owns:_ `internal/tools/`. _(web)_
+- **Onboarding + config-backed web access** — `onboard.Config.Web {enabled, allow, search, search_key_ref}`, a **Web access** step in the `nilcore init` wizard (and `FromEnv` via `NILCORE_WEB_ALLOW`/`NILCORE_WEB_SEARCH`/`BRAVE_API_KEY`), so web is configured ONCE and `chat`/`serve` enable it automatically — `-allow-egress` is now additive, not required. `resolveWeb` merges config + flag, picks the backend, and **auto-adds the search host** to the allowlist so search works without the user listing it. The Brave key resolves via the cred resolver (`secretRefsByEnv`), env-first then SecretStore, never logged (I3). Serve gets full web parity (egress proxy + tools). _Owns:_ `internal/onboard/`, `cmd/nilcore/`, `internal/server/`. _(web)_
+- **Discoverability** — `init` readiness + `nilcore doctor` report web status (on/off, backend, whether the Brave key resolves); the chat startup prints a one-line hint when web is off (how to enable it). _Owns:_ `internal/onboard/`, `cmd/nilcore/`, `docs/OPERATIONS.md`. _(ux)_
+
 ### User-set modes · context attach · web access — the conversational front door grows steering, context, and the web
 
 The chat front door inferred everything (machine + capability) from the goal. This workstream adds three things the user controls directly, all inside the one chat loop, none touching the frozen `backend.CodingBackend` contract (I1):

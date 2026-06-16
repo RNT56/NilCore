@@ -28,12 +28,12 @@ func (b *envBox) ExecWithEnv(_ context.Context, cmd string, env map[string]strin
 }
 func (b *envBox) Workdir() string { return "/work" }
 
-// The headline I3 test: the literal API key must NOT appear in the command string
-// (which the loop logs), only in the per-run env (which the sandbox never logs).
-func TestWebSearchDoesNotLeakKeyIntoCommand(t *testing.T) {
+// The headline I3 test (brave backend): the literal API key must NOT appear in the
+// command string (which the loop logs), only in the per-run env.
+func TestWebSearchBraveDoesNotLeakKey(t *testing.T) {
 	const key = "brave-secret-key-123"
 	box := &envBox{result: sandbox.Result{Stdout: `{"web":{"results":[]}}`, ExitCode: 0}}
-	tool := WebSearchTool{Box: box, APIKey: key}
+	tool := WebSearchTool{Box: box, Backend: SearchBrave, APIKey: key}
 
 	out, err := tool.Run(context.Background(), "", json.RawMessage(`{"query":"golang context window"}`))
 	if err != nil {
@@ -48,29 +48,60 @@ func TestWebSearchDoesNotLeakKeyIntoCommand(t *testing.T) {
 	if !strings.Contains(box.cmd, "$NILCORE_SEARCH_KEY") {
 		t.Errorf("command should reference the key via $env, got %q", box.cmd)
 	}
-	// Ran a curl against the Brave host with the escaped query.
-	if !strings.Contains(box.cmd, searchHost) || !strings.Contains(box.cmd, "golang+context+window") {
-		t.Errorf("search did not curl the API host with the escaped query: %q", box.cmd)
+	if !strings.Contains(box.cmd, SearchHostFor(SearchBrave)) || !strings.Contains(box.cmd, "golang+context+window") {
+		t.Errorf("search did not curl the Brave host with the escaped query: %q", box.cmd)
 	}
-	// Results are fenced as untrusted data (I7).
 	if !strings.Contains(out, "UNTRUSTED DATA") {
 		t.Errorf("results not guard.Wrap-fenced:\n%s", out)
 	}
 }
 
-func TestWebSearchRefusesWithoutBoxOrKey(t *testing.T) {
-	if _, err := (WebSearchTool{APIKey: "k"}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
-		t.Error("web_search with nil box must refuse (no host fallback)")
+// The keyless DDG backend: NO key, NO env, hits the DuckDuckGo Lite host, fences
+// the HTML body. This is the no-signup default.
+func TestWebSearchDDGKeyless(t *testing.T) {
+	box := &envBox{result: sandbox.Result{Stdout: "<html>results</html>", ExitCode: 0}}
+	tool := WebSearchTool{Box: box, Backend: SearchDDG} // no APIKey
+
+	out, err := tool.Run(context.Background(), "", json.RawMessage(`{"query":"go testing"}`))
+	if err != nil {
+		t.Fatalf("ddg web_search: %v", err)
 	}
-	box := &envBox{result: sandbox.Result{ExitCode: 0}}
-	if _, err := (WebSearchTool{Box: box}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
-		t.Error("web_search with no key must refuse")
+	if len(box.env) != 0 {
+		t.Errorf("keyless backend must pass no env, got %v", box.env)
+	}
+	if !strings.Contains(box.cmd, SearchHostFor(SearchDDG)) || !strings.Contains(box.cmd, "go+testing") {
+		t.Errorf("ddg did not curl the lite host with the escaped query: %q", box.cmd)
+	}
+	if strings.Contains(box.cmd, "Subscription-Token") {
+		t.Errorf("keyless backend must not send an auth header: %q", box.cmd)
+	}
+	if !strings.Contains(out, "UNTRUSTED DATA") {
+		t.Errorf("ddg results not fenced:\n%s", out)
 	}
 }
 
-func TestWebSearchRejectsControlCharsAndEmptyQuery(t *testing.T) {
+func TestWebSearchRefusesMisconfigured(t *testing.T) {
 	box := &envBox{result: sandbox.Result{ExitCode: 0}}
-	tool := WebSearchTool{Box: box, APIKey: "k"}
+	// nil box
+	if _, err := (WebSearchTool{Backend: SearchDDG}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
+		t.Error("nil box must refuse (no host fallback)")
+	}
+	// brave with no key
+	if _, err := (WebSearchTool{Box: box, Backend: SearchBrave}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
+		t.Error("brave with no key must refuse")
+	}
+	// off / unresolved
+	if _, err := (WebSearchTool{Box: box, Backend: SearchOff}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
+		t.Error("SearchOff must refuse")
+	}
+	if _, err := (WebSearchTool{Box: box, Backend: SearchAuto}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`)); err == nil {
+		t.Error("unresolved SearchAuto must refuse")
+	}
+}
+
+func TestWebSearchRejectsBadQuery(t *testing.T) {
+	box := &envBox{result: sandbox.Result{ExitCode: 0}}
+	tool := WebSearchTool{Box: box, Backend: SearchDDG}
 	if _, err := tool.Run(context.Background(), "", json.RawMessage(`{"query":"  "}`)); err == nil {
 		t.Error("empty query must be rejected")
 	}
@@ -79,15 +110,25 @@ func TestWebSearchRejectsControlCharsAndEmptyQuery(t *testing.T) {
 	}
 }
 
-// A non-zero curl exit (egress-blocked host, auth failure) is surfaced as fenced
-// data, not a Go error — the model reacts without being instructed by the remote.
 func TestWebSearchFencesErrorBody(t *testing.T) {
 	box := &envBox{result: sandbox.Result{Stderr: "curl: (22) 403", ExitCode: 22}}
-	out, err := (WebSearchTool{Box: box, APIKey: "k"}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`))
+	out, err := (WebSearchTool{Box: box, Backend: SearchDDG}).Run(context.Background(), "", json.RawMessage(`{"query":"x"}`))
 	if err != nil {
 		t.Fatalf("a non-zero exit should be a fenced result, not an error: %v", err)
 	}
 	if !strings.Contains(out, "UNTRUSTED DATA") {
 		t.Errorf("error body not fenced:\n%s", out)
+	}
+}
+
+func TestSearchHostFor(t *testing.T) {
+	if SearchHostFor(SearchBrave) != "api.search.brave.com" {
+		t.Error("brave host")
+	}
+	if SearchHostFor(SearchDDG) != "lite.duckduckgo.com" {
+		t.Error("ddg host")
+	}
+	if SearchHostFor(SearchOff) != "" || SearchHostFor(SearchAuto) != "" {
+		t.Error("off/auto have no fixed host")
 	}
 }
