@@ -613,7 +613,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			// Bind /add'd context roots into a container READ-ONLY so the execute-mode
 			// shell can read them too (the file tools already see them host-side).
 			applyContainerReadRoots(box, in.ReadRoots)
-			var v verify.Verifier = verify.New(box, *d.flags.common.checkCmd)
+			v := behavioralVerifier(box, *d.flags.common.checkCmd)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
