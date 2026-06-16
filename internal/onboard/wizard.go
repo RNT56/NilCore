@@ -173,6 +173,28 @@ func (w *Wizard) Run() (Config, error) {
 		cfg.Channel.Allow = splitList(ask("  Allowed principal ids (comma-separated)", ""))
 	}
 
+	section(w.Out, st, "Web access")
+	fmt.Fprintln(w.Out, st.dim("Let the agent fetch URLs and search the web — sandboxed, only to hosts you allow. Off by default."))
+	if strings.HasPrefix(strings.ToLower(ask("Enable web access? (y/N)", "n")), "y") {
+		cfg.Web.Enabled = true
+		fmt.Fprintln(w.Out, st.dim("  The agent reaches only these hosts (plus the search host). Blank = search only."))
+		cfg.Web.Allow = splitList(ask("  Allowed hosts (comma-separated, e.g. \"docs.python.org,*.github.io\")", ""))
+		fmt.Fprintln(w.Out, st.dim("  Search: ddg works with no key (best-effort); brave is higher quality but needs a free API key."))
+		cfg.Web.Search = ask("  Web search (ddg|brave|off)", "ddg")
+		if cfg.Web.Search == "brave" {
+			ref, err := captureSecret("  Brave Search API key (get one free at brave.com/search/api)", "brave_api_key")
+			if err != nil {
+				return Config{}, err
+			}
+			if ref != "" {
+				cfg.Web.SearchKeyRef = ref
+			} else {
+				fmt.Fprintln(w.Out, st.dim("  no key entered — falling back to keyless ddg search"))
+				cfg.Web.Search = "ddg"
+			}
+		}
+	}
+
 	// Delegated-backend key (optional): the codex backend reads CODEX_API_KEY;
 	// claude-code reuses the Anthropic key captured above.
 	if ref, err := captureSecret("  Codex API key (for the codex backend; blank to skip)", "codex_api_key"); err != nil {
@@ -245,6 +267,23 @@ func FromEnv(getenv func(string) string, store secrets.SecretStore) (Config, err
 		cfg.Channel.Allow = splitList(getenv("NILCORE_ALLOWLIST"))
 	}
 
+	// Web access: enabled when an allowlist or a Brave key is provided. A key implies
+	// the brave backend; otherwise the keyless ddg default.
+	if getenv("NILCORE_WEB_ALLOW") != "" || getenv("BRAVE_API_KEY") != "" {
+		cfg.Web.Enabled = true
+		cfg.Web.Allow = splitList(getenv("NILCORE_WEB_ALLOW"))
+		cfg.Web.Search = orDefault(getenv("NILCORE_WEB_SEARCH"), "ddg")
+		if v := getenv("BRAVE_API_KEY"); v != "" {
+			if err := store.Set("brave_api_key", v); err != nil {
+				return Config{}, err
+			}
+			cfg.Web.SearchKeyRef = "brave_api_key"
+			if cfg.Web.Search == "" || cfg.Web.Search == "ddg" {
+				cfg.Web.Search = "brave"
+			}
+		}
+	}
+
 	cfg.Delegated = detectDelegated()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -303,6 +342,15 @@ func (c Config) Readiness() string {
 	fmt.Fprintf(&b, "  %s chat channel: %s\n", ok(c.Channel.Type != "" && c.Channel.Type != "none"), c.Channel.Type)
 	if c.Channel.Type == "telegram" || c.Channel.Type == "slack" {
 		fmt.Fprintf(&b, "  %s serve allowlist set (%d) — required to serve a channel\n", ok(len(c.Channel.Allow) > 0), len(c.Channel.Allow))
+	}
+	if c.Web.Enabled {
+		search := c.Web.Search
+		if search == "" {
+			search = "ddg (keyless)"
+		}
+		fmt.Fprintf(&b, "  ✓ web access on — search: %s, %d allowed host(s)\n", search, len(c.Web.Allow))
+	} else {
+		fmt.Fprintf(&b, "  · web access off (the agent cannot reach the network)\n")
 	}
 	if len(c.Delegated) > 0 {
 		fmt.Fprintf(&b, "  ✓ delegated CLIs detected: %s\n", strings.Join(c.Delegated, ", "))

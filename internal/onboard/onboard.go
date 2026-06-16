@@ -56,7 +56,18 @@ type Config struct {
 	Runtime   string           `json:"runtime"`           // podman | docker
 	Image     string           `json:"image"`             //
 	Channel   ChannelConfig    `json:"channel"`           //
+	Web       WebConfig        `json:"web,omitempty"`     // sandboxed web access (egress allowlist + search)
 	Delegated []string         `json:"delegated"`         // detected CLIs (informational): codex, claude
+}
+
+// WebConfig records the agent's web-access setup (so it survives a restart and is
+// not a flag the operator must remember). It references secrets, never secrets.
+// Empty/zero ⇒ web access off (default-deny), the prior behavior.
+type WebConfig struct {
+	Enabled      bool     `json:"enabled,omitempty"`        // master switch for sandboxed web access
+	Allow        []string `json:"allow,omitempty"`          // egress host allowlist (the search host is auto-added)
+	Search       string   `json:"search,omitempty"`         // "" (auto) | off | ddg (keyless) | brave (keyed)
+	SearchKeyRef string   `json:"search_key_ref,omitempty"` // SecretStore ref for the brave key (never the key)
 }
 
 // Recognized values. Kept as closed sets so Validate and the wizard share one
@@ -66,6 +77,7 @@ var (
 	validBackends  = map[string]bool{"native": true, "codex": true, "claude-code": true}
 	validProviders = map[string]bool{"anthropic": true, "openai": true, "openrouter": true, "codex": true}
 	validChannels  = map[string]bool{"": true, "none": true, "telegram": true, "slack": true}
+	validSearch    = map[string]bool{"": true, "off": true, "ddg": true, "brave": true}
 )
 
 // Validate reports whether c is internally consistent enough for boot to trust
@@ -85,6 +97,9 @@ func (c Config) Validate() error {
 	}
 	if !validChannels[c.Channel.Type] {
 		return fmt.Errorf("unknown channel %q; valid values are none, telegram, slack", c.Channel.Type)
+	}
+	if !validSearch[c.Web.Search] {
+		return fmt.Errorf("unknown web.search %q; valid values are off, ddg, brave", c.Web.Search)
 	}
 	for _, p := range c.Providers {
 		if !validProviders[p.Name] {

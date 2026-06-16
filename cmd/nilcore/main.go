@@ -327,6 +327,11 @@ func diagnose(cfg onboard.Config, cred func(string) string, check func(string) e
 		allow := principalAllowlist(cfg)
 		fmt.Fprintf(&b, "  %s serve allowlist resolves (%d) — required to serve\n", ok(len(allow) > 0), len(allow))
 	}
+	// The web-search key (brave) resolves like any credential — report it so doctor
+	// is honest about whether the keyed search backend will actually work.
+	if cfg.Web.Enabled && cfg.Web.SearchKeyRef != "" {
+		fmt.Fprintf(&b, "  %s web search key resolves (BRAVE_API_KEY)\n", ok(cred(searchKeyEnv) != ""))
+	}
 
 	// Optional live check: prove the configured model actually authenticates,
 	// not merely that a key is present. A failure makes the host not-ready.
@@ -621,16 +626,33 @@ func serveMain(args []string) {
 	gate := newDriveGate(ctx, *maxConcurrent)
 	defer gate.close()
 
+	// Web access (parity with chat): resolved from config, with the search backend's
+	// host auto-allowlisted. The proxy is bound to the serve ctx (one proxy for the
+	// server). Default-deny when web is not configured.
+	searchKey := b.cred(searchKeyEnv)
+	webAllow, searchBackend := resolveWeb(b.cfg, "", searchKey)
+	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow)
+	defer stopProxy()
+	if egress.Empty() {
+		fmt.Fprintln(os.Stderr, "nilcore serve: web access off (default-deny)")
+	} else {
+		fmt.Fprintf(os.Stderr, "nilcore serve: web access on — search: %s, %d allowed host(s)\n", searchBackend, len(webAllow))
+	}
+
 	d := serveDeps{
-		flags:      c,
-		provider:   prov,
-		boot:       b,
-		log:        log,
-		baseRepo:   absDir,
-		budget:     *budgetCeil,
-		gate:       gate,
-		mem:        mem,
-		checkpoint: ckpt,
+		flags:           c,
+		provider:        prov,
+		boot:            b,
+		log:             log,
+		baseRepo:        absDir,
+		budget:          *budgetCeil,
+		gate:            gate,
+		mem:             mem,
+		checkpoint:      ckpt,
+		egress:          egress,
+		egressProxyAddr: proxyAddr,
+		searchBackend:   searchBackend,
+		searchKey:       searchKey,
 	}
 	factory := serveSessionFactory(d)
 
@@ -742,6 +764,18 @@ type serveDeps struct {
 	gate       *driveGate        // shared serve drive-concurrency cap
 	mem        *memory.Memory    // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
 	checkpoint *agent.Checkpoint // durable task/conversation persistence (nil ⇒ in-memory only, no resume)
+
+	// Web access, resolved once from config (nilcore init) and applied to every
+	// thread's drives — parity with the chat front door. egress empty ⇒ default-deny.
+	egress          policy.Egress
+	egressProxyAddr string
+	searchBackend   tools.SearchBackend
+	searchKey       string
+}
+
+// webEnabled reports whether sandboxed web access is configured for serve.
+func (d serveDeps) webEnabled() bool {
+	return !d.egress.Empty() && d.egressProxyAddr != ""
 }
 
 // serveSessionFactory returns the server.SessionFactory that builds one wired
@@ -809,8 +843,10 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir)
-			// A read-only mode bind-mounts /add'd roots into a container so the (suppressed)
-			// shell would see them; harmless when there is no shell. Mirrors chat.
+			// Route a container box through the allowlist proxy when web access is on
+			// (no-op otherwise; default-deny stays the norm), and bind-mount /add'd
+			// roots read-only. Mirrors chat.
+			applyContainerEgress(box, d.egress, d.egressProxyAddr, *d.flags.runtime)
 			applyContainerReadRoots(box, in.ReadRoots)
 			// Read-only modes ship nothing, so there is nothing to gate (I2) — a
 			// pass-through verifier; Execute/Auto get the real project verifier.
@@ -852,6 +888,17 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if len(in.ReadRoots) > 0 {
 		reg.Register(tools.ReadTool{ReadRoots: in.ReadRoots})
 		reg.Register(tools.SearchTool{ReadRoots: in.ReadRoots})
+	}
+	// Web tools (parity with chat): advertised only when web access is on and the box
+	// is egress-capable; the body is fenced as untrusted data (I7), the search key
+	// (brave) injected via per-run env, never the command string (I3).
+	if d.webEnabled() {
+		if _, ok := box.(*sandbox.Container); ok {
+			reg.Register(tools.WebFetchTool{Box: box})
+			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
+			}
+		}
 	}
 	n := &backend.Native{
 		Model:        prov,
@@ -1496,6 +1543,11 @@ func secretRefsByEnv(cfg onboard.Config) map[string]string {
 		if len(cfg.Channel.TokenRefs) > 1 {
 			m["SLACK_BOT_TOKEN"] = cfg.Channel.TokenRefs[1]
 		}
+	}
+	// The web-search key resolves like a provider key: env-first then SecretStore via
+	// this ref (I3 — never the key itself, never logged, never in a prompt).
+	if cfg.Web.SearchKeyRef != "" {
+		m["BRAVE_API_KEY"] = cfg.Web.SearchKeyRef
 	}
 	return m
 }

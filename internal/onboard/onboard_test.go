@@ -30,8 +30,8 @@ func (s *mapStore) Name() string                 { return "map" }
 
 func TestWizardRun(t *testing.T) {
 	// runtime, image, backend, anthropic, openai, openrouter, executor, advisor,
-	// channel, telegram-token, allowlist, codex, confirm.
-	input := "docker\n\n\nsk-ant-123\n\n\n\n\ntelegram\ntg-token-456\n123, 456\n\n\n"
+	// channel, telegram-token, allowlist, web(n), codex, confirm.
+	input := "docker\n\n\nsk-ant-123\n\n\n\n\ntelegram\ntg-token-456\n123, 456\n\n\n\n"
 	store := newMapStore()
 	w := &Wizard{In: strings.NewReader(input), Out: io.Discard, Secrets: store}
 
@@ -74,8 +74,8 @@ func TestWizardRun(t *testing.T) {
 // maps positionally to SLACK_APP_TOKEN / SLACK_BOT_TOKEN.
 func TestWizardRunSlack(t *testing.T) {
 	// runtime, image, backend, anthropic, openai, openrouter, executor, advisor,
-	// channel(slack), app, bot, allowlist, codex, confirm.
-	input := "\n\n\nsk-ant-1\n\n\n\n\nslack\nxapp-1\nxoxb-2\nU123\n\n\n"
+	// channel(slack), app, bot, allowlist, web(n), codex, confirm.
+	input := "\n\n\nsk-ant-1\n\n\n\n\nslack\nxapp-1\nxoxb-2\nU123\n\n\n\n"
 	store := newMapStore()
 	w := &Wizard{In: strings.NewReader(input), Out: io.Discard, Secrets: store}
 
@@ -102,8 +102,8 @@ func TestWizardRunSlack(t *testing.T) {
 // tokens leaves the channel unconfigured rather than mislabeling the entered
 // token as the missing one (positional-corruption guard).
 func TestWizardSlackIncomplete(t *testing.T) {
-	// ...channel(slack), app(blank), bot(xoxb-2), codex, confirm.
-	input := "\n\n\nsk-ant-1\n\n\n\n\nslack\n\nxoxb-2\n\n\n"
+	// ...channel(slack), app(blank), bot(xoxb-2), web(n), codex, confirm.
+	input := "\n\n\nsk-ant-1\n\n\n\n\nslack\n\nxoxb-2\n\n\n\n"
 	w := &Wizard{In: strings.NewReader(input), Out: io.Discard, Secrets: newMapStore()}
 	cfg, err := w.Run()
 	if err != nil {
@@ -121,12 +121,63 @@ func TestWizardSlackIncomplete(t *testing.T) {
 // and assembles nothing the caller would persist.
 func TestWizardAbort(t *testing.T) {
 	// runtime, image, backend, anthropic, openai, openrouter, executor, advisor,
-	// channel(none), codex, confirm(n).
-	input := "\n\n\nsk-ant-1\n\n\n\n\nnone\n\nn\n"
+	// channel(none), web(n), codex, confirm(n).
+	input := "\n\n\nsk-ant-1\n\n\n\n\nnone\n\n\nn\n"
 	w := &Wizard{In: strings.NewReader(input), Out: io.Discard, Secrets: newMapStore()}
 	_, err := w.Run()
 	if !errors.Is(err, ErrAborted) {
 		t.Fatalf("expected ErrAborted, got %v", err)
+	}
+}
+
+// TestWizardWebEnabled exercises the Web access branch: opting in, listing a host,
+// choosing the keyless ddg search, and confirming it lands on the config.
+func TestWizardWebEnabled(t *testing.T) {
+	// ...channel(none), web(y), hosts, search(ddg), codex, confirm.
+	input := "\n\n\nsk-ant-1\n\n\n\n\nnone\ny\ndocs.python.org\nddg\n\n\n"
+	w := &Wizard{In: strings.NewReader(input), Out: io.Discard, Secrets: newMapStore()}
+	cfg, err := w.Run()
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !cfg.Web.Enabled {
+		t.Fatal("web should be enabled")
+	}
+	if cfg.Web.Search != "ddg" {
+		t.Errorf("search = %q, want ddg", cfg.Web.Search)
+	}
+	if strings.Join(cfg.Web.Allow, ",") != "docs.python.org" {
+		t.Errorf("allow = %v", cfg.Web.Allow)
+	}
+	if cfg.Web.SearchKeyRef != "" {
+		t.Errorf("ddg needs no key ref, got %q", cfg.Web.SearchKeyRef)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+// TestFromEnvWeb proves non-interactive provisioning enables web from a Brave key
+// (implying the brave backend) and an allowlist.
+func TestFromEnvWeb(t *testing.T) {
+	env := map[string]string{
+		"ANTHROPIC_API_KEY": "sk-x",
+		"BRAVE_API_KEY":     "brave-k",
+		"NILCORE_WEB_ALLOW": "docs.io",
+	}
+	store := newMapStore()
+	cfg, err := FromEnv(func(k string) string { return env[k] }, store)
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if !cfg.Web.Enabled || cfg.Web.Search != "brave" {
+		t.Errorf("web = %+v, want enabled brave", cfg.Web)
+	}
+	if cfg.Web.SearchKeyRef != "brave_api_key" || store.m["brave_api_key"] != "brave-k" {
+		t.Errorf("brave key not captured: ref=%q store=%v", cfg.Web.SearchKeyRef, store.m)
+	}
+	if strings.Join(cfg.Web.Allow, ",") != "docs.io" {
+		t.Errorf("allow = %v", cfg.Web.Allow)
 	}
 }
 

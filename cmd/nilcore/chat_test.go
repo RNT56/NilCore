@@ -15,10 +15,12 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
+	"nilcore/internal/onboard"
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
+	"nilcore/internal/tools"
 	"nilcore/internal/verb"
 )
 
@@ -391,6 +393,60 @@ func TestApplyAddVerbAddsRoot(t *testing.T) {
 	resolved, _ := filepath.EvalSymlinks(dir)
 	if roots[0] != resolved {
 		t.Errorf("registered root = %q, want %q", roots[0], resolved)
+	}
+}
+
+// TestResolveWeb covers the config + flag → (allowlist, backend) resolution that
+// makes web access "configure once, then it just works".
+func TestResolveWeb(t *testing.T) {
+	has := func(allow []string, h string) bool {
+		for _, a := range allow {
+			if a == h {
+				return true
+			}
+		}
+		return false
+	}
+	ddgHost := tools.SearchHostFor(tools.SearchDDG)
+	braveHost := tools.SearchHostFor(tools.SearchBrave)
+
+	// Off by default: no config opt-in, no flag → default-deny, no search.
+	if allow, b := resolveWeb(onboard.Config{}, "", ""); allow != nil || b != tools.SearchOff {
+		t.Errorf("default: allow=%v backend=%v, want nil/off", allow, b)
+	}
+
+	// Config-enabled, keyless: ddg backend, its host auto-added alongside the host.
+	cfg := onboard.Config{Web: onboard.WebConfig{Enabled: true, Allow: []string{"docs.io"}, Search: "ddg"}}
+	allow, b := resolveWeb(cfg, "", "")
+	if b != tools.SearchDDG || !has(allow, "docs.io") || !has(allow, ddgHost) {
+		t.Errorf("ddg config: allow=%v backend=%v", allow, b)
+	}
+
+	// Auto search + a key present ⇒ brave, brave host auto-added.
+	cfg2 := onboard.Config{Web: onboard.WebConfig{Enabled: true, Search: ""}}
+	allow, b = resolveWeb(cfg2, "", "brave-key")
+	if b != tools.SearchBrave || !has(allow, braveHost) {
+		t.Errorf("auto+key: allow=%v backend=%v, want brave", allow, b)
+	}
+
+	// Configured brave but NO key ⇒ keyless ddg fallback (never advertise a dead tool).
+	cfg3 := onboard.Config{Web: onboard.WebConfig{Enabled: true, Search: "brave"}}
+	_, b = resolveWeb(cfg3, "", "")
+	if b != tools.SearchDDG {
+		t.Errorf("brave-without-key should fall back to ddg, got %v", b)
+	}
+
+	// Flag-only (no config): enables web, additive host, keyless ddg default.
+	allow, b = resolveWeb(onboard.Config{}, "example.com", "")
+	if b != tools.SearchDDG || !has(allow, "example.com") || !has(allow, ddgHost) {
+		t.Errorf("flag-only: allow=%v backend=%v", allow, b)
+	}
+
+	// Explicit search off ⇒ web_fetch only, no search host added.
+	cfg4 := onboard.Config{Web: onboard.WebConfig{Enabled: true, Allow: []string{"docs.io"}, Search: "off"}}
+	allow, b = resolveWeb(cfg4, "", "")
+	if b != tools.SearchOff || has(allow, ddgHost) || !has(allow, "docs.io") {
+		t.Errorf("search-off: allow=%v backend=%v", allow, b)
 	}
 }
 

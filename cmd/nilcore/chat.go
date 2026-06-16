@@ -46,6 +46,7 @@ import (
 	"nilcore/internal/memory"
 	"nilcore/internal/meter"
 	"nilcore/internal/model"
+	"nilcore/internal/onboard"
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
@@ -145,7 +146,11 @@ func chatMain(args []string) {
 	// the web_fetch tool. The proxy is bound to the conversation ctx, so it shuts
 	// down when the REPL exits. A namespace-backend sandbox has no proxy egress path
 	// (CLONE_NEWNET with no interfaces), so web access requires the container backend.
-	egress, proxyAddr, stopProxy := startEgress(ctx, *cf.allowEgress, console)
+	// Effective web access from config (nilcore init) + the -allow-egress flag, with
+	// the search backend resolved and its host auto-allowlisted.
+	searchKey := b.cred(searchKeyEnv)
+	allow, searchBackend := resolveWeb(b.cfg, *cf.allowEgress, searchKey)
+	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console)
 	defer stopProxy()
 
 	sess, err := buildChatSession(chatDeps{
@@ -158,9 +163,10 @@ func chatMain(args []string) {
 		emitter:         emitter,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
-		// Web-search key resolved env-first then SecretStore (I3). Only matters when
-		// web access is enabled and the Brave host is in -allow-egress.
-		searchKey: b.cred(searchKeyEnv),
+		searchBackend:   searchBackend,
+		// Web-search key resolved env-first then SecretStore (I3); used only by the
+		// brave backend, never logged, never placed in a prompt.
+		searchKey: searchKey,
 	})
 	if err != nil {
 		fatal(err)
@@ -178,6 +184,11 @@ func chatMain(args []string) {
 	}
 
 	console.Line(console.Style().Dim(chatBanner))
+	// Make web access discoverable: when it's off, say so and how to turn it on (the
+	// "on" case already prints an "enabled" line from startEgress above).
+	if egress.Empty() {
+		console.Line(console.Style().Dim("  web access is off — enable it in `nilcore init`, or pass -allow-egress <host>"))
+	}
 	if err := chatREPL(ctx, sess, os.Stdin, console, emitter); err != nil && err != io.EOF {
 		fatal(err)
 	}
@@ -225,11 +236,13 @@ type chatDeps struct {
 	egress          policy.Egress
 	egressProxyAddr string
 
-	// searchKey is the web-search API key (resolved env-first then SecretStore, I3;
-	// never logged, never placed in a prompt). When set AND web access is enabled AND
-	// the search host is allowlisted, the web_search tool is advertised; the key is
-	// injected into the in-box request via per-run env, never the command string.
-	searchKey string
+	// searchBackend is the resolved web_search engine (off | ddg keyless | brave
+	// keyed). searchKey is the brave API key (resolved env-first then SecretStore, I3;
+	// never logged, never in a prompt; injected into the in-box request via per-run
+	// env). web_search is advertised when web access is on, the backend is not off,
+	// and the backend's host is allowlisted.
+	searchBackend tools.SearchBackend
+	searchKey     string
 }
 
 // webEnabled reports whether sandboxed web access is configured (a non-empty
@@ -249,6 +262,54 @@ func (d chatDeps) approverOr() policy.Approver {
 	return policy.NewConsoleApprover(os.Stdin, os.Stdout)
 }
 
+// resolveWeb computes the effective egress allowlist and search backend from the
+// persisted config (set by `nilcore init`) plus the -allow-egress flag — so web
+// access is configured ONCE and then just works, not a flag the user must remember.
+//
+//   - Config (`cfg.Web`) is the baseline; the flag ADDS hosts on top (a one-off
+//     `-allow-egress foo.com` extends, never silently replaces, the saved set).
+//   - Web is enabled when the operator opted in (`cfg.Web.Enabled`) OR passed any
+//     flag host. Otherwise it stays default-deny (nil allowlist, no proxy).
+//   - The chosen search backend's host is AUTO-ADDED to the allowlist, so search
+//     works the moment web is on without the user having to list it.
+//   - The backend resolves from config; left auto, a Brave key ⇒ brave, else the
+//     keyless ddg default. A configured brave with no resolvable key degrades to ddg.
+func resolveWeb(cfg onboard.Config, flagAllow, searchKey string) (allow []string, backend tools.SearchBackend) {
+	seen := map[string]bool{}
+	add := func(h string) {
+		if h = strings.TrimSpace(h); h != "" && !seen[h] {
+			seen[h] = true
+			allow = append(allow, h)
+		}
+	}
+	for _, h := range cfg.Web.Allow {
+		add(h)
+	}
+	flagHosts := splitHosts(flagAllow)
+	for _, h := range flagHosts {
+		add(h)
+	}
+	if !cfg.Web.Enabled && len(flagHosts) == 0 {
+		return nil, tools.SearchOff // default-deny: no opt-in, no flag
+	}
+
+	backend = tools.SearchBackend(cfg.Web.Search)
+	if backend == tools.SearchOff {
+		return allow, tools.SearchOff // web_fetch only, search explicitly off
+	}
+	if backend == tools.SearchAuto {
+		backend = tools.SearchDDG
+		if searchKey != "" {
+			backend = tools.SearchBrave
+		}
+	}
+	if backend == tools.SearchBrave && searchKey == "" {
+		backend = tools.SearchDDG // configured brave but no key → keyless fallback
+	}
+	add(tools.SearchHostFor(backend)) // so search works without the user listing the host
+	return allow, backend
+}
+
 // startEgress resolves the -allow-egress allowlist and, when non-empty, stands up
 // the allowlist proxy bound to ctx. It returns the resolved Egress, the proxy's
 // bound host:port (empty when egress is off), and an idempotent stop func (a no-op
@@ -257,22 +318,38 @@ func (d chatDeps) approverOr() policy.Approver {
 // sandbox container can reach it across the bridge; it only ever forwards to the
 // allowlisted hosts and refuses private/loopback destinations (the SSRF guard), so
 // it is never an open relay.
-func startEgress(ctx context.Context, allow string, con *termui.Console) (policy.Egress, string, func()) {
-	hosts := splitHosts(allow)
+func startEgress(ctx context.Context, hosts []string, con *termui.Console) (policy.Egress, string, func()) {
+	egress, addr, stop, ok := startEgressProxy(ctx, hosts)
+	switch {
+	case len(hosts) == 0:
+		// default-deny; nothing to announce.
+	case !ok:
+		// Fail-closed: the proxy could not bind, so run with no egress.
+		con.Line(con.Style().Warn("  web access disabled: could not start the egress proxy"))
+	default:
+		con.Line(con.Style().Dim(fmt.Sprintf("  web access enabled for %d host(s) via the allowlist proxy", len(hosts))))
+	}
+	return egress, addr, stop
+}
+
+// startEgressProxy stands up the allowlist proxy for hosts, bound to ctx (it shuts
+// down when ctx is cancelled or stop is called). It is the console-free core shared
+// by chat (startEgress) and serve. Returns the egress policy, the proxy host:port,
+// an idempotent stop, and ok=false (with a no-op result) when hosts is empty or the
+// proxy cannot bind — fail-closed: a bind failure runs with no egress, not an open
+// sandbox. It binds 0.0.0.0 so a bridged container can reach it; the proxy only ever
+// forwards to the allowlisted hosts and refuses private/loopback (the SSRF guard).
+func startEgressProxy(ctx context.Context, hosts []string) (policy.Egress, string, func(), bool) {
 	if len(hosts) == 0 {
-		return policy.Egress{}, "", func() {}
+		return policy.Egress{}, "", func() {}, false
 	}
 	egress := policy.Egress{Allowed: hosts}
 	proxy := &policy.EgressProxy{Egress: egress}
 	addr, stop, err := proxy.Start(ctx, "0.0.0.0:0")
 	if err != nil {
-		// Fail-closed: if the proxy cannot bind, run with no egress rather than
-		// silently leaving the sandbox networked.
-		con.Line(con.Style().Warn("  web access disabled: could not start egress proxy: " + err.Error()))
-		return policy.Egress{}, "", func() {}
+		return policy.Egress{}, "", func() {}, false
 	}
-	con.Line(con.Style().Dim(fmt.Sprintf("  web access enabled for %d host(s) via the allowlist proxy", len(hosts))))
-	return egress, addr, stop
+	return egress, addr, stop, true
 }
 
 // splitHosts parses a comma-separated host allowlist, trimming blanks.
@@ -606,11 +683,10 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if d.webEnabled() {
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
-			// web_search is advertised only when a key is configured AND its host is
-			// in the allowlist (otherwise the request fails closed at the proxy, so
-			// advertising it would be dishonest surface).
-			if d.searchKey != "" && d.egress.Allow(tools.WebSearchHost()) {
-				reg.Register(tools.WebSearchTool{Box: box, APIKey: d.searchKey})
+			// web_search is advertised when the resolved backend is not off AND its
+			// host is allowlisted (resolveWeb auto-adds it, so this holds in practice).
+			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
 		}
 	}
