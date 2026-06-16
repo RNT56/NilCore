@@ -104,6 +104,17 @@ type Supervisor struct {
 	MaxAgents     int // tree-wide spawn ceiling (atomic); <1 → unlimited
 	MaxColocSteps int // step ceiling for a self-coded pass (passed through Code)
 
+	// Concurrency caps how many subagents of one decomposition wave run at once.
+	// <2 ⇒ SERIAL dispatch, byte-identical to the pre-concurrency path: each
+	// spawn_subagent block runs to completion before the next block is processed.
+	// >1 batches a turn's CONSECUTIVE spawn_subagent blocks into a wave-DAG that
+	// runs concurrently under this cap (docs/CONCURRENCY.md §2): independent
+	// siblings parallelize, dependent chains stay ordered via the DAG edges, and a
+	// dependent is cut from its dependency's verified branch. The integrator stays
+	// strictly serial regardless (I2 "tip always green"). The wiring site sets this
+	// from -concurrency; every other surface leaves it 0 ⇒ serial.
+	Concurrency int
+
 	Budget *budget.Ledger // shared ledger; charged at the wiring site via meter (§7)
 
 	// Inbox, if set, is the conversational front door's user→agent seam (C1-T04),
@@ -557,59 +568,96 @@ func (s *Supervisor) drainFindings(r *reader) string {
 	return b.String()
 }
 
+// concurrency returns the effective in-wave parallelism cap. <2 (the default)
+// means SERIAL: dispatch takes the byte-identical doSpawn-per-block path. >1
+// enables the concurrent wave path (docs/CONCURRENCY.md §2).
+func (s *Supervisor) concurrency() int {
+	if s.Concurrency < 1 {
+		return 1
+	}
+	return s.Concurrency
+}
+
 // dispatch handles every tool_use block in one model turn, building a tool_result
 // per block (the API requires one for each), and reports whether finish was called
 // plus its summary. It mirrors native.go's per-block switch exactly, so a tool
 // failure is a structured error fed back to the model, never a Go fault. Subagent
 // data that flows back is guard.Wrap-fenced at every seam (I7).
+//
+// At concurrency() == 1 it routes to dispatchSerial — the unchanged path, so a
+// serial run is byte-identical to the pre-concurrency build (the §5 contract).
+// Above 1 it routes to dispatchConcurrent, which batches a turn's spawn blocks into
+// a concurrent wave-DAG (P8-T04). Both share dispatchOne for every NON-spawn tool,
+// so the tool semantics are defined once.
 func (s *Supervisor) dispatch(ctx context.Context, round int, st *runState, content []model.Block) (results []model.Block, finished bool, summary string) {
+	if s.concurrency() <= 1 {
+		return s.dispatchSerial(ctx, round, st, content)
+	}
+	return s.dispatchConcurrent(ctx, round, st, content)
+}
+
+// dispatchSerial is the original per-block dispatch: each spawn_subagent runs to
+// completion inline before the next block. It is the byte-identical reference path
+// — the concurrency knob never touches it (concurrency() == 1 lands here).
+func (s *Supervisor) dispatchSerial(ctx context.Context, round int, st *runState, content []model.Block) (results []model.Block, finished bool, summary string) {
 	for _, b := range content {
 		if b.Type != "tool_use" {
 			continue
 		}
-		switch b.Name {
-		case toolFinish:
-			var in struct {
-				Summary string `json:"summary"`
-			}
-			_ = json.Unmarshal(b.Input, &in)
-			summary, finished = in.Summary, true
-			results = append(results, ok(b.ID, "noted"))
-
-		case toolPlan:
-			results = append(results, s.doPlan(ctx, b))
-
-		case toolSpawnSubagent:
+		if b.Name == toolSpawnSubagent {
 			results = append(results, s.doSpawn(ctx, round, st, b))
-
-		case toolMessageSubagent:
-			results = append(results, s.doMessage(ctx, b))
-
-		case toolAwaitResults:
-			results = append(results, s.doAwait(ctx, st, b))
-
-		case toolIntegrate:
-			results = append(results, s.doIntegrate(ctx, round, st, b))
-
-		case toolCode:
-			results = append(results, s.doCode(ctx, round, st, b))
-
-		default:
-			// Read/search tools dispatch through the read registry over the
-			// integration tree; their output is fenced (untrusted file contents, I7).
-			if s.ReadTools != nil && s.ReadDir != "" && s.ReadTools.Has(b.Name) && !busToolNames[b.Name] {
-				out, err := s.ReadTools.Dispatch(ctx, b.Name, s.ReadDir, b.Input)
-				if err != nil {
-					results = append(results, errf(b.ID, b.Name+": "+err.Error()))
-					continue
-				}
-				results = append(results, ok(b.ID, guard.Wrap(b.Name+" output", out)))
-				continue
-			}
-			results = append(results, errf(b.ID, "unknown tool: "+b.Name))
+			continue
+		}
+		res, fin, sum := s.dispatchOne(ctx, round, st, b)
+		results = append(results, res)
+		if fin {
+			finished, summary = true, sum
 		}
 	}
 	return results, finished, summary
+}
+
+// dispatchOne handles one NON-spawn tool_use block, returning its tool_result plus
+// (for finish) the finished flag and summary. It is the single definition of every
+// orchestration verb except spawn_subagent, shared by the serial and concurrent
+// dispatch paths so the tool semantics never drift between them. Spawn is handled
+// separately: serially in dispatchSerial, batched into a wave in dispatchConcurrent.
+func (s *Supervisor) dispatchOne(ctx context.Context, round int, st *runState, b model.Block) (result model.Block, finished bool, summary string) {
+	switch b.Name {
+	case toolFinish:
+		var in struct {
+			Summary string `json:"summary"`
+		}
+		_ = json.Unmarshal(b.Input, &in)
+		return ok(b.ID, "noted"), true, in.Summary
+
+	case toolPlan:
+		return s.doPlan(ctx, b), false, ""
+
+	case toolMessageSubagent:
+		return s.doMessage(ctx, b), false, ""
+
+	case toolAwaitResults:
+		return s.doAwait(ctx, st, b), false, ""
+
+	case toolIntegrate:
+		return s.doIntegrate(ctx, round, st, b), false, ""
+
+	case toolCode:
+		return s.doCode(ctx, round, st, b), false, ""
+
+	default:
+		// Read/search tools dispatch through the read registry over the
+		// integration tree; their output is fenced (untrusted file contents, I7).
+		if s.ReadTools != nil && s.ReadDir != "" && s.ReadTools.Has(b.Name) && !busToolNames[b.Name] {
+			out, err := s.ReadTools.Dispatch(ctx, b.Name, s.ReadDir, b.Input)
+			if err != nil {
+				return errf(b.ID, b.Name+": "+err.Error()), false, ""
+			}
+			return ok(b.ID, guard.Wrap(b.Name+" output", out)), false, ""
+		}
+		return errf(b.ID, "unknown tool: "+b.Name), false, ""
+	}
 }
 
 // steerPending non-blocking checks the inbox's steer signal: true iff a steer is

@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -52,6 +53,7 @@ import (
 	"nilcore/internal/roster"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/spawn"
+	"nilcore/internal/strongcap"
 	"nilcore/internal/summarize"
 	"nilcore/internal/super"
 	"nilcore/internal/verify"
@@ -62,6 +64,17 @@ import (
 // internal naming only — never a security boundary — so a monotonic counter plus a
 // timestamp is sufficient (stdlib-arithmetic only, I6).
 var buildSeq atomic.Uint64
+
+// gitMu serializes the git-METADATA mutations that concurrent role-workers issue
+// against the ONE shared integration repo: `git worktree add` (CreateFrom), the
+// per-worker commit, and worktree release. Under -concurrency >1 several workers
+// run at once; git's own locking on the worktree admin files / refs is not safe to
+// race, so we serialize just these fast steps. The long pole — each worker's model
+// loop inside its own worktree+sandbox — runs fully concurrently, so this costs
+// almost no wall-clock. Serial runs never contend (one worker at a time). The
+// integrator never overlaps workers (it runs between waves on the supervisor
+// goroutine), so worker-vs-integrator needs no lock here.
+var gitMu sync.Mutex
 
 // buildFlags are the build subcommand's own flags (docs/MULTI-AGENT.md §9). They
 // are deliberately separate from registerCommon: build does not run a single task
@@ -81,6 +94,7 @@ type buildFlags struct {
 	maxFan      *int
 	maxAgent    *int
 	maxDepth    *int
+	concurrency *int
 	budget      *float64
 	deadline    *time.Duration
 	maxSteps    *int
@@ -101,6 +115,7 @@ func registerBuildFlags(fs *flag.FlagSet) buildFlags {
 		maxFan:      fs.Int("max-fanout", 8, "subagents per single decomposition wave"),
 		maxAgent:    fs.Int("max-agents", 64, "tree-wide spawn ceiling"),
 		maxDepth:    fs.Int("max-depth", 1, "spawn depth ceiling (1 = only the top supervisor spawns)"),
+		concurrency: fs.Int("concurrency", 1, "max subagents run at once within a decomposition wave (1 = serial, the byte-identical default)"),
 		budget:      fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
 		deadline:    fs.Duration("deadline", 2*time.Hour, "wall-clock ceiling for the whole run"),
 		maxSteps:    fs.Int("max-steps", 80, "tool-call budget for each role-worker and the supervisor's own coding pass"),
@@ -164,6 +179,7 @@ func buildMain(args []string) {
 		maxFan:      *bf.maxFan,
 		maxAgent:    *bf.maxAgent,
 		maxDepth:    *bf.maxDepth,
+		concurrency: *bf.concurrency,
 		maxSteps:    *bf.maxSteps,
 		budget:      *bf.budget,
 		executor:    exec,
@@ -211,6 +227,7 @@ type buildDeps struct {
 	sandboxPref              string
 	maxIter, maxFan          int
 	maxAgent, maxDepth       int
+	concurrency              int
 	maxSteps                 int
 	budget                   float64
 
@@ -285,7 +302,19 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 	// Researcher gets no network here (build keeps egress denied by default — the
 	// operator opts in elsewhere); every read-only role is handed a write-free
 	// registry and deny-all egress by NewDefault, enforced structurally by NewWorker.
-	rost := roster.NewDefault(exec, strong, policy.Egress{})
+	//
+	// Under concurrency the strong provider handed to roster workers (their per-worker
+	// ask_advisor tier) is wrapped in a PROCESS-GLOBAL ctx-honoring limiter (P8-T03):
+	// a correlated EscalateAfter herd then cannot overrun the provider's rate limit.
+	// It wraps ONLY the worker-advisor provider — the supervisor's own Model and the
+	// Answer hook below keep the un-throttled `strong`, so coordination is never
+	// starved by the herd (docs/CONCURRENCY.md §3). Serial runs (concurrency 1) skip
+	// the wrap entirely, so the worker path is byte-identical to before.
+	workerAdvisor := strong
+	if d.concurrency > 1 {
+		workerAdvisor = strongcap.New(strong, advisorCap(d.maxFan))
+	}
+	rost := roster.NewDefault(exec, workerAdvisor, policy.Egress{})
 
 	// The per-worktree environment factory: a sandbox over the worktree dir plus the
 	// project verifier. Shared by the integrator (verify-after-each-merge) and the
@@ -312,11 +341,12 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		// canned fallback. It reuses the SAME metered strong provider as Model, so the
 		// answer call charges the one shared ledger (budget rail, §7); a model
 		// error/timeout returns "" and the reader falls back gracefully (never hangs).
-		Answer:    buildAnswerFunc(strong, d.log),
-		MaxDepth:  d.maxDepth,
-		MaxFanout: d.maxFan,
-		MaxAgents: d.maxAgent,
-		Budget:    ledger,
+		Answer:      buildAnswerFunc(strong, d.log),
+		MaxDepth:    d.maxDepth,
+		MaxFanout:   d.maxFan,
+		MaxAgents:   d.maxAgent,
+		Concurrency: d.concurrency, // <2 ⇒ serial dispatch (byte-identical); >1 ⇒ in-wave concurrency
+		Budget:      ledger,
 	}
 
 	loop := &project.Loop{
@@ -347,6 +377,18 @@ func meterProvider(prov model.Provider, ledger *budget.Ledger, task string) mode
 		return nil
 	}
 	return &meter.Provider{Inner: prov, Ledger: ledger, Task: task, Price: meter.NewTable()}
+}
+
+// advisorCap sizes the process-global worker-advisor concurrency limiter (P8-T03).
+// It is held strictly BELOW MaxFanout (docs/CONCURRENCY.md §3.4): a cap equal to the
+// wave size would admit the entire herd and do nothing. The cap need only be ≥1 to
+// be deadlock-free (the limiter is ctx-honoring and falls through to the graceful
+// fallback on saturation), so an unlimited/degenerate MaxFanout floors at 1.
+func advisorCap(maxFanout int) int {
+	if maxFanout > 1 {
+		return maxFanout - 1
+	}
+	return 1
 }
 
 // advisorFor builds a strong-tier advisor for the project loop's reflect ladder, or
@@ -444,14 +486,18 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		if base == "" {
 			base = "HEAD"
 		}
+		// Serialize the `git worktree add` against the shared repo (gitMu): the model
+		// loop afterward runs concurrently in the worker's own worktree.
+		gitMu.Lock()
 		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(spec.ID), base)
+		gitMu.Unlock()
 		if err != nil {
 			return spawn.Result{ID: spec.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("spawn: worktree: %w", err)}
 		}
 		// Release (not Cleanup) — keep the task/<ID> branch alive so a later
 		// dependent can branch from it; the wave's branches are swept at run end.
-		defer func() { _ = wt.Release() }()
+		defer func() { gitMu.Lock(); _ = wt.Release(); gitMu.Unlock() }()
 
 		// Sandbox + verifier over the worker's own worktree. The role's egress is
 		// intersected with the tree's (here deny-all) and applied to the box before it
@@ -491,7 +537,9 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		if !rep.Passed {
 			return spawn.Result{ID: spec.ID, Summary: res.Summary, Passed: false, State: spawn.StateFailed}
 		}
+		gitMu.Lock()
 		sha, _, cerr := wt.Commit(ctx, "feat("+spec.ID+"): "+truncate(spec.Goal, 60))
+		gitMu.Unlock()
 		if cerr != nil {
 			return spawn.Result{ID: spec.ID, Summary: res.Summary, State: spawn.StateFailed,
 				Err: fmt.Errorf("spawn: commit: %w", cerr)}

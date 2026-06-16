@@ -101,7 +101,7 @@ The hard requirement: **a stuck executor must ALWAYS be able to reach the adviso
 ## 5. Deployment phases
 
 - **Flag-gated, default off:** `-concurrency N` (default `1` = serial = **byte-identical**; clamp ≥1). At 1 the existing serial `doSpawn` path is taken unchanged — no new code path.
-- **Phase 1 (P8-T01..04)** — pre-wave validation; wire `DAGScheduler` into `dispatch()` for in-turn concurrency; the ctx-honoring worker advisor limiter (process-global, `< MaxFanout`); fix the unmetered-advisor budget-escape; fix the `Spawner` ctx bug. Integration unchanged. *Bulk of the value, lowest risk.*
+- **Phase 1 (P8-T01..04) — ✅ SHIPPED.** pre-wave validation (`checkSpawnRails` + `runSpawnWave`); `DAGScheduler` wired into `dispatch()` (`dispatchConcurrent`) for in-turn concurrency, gated on `-concurrency`; the ctx-honoring process-global worker advisor limiter (`internal/strongcap`, `< MaxFanout`, worker `ask_advisor` path only); the unmetered-advisor budget-escape and the `Spawner` ctx bug fixed (P8-T01). Concurrent shared-repo git ops serialized (`gitMu`); integration unchanged. Proven by the §6 gates as `-race` property tests in `internal/super` / `internal/strongcap`. *Bulk of the value, lowest risk.*
 - **Phase 2** — `OnReady` re-base dependents on a merged tip (extends single-dep branch-cut to multi-dep).
 - **Phase 3** — pipelined waves (plan wave N+1 while wave N runs) + the supervisor's between-wave re-plan policy on a red dependency.
 
