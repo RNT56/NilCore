@@ -839,7 +839,22 @@ func resolveProvider(backendName string, b boot) (model.Provider, error) {
 			}
 			return nil, fmt.Errorf("%w; run `nilcore init` to store the key", err)
 		}
-		return p, nil
+		// Wrap the executor in the resilience layer: transient API errors retry with
+		// jittered exponential backoff and a circuit breaker trips on sustained
+		// failure, so an unattended run survives provider blips. It stays INNERMOST —
+		// the meter (the budget wall) wraps this, so budget.ErrCeiling is never
+		// mistaken for a transient fault and retried. Failover across providers
+		// activates when more than one is configured; a single provider gets
+		// retry + breaker. On invalid options, fall back to the bare provider.
+		res, rerr := model.NewResilient([]model.Provider{p}, model.Options{
+			MaxRetries:       2,
+			Jitter:           200 * time.Millisecond,
+			BreakerThreshold: 4,
+		})
+		if rerr != nil {
+			return p, nil
+		}
+		return res, nil
 	case "codex", "claude-code":
 		return nil, nil
 	default:

@@ -109,6 +109,11 @@ func chatMain(args []string) {
 	log := openLog(*cf.common.logPath)
 	defer log.Close()
 
+	// Persistence backbone (best-effort): a checkpointer that lets the conversation
+	// survive a restart (set as the Session.Store below) and durable event-log
+	// mirroring. A nil checkpoint keeps the conversation in-memory only.
+	_, ckpt := setupPersistence(log)
+
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -156,6 +161,17 @@ func chatMain(args []string) {
 	})
 	if err != nil {
 		fatal(err)
+	}
+
+	// Conversation persistence (C4-T01): with a checkpointer set as the Store, the
+	// bounded WorkState is saved after every drive fold and re-hydrated on startup —
+	// so a restarted `nilcore chat` CONTINUES the prior conversation (including its
+	// pinned mode, which now round-trips). A nil checkpoint keeps it in-memory only.
+	if ckpt != nil {
+		sess.Store = ckpt
+		if sess.Restore(context.Background()) {
+			console.Line(console.Style().Dim("↻ resumed the previous conversation"))
+		}
 	}
 
 	console.Line(console.Style().Dim(chatBanner))

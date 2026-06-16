@@ -83,30 +83,57 @@ func (g *Graph) AddEdge(ctx context.Context, e Edge) error {
 	return err
 }
 
-// BuildFile indexes a Go file: its symbols become nodes and its calls become
-// `calls` edges (by name, scoped to the fixture/package). Idempotent.
+// BuildFile (re)indexes a Go file: its symbols become nodes and its calls become
+// `calls` edges (by name, scoped to the fixture/package). It is a full REPLACE of
+// the file's contribution, not an append — it first prunes the file's prior nodes
+// and the edges originating from them, so a symbol or call that the file no longer
+// contains does NOT linger (the incremental `live` re-index depends on this).
+// Symbols are upserted, so a symbol's file/kind is refreshed on rebuild (e.g. when
+// it moves into this file). The prune+rebuild is atomic in one transaction.
 func (g *Graph) BuildFile(ctx context.Context, path string) error {
 	syms, err := ast.Symbols(path)
 	if err != nil {
 		return err
 	}
-	for _, s := range syms {
-		if err := g.AddNode(ctx, Node{ID: s.Name, Kind: string(s.Kind), Name: s.Name, File: path}); err != nil {
-			return err
-		}
-	}
 	calls, err := ast.Calls(path)
 	if err != nil {
 		return err
 	}
+
+	tx, err := g.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	// Prune the file's prior contribution: the edges that originate from its
+	// symbols, then its nodes. Edges INTO this file's symbols from elsewhere are
+	// owned by the caller's file and are deliberately left intact.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE file = ?)`, path); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE file = ?`, path); err != nil {
+		return err
+	}
+
+	for _, s := range syms {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO nodes (id, kind, name, file) VALUES (?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, file=excluded.file`,
+			s.Name, string(s.Kind), s.Name, path); err != nil {
+			return err
+		}
+	}
 	for caller, callees := range calls {
 		for _, callee := range callees {
-			if err := g.AddEdge(ctx, Edge{From: caller, To: callee, Kind: "calls"}); err != nil {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT OR IGNORE INTO edges (from_id, to_id, kind) VALUES (?, ?, 'calls')`,
+				caller, callee); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // Callers returns the direct callers of id.

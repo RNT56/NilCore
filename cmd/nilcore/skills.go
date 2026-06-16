@@ -72,6 +72,11 @@ func skillTools() []tools.Tool {
 // tools.Default set — skills are a primary-loop capability.)
 func loopTools() *tools.Registry {
 	r := tools.Default()
+	// The read-only code-intelligence tool (graph-native callers/callees/repomap,
+	// plus the compiler-grade LSP "precise" lens when NILCORE_LSP_COMMAND is set)
+	// belongs on every primary loop, not only the build understander — "understand
+	// before you change" applies to run/chat/serve too.
+	r.Register(tools.CodeintelTool{})
 	for _, t := range skillTools() {
 		r.Register(t)
 	}
