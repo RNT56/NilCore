@@ -579,6 +579,7 @@ func serveMain(args []string) {
 	channelName := fs.String("channel", "", "telegram | slack (default: config, else telegram)")
 	budgetCeil := fs.Float64("budget", chatDefaultBudget, "global dollar ceiling per conversation (a hard wall via the meter)")
 	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
+	maxLifetime := fs.Duration("max-lifetime", 0, "after this wall-clock duration, serve checkpoints in-flight work and exits cleanly so a supervisor (systemd) restarts it into the resume path (0 = no cap)")
 	webhookAddr := fs.String("webhook", "", "address for the SCM/CI webhook intake (e.g. 127.0.0.1:8099); needs NILCORE_WEBHOOK_SECRET")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
@@ -626,6 +627,17 @@ func serveMain(args []string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Optional wall-clock lifetime cap: after -max-lifetime, the serve ctx expires,
+	// Serve returns, and the SAME clean-shutdown path below checkpoints in-flight work
+	// (ckpt.Interrupt) — so a supervisor (systemd Restart=always) brings it back into
+	// the resume path on a schedule (a bounded-lifetime self-restart for very long
+	// unattended operation). 0 ⇒ no cap (byte-identical: runs until a signal).
+	if *maxLifetime > 0 {
+		var cancelLifetime context.CancelFunc
+		ctx, cancelLifetime = context.WithTimeout(ctx, *maxLifetime)
+		defer cancelLifetime()
+		fmt.Fprintf(os.Stderr, "nilcore serve: max-lifetime %s (will checkpoint + exit for a supervised restart)\n", *maxLifetime)
+	}
 
 	// Periodic maintenance: a long-lived serve accumulates worktree admin entries from
 	// crashed/abandoned drives between restarts, so re-run the crash-safe worktree GC
