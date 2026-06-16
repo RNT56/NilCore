@@ -94,6 +94,18 @@ type Supervisor struct {
 	// tree). Empty disables those tools gracefully.
 	ReadDir string
 
+	// RefreshRead, if set, re-points the read worktree (ReadDir) at the latest verified
+	// tree (tip) so the supervisor's read/search tools and the grounded answer see the
+	// CURRENT integrated state, not a stale base — the live repo-read countercheck. It
+	// is called SINGLE-OWNER on the main goroutine when the tip advances (every
+	// st.branch mutation), returns a bounded file-tree of the tip for the answer
+	// grounding (or "" on error/none), and the wiring site runs its git ops under the
+	// shared gitMu. nil leaves the read tree static (or absent) and adds no file-tree
+	// grounding — byte-identical to a run without it. The reader goroutine NEVER calls
+	// this and NEVER reads ReadDir; live host I/O stays on the main loop (the reader
+	// answers off a by-value snapshot only — deadlock-freedom unchanged).
+	RefreshRead func(ctx context.Context, tip string) (tree string)
+
 	// Answer, if set, produces the supervisor's reply to a subagent's blocking
 	// question/review-request (delivered by the reader goroutine). nil yields the
 	// graceful "proceed with your best judgment" fallback — so a subagent's Ask is
@@ -184,6 +196,7 @@ type RunContext struct {
 	Plan   string        // compact digest of the latest plan tree (not raw JSON)
 	Cohort []CohortEntry // live per-subagent state (who passed/failed/is running)
 	Tip    string        // the current integration tip branch (merged+verified work)
+	Tree   string        // bounded file list of the current integrated tree (structure)
 }
 
 // CohortEntry is one subagent's live state in a RunContext: enough for the answer to
@@ -201,7 +214,7 @@ type CohortEntry struct {
 // Empty reports whether the snapshot carries no grounding, so the Answer hook can
 // take the byte-identical ungrounded path.
 func (rc RunContext) Empty() bool {
-	return rc.Goal == "" && rc.Plan == "" && len(rc.Cohort) == 0 && rc.Tip == ""
+	return rc.Goal == "" && rc.Plan == "" && len(rc.Cohort) == 0 && rc.Tip == "" && rc.Tree == ""
 }
 
 // publishRunContext stores a freshly-built snapshot for the reader to load. Called
@@ -246,7 +259,19 @@ func (s *Supervisor) buildRunContext(st *runState) RunContext {
 			State: state, Branch: branch, Report: report})
 	}
 	sort.Slice(cohort, func(i, j int) bool { return cohort[i].ID < cohort[j].ID })
-	return RunContext{Goal: st.goal, Plan: st.planDigest, Cohort: cohort, Tip: st.branch}
+	return RunContext{Goal: st.goal, Plan: st.planDigest, Cohort: cohort, Tip: st.branch, Tree: st.tree}
+}
+
+// refreshAndPublish re-points the read worktree at the latest verified tip (so the
+// supervisor's read tools and the grounded answer's file-tree see the CURRENT
+// integrated state) and re-publishes the snapshot. Called single-owner on the main
+// goroutine at every st.branch mutation. With no RefreshRead wired it is just a
+// publish (no read tree, no file-tree grounding) — byte-identical to before.
+func (s *Supervisor) refreshAndPublish(ctx context.Context, st *runState) {
+	if s.RefreshRead != nil && st.branch != "" {
+		st.tree = s.RefreshRead(ctx, st.branch)
+	}
+	s.publishRunContext(s.buildRunContext(st))
 }
 
 // Inbox is the minimal handle the supervisor loop needs onto the conversational
@@ -526,6 +551,7 @@ type runState struct {
 	branch     string // last integration tip the supervisor converged on
 	goal       string // the run's goal, kept so every publish can rebuild RunContext
 	planDigest string // compact digest of the latest plan tree (set by doPlan)
+	tree       string // bounded file list of the current integrated tree (set by RefreshRead)
 }
 
 // depthCap returns the effective spawn-depth ceiling (default 1: only the

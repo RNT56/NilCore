@@ -251,6 +251,7 @@ func TestBuildStackBudgetCeilingAbortsRunaway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildStack: %v", err)
 	}
+	defer stack.cleanup() // reclaim the supervisor's live read worktree
 
 	// The wiring must hand the injected ledger straight through (the single-wall
 	// invariant): the assembly's ledger is the one we exhausted.

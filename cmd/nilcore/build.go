@@ -56,6 +56,7 @@ import (
 	"nilcore/internal/strongcap"
 	"nilcore/internal/summarize"
 	"nilcore/internal/super"
+	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -194,12 +195,11 @@ func buildMain(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), *bf.deadline)
 	defer cancel()
 
-	// Sweep the per-worker task/<ID> branches that buildSpawnFunc kept alive via
-	// Release (so dependents could branch from them), plus the throwaway rebase/<ID>
-	// tips that mergedBaseTip kept alive for a multi-dep worker's CreateFrom to pin.
-	// Branches are cheap refs; reclaim them once the run is done.
-	defer worktree.DeleteBranches(context.Background(), stack.repo, "task/")
-	defer worktree.DeleteBranches(context.Background(), stack.repo, "rebase/")
+	// Tear down run-scoped resources: the supervisor's live read worktree plus the
+	// run's throwaway branches (task/, rebase/, integrate/, read/ — kept alive during
+	// the run via Release so dependents/RefreshRead/the promote Differ could read them).
+	// All of it lives in stack.cleanup so every entry path reclaims it uniformly.
+	defer stack.cleanup()
 
 	out, err := stack.loop.Run(ctx)
 	if err != nil {
@@ -253,6 +253,10 @@ type buildAssembly struct {
 	loop   *project.Loop
 	repo   string
 	ledger *budget.Ledger
+	// cleanup tears down run-scoped resources the stack created (the supervisor's live
+	// read worktree). Always non-nil — a no-op when nothing needs cleanup. Every caller
+	// defers it after loop.Run so a long-lived serve session never leaks read worktrees.
+	cleanup func()
 }
 
 // buildStack wires the whole stack: the shared ledger + metered providers, the
@@ -329,6 +333,55 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Log:      d.log,
 	}
 
+	// Live repo-read: a long-lived READ worktree the supervisor's read/search tools
+	// operate over, re-pointed at the integration tip as the run progresses
+	// (RefreshRead) so the supervisor reads the CURRENT integrated tree — not a stale
+	// base — when it reasons, and the grounded answer carries the tip's file structure.
+	// Cut off base HEAD as a throwaway read/<seq> branch (detached on each refresh).
+	// Best-effort: if it cannot be created the supervisor simply runs WITHOUT read
+	// tools (degrades gracefully, never fatal). Re-checkout shares gitMu (vs concurrent
+	// worker worktree-adds); the reader goroutine never touches it. Torn down by the
+	// returned cleanup so a long serve session never leaks read worktrees.
+	var (
+		readTools   *tools.Registry
+		readDir     string
+		refreshRead func(ctx context.Context, tip string) string
+		readWt      *worktree.Worktree
+	)
+	if wt, rwErr := worktree.CreateFrom(context.Background(), repo, "read/"+shortID(), "read-"+shortID(), "HEAD"); rwErr == nil {
+		readWt = wt
+		readTools = tools.ReadOnly()
+		readDir = wt.Path()
+		refreshRead = func(ctx context.Context, tip string) string {
+			gitMu.Lock()
+			defer gitMu.Unlock()
+			if cerr := wt.Checkout(ctx, tip); cerr != nil {
+				return "" // a re-point failure degrades to a stale/empty tree, never fatal
+			}
+			tree, _ := wt.ListFiles(ctx, 0)
+			return tree
+		}
+	} else {
+		d.log.Append(eventlog.Event{Task: string(bus.Supervisor), Kind: "super_read_skip",
+			Detail: map[string]any{"reason": rwErr.Error()}})
+	}
+	// cleanup is the single run-scoped teardown EVERY caller defers (build/chat/serve):
+	// remove the read worktree (if any) and sweep the run's throwaway branches —
+	// task/ (workers), rebase/ (multi-dep re-base tips), integrate/ (integration tips,
+	// now Released so RefreshRead + the promote Differ can read them), read/ (the read
+	// worktree's own). Consolidated here so a long serve session never leaks worktrees
+	// or branch refs and no caller has to remember the per-prefix sweeps.
+	cleanup := func() {
+		if readWt != nil {
+			gitMu.Lock()
+			_ = readWt.Cleanup()
+			gitMu.Unlock()
+		}
+		for _, p := range []string{"task/", "rebase/", "integrate/", "read/"} {
+			worktree.DeleteBranches(context.Background(), repo, p)
+		}
+	}
+
 	sup := &super.Supervisor{
 		Model:     strong,
 		Roster:    rost,
@@ -344,6 +397,9 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		// answer call charges the one shared ledger (budget rail, §7); a model
 		// error/timeout returns "" and the reader falls back gracefully (never hangs).
 		Answer:      buildAnswerFunc(strong, d.log),
+		ReadTools:   readTools,   // live read/search over the integration tree (nil ⇒ no read tools)
+		ReadDir:     readDir,     // the read worktree, re-pointed at the tip by RefreshRead
+		RefreshRead: refreshRead, // re-point the read tree + return its file-tree on each tip change
 		MaxDepth:    d.maxDepth,
 		MaxFanout:   d.maxFan,
 		MaxAgents:   d.maxAgent,
@@ -367,7 +423,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Deadline:      time.Time{}, // wall-clock is enforced by the ctx deadline in buildMain
 	}
 
-	return buildAssembly{loop: loop, repo: repo, ledger: ledger}, nil
+	return buildAssembly{loop: loop, repo: repo, ledger: ledger, cleanup: cleanup}, nil
 }
 
 // meterProvider wraps prov in a meter.Provider charging the shared ledger under the
@@ -700,7 +756,10 @@ func buildCodeFunc(d buildDeps, repo string, exec model.Provider, newEnv func(di
 		if err != nil {
 			return spawn.Result{ID: id, State: spawn.StateFailed, Err: fmt.Errorf("code: worktree: %w", err)}
 		}
-		defer func() { _ = wt.Cleanup() }()
+		// Release (not Cleanup): KEEP the task/<id> branch so the supervisor's read tree
+		// can be re-pointed at it (RefreshRead) — Cleanup would delete it before the
+		// refresh runs. The run-end sweep reclaims task/ branches.
+		defer func() { _ = wt.Release() }()
 
 		env := newEnv(wt.Path())
 		worker := roster.NewWorker(roster.Profile{
@@ -739,7 +798,11 @@ func buildIntegrateFunc(intr *integrate.Integrator) super.IntegrateFunc {
 		branch := ""
 		if wt != nil {
 			branch = wt.Branch()
-			defer func() { _ = wt.Cleanup() }()
+			// Release (not Cleanup): KEEP the integrate/<suffix> tip branch so the
+			// supervisor's read tree can be re-pointed at it (RefreshRead) AND the
+			// project loop's promote-time Differ can diff it — Cleanup would delete the
+			// branch before either runs. The run-end sweep reclaims integrate/ branches.
+			defer func() { _ = wt.Release() }()
 		}
 		return branch, results, nil
 	}
@@ -833,6 +896,9 @@ func renderGrounding(rc super.RunContext) string {
 	}
 	if rc.Tip != "" {
 		fmt.Fprintf(&b, "\n- integration tip (merged+verified work): %s", rc.Tip)
+	}
+	if rc.Tree != "" {
+		fmt.Fprintf(&b, "\n- files in the integrated tree:\n%s", rc.Tree)
 	}
 	return clipRunes(b.String(), maxGroundingBytes)
 }
