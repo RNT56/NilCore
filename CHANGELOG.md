@@ -18,6 +18,16 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 _All 56 tasks in the `docs/TASKS.md` DAG are merged — see [0.1.0] below._
 
+### Phase 10 — Context depth, trusted steering & distribution (implementation)
+
+Implements the Tier-2 upgrade path (`docs/UPGRADE-PATH.md` / `docs/TASKS.md` Phase 10). Additive and nil/flag-gated; the default binary is byte-identical. `make verify` + `golangci-lint` (0 issues) green.
+
+- **P10-T01** — Operator steering file: `internal/steering` loads a committed `NILCORE.md`/`AGENTS.md` and frames it as AUTHORITATIVE instructions — the deliberate, scoped I7 exception for operator-authored input (un-fenced, distinct from memory's "NOT instructions" block, explicitly bounded below the safety core). A new nil-gated `backend.Native.SteeringContext` seam prepends it above memory+goal (nil ⇒ byte-identical). _Owns:_ `internal/steering`, `internal/backend`. _(Phase 10)_
+- **P10-T03** — `internal/embed`: a provider-backed `semantic.Embedder` over the OpenAI-compatible `/embeddings` shape (key as a per-request header, never logged / model-visible — I3; stdlib only — I6), so the dormant semantic-vector path can be activated. _Owns:_ `internal/embed`. _(Phase 10)_
+- **P10-T06** — Versioned registry: `internal/registry` adds a manifest + verified **local** skill install/list over the existing discovery dir, with additive `Version` metadata on `skills.Skill` (SKILL.md `version:` frontmatter) and `mcp.ServerSpec`. A bad install rolls back; remote fetch (EXT-07) and MCP-server install are out of scope here. _Owns:_ `internal/registry`, `internal/skills`, `internal/mcp`. _(Phase 10)_
+- **P10-T07** (wiring) — steering is discovered + wired end-to-end on the native backend in the chat front door and the run/build path (front-door / operator origin; nil/empty ⇒ byte-identical). _Owns:_ `cmd/nilcore`. _(Phase 10)_
+- **Deferred** (honestly flagged) — **P10-T04** (pure-Go HNSW replacing the linear cosine scan; the Embedder prerequisite is done, the sub-linear ANN graph is the remaining algorithm) and **P10-T05** (pure-Go/wasm multi-language AST; tree-sitter is cgo, against I6). Remaining P10-T07 wiring: Embedder→`Retriever.Semantic` on-by-default (needs a persistent-index + indexing-pass design) and a `nilcore registry` CLI — the packages are ready. P10-T02's WorkState-snapshot persistence of steering is deferred (steering already loads at the front door from the operator's repo — the principal/operator origin).
+
 ### Phase 9 — Behavioral verification & event-driven autonomy (implementation)
 
 Implements the Tier-1 upgrade path (`docs/UPGRADE-PATH.md` / `docs/TASKS.md` Phase 9). Every package is additive and nil/flag-gated — the default binary is byte-identical when the features are off. `make verify` + `golangci-lint` (0 issues) green.

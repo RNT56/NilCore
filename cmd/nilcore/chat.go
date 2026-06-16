@@ -50,6 +50,7 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
+	"nilcore/internal/steering"
 	"nilcore/internal/summarize"
 	"nilcore/internal/termui"
 	"nilcore/internal/tools"
@@ -736,6 +737,13 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	// advertised front door silently lacked it. Off by default (nil seam).
 	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
+	}
+	// Operator steering (P10-T01): an authoritative project steering file
+	// (NILCORE.md / AGENTS.md) committed at the repo root is loaded ONCE at launch
+	// from the operator's own repo — front-door origin, never tool/inbox text — and
+	// prepended as TRUSTED instructions (the I7 exception). nil/empty ⇒ byte-identical.
+	if steer, _ := steering.DiscoverAndLoad(d.baseRepo); steer != "" {
+		n.SteeringContext = func() string { return steer }
 	}
 	return n
 }

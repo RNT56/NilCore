@@ -51,6 +51,7 @@ import (
 	"nilcore/internal/secrets"
 	"nilcore/internal/server"
 	"nilcore/internal/session"
+	"nilcore/internal/steering"
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
@@ -1138,6 +1139,14 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
 		v := verify.New(box, *c.checkCmd)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project)
+		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
+		// the worktree checkout; load it once and prepend as trusted instructions on
+		// the native backend. nil/empty ⇒ byte-identical; only the native loop reads it.
+		if n, ok := be.(*backend.Native); ok {
+			if steer, _ := steering.DiscoverAndLoad(dir); steer != "" {
+				n.SteeringContext = func() string { return steer }
+			}
+		}
 		return agent.Env{Backend: be, Verifier: v}
 	}
 }

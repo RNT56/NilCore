@@ -51,6 +51,14 @@ type Native struct {
 	// instructions (the boundary, I7).
 	MemoryContext func(ctx context.Context, goal string) string
 
+	// SteeringContext, if set, returns operator-authored AUTHORITATIVE project
+	// instructions (a steering file) to prepend at the very top of the task turn
+	// (P10-T01). Unlike MemoryContext it is TRUSTED, un-fenced text — the deliberate
+	// I7 exception for operator/principal-authored input, loaded only at the front
+	// door. It cannot widen capability (the tool set is a wiring property) or bypass
+	// the gate/verifier. nil ⇒ byte-identical.
+	SteeringContext func() string
+
 	MaxSteps int // tool-call ceiling (budget). Generous by default.
 
 	// Advisor, if set, is the strong-model tier the executor consults via the
@@ -231,6 +239,14 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	if n.MemoryContext != nil {
 		if mem := n.MemoryContext(ctx, t.Goal); mem != "" {
 			user = mem + "\n\n" + user
+		}
+	}
+	// Operator steering (P10-T01) is prepended ABOVE memory and goal as the top,
+	// authoritative frame. It is TRUSTED, un-fenced text (the I7 exception); nil or
+	// empty ⇒ byte-identical. It cannot widen capability or bypass the gate/verifier.
+	if n.SteeringContext != nil {
+		if steer := n.SteeringContext(); steer != "" {
+			user = steer + "\n\n" + user
 		}
 	}
 	// Seed the conversation: when a prior drive's History is supplied (Seed), the
