@@ -253,6 +253,43 @@ func (w *Worktree) Cleanup() error {
 	return nil
 }
 
+// Release removes the worktree's checkout (directory + admin entry + scratch) but
+// KEEPS its branch, so a dependent worker can still cut a new worktree from it
+// (the DependsOn-propagation seam). The branch is reclaimed later by the wave's
+// end-of-run sweep (DeleteBranches) — branches are cheap refs. Idempotent.
+func (w *Worktree) Release() error {
+	if w == nil {
+		return nil
+	}
+	ctx := context.Background()
+	if _, err := os.Stat(w.path); err == nil {
+		if _, err := git(ctx, w.baseRepo, "worktree", "remove", "--force", w.path); err != nil {
+			_ = os.RemoveAll(w.path)
+		}
+	}
+	_, _ = git(ctx, w.baseRepo, "worktree", "prune")
+	_ = os.RemoveAll(w.tmpBase)
+	if _, err := os.Stat(w.path); err == nil {
+		return fmt.Errorf("worktree %s still present after release", w.path)
+	}
+	return nil
+}
+
+// DeleteBranches removes every local branch under prefix (e.g. "task/") in
+// baseRepo — the end-of-run sweep for worker branches kept alive by Release so
+// dependents could branch from them. Best-effort: a branch already gone is fine.
+func DeleteBranches(ctx context.Context, baseRepo, prefix string) {
+	out, err := git(ctx, baseRepo, "branch", "--list", prefix+"*", "--format=%(refname:short)")
+	if err != nil {
+		return
+	}
+	for _, b := range strings.Split(strings.TrimSpace(out), "\n") {
+		if b = strings.TrimSpace(b); b != "" {
+			_, _ = git(ctx, baseRepo, "branch", "-D", b)
+		}
+	}
+}
+
 // Prunable returns the paths of worktrees registered to baseRepo whose checkout
 // directory no longer exists — left behind by a crashed prior process. These are
 // the ONLY worktrees safe to reclaim blindly: a live worktree's directory is

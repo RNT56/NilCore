@@ -372,3 +372,57 @@ func TestCreateDoesNotRunRepoHook(t *testing.T) {
 		t.Fatalf("unexpected stat error: %v", err)
 	}
 }
+
+// TestReleaseKeepsBranchForDependent is the DependsOn-propagation regression: a
+// worker's worktree is Release'd (checkout removed, branch KEPT) so a dependent
+// can cut a new worktree from that branch and see the dependency's committed code;
+// a worker cut from HEAD does not. DeleteBranches then sweeps the kept branches.
+func TestReleaseKeepsBranchForDependent(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	repo := initRepo(t)
+
+	// Dependency t1: commit a file, then Release (checkout gone, branch kept).
+	wt1, err := CreateFrom(ctx, repo, "task/t1", "t1", "HEAD")
+	if err != nil {
+		t.Fatalf("CreateFrom t1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt1.Path(), "dep.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := wt1.Commit(ctx, "t1 work"); err != nil {
+		t.Fatalf("commit t1: %v", err)
+	}
+	if err := wt1.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, err := os.Stat(wt1.Path()); err == nil {
+		t.Fatal("Release left the checkout directory present")
+	}
+
+	// A dependent cut from t1's surviving branch SEES dep.go.
+	wt2, err := CreateFrom(ctx, repo, "task/t2", "t2", "task/t1")
+	if err != nil {
+		t.Fatalf("CreateFrom task/t1 (the branch must survive Release): %v", err)
+	}
+	defer func() { _ = wt2.Cleanup() }()
+	if _, err := os.Stat(filepath.Join(wt2.Path(), "dep.go")); err != nil {
+		t.Errorf("dependent should see the dependency's dep.go: %v", err)
+	}
+
+	// A worker cut from HEAD does NOT see it (the bug this fixes).
+	wt3, err := CreateFrom(ctx, repo, "task/t3", "t3", "HEAD")
+	if err != nil {
+		t.Fatalf("CreateFrom HEAD: %v", err)
+	}
+	defer func() { _ = wt3.Cleanup() }()
+	if _, err := os.Stat(filepath.Join(wt3.Path(), "dep.go")); err == nil {
+		t.Error("a worker cut from HEAD must NOT see the dependency's dep.go")
+	}
+
+	// DeleteBranches sweeps the kept branches: cutting from task/t1 then fails.
+	DeleteBranches(ctx, repo, "task/")
+	if _, err := CreateFrom(ctx, repo, "task/t4", "t4", "task/t1"); err == nil {
+		t.Error("DeleteBranches should have removed task/t1 (CreateFrom from it must now fail)")
+	}
+}
