@@ -56,6 +56,12 @@ type persistedState struct {
 	Active      string   `json:"active,omitempty"`
 	Branch      string   `json:"branch,omitempty"`
 	LastOutcome string   `json:"last_outcome,omitempty"`
+	// Mode is the user-set behavioral policy, stored by its stable string name. It
+	// MUST round-trip: a mode is a SAFETY posture (e.g. /plan = "do not write my
+	// repo"), so a conversation that resumes after a restart must come back in the
+	// same mode rather than silently defaulting to full-capability ModeAuto. An
+	// unknown name decodes to ModeAuto (router decides), never an unexpected pin.
+	Mode string `json:"mode,omitempty"`
 }
 
 // encodeState maps the bounded WorkState onto its wire shape. It is total and
@@ -70,6 +76,7 @@ func encodeState(st WorkState) persistedState {
 		Active:      st.Active.String(),
 		Branch:      st.Branch,
 		LastOutcome: st.LastOutcome,
+		Mode:        st.Mode.String(),
 	}
 }
 
@@ -82,6 +89,7 @@ func (p persistedState) decode() WorkState {
 		Active:      routeFromString(p.Active),
 		Branch:      p.Branch,
 		LastOutcome: p.LastOutcome,
+		Mode:        ModeFromString(p.Mode),
 	}
 	st.Summary.Goal = p.Goal
 	st.Summary.Constraints = p.Constraints

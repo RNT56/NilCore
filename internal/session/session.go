@@ -12,6 +12,7 @@ import (
 	"nilcore/internal/inbox"
 	"nilcore/internal/memory"
 	"nilcore/internal/model"
+	"nilcore/internal/summarize"
 )
 
 // Routing-failure sentinels: an Idle Turn that cannot reach a router or a wired
@@ -56,6 +57,30 @@ type Session struct {
 	// Inbox is the user→agent seam a running drive drains. It is created at New
 	// and reused across drives so a mid-work Turn always has somewhere to push.
 	Inbox *inbox.Box
+
+	// Sizer is the native-vs-supervise sizing heuristic used ONLY when the user has
+	// pinned ModeExecute (which bypasses the auto-router): a complex goal routes to
+	// the supervisor, otherwise the single native loop. It is the SAME pure function
+	// the SupervisorFirstRouter holds (chatShouldSupervise), injected here so the
+	// session need not depend on the concrete router type. nil ⇒ "not complex" (the
+	// conservative single-loop default). Unused in ModeAuto (the router sizes there).
+	Sizer func(goal string) bool
+
+	// readRoots are additional READ-ONLY context roots (absolute, symlink-resolved
+	// by the caller before AddReadRoot) the drive's read/search tools may consult
+	// beyond the worktree — the user's "add a folder/files as context" (X-T01).
+	// Guarded by mu; threaded into each drive's DriveInput at launch. They are never
+	// writable (only the read/search tools consult them), so they cannot widen the
+	// single-writable-root invariant (I4).
+	readRoots []string
+
+	// CtxWindow resolves a model id to its context-window size in tokens (injected
+	// from meter.CtxWindow so this leaf does not import meter). nil ⇒ no gauge and no
+	// auto-compaction. Summarizer is the metered provider auto-compaction summarizes
+	// History with when the window nears full; nil ⇒ compaction off (byte-identical).
+	CtxWindow  func(modelID string) int
+	Summarizer model.Provider
+	usage      usageState // latest model usage (the context-gauge signal); guarded by mu
 
 	mu      sync.Mutex      // guards Phase + History + driveCancel
 	Phase   Phase           // current conversational state
@@ -191,6 +216,25 @@ func (s *Session) clearDriveCancelLocked() {
 // routing failure it returns the Session to Idle so the conversation is not
 // wedged in Routing.
 func (s *Session) route(ctx context.Context, text string, st WorkState, history []model.Message) error {
+	// Auto-compaction: if the context window is near full, summarize the prior
+	// conversation into a compact seed before launching, so a long conversation
+	// continues rather than overrunning the window. No-op unless a Summarizer is
+	// wired and the window is ≥ the threshold (so fake-driven paths are unchanged).
+	history = s.maybeCompact(ctx, st, history)
+
+	// A pinned mode OVERRIDES the auto-router: the user has declared intent, so it
+	// governs which machine runs (and the read-only modes pin the capability the
+	// driver builds). ModeAuto falls through to the classifier exactly as before, so
+	// an unset mode is byte-identical. The mode route needs no model call.
+	if r, ok := s.routeForMode(st.Mode, text); ok {
+		s.Log.Append(eventlog.Event{
+			Task:   s.ID,
+			Kind:   "session_route",
+			Detail: map[string]any{"route": r.String(), "mode": st.Mode.String(), "len_text": len(text)},
+		})
+		return s.launch(ctx, r, text, st, history)
+	}
+
 	if s.Router == nil {
 		s.toIdle()
 		return errNoRouter
@@ -207,27 +251,60 @@ func (s *Session) route(ctx context.Context, text string, st WorkState, history 
 		return err
 	}
 
-	drv := s.driverFor(r, st)
 	s.Log.Append(eventlog.Event{
-		Task: s.ID,
-		Kind: "session_route",
-		Detail: map[string]any{
-			"route":    r.String(),
-			"len_text": len(text),
-		},
+		Task:   s.ID,
+		Kind:   "session_route",
+		Detail: map[string]any{"route": r.String(), "len_text": len(text)},
 	})
+	return s.launch(ctx, r, text, st, history)
+}
+
+// routeForMode maps a pinned Mode to a Route, bypassing the auto-router. The
+// read-only modes (Discuss/Plan) run the single native loop with read-only
+// capability (built by the driver from DriveInput.Mode); Execute sizes
+// native-vs-supervise via the injected Sizer (the same heuristic the router uses),
+// so a large execute request still fans out. ModeAuto returns ok=false so the
+// caller falls through to the classifier — the byte-identical default.
+func (s *Session) routeForMode(mode Mode, text string) (Route, bool) {
+	switch mode {
+	case ModeDiscuss, ModePlan:
+		return RouteNative, true
+	case ModeExecute:
+		if s.Sizer != nil && s.Sizer(text) {
+			return RouteSupervise, true
+		}
+		return RouteNative, true
+	default:
+		return RouteContinue, false
+	}
+}
+
+// launch resolves the Route to a driver, claims Working, and starts the drive
+// goroutine. It is shared by the mode-override path and the auto-router path so
+// the DriveInput (which now carries the pinned Mode) and the Working/Active
+// bookkeeping are built one way. A route with no wired driver returns the Session
+// to Idle with errNoDriver rather than panicking.
+func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState, history []model.Message) error {
+	drv := s.driverFor(r, st)
 	if drv == nil {
 		s.toIdle()
 		return errNoDriver
 	}
 
+	s.mu.Lock()
+	roots := make([]string, len(s.readRoots))
+	copy(roots, s.readRoots)
+	s.mu.Unlock()
+
 	in := DriveInput{
-		Route:   r,
-		Goal:    text,
-		History: history,
-		State:   st,
-		Inbox:   s.Inbox,
-		Out:     s.Out,
+		Route:     r,
+		Goal:      text,
+		History:   history,
+		State:     st,
+		Inbox:     s.Inbox,
+		Out:       s.Out,
+		Mode:      st.Mode, // capability captured at launch (fixed for the drive's life)
+		ReadRoots: roots,   // read-only context roots captured at launch
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the
@@ -241,7 +318,7 @@ func (s *Session) route(ctx context.Context, text string, st WorkState, history 
 	s.Log.Append(eventlog.Event{
 		Task:    s.ID,
 		Kind:    "session_drive_start",
-		Detail:  map[string]any{"route": r.String()},
+		Detail:  map[string]any{"route": r.String(), "mode": st.Mode.String()},
 		Backend: r.String(),
 	})
 
@@ -351,6 +428,88 @@ func (s *Session) PhaseNow() Phase {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Phase
+}
+
+// SetMode pins the conversation's behavioral mode (auto/discuss/plan/execute). It
+// is called ONLY by a principal control verb at the front door — never from Turn
+// text, an inbox follow-up, or tool output — so untrusted content can never flip
+// the mode (I7); the front door's verb parser is the single authority. A change
+// while a drive is Working affects only the NEXT drive: the running drive captured
+// its mode in DriveInput at launch, so capability is fixed for a drive's lifetime
+// (a write-capable run is never silently downgraded mid-flight, nor vice versa).
+// The mode lives on WorkState, so it is persisted and survives a restart.
+func (s *Session) SetMode(m Mode) {
+	s.mu.Lock()
+	prev := s.State.Mode
+	s.State.Mode = m
+	working := s.Phase != Idle
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{
+		Task:   s.ID,
+		Kind:   "session_mode",
+		Detail: map[string]any{"mode": m.String(), "prev": prev.String(), "working": working},
+	})
+}
+
+// CurrentMode reads the pinned mode under s.mu. The front door uses it to ack the
+// active mode and to tell the user when a switch applies only to the next turn.
+func (s *Session) CurrentMode() Mode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State.Mode
+}
+
+// AddReadRoot registers an additional READ-ONLY context root (an absolute,
+// already-symlink-resolved host path — the caller validates it before calling, so
+// the session stays a pure state container with no filesystem dependency). It is
+// idempotent (a duplicate is ignored) and applies to the NEXT drive launched; the
+// running drive captured its roots at launch. Like SetMode, it is invoked only by a
+// principal control verb at the front door, never from Turn/inbox/tool text (I7).
+func (s *Session) AddReadRoot(resolvedPath string) {
+	s.mu.Lock()
+	for _, r := range s.readRoots {
+		if r == resolvedPath {
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.readRoots = append(s.readRoots, resolvedPath)
+	n := len(s.readRoots)
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "context_add", Detail: map[string]any{"kind": "root", "count": n}})
+}
+
+// ReadRootsNow returns a copy of the registered read roots under s.mu (the front
+// door uses it to show what context is attached).
+func (s *Session) ReadRootsNow() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.readRoots))
+	copy(out, s.readRoots)
+	return out
+}
+
+// Clear resets the conversation's in-memory context — the turn History and the
+// bounded WorkState summary/outcome — so the next turn starts fresh (the `/clear`
+// command, and the manual sibling of auto-compaction). It deliberately PRESERVES
+// the pinned Mode and the attached read roots: clearing context is not a change of
+// safety posture or of what's attached. It REFUSES while a drive is in flight — a
+// drive was seeded from the old History, so clearing under it would desync — and
+// records a metadata-only session_clear audit event (the in-memory seed is reset;
+// the append-only event log is never mutated, I5). Returns an error if not Idle.
+func (s *Session) Clear() error {
+	s.mu.Lock()
+	if s.Phase != Idle {
+		s.mu.Unlock()
+		return errors.New("session: cannot clear while a run is in flight (cancel it first)")
+	}
+	s.History = nil
+	s.State.Summary = summarize.ContextSummary{}
+	s.State.LastOutcome = ""
+	s.State.Branch = ""
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_clear"})
+	return nil
 }
 
 // classifyInterrupt is the local queue-vs-steer rule for an in-flight message —

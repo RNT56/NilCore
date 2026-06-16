@@ -36,6 +36,16 @@ type Native struct {
 	// model and is never run. Wired to policy.CommandPolicy.Check.
 	CommandGuard func(cmd string) (allowed bool, reason string)
 
+	// DisableShell, when true, suppresses the always-on `run` shell tool entirely:
+	// it is never advertised to the model, and any `run` call the model emits anyway
+	// is refused. It is the STRUCTURAL half of a read-only drive's no-write guarantee
+	// (the conversational Discuss/Plan modes): combined with a write-free Tools
+	// registry (no write/edit/git), a shell-off loop has NO registered path to mutate
+	// the tree — the guarantee is a property of the wiring, not of a command denylist
+	// or the model choosing to behave (I7). false ⇒ byte-identical: the shell is the
+	// loop's normal fallback, gated like every other additive field above.
+	DisableShell bool
+
 	// MemoryContext, if set, returns relevant memory to prepend at task start
 	// (P4-T04). It is injected as clearly-labeled background context, not
 	// instructions (the boundary, I7).
@@ -157,18 +167,23 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		steps = 60 // generous: optimize for finishing
 	}
 
-	toolDefs := []model.Tool{
-		{
+	var toolDefs []model.Tool
+	// The shell `run` tool is the loop's always-on fallback — UNLESS DisableShell is
+	// set (a read-only Discuss/Plan drive), in which case it is never advertised, so
+	// the model has no shell to write or execute through. false ⇒ the original
+	// [run, finish] order is preserved (byte-identical).
+	if !n.DisableShell {
+		toolDefs = append(toolDefs, model.Tool{
 			Name:        "run",
 			Description: "Run a shell command in the working directory. Returns stdout, stderr, exit code.",
 			InputSchema: json.RawMessage(`{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}`),
-		},
-		{
-			Name:        "finish",
-			Description: "Declare the goal complete. Provide a one-paragraph summary of what changed.",
-			InputSchema: json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`),
-		},
+		})
 	}
+	toolDefs = append(toolDefs, model.Tool{
+		Name:        "finish",
+		Description: "Declare the goal complete. Provide a one-paragraph summary of what changed.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}`),
+	})
 	// Structured tools (read/write/edit/search/git) load from the registry, so
 	// adding a tool never edits this loop; shell ("run") stays the fallback.
 	if n.Tools != nil {
@@ -459,6 +474,13 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: "noted"})
 
 			case "run":
+				// Shell off (read-only drive): refuse even if the model emits `run`
+				// despite it never being advertised — the no-write guarantee must not
+				// rest on the tool merely being hidden.
+				if n.DisableShell {
+					results = append(results, errorResult(b.ID, "shell is disabled in this mode (read-only): use read/search/codeintel"))
+					continue
+				}
 				var in struct {
 					Cmd string `json:"cmd"`
 				}

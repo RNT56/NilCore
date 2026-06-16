@@ -40,6 +40,7 @@ import (
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/memory"
+	"nilcore/internal/meter"
 	"nilcore/internal/model"
 	"nilcore/internal/onboard"
 	"nilcore/internal/paths"
@@ -51,6 +52,7 @@ import (
 	"nilcore/internal/session"
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
+	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
 
@@ -613,7 +615,7 @@ func serveMain(args []string) {
 		gate:     gate,
 	})
 
-	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log}
+	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	if err := srv.Serve(ctx); err != nil {
 		fatal(err)
@@ -650,11 +652,15 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 		// fold-back all charge this single wall (§6).
 		ledger := budget.New()
 		ledger.SetGlobalCeiling(d.budget)
-		metered := meterProvider(d.provider, ledger, threadID)
+		metered := &meter.Provider{Inner: d.provider, Ledger: ledger, Task: threadID, Price: meter.NewTable()}
 
 		sess := session.New(threadID, sender, d.baseRepo, d.log)
 		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
 		sess.Budget = ledger
+		// Context-usage tracking + auto-compaction parity with the chat front door.
+		sess.CtxWindow = meter.CtxWindow
+		sess.Summarizer = metered
+		metered.OnUsage = sess.RecordUsage
 
 		sess.Router = &session.SupervisorFirstRouter{
 			Classifier:      metered,
@@ -662,6 +668,9 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 			Log:             d.log,
 			ID:              threadID,
 		}
+		// Execute-mode sizing parity with chat: a pinned /execute bypasses the router
+		// and sizes native-vs-supervise with the same heuristic.
+		sess.Sizer = chatShouldSupervise
 		sess.Drivers = session.Drivers{
 			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID)), metered, threadID),
 			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver)), metered),
@@ -684,7 +693,15 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir)
-			v := verify.New(box, *d.flags.checkCmd)
+			// A read-only mode bind-mounts /add'd roots into a container so the (suppressed)
+			// shell would see them; harmless when there is no shell. Mirrors chat.
+			applyContainerReadRoots(box, in.ReadRoots)
+			// Read-only modes ship nothing, so there is nothing to gate (I2) — a
+			// pass-through verifier; Execute/Auto get the real project verifier.
+			var v verify.Verifier = verify.New(box, *d.flags.checkCmd)
+			if in.Mode.ReadOnly() {
+				v = verify.Pass{}
+			}
 			n := serveNativeBackend(d, metered, adv, box, v, in)
 			return agent.Env{Backend: n, Verifier: v}
 		}
@@ -696,7 +713,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			Spawner:  agent.NoSpawner{},
 			Approver: approver, // gates route back to this thread (Channel.Ask)
 		}
-		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: in.Goal})
+		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -709,13 +726,23 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 // History — continue, not restart), and Emitter (live reasoning over Channel.Update).
 // It mirrors chatNativeBackend but is fed by the serve deps.
 func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, in session.NativeRun) *backend.Native {
+	// Mode capability parity with the chat front door: a read-only Discuss/Plan drive
+	// over a channel gets the write-free registry + shell off (the same structural
+	// no-write guarantee), Execute/Auto get the full set. Without this, a /plan pinned
+	// over Telegram would be advertised but not enforced.
+	reg, guard, disableShell := capabilityForMode(in.Mode)
+	if len(in.ReadRoots) > 0 {
+		reg.Register(tools.ReadTool{ReadRoots: in.ReadRoots})
+		reg.Register(tools.SearchTool{ReadRoots: in.ReadRoots})
+	}
 	n := &backend.Native{
 		Model:        prov,
 		Box:          box,
 		Verifier:     v,
 		Log:          d.log,
-		Tools:        loopTools(),
-		CommandGuard: policy.DefaultCommandPolicy().Check,
+		Tools:        reg,
+		CommandGuard: guard,
+		DisableShell: disableShell,
 		MaxSteps:     *d.flags.maxSteps,
 		Seed:         in.Seed,
 	}
