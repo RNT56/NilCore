@@ -206,6 +206,9 @@ type DriveInput struct {
 	// write-free, shell-off backend with a pass-through verifier; Execute/Auto build
 	// the full write-capable backend gated by the real verifier (I2).
 	Mode Mode
+	// ReadRoots are the additional READ-ONLY context roots (absolute, resolved) the
+	// drive's read/search tools may consult beyond the worktree — captured at launch.
+	ReadRoots []string
 }
 
 // DriveResult is a driver's terminal outcome, folded into WorkState on

@@ -261,6 +261,33 @@ func TestPinnedModeBypassesRouterAndThreadsMode(t *testing.T) {
 	s.Wait()
 }
 
+// An added read root must be captured into the launched DriveInput (so the wiring
+// closure can build the read/search tools with it) and must NOT be duplicated.
+func TestAddReadRootThreadsIntoDrive(t *testing.T) {
+	rt := &fakeRouter{route: RouteNative}
+	drv := newFakeDriver(DriveResult{Verified: true})
+	s := New("c", "local", "/repo", nil)
+	s.Router = rt
+	s.Drivers = Drivers{Native: drv}
+	s.AddReadRoot("/abs/lib")
+	s.AddReadRoot("/abs/lib") // duplicate ignored
+	s.AddReadRoot("/abs/docs")
+
+	if err := s.Turn(context.Background(), "use the lib"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	waitClosed(t, drv.started)
+	waitPhase(t, s, Working)
+
+	in := drv.input()
+	if len(in.ReadRoots) != 2 || in.ReadRoots[0] != "/abs/lib" || in.ReadRoots[1] != "/abs/docs" {
+		t.Fatalf("drive ReadRoots = %v, want [/abs/lib /abs/docs] (deduped)", in.ReadRoots)
+	}
+
+	close(drv.release)
+	s.Wait()
+}
+
 // --- Cancel: abort the in-flight run, stay in the conversation ------------------
 
 func TestSessionCancelAbortsInFlightDrive(t *testing.T) {

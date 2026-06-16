@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -353,6 +354,64 @@ func clip(s string) string {
 	return s
 }
 
+// TestParseAddVerb covers the /add control verb parse (path or URL argument).
+func TestParseAddVerb(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantArg string
+		wantOK  bool
+	}{
+		{"/add", "", true},                              // bare: handler prints usage
+		{"/add /tmp/lib", "/tmp/lib", true},             // path
+		{"  /add   /tmp/lib  ", "/tmp/lib", true},       // trimmed
+		{"/add https://x.io/p", "https://x.io/p", true}, // URL
+		{"/added thing", "", false},                     // not the exact verb
+		{"fix the bug", "", false},                      // ordinary message
+	}
+	for _, c := range cases {
+		arg, ok := parseAddVerb(c.in)
+		if arg != c.wantArg || ok != c.wantOK {
+			t.Errorf("parseAddVerb(%q) = (%q,%v), want (%q,%v)", c.in, arg, ok, c.wantArg, c.wantOK)
+		}
+	}
+}
+
+// TestResolveReadRoot validates that an existing path resolves to an absolute,
+// symlink-resolved root and a missing path errors (so /add never registers a root
+// the read/search tools cannot reach).
+func TestResolveReadRoot(t *testing.T) {
+	dir := t.TempDir()
+	got, err := resolveReadRoot(dir)
+	if err != nil {
+		t.Fatalf("resolveReadRoot(%q): %v", dir, err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("resolved root not absolute: %q", got)
+	}
+	if _, err := resolveReadRoot(filepath.Join(dir, "does-not-exist")); err == nil {
+		t.Error("a missing path must be rejected")
+	}
+}
+
+// TestApplyAddVerbAddsRoot drives the full /add <path> control path against a real
+// Session and asserts the resolved root is registered (and shows up in ReadRootsNow).
+func TestApplyAddVerbAddsRoot(t *testing.T) {
+	dir := t.TempDir()
+	sess := session.New("c", "local", dir, newMemLog(t))
+	con := termui.New(io.Discard)
+
+	applyAddVerb(context.Background(), sess, con, dir)
+
+	roots := sess.ReadRootsNow()
+	if len(roots) != 1 {
+		t.Fatalf("ReadRootsNow = %v, want one root", roots)
+	}
+	resolved, _ := filepath.EvalSymlinks(dir)
+	if roots[0] != resolved {
+		t.Errorf("registered root = %q, want %q", roots[0], resolved)
+	}
+}
+
 // TestApplyContainerEgress proves the egress wiring: a container box is routed
 // through the allowlist proxy (bridge network + HTTP_PROXY via the runtime host
 // alias), docker additionally gets the --add-host so it resolves on Linux, and an
@@ -420,11 +479,11 @@ func TestParseModeVerb(t *testing.T) {
 		{"/plan", session.ModePlan, "", true},
 		{"/execute", session.ModeExecute, "", true},
 		{"/auto", session.ModeAuto, "", true},
-		{"  /plan  ", session.ModePlan, "", true},                  // surrounding space tolerated
+		{"  /plan  ", session.ModePlan, "", true},                                  // surrounding space tolerated
 		{"/plan add a rate limiter", session.ModePlan, "add a rate limiter", true}, // verb + request
-		{"/planning ahead", session.ModeAuto, "", false},           // not an exact verb token
-		{"fix the bug", session.ModeAuto, "", false},               // ordinary message
-		{"/steer correct it", session.ModeAuto, "", false},         // steer is not a mode verb
+		{"/planning ahead", session.ModeAuto, "", false},                           // not an exact verb token
+		{"fix the bug", session.ModeAuto, "", false},                               // ordinary message
+		{"/steer correct it", session.ModeAuto, "", false},                         // steer is not a mode verb
 		{"", session.ModeAuto, "", false},
 	}
 	for _, c := range cases {

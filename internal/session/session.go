@@ -65,6 +65,14 @@ type Session struct {
 	// conservative single-loop default). Unused in ModeAuto (the router sizes there).
 	Sizer func(goal string) bool
 
+	// readRoots are additional READ-ONLY context roots (absolute, symlink-resolved
+	// by the caller before AddReadRoot) the drive's read/search tools may consult
+	// beyond the worktree — the user's "add a folder/files as context" (X-T01).
+	// Guarded by mu; threaded into each drive's DriveInput at launch. They are never
+	// writable (only the read/search tools consult them), so they cannot widen the
+	// single-writable-root invariant (I4).
+	readRoots []string
+
 	mu      sync.Mutex      // guards Phase + History + driveCancel
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
@@ -268,14 +276,20 @@ func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState
 		return errNoDriver
 	}
 
+	s.mu.Lock()
+	roots := make([]string, len(s.readRoots))
+	copy(roots, s.readRoots)
+	s.mu.Unlock()
+
 	in := DriveInput{
-		Route:   r,
-		Goal:    text,
-		History: history,
-		State:   st,
-		Inbox:   s.Inbox,
-		Out:     s.Out,
-		Mode:    st.Mode, // capability captured at launch (fixed for the drive's life)
+		Route:     r,
+		Goal:      text,
+		History:   history,
+		State:     st,
+		Inbox:     s.Inbox,
+		Out:       s.Out,
+		Mode:      st.Mode, // capability captured at launch (fixed for the drive's life)
+		ReadRoots: roots,    // read-only context roots captured at launch
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the
@@ -428,6 +442,36 @@ func (s *Session) CurrentMode() Mode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.State.Mode
+}
+
+// AddReadRoot registers an additional READ-ONLY context root (an absolute,
+// already-symlink-resolved host path — the caller validates it before calling, so
+// the session stays a pure state container with no filesystem dependency). It is
+// idempotent (a duplicate is ignored) and applies to the NEXT drive launched; the
+// running drive captured its roots at launch. Like SetMode, it is invoked only by a
+// principal control verb at the front door, never from Turn/inbox/tool text (I7).
+func (s *Session) AddReadRoot(resolvedPath string) {
+	s.mu.Lock()
+	for _, r := range s.readRoots {
+		if r == resolvedPath {
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.readRoots = append(s.readRoots, resolvedPath)
+	n := len(s.readRoots)
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "context_add", Detail: map[string]any{"kind": "root", "count": n}})
+}
+
+// ReadRootsNow returns a copy of the registered read roots under s.mu (the front
+// door uses it to show what context is attached).
+func (s *Session) ReadRootsNow() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.readRoots))
+	copy(out, s.readRoots)
+	return out
 }
 
 // classifyInterrupt is the local queue-vs-steer rule for an in-flight message —
