@@ -63,10 +63,27 @@ type oaiToolCall struct {
 }
 
 type oaiMessage struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
+	Role string `json:"role"`
+	// Content is a plain string for text-only messages (byte-identical to before)
+	// or a []oaiContentPart array when the message carries an image. It is left nil
+	// (omitted) when empty, so an assistant message that is only tool_calls marshals
+	// exactly as it did.
+	Content    any           `json:"content,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
+}
+
+// oaiContentPart is one element of a multimodal message content array. OpenAI
+// represents an image as an image_url part whose URL is a base64 data: URI; text
+// is a text part. Parts are used only when an image is present.
+type oaiContentPart struct {
+	Type     string       `json:"type"` // "text" | "image_url"
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
+}
+
+type oaiImageURL struct {
+	URL string `json:"url"` // "data:<media_type>;base64,<data>"
 }
 
 type oaiTool struct {
@@ -173,10 +190,11 @@ func toOpenAIMessages(system string, msgs []model.Message) []oaiMessage {
 	for _, m := range msgs {
 		if m.Role == "assistant" {
 			am := oaiMessage{Role: "assistant"}
+			var atext string
 			for _, b := range m.Content {
 				switch b.Type {
 				case "text":
-					am.Content += b.Text
+					atext += b.Text
 				case "tool_use":
 					tc := oaiToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -184,20 +202,42 @@ func toOpenAIMessages(system string, msgs []model.Message) []oaiMessage {
 					am.ToolCalls = append(am.ToolCalls, tc)
 				}
 			}
+			// Assign only when non-empty so an assistant message that is only
+			// tool_calls keeps Content nil (omitted), exactly as before.
+			if atext != "" {
+				am.Content = atext
+			}
 			out = append(out, am)
 			continue
 		}
-		// user turn: tool results become role:"tool" messages; text stays user.
+		// user turn: tool results become role:"tool" messages; text + images stay on
+		// the user message — a plain string when there is no image (byte-identical to
+		// the prior path), a multimodal content-part array when an image is present.
 		var text string
+		var parts []oaiContentPart
 		for _, b := range m.Content {
 			switch b.Type {
 			case "tool_result":
 				out = append(out, oaiMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: b.Content})
 			case "text":
 				text += b.Text
+			case "image":
+				if b.Source != nil {
+					parts = append(parts, oaiContentPart{
+						Type:     "image_url",
+						ImageURL: &oaiImageURL{URL: "data:" + b.Source.MediaType + ";base64," + b.Source.Data},
+					})
+				}
 			}
 		}
-		if text != "" {
+		switch {
+		case len(parts) > 0:
+			// A leading text part carries the prompt alongside the image(s).
+			if text != "" {
+				parts = append([]oaiContentPart{{Type: "text", Text: text}}, parts...)
+			}
+			out = append(out, oaiMessage{Role: "user", Content: parts})
+		case text != "":
 			out = append(out, oaiMessage{Role: "user", Content: text})
 		}
 	}

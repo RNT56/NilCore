@@ -106,6 +106,8 @@ func main() {
 		proposeEditMain(args[1:])
 	case "watch":
 		watchMain(args[1:])
+	case "schedule":
+		scheduleMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -897,6 +899,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 			reg.Register(tools.WebFetchTool{Box: box})
 			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
+			}
+			// browser_view (P9-T02): opt-in via NILCORE_BROWSER, same as chat.
+			if drv := os.Getenv("NILCORE_BROWSER"); drv != "" {
+				reg.Register(tools.BrowserViewTool{Box: box, DriverCmd: drv})
 			}
 		}
 	}

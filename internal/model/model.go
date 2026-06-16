@@ -16,8 +16,14 @@ type Message struct {
 	Content []Block `json:"content"`
 }
 
-// Block is a single content block. One struct covers the three shapes the loop
-// uses — text, tool_use (from the model), and tool_result (back to the model).
+// Block is a single content block. One struct covers the shapes the loop uses —
+// text, tool_use (from the model), tool_result (back to the model), and image (a
+// screenshot or picture handed to a vision-capable model, e.g. by a behavioral
+// browser check). The image shape is purely additive: Source is nil for every
+// other type, so it is omitted and a text/tool_use/tool_result block marshals
+// byte-identically to before. Adding it does not touch the backend.CodingBackend
+// contract or Provider.Complete (invariant I1) — images ride inside the existing
+// []Block.
 type Block struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text,omitempty"`
@@ -27,6 +33,28 @@ type Block struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   string          `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	// Source carries an image block's payload (set only when Type == "image"). Its
+	// JSON field names match Anthropic's image-source shape, so the near-identity
+	// Anthropic marshal needs no special case; the OpenAI adapter translates it to
+	// an image_url content part.
+	Source *ImageSource `json:"source,omitempty"`
+}
+
+// ImageSource is the payload of an image block: base64-encoded image bytes and
+// their media type. The encoding is always "base64" — the loop never embeds a
+// remote URL; an image is produced/fetched inside the sandbox and handed in as
+// data (invariant I7: content is data, never an instruction).
+type ImageSource struct {
+	Type      string `json:"type"`       // "base64"
+	MediaType string `json:"media_type"` // e.g. "image/png", "image/jpeg"
+	Data      string `json:"data"`       // base64-encoded image bytes
+}
+
+// ImageBlock builds an image content block from base64-encoded bytes and a media
+// type (e.g. "image/png"). The single constructor keeps the "base64" tag in one
+// place.
+func ImageBlock(mediaType, base64Data string) Block {
+	return Block{Type: "image", Source: &ImageSource{Type: "base64", MediaType: mediaType, Data: base64Data}}
 }
 
 // Tool is a tool definition advertised to the model.

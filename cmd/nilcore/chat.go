@@ -688,6 +688,14 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
+			// browser_view (P9-T02) is opt-in via NILCORE_BROWSER (the in-sandbox
+			// driver command), mirroring NILCORE_LSP_COMMAND: it is advertised only
+			// when the operator signals the sandbox image carries a headless browser,
+			// so the loop never surfaces a tool that would only ever fail closed. It
+			// is read-only (no in-tree write), so it is safe in every mode.
+			if drv := os.Getenv("NILCORE_BROWSER"); drv != "" {
+				reg.Register(tools.BrowserViewTool{Box: box, DriverCmd: drv})
+			}
 		}
 	}
 	// Added read-only context roots (/add <path>): re-register the read/search tools
