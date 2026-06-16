@@ -266,7 +266,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 	repo := firstNonEmpty(d.dir, d.fresh)
 	verifyCmd := d.verify
 	if project.NeedsBootstrap(repo) {
-		res, err := bootstrapGreenfield(context.Background(), d, repo, exec)
+		res, err := bootstrapGreenfield(context.Background(), d, repo, exec, strong)
 		if err != nil {
 			return buildAssembly{}, fmt.Errorf("build: bootstrap: %w", err)
 		}
@@ -326,7 +326,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Plan:          buildPlanFunc(d.goal),
 		RunSlice:      buildRunSliceFunc(sup),
 		Verifier:      func(dir string) verify.Verifier { return newEnv(dir).Verifier },
-		Advisor:       advisorFor(d.strong),
+		Advisor:       advisorFor(strong), // METERED strong: reflect-advisor spend must charge the budget wall (was raw d.strong — a budget-escape)
 		Reviewer:      strong,
 		Differ:        func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) },
 		Gate:          buildGateFunc(d.approver, d.log),
@@ -788,11 +788,11 @@ func safeSender(sender string) string {
 // "done" means something from iteration 0 (closes the I2 vacuous-verifier hole).
 // The scaffold runs as a bounded, SANDBOXED native task built through the same
 // env factory — the wiring owns the sandbox; project stays a leaf.
-func bootstrapGreenfield(ctx context.Context, d buildDeps, repo string, exec model.Provider) (project.BootstrapResult, error) {
+func bootstrapGreenfield(ctx context.Context, d buildDeps, repo string, exec, strong model.Provider) (project.BootstrapResult, error) {
 	cfg := project.BootstrapConfig{
 		Repo:          repo,
 		Goal:          d.goal,
-		Advisor:       advisorFor(d.strong),
+		Advisor:       advisorFor(strong), // METERED strong: bootstrap-advisor spend must charge the budget wall (was raw d.strong)
 		Override:      d.verify,
 		Log:           d.log,
 		ScaffoldSteps: d.maxSteps,

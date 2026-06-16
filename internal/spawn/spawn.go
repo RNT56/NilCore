@@ -75,8 +75,21 @@ func (s *Spawner) Spawn(ctx context.Context, subtasks []Subtask) []Result {
 	var wg sync.WaitGroup
 
 	for i := range subtasks {
+		// Acquire a slot, but honor cancellation: a cancelled ctx must not block the
+		// dispatcher on a full semaphore. On cancel, record a terminal (Skipped)
+		// Result for this and every remaining subtask so the slice stays
+		// len(subtasks) and callers see a cancelled outcome, then drain the
+		// already-launched goroutines and return.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			for j := i; j < len(subtasks); j++ {
+				results[j] = Result{ID: subtasks[j].ID, State: StateSkipped, Err: ctx.Err()}
+			}
+			wg.Wait()
+			return results
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
