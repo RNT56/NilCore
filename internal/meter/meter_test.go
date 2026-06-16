@@ -84,6 +84,50 @@ func almostEqualDollars(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 // TestCompleteChargesPerCall asserts the core acceptance criterion: a wrapped
 // provider charges the ledger once per Complete, with the dollar amount the
 // Pricer assigns to resp.Usage and the token count = input+output.
+// OnUsage must fire on every forwarded call (Complete and Stream) with the model
+// id and token split — the seam the context gauge feeds from.
+func TestOnUsageFiresOnCompleteAndStream(t *testing.T) {
+	inner := &fakeProvider{id: "claude-opus-4-8", usage: model.Usage{InputTokens: 1234, OutputTokens: 56}}
+	var gotModel string
+	var gotIn, gotOut, calls int
+	p := &Provider{Inner: inner, Ledger: budget.New(), Task: "t", Price: NewTable(),
+		OnUsage: func(m string, in, out int) { gotModel, gotIn, gotOut, calls = m, in, out, calls+1 }}
+
+	if _, err := p.Complete(context.Background(), "sys", nil, nil, 100); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if calls != 1 || gotModel != "claude-opus-4-8" || gotIn != 1234 || gotOut != 56 {
+		t.Errorf("after Complete: calls=%d model=%q in=%d out=%d", calls, gotModel, gotIn, gotOut)
+	}
+	if _, err := p.Stream(context.Background(), "sys", nil, nil, 100, func(model.Chunk) {}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("OnUsage should fire on Stream too; calls=%d", calls)
+	}
+}
+
+func TestCtxWindow(t *testing.T) {
+	cases := map[string]int{
+		"claude-opus-4-8":     200_000,
+		"claude-opus-4-8[1m]": 1_000_000, // the 1M-context variant
+		"claude-opus-4-8-1m":  1_000_000,
+		"claude-sonnet-4-6":   200_000,
+		"claude-haiku-4-5":    200_000,
+		"claude-fable-5":      200_000,
+		"gpt-5.5":             400_000,
+		"gpt-5.4-mini":        400_000,
+		"openrouter/fusion":   128_000,
+		"some-unknown-model":  fallbackWindow, // conservative small window
+		"":                    fallbackWindow,
+	}
+	for id, want := range cases {
+		if got := CtxWindow(id); got != want {
+			t.Errorf("CtxWindow(%q) = %d, want %d", id, got, want)
+		}
+	}
+}
+
 func TestCompleteChargesPerCall(t *testing.T) {
 	inner := &fakeProvider{id: "claude-opus-4-8", usage: model.Usage{InputTokens: 1000, OutputTokens: 1000}}
 	led := budget.New()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
+	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
 	"nilcore/internal/verb"
@@ -39,12 +42,17 @@ func TestParseChatLine(t *testing.T) {
 		{"/quit", "quit", true},
 		{"/exit", "quit", true},
 		{"  /quit  ", "quit", true}, // surrounding space tolerated
-		{"/status", "status", true},
 		{"/help", "help", true},
 		{"/?", "help", true},
+		// The shared verbs (/status /mode /cancel /clear /add /discuss …) are handled
+		// by session.ParseControl now, NOT parseChatLine — so they read as unhandled here.
+		{"/status", "", false},
+		{"/mode", "", false},
+		{"/cancel", "", false},
 		{"fix the failing test", "", false}, // ordinary message
 		{"!the path is wrong", "", false},   // a steer is NOT a control verb
 		{"/steer use ./service", "", false}, // /steer flows to Turn, not handled here
+		{"/plan", "", false},                // mode verbs are handled by ParseControl, not here
 		{"", "", false},                     // blank line
 	}
 	for _, c := range cases {
@@ -347,6 +355,173 @@ func clip(s string) string {
 		return s[:40] + "…"
 	}
 	return s
+}
+
+// TestParseAddVerb covers the /add control verb parse (path or URL argument).
+// TestResolveReadRoot validates that an existing path resolves to an absolute,
+// symlink-resolved root and a missing path errors (so /add never registers a root
+// the read/search tools cannot reach).
+func TestResolveReadRoot(t *testing.T) {
+	dir := t.TempDir()
+	got, err := resolveReadRoot(dir)
+	if err != nil {
+		t.Fatalf("resolveReadRoot(%q): %v", dir, err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("resolved root not absolute: %q", got)
+	}
+	if _, err := resolveReadRoot(filepath.Join(dir, "does-not-exist")); err == nil {
+		t.Error("a missing path must be rejected")
+	}
+}
+
+// TestApplyAddVerbAddsRoot drives the full /add <path> control path against a real
+// Session and asserts the resolved root is registered (and shows up in ReadRootsNow).
+func TestApplyAddVerbAddsRoot(t *testing.T) {
+	dir := t.TempDir()
+	sess := session.New("c", "local", dir, newMemLog(t))
+	con := termui.New(io.Discard)
+
+	applyAddVerb(context.Background(), sess, con, dir)
+
+	roots := sess.ReadRootsNow()
+	if len(roots) != 1 {
+		t.Fatalf("ReadRootsNow = %v, want one root", roots)
+	}
+	resolved, _ := filepath.EvalSymlinks(dir)
+	if roots[0] != resolved {
+		t.Errorf("registered root = %q, want %q", roots[0], resolved)
+	}
+}
+
+// TestApplyContainerEgress proves the egress wiring: a container box is routed
+// through the allowlist proxy (bridge network + HTTP_PROXY via the runtime host
+// alias), docker additionally gets the --add-host so it resolves on Linux, and an
+// empty allowlist leaves the box default-deny (no network).
+func TestApplyContainerEgress(t *testing.T) {
+	egress := policy.Egress{Allowed: []string{"example.com"}}
+
+	// podman: host.containers.internal, no --add-host.
+	pod := sandbox.NewContainer("podman", "img", "/work")
+	applyContainerEgress(pod, egress, "0.0.0.0:54321", "podman")
+	if pod.Network != "bridge" {
+		t.Errorf("podman egress: Network = %q, want bridge", pod.Network)
+	}
+	if pod.Env["HTTP_PROXY"] != "http://host.containers.internal:54321" {
+		t.Errorf("podman proxy url = %q", pod.Env["HTTP_PROXY"])
+	}
+	if len(pod.ExtraHosts) != 0 {
+		t.Errorf("podman should need no --add-host, got %v", pod.ExtraHosts)
+	}
+
+	// docker: host.docker.internal + --add-host.
+	dock := sandbox.NewContainer("docker", "img", "/work")
+	applyContainerEgress(dock, egress, "0.0.0.0:54321", "docker")
+	if dock.Env["HTTP_PROXY"] != "http://host.docker.internal:54321" {
+		t.Errorf("docker proxy url = %q", dock.Env["HTTP_PROXY"])
+	}
+	if len(dock.ExtraHosts) != 1 || dock.ExtraHosts[0] != "host.docker.internal:host-gateway" {
+		t.Errorf("docker --add-host = %v", dock.ExtraHosts)
+	}
+
+	// Empty allowlist ⇒ untouched (default-deny stays).
+	deny := sandbox.NewContainer("podman", "img", "/work")
+	applyContainerEgress(deny, policy.Egress{}, "", "podman")
+	if deny.Network != "none" {
+		t.Errorf("no allowlist must stay --network none, got %q", deny.Network)
+	}
+}
+
+func TestWebEnabled(t *testing.T) {
+	off := chatDeps{}
+	if off.webEnabled() {
+		t.Error("no egress configured: webEnabled must be false")
+	}
+	on := chatDeps{egress: policy.Egress{Allowed: []string{"x.com"}}, egressProxyAddr: "0.0.0.0:1"}
+	if !on.webEnabled() {
+		t.Error("egress + proxy addr: webEnabled must be true")
+	}
+	// Allowlist but no proxy (proxy failed to start) ⇒ still off (fail-closed).
+	half := chatDeps{egress: policy.Egress{Allowed: []string{"x.com"}}}
+	if half.webEnabled() {
+		t.Error("allowlist without a running proxy must be treated as off")
+	}
+}
+
+// TestModeGlyphDistinct asserts each mode maps to a DISTINCT prompt glyph, so the
+// user can see at a glance which mode they're in.
+func TestModeGlyphDistinct(t *testing.T) {
+	st := termui.New(io.Discard).Style()
+	seen := map[string]session.Mode{}
+	for _, m := range []session.Mode{session.ModeAuto, session.ModeDiscuss, session.ModePlan, session.ModeExecute} {
+		g, paint := modeGlyph(m, st)
+		if g == "" || paint == nil {
+			t.Fatalf("mode %v: empty glyph or nil paint", m)
+		}
+		if prev, dup := seen[g]; dup {
+			t.Errorf("mode %v shares glyph %q with %v — modes must look distinct", m, g, prev)
+		}
+		seen[g] = m
+	}
+}
+
+// TestIsUnknownSlash: a leading-'/' typo that is not a real verb and not a steer is
+// flagged as unknown (so the REPL warns instead of sending it to the model).
+func TestIsUnknownSlash(t *testing.T) {
+	cases := map[string]bool{
+		"/foo":           true,  // a typo
+		"/discus":        true,  // misspelled mode verb
+		"/steer fix it":  false, // a steer message, not a command
+		"/steer":         false, // bare steer
+		"!correct it":    false, // bang-steer
+		"just a message": false, // ordinary text
+		"  /bar  ":       true,  // trimmed
+		"":               false,
+	}
+	for in, want := range cases {
+		if got := isUnknownSlash(in); got != want {
+			t.Errorf("isUnknownSlash(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// (Mode-verb and /add parsing now live in session.ParseControl — see
+// internal/session/control_test.go for the full table, shared by both front doors.)
+
+// TestCapabilityForMode is the enforcement assertion: the read-only modes
+// (Discuss/Plan) get a write-free registry AND the shell switched off, so there is
+// NO structural path to mutate the tree; Execute/Auto get the full write set with
+// the shell on. This is the guarantee "/plan writes no code" rests on — a property
+// of the wiring, not of the model behaving.
+func TestCapabilityForMode(t *testing.T) {
+	writeTools := []string{"write", "edit", "git"}
+
+	for _, m := range []session.Mode{session.ModeDiscuss, session.ModePlan} {
+		reg, _, disableShell := capabilityForMode(m)
+		if !disableShell {
+			t.Errorf("%v: shell must be disabled (DisableShell=false)", m)
+		}
+		for _, name := range writeTools {
+			if reg.Has(name) {
+				t.Errorf("%v: read-only registry must NOT advertise %q", m, name)
+			}
+		}
+		if !reg.Has("read") || !reg.Has("search") || !reg.Has("codeintel") {
+			t.Errorf("%v: read-only registry must offer read/search/codeintel", m)
+		}
+	}
+
+	for _, m := range []session.Mode{session.ModeExecute, session.ModeAuto} {
+		reg, _, disableShell := capabilityForMode(m)
+		if disableShell {
+			t.Errorf("%v: shell must be enabled for a write-capable mode", m)
+		}
+		for _, name := range writeTools {
+			if !reg.Has(name) {
+				t.Errorf("%v: write-capable registry must advertise %q", m, name)
+			}
+		}
+	}
 }
 
 // --- test doubles -----------------------------------------------------------

@@ -41,6 +41,12 @@ Beyond the audit trail, the operator needs to **see and debug**. `nilcore` subco
 ### 9. Config integrity (P6-T08)
 `nilcore init` writes config; something must load it safely every run. A **versioned schema** with **validation** (clear errors, sane defaults) and **migration** across versions turns a malformed config into a precise message instead of a confusing runtime failure. This now lives in `internal/onboard` — the live `Config`'s `Load` decodes strictly (unknown fields rejected), migrates by `version`, and `Validate`s — so there is one config schema, not two. (The standalone `internal/config` package was retired: it was never wired into boot and its schema had diverged from the live one.)
 
+## Web access requires the container backend
+
+The web tools (`web_fetch`, `web_search`) reach the network only through the **egress allowlist proxy**, enabled with `nilcore chat -allow-egress host,host`. That proxy is wired for the **container** sandbox (`AllowEgressVia` routes the box through it via the runtime host alias). The **namespace** backend is born in a fresh, empty network namespace (`CLONE_NEWNET`, no interface) — the cleanest possible default-deny — so it has **no egress path at all**, and the web tools are simply not advertised there (fail-closed). This is deliberate: bolting userspace networking (slirp4netns/pasta/veth) onto the namespace backend would add an external dependency and a second egress path competing with the proxy as the single enforcement point (against I4/I6). **To use the web tools, run on the container backend** (`-sandbox container`, or any host without Landlock/userns where `auto` already picks it). `web_search` additionally needs `BRAVE_API_KEY` set and `api.search.brave.com` in the allowlist.
+
+`/add <path>` context roots are honored host-side by the read/search tools on every backend; the container backend additionally bind-mounts them read-only so the execute-mode shell can read them too (the namespace backend's shell cannot — it sees only the worktree).
+
 ## A note on context assembly (deliberately *not* a task)
 
 Window construction (system prompt + persona + repo-map + Context Bundle + memory + history, within budget) is **intentionally distributed** — each source contributes through its own seam (`ContextSummary` P3-T06, Context Bundle P3-T14, memory retrieval P4-T04). This is a design choice, not a gap; consolidating it behind a single assembler is a future refactor if the seams prove hard to reason about, not a missing capability.

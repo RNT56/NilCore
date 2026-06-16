@@ -78,6 +78,7 @@ func sampleState() WorkState {
 		Active:      RouteProject,
 		Branch:      "integration-tip",
 		LastOutcome: "verify passed; 12 tests green",
+		Mode:        ModePlan,
 	}
 }
 
@@ -107,6 +108,54 @@ func TestWorkStateEncodeDecodeRoundTrip(t *testing.T) {
 	}
 	if out.LastOutcome != in.LastOutcome {
 		t.Errorf("LastOutcome = %q, want %q", out.LastOutcome, in.LastOutcome)
+	}
+	if out.Mode != in.Mode {
+		t.Errorf("Mode = %v, want %v", out.Mode, in.Mode)
+	}
+}
+
+// A pinned mode is a SAFETY posture (e.g. /plan = "do not write my repo"), so it
+// MUST survive a restart: a conversation that resumes must come back in the same
+// mode rather than silently defaulting to full-capability ModeAuto. This asserts
+// the round-trip through the store and Restore, and that every mode name maps back.
+func TestModePersistsAcrossRestore(t *testing.T) {
+	for _, m := range []Mode{ModeAuto, ModeDiscuss, ModePlan, ModeExecute} {
+		store := newFakeStore()
+
+		// First session: pin the mode and persist its bounded state.
+		s1 := New("convo-mode", "local", "/repo", nil)
+		s1.Store = store
+		s1.SetMode(m)
+		s1.persist(context.Background(), s1.snapshotState())
+
+		// Second session (a "restart"): restore and confirm the mode came back.
+		s2 := New("convo-mode", "local", "/repo", nil)
+		s2.Store = store
+		s2.Restore(context.Background())
+		if got := s2.CurrentMode(); got != m {
+			t.Errorf("restored mode = %v, want %v", got, m)
+		}
+	}
+}
+
+func TestModeFromStringMapsEveryName(t *testing.T) {
+	cases := map[string]Mode{
+		"auto":    ModeAuto,
+		"discuss": ModeDiscuss,
+		"plan":    ModePlan,
+		"execute": ModeExecute,
+		"":        ModeAuto, // empty: router decides
+		"bogus":   ModeAuto, // unknown/forward-compat: never an unexpected pin
+		"PLAN":    ModeAuto, // case-sensitive: unknown -> auto
+	}
+	for name, want := range cases {
+		if got := ModeFromString(name); got != want {
+			t.Errorf("ModeFromString(%q) = %v, want %v", name, got, want)
+		}
+		// And every real mode renders to a name that maps back (round-trip).
+		if want != ModeAuto && ModeFromString(want.String()) != want {
+			t.Errorf("round-trip %v -> %q -> %v", want, want.String(), ModeFromString(want.String()))
+		}
 	}
 }
 

@@ -29,6 +29,44 @@ func TestPlainConsoleNoEscapes(t *testing.T) {
 	}
 }
 
+// Blue/Magenta join the existing palette: they wrap with the right ANSI code when
+// styling is on, and pass through unchanged when off (the I6 non-TTY discipline).
+func TestBlueMagentaStyle(t *testing.T) {
+	on := Style{on: true}
+	if got := on.Blue("x"); got != "\033[34mx\033[0m" {
+		t.Errorf("Blue on = %q", got)
+	}
+	if got := on.Magenta("x"); got != "\033[35mx\033[0m" {
+		t.Errorf("Magenta on = %q", got)
+	}
+	off := Style{on: false}
+	if off.Blue("x") != "x" || off.Magenta("x") != "x" {
+		t.Error("colors must pass through unchanged when styling is off")
+	}
+}
+
+// The gauge degrades to plain "context NN%" with no escapes off a terminal (I6),
+// clamps out-of-range input, and buckets the ring on a styled console.
+func TestGauge(t *testing.T) {
+	var buf bytes.Buffer
+	plain := New(&buf) // a buffer is not a TTY
+	for in, want := range map[int]string{0: "context 0%", 42: "context 42%", 100: "context 100%", -5: "context 0%", 150: "context 100%"} {
+		if got := plain.Gauge(in); got != want {
+			t.Errorf("plain Gauge(%d) = %q, want %q", in, got, want)
+		}
+		if strings.Contains(plain.Gauge(in), "\033[") {
+			t.Errorf("plain gauge must contain no ANSI escapes: %q", plain.Gauge(in))
+		}
+	}
+	// On a styled console the ring bucket reflects the band.
+	styled := &Console{w: &buf, st: Style{on: true}}
+	for in, ring := range map[int]string{10: "○", 30: "◔", 55: "◑", 80: "◕", 100: "●"} {
+		if got := styled.Gauge(in); !strings.Contains(got, ring) {
+			t.Errorf("styled Gauge(%d) = %q, want ring %q", in, got, ring)
+		}
+	}
+}
+
 // Streamed tokens flow inline; a following finalized line closes the stream with
 // a newline so it never runs onto the token text.
 func TestStreamThenLine(t *testing.T) {

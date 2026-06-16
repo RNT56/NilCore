@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 )
 
 func TestEgressAllow(t *testing.T) {
@@ -100,6 +102,61 @@ func TestEgressProxyRefusesPrivateDestination(t *testing.T) {
 	}
 	if rec.Code != http.StatusBadGateway {
 		t.Errorf("loopback forward = %d, want 502", rec.Code)
+	}
+}
+
+// TestEgressProxyStartServesAndShutsDown proves the LIFECYCLE: Start binds a real
+// listener and serves; a client pointed at the proxy reaches an allowlisted host
+// and is refused an off-list one with 403; and stop() shuts the listener down so a
+// follow-up dial fails. This is the half ServeHTTP alone did not provide.
+func TestEgressProxyStartServesAndShutsDown(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+
+	// Allow the backend host; relax the SSRF guard since the backend is on loopback.
+	p := &EgressProxy{Egress: Egress{Allowed: []string{"127.0.0.1"}}, blockIP: func(net.IP) bool { return false }}
+	addr, stop, err := p.Start(context.Background(), "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	proxyURL, _ := url.Parse(ProxyURL(addr))
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+
+	// Allowlisted host: reaches the backend through the listening proxy.
+	resp, err := client.Get(backend.URL + "/x")
+	if err != nil {
+		t.Fatalf("GET through proxy: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "ok" {
+		t.Errorf("allowlisted GET = %d %q, want 200 ok", resp.StatusCode, body)
+	}
+
+	// Off-list host: 403 before any connection.
+	resp2, err := client.Get("http://denied.example.com/x")
+	if err != nil {
+		t.Fatalf("GET denied through proxy: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("off-list GET = %d, want 403", resp2.StatusCode)
+	}
+
+	// Shutdown: a fresh dial to the (now closed) listener must fail.
+	stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, derr := net.DialTimeout("tcp", addr, 50*time.Millisecond); derr != nil {
+			break // listener is down
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("proxy listener still accepting after stop()")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

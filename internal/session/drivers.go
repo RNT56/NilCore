@@ -77,6 +77,13 @@ type NativeRun struct {
 	Seed    []model.Message // prior History the loop continues on (nil = fresh)
 	Inbox   InboxHandle     // the live user→agent seam wired into backend.Native
 	Emitter emit.Emitter    // the reasoning sink wired into backend.Native
+	// Mode is the capability the closure builds the backend with (captured at drive
+	// launch). ReadOnly modes ⇒ write-free registry + DisableShell + pass-through
+	// verifier; Execute/Auto ⇒ the full write set gated by the real verifier (I2).
+	Mode Mode
+	// ReadRoots are the read-only context roots the closure wires onto the read/
+	// search tools (absolute, resolved). Empty ⇒ worktree-only (byte-identical).
+	ReadRoots []string
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
@@ -123,11 +130,13 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		return DriveResult{}, fmt.Errorf("session: native driver has no run closure")
 	}
 	out, err := d.run(ctx, NativeRun{
-		TaskID:  fmt.Sprintf("%s-%d", d.id, atomic.AddInt64(&d.seq, 1)),
-		Goal:    in.Goal,
-		Seed:    in.History, // continue, not restart (the persistence requirement)
-		Inbox:   in.Inbox,
-		Emitter: in.Out,
+		TaskID:    fmt.Sprintf("%s-%d", d.id, atomic.AddInt64(&d.seq, 1)),
+		Goal:      in.Goal,
+		Seed:      in.History, // continue, not restart (the persistence requirement)
+		Inbox:     in.Inbox,
+		Emitter:   in.Out,
+		Mode:      in.Mode,      // capability captured at launch (read-only vs full)
+		ReadRoots: in.ReadRoots, // read-only context roots captured at launch
 	})
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)

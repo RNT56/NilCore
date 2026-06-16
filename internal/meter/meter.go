@@ -41,6 +41,23 @@ type Provider struct {
 	Ledger *budget.Ledger // shared ledger charged once per Complete
 	Task   string         // budget scope key for this provider's charges
 	Price  Pricer         // dollar pricer for resp.Usage (e.g. meter.Table)
+
+	// OnUsage, if set, is called with the model id and token split after EVERY
+	// forwarded call (Complete and Stream) — the one seam that sees resp.Usage on
+	// every model interaction, including in-drive calls. The conversational front
+	// door wires it to track the latest INPUT-token count (the model's own measure
+	// of the live context size) for the context-usage gauge and auto-compaction. It
+	// is purely observational: nil leaves the decorator byte-identical, and it never
+	// affects charging or the returned response. Must be safe for concurrent calls.
+	OnUsage func(modelID string, in, out int)
+}
+
+// reportUsage invokes OnUsage if wired (nil-safe), so both Complete and Stream feed
+// the front door's context tracker without duplicating the nil check.
+func (p *Provider) reportUsage(u model.Usage) {
+	if p.OnUsage != nil {
+		p.OnUsage(p.Inner.Model(), u.InputTokens, u.OutputTokens)
+	}
 }
 
 // Complete forwards to the inner provider and, on success, charges the ledger
@@ -64,6 +81,7 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 		return resp, err
 	}
 
+	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
 	dollars := p.Price.Price(p.Inner.Model(), resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	if cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars); cerr != nil {
@@ -122,6 +140,7 @@ func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Messa
 
 	// Charge whatever usage came back — including a partial-on-cancel response —
 	// because the tokens it reports were genuinely produced and are billable.
+	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
 	dollars := p.Price.Price(p.Inner.Model(), resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars)
