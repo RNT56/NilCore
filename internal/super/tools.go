@@ -38,6 +38,15 @@ type SubagentSpec struct {
 	// while coding. The dispatcher resolves it from a passing dependency's branch;
 	// empty ⇒ cut from base HEAD (the default, byte-identical to before).
 	BaseRef string `json:"-"`
+	// BaseRefs is the multi-dependency generalization of BaseRef, also HARNESS-only
+	// (json:"-" — same no-model-control property): the verified branches of ALL of a
+	// dependent's passed dependencies. When ≥2 survive, the wiring seam octopus-merges
+	// them into a THROWAWAY, unverified re-base tip and cuts the worker from that union
+	// (Phase 2, docs/CONCURRENCY.md §5) so it sees its combined deps while coding; on
+	// any conflict it degrades to base HEAD. <2 ⇒ the BaseRef/HEAD path is used,
+	// byte-identical to before. The throwaway tip is NEVER an integration — the serial
+	// Integrator stays the sole verified merge path (I2).
+	BaseRefs []string `json:"-"`
 }
 
 // Handle is the supervisor's record of one spawned subagent: its spec plus its

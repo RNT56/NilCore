@@ -195,9 +195,11 @@ func buildMain(args []string) {
 	defer cancel()
 
 	// Sweep the per-worker task/<ID> branches that buildSpawnFunc kept alive via
-	// Release (so dependents could branch from them). Branches are cheap refs;
-	// reclaim them once the run is done.
+	// Release (so dependents could branch from them), plus the throwaway rebase/<ID>
+	// tips that mergedBaseTip kept alive for a multi-dep worker's CreateFrom to pin.
+	// Branches are cheap refs; reclaim them once the run is done.
 	defer worktree.DeleteBranches(context.Background(), stack.repo, "task/")
+	defer worktree.DeleteBranches(context.Background(), stack.repo, "rebase/")
 
 	out, err := stack.loop.Run(ctx)
 	if err != nil {
@@ -462,6 +464,49 @@ func buildRunSliceFunc(sup *super.Supervisor) func(ctx context.Context, sl proje
 	}
 }
 
+// mergedBaseTip builds a THROWAWAY, UNVERIFIED merged tip of refs (the verified
+// branches of a multi-dependency worker's deps) so the worker can be cut from the
+// UNION of its deps' work instead of base HEAD (Phase 2, docs/CONCURRENCY.md §5).
+// It is re-base convenience ONLY — never an integration: the serial Integrator
+// stays the sole verified merge path (I2). refs[0] seeds a fresh rebase/<id>-<seq>
+// branch; each remaining ref is merged (--no-ff, committed) sequentially through the
+// hardened worktree primitives (I4). ANY conflict or git fault tears the throwaway
+// down and returns ("", ...) so buildSpawnFunc falls back to base HEAD — a re-base
+// that doesn't pan out NEVER fails the spawn. On success the throwaway WORKTREE dir
+// is Released (removed) but its BRANCH ref is kept for the worker's CreateFrom to
+// pin; the run-end rebase/ sweep reclaims the branch.
+//
+// The CALLER MUST HOLD gitMu across this whole call AND the worker's subsequent
+// CreateFrom, so no other worker's worktree add interleaves a ref update mid-merge
+// (gitMu is not reentrant — this helper never takes it). conflict reports a clean
+// dep-branch conflict (vs a git fault in err); both mean "fall back to HEAD" and are
+// distinguished only for the audit log.
+func mergedBaseTip(ctx context.Context, repo, id string, refs []string) (branch string, conflict bool, err error) {
+	if len(refs) < 2 {
+		return "", false, nil // 0/1 ref: caller uses BaseRef / HEAD (no throwaway)
+	}
+	rb := "rebase/" + id + "-" + shortID()
+	wt, cerr := worktree.CreateFrom(ctx, repo, rb, leafName(id), refs[0])
+	if cerr != nil {
+		return "", false, fmt.Errorf("rebase tip create: %w", cerr)
+	}
+	for _, ref := range refs[1:] {
+		conf, merr := wt.Merge(ctx, ref, "rebase("+id+"): merge "+ref)
+		if merr != nil {
+			_ = wt.Cleanup() // full teardown (dir + branch) on a git fault
+			return "", false, merr
+		}
+		if conf {
+			_ = wt.Cleanup() // graceful: caller falls back to base HEAD
+			return "", true, nil
+		}
+	}
+	// Keep the BRANCH (Release, not Cleanup) so the worker's CreateFrom can cut from
+	// it; the run-end rebase/ DeleteBranches sweep reclaims it.
+	_ = wt.Release()
+	return rb, false, nil
+}
+
 // buildSpawnFunc returns the supervisor's SpawnFunc: it runs ONE role-worker in its
 // own worktree (cut off the current integration tip), sandbox, and verifier, built
 // ONLY through roster.NewWorker (the single safe constructor — always sandboxed,
@@ -482,13 +527,25 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		// dispatcher resolved a dependency's branch (so a dependent codes ON TOP of
 		// its dependency's work), else from base HEAD (the default).
 		branch := "task/" + spec.ID
+		// Serialize the shared-repo git ops (gitMu): the optional multi-dep re-base
+		// merge AND the worker's `git worktree add` run as ONE critical section so no
+		// other worker's worktree add interleaves a ref update mid-merge; the model
+		// loop afterward runs concurrently in the worker's own worktree. Base
+		// selection: a multi-dep worker is cut from a throwaway merged tip of its
+		// deps' verified branches (mergedBaseTip); a single-dep worker from BaseRef; a
+		// conflict or 0 deps from base HEAD. The throwaway tip is re-base convenience,
+		// never an integration (I2).
+		gitMu.Lock()
 		base := spec.BaseRef
+		if rb, conflict, merr := mergedBaseTip(ctx, repo, spec.ID, spec.BaseRefs); rb != "" {
+			base = rb
+		} else if conflict || merr != nil {
+			d.log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_rebase_fallback",
+				Detail: map[string]any{"deps": len(spec.BaseRefs), "conflict": conflict, "fault": merr != nil}})
+		}
 		if base == "" {
 			base = "HEAD"
 		}
-		// Serialize the `git worktree add` against the shared repo (gitMu): the model
-		// loop afterward runs concurrently in the worker's own worktree.
-		gitMu.Lock()
 		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(spec.ID), base)
 		gitMu.Unlock()
 		if err != nil {

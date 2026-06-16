@@ -345,6 +345,53 @@ func TestConcurrentRunStateSingleOwnerRace(t *testing.T) {
 	}
 }
 
+// --- 9. Multi-dep re-base handoff: a dependent's SpawnFunc gets all dep branches --
+
+// A 3-dep node (super.t4 depends_on t1,t2,t3) must receive BaseRefs = the verified
+// branches of ALL THREE passed deps (the Phase-2 multi-dep handoff resolveBaseRefs
+// builds); a single-dep node still gets BaseRef and empty BaseRefs. Tested under
+// concurrency so the intra-wave `branches` resolution path is exercised.
+func TestConcurrentMultiDepBaseRefsHandoff(t *testing.T) {
+	var mu sync.Mutex
+	gotRefs := map[string][]string{}
+	gotBase := map[string]string{}
+	m := spawnWave(implSpec("super.t1"), implSpec("super.t2"), implSpec("super.t3"),
+		implSpec("super.t4", "super.t1", "super.t2", "super.t3"),
+		implSpec("super.t5", "super.t1"))
+	s := baseSup(m, passVerifier{})
+	s.Concurrency = 4
+	s.Spawn = func(_ context.Context, spec SubagentSpec) spawn.Result {
+		mu.Lock()
+		gotRefs[spec.ID] = append([]string(nil), spec.BaseRefs...)
+		gotBase[spec.ID] = spec.BaseRef
+		mu.Unlock()
+		return spawn.Result{ID: spec.ID, Passed: true, Branch: "task/" + spec.ID}
+	}
+	s.Integrate = noopIntegrate("integrate/tip", nil)
+
+	if _, err := s.Run(context.Background(), "goal"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// The 3-dep node gets all three verified dep branches, in DependsOn order.
+	want := []string{"task/super.t1", "task/super.t2", "task/super.t3"}
+	if got := gotRefs["super.t4"]; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("super.t4 BaseRefs = %v, want %v", got, want)
+	}
+	// The single-dep node uses BaseRef (not BaseRefs).
+	if len(gotRefs["super.t5"]) != 0 {
+		t.Errorf("single-dep super.t5 should have empty BaseRefs, got %v", gotRefs["super.t5"])
+	}
+	if gotBase["super.t5"] != "task/super.t1" {
+		t.Errorf("single-dep super.t5 BaseRef = %q, want task/super.t1", gotBase["super.t5"])
+	}
+	// Independent nodes get neither.
+	if len(gotRefs["super.t1"]) != 0 || gotBase["super.t1"] != "" {
+		t.Errorf("independent super.t1 should have no re-base hint, got BaseRefs=%v BaseRef=%q", gotRefs["super.t1"], gotBase["super.t1"])
+	}
+}
+
 // immediateModel is a no-op strong model for the advisor path: it returns at once so
 // the limiter (not the model) is the only thing that can gate the herd.
 type immediateModel struct{}
