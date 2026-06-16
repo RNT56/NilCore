@@ -448,7 +448,7 @@ func TestSuperStreamWatcherAndBusReaderCoexist(t *testing.T) {
 	s.Bus = b // starts the dedicated bus-reader alongside the per-round stream-watcher
 	// A graceful Answer hook so the subagent's Ask resolves promptly and we can assert
 	// the bus-reader kept answering across the steer.
-	s.Answer = func(context.Context, bus.Message) string { return "proceed within scope" }
+	s.Answer = func(context.Context, bus.Message, RunContext) string { return "proceed within scope" }
 
 	done := make(chan error, 1)
 	go func() { _, err := s.Run(context.Background(), "goal"); done <- err }()

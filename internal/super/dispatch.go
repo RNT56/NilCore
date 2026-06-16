@@ -30,7 +30,7 @@ type (
 // the supervisor's own model, returning the tasks as fenced DATA for the model to
 // turn into spawn calls. A planner failure is a structured error, not a fault: the
 // supervisor can fall back to coding the goal itself.
-func (s *Supervisor) doPlan(ctx context.Context, b modelToolUse) modelResult {
+func (s *Supervisor) doPlan(ctx context.Context, st *runState, b modelToolUse) modelResult {
 	var in struct {
 		Goal string `json:"goal"`
 	}
@@ -43,11 +43,40 @@ func (s *Supervisor) doPlan(ctx context.Context, b modelToolUse) modelResult {
 	}
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_plan",
 		Detail: map[string]any{"tasks": len(tree.Tasks)}})
+	// Capture a COMPACT digest of the plan onto the run state and re-publish the
+	// grounding, so a subagent's later ask_supervisor is answered WITH the plan in
+	// context (the grounded-answer seam). The digest is a bounded per-task summary, not
+	// the raw JSON, so it can never bloat the answer prompt.
+	st.planDigest = planDigest(tree)
+	s.publishRunContext(s.buildRunContext(st))
 	// The plan is the supervisor's OWN model output, so it is trusted control data;
 	// we still render it compactly (not as instructions to a downstream agent).
 	enc, _ := json.Marshal(tree)
 	return ok(b.ID, "Proposed task tree (spawn these, honoring depends_on):\n"+string(enc))
 }
+
+// planDigest renders a compact, bounded digest of a plan tree for the grounded
+// answer: one line per task (id · clipped goal · depends_on), capped so it can never
+// bloat the answer prompt. It is the supervisor's own trusted control data.
+func planDigest(tree planner.Tree) string {
+	var b strings.Builder
+	for _, t := range tree.Tasks {
+		fmt.Fprintf(&b, "%s: %s", t.ID, clip(strings.ReplaceAll(t.Goal, "\n", " "), 80))
+		if len(t.DependsOn) > 0 {
+			fmt.Fprintf(&b, " [needs %s]", strings.Join(t.DependsOn, ","))
+		}
+		b.WriteByte('\n')
+		if b.Len() > maxPlanDigestBytes {
+			b.WriteString("…\n")
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// maxPlanDigestBytes bounds the plan digest carried in the grounded answer so a large
+// decomposition can never bloat the answer prompt (or its token budget).
+const maxPlanDigestBytes = 2048
 
 // doSpawn enforces every spawn rail (design §6, risk #4) BEFORE running a worker,
 // emitting spawn_denied on any refusal so a runaway is auditable:
@@ -130,6 +159,9 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	}
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_report",
 		Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
+	// Re-publish the grounding so a concurrent sibling's ask_supervisor sees this
+	// subagent's just-folded state (passed/failed + branch). Single-owner here.
+	s.publishRunContext(s.buildRunContext(st))
 
 	// The worker's summary is UNTRUSTED data — fence it. We surface only typed
 	// fields (passed/branch) as trusted control data; the prose is fenced (I7).
@@ -330,6 +362,9 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 			Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
 		results[a.idx] = ok(a.toolID, s.renderReport(res))
 	}
+	// Re-publish the grounding once after the whole wave folds (single-owner, after
+	// the pool drained) so a later ask_supervisor sees the full cohort outcome.
+	s.publishRunContext(s.buildRunContext(st))
 	return results
 }
 
@@ -489,6 +524,9 @@ func (s *Supervisor) doIntegrate(ctx context.Context, round int, st *runState, b
 	}
 	if branch != "" {
 		st.branch = branch
+		// Re-publish so the grounded answer's integration-tip countercheck reflects the
+		// freshly-merged tree (single-owner here).
+		s.publishRunContext(s.buildRunContext(st))
 	}
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_integrate",
 		Detail: map[string]any{"items": len(order), "branch": branch}})
@@ -519,6 +557,9 @@ func (s *Supervisor) doCode(ctx context.Context, round int, st *runState, b mode
 	res := s.Code(ctx, in.Goal)
 	if res.Branch != "" {
 		st.branch = res.Branch
+		// Re-publish so the grounded answer's tip reflects the supervisor's own coded
+		// branch too (single-owner here) — every st.branch mutation point publishes.
+		s.publishRunContext(s.buildRunContext(st))
 	}
 	// The coder's summary is the supervisor's own loop output (trusted), but we
 	// surface only typed fields plus a fenced prose tail to keep the I7 boundary

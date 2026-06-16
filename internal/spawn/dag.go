@@ -102,13 +102,22 @@ func (d *DAGScheduler) Run(ctx context.Context, subs []Subtask) map[string]Resul
 		d.runWave(ctx, ready, nodes, results)
 	}
 
-	// Anything still without a result is in (or downstream of) a cycle: nothing
-	// ever drove its indegree to zero. Resolve the whole remainder as Cycle so
-	// every node terminates in exactly one state and the loop never spins.
+	// Anything still without a result terminated without running. Distinguish the
+	// two causes so the outcome is honest: if ctx is done, the scheduler SKIPPED the
+	// still-queued nodes on cancellation (a deadline/shutdown), so they are Skipped
+	// (cancelled) — not cyclic. Otherwise nothing ever drove their indegree to zero,
+	// which is (or is downstream of) a dependency cycle. Either way every node
+	// terminates in exactly one state and the loop never spins.
+	cancelled := ctx.Err()
 	for _, id := range order {
 		if _, ok := results[id]; !ok {
-			results[id] = Result{ID: id, State: StateCycle,
-				Summary: "skipped: dependency cycle"}
+			if cancelled != nil {
+				results[id] = Result{ID: id, State: StateSkipped, Err: cancelled,
+					Summary: "skipped: run cancelled"}
+			} else {
+				results[id] = Result{ID: id, State: StateCycle,
+					Summary: "skipped: dependency cycle"}
+			}
 			nodes[id].done = true
 		}
 	}

@@ -154,7 +154,7 @@ func TestConcurrentNoDeadlockAskSupervisorAndAdvisor(t *testing.T) {
 	s := baseSup(m, passVerifier{})
 	s.Concurrency = 3
 	s.Bus = b
-	s.Answer = func(_ context.Context, _ bus.Message) string { return answer }
+	s.Answer = func(_ context.Context, _ bus.Message, _ RunContext) string { return answer }
 	s.Spawn = func(ctx context.Context, spec SubagentSpec) spawn.Result {
 		peer, err := bus.NewPeer(b, bus.AgentID(spec.ID))
 		if err != nil {

@@ -32,7 +32,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"nilcore/internal/agent/bus"
@@ -96,7 +98,16 @@ type Supervisor struct {
 	// question/review-request (delivered by the reader goroutine). nil yields the
 	// graceful "proceed with your best judgment" fallback — so a subagent's Ask is
 	// ALWAYS answered promptly, never left to time out, even mid-await/mid-code.
-	Answer func(ctx context.Context, q bus.Message) string
+	//
+	// rc is the GROUNDED run-context snapshot (goal + plan digest + live cohort state
+	// + integration tip) the supervisor publishes single-owner from its main loop and
+	// the reader loads under a mutex (loadRunContext) — so the answer is grounded in
+	// the supervisor's own plan and what the cohort has actually produced, NOT a
+	// context-free one-shot. It is passed BY VALUE (no aliasing of live main-goroutine
+	// state). An empty rc (nothing published yet) keeps the answer byte-identical to
+	// the ungrounded path. rc is the supervisor's OWN trusted control data; the
+	// subagent's question stays fenced as untrusted (I7).
+	Answer func(ctx context.Context, q bus.Message, rc RunContext) string
 
 	MaxDepth      int // spawn depth ceiling; <1 → 1 (leaf roles cannot spawn)
 	MaxFanout     int // subagents per single decomposition wave; <1 → unlimited within MaxAgents
@@ -146,6 +157,96 @@ type Supervisor struct {
 	// touched only through reserveAgent (atomic) so the ceiling holds regardless of
 	// whether spawns are ever issued concurrently (design §6).
 	agents int64
+
+	// snapMu guards snap, the GROUNDED run-context the Answer hook reads. The main
+	// goroutine PUBLISHES snap (publishRunContext) at the points it already mutates
+	// runState (Run start, doPlan, every spawn/fold, doIntegrate); the reader
+	// goroutine LOADS it (loadRunContext) to ground a subagent's ask_supervisor reply.
+	// This is the same single-producer/single-consumer mutex hand-off the reader
+	// already uses for findings, roles inverted (main produces, reader consumes). snap
+	// is a flat value type (no pointers into runState), so a load returns a copy that
+	// shares no backing array — the reader never touches runState or msgs (no race).
+	snapMu sync.Mutex
+	snap   RunContext
+}
+
+// RunContext is the supervisor's GROUNDED run snapshot, handed to the Answer hook so
+// a subagent's ask_supervisor reply is grounded in the plan and what the cohort has
+// actually produced — the supervisor's OWN trusted control data (never untrusted
+// subagent text). It is a flat value type: Cohort is freshly allocated on each
+// publish, so a loaded copy shares no backing array with the live snapshot. The zero
+// value (nothing published) renders no grounding, keeping the answer byte-identical
+// to the ungrounded path. The supervisor sees the INTEGRATION tree (merged+passing
+// branches via Tip + each entry's verified Branch/Report), never a subagent's
+// in-progress private worktree — a fundamental boundary, stated honestly.
+type RunContext struct {
+	Goal   string        // the run's high-level goal
+	Plan   string        // compact digest of the latest plan tree (not raw JSON)
+	Cohort []CohortEntry // live per-subagent state (who passed/failed/is running)
+	Tip    string        // the current integration tip branch (merged+verified work)
+}
+
+// CohortEntry is one subagent's live state in a RunContext: enough for the answer to
+// say "your dependency failed, stop building on it" or "a sibling already produced
+// this". Report is a one-line clip of the (already host-side, byte-capped) work
+// report. All fields are values — no pointers into runState.
+type CohortEntry struct {
+	ID     string // the subagent's spec ID
+	Role   string // its role
+	State  string // running | passed | failed
+	Branch string // its verified task branch when passed (else "")
+	Report string // a one-line clip of its work report (passed) or ""
+}
+
+// Empty reports whether the snapshot carries no grounding, so the Answer hook can
+// take the byte-identical ungrounded path.
+func (rc RunContext) Empty() bool {
+	return rc.Goal == "" && rc.Plan == "" && len(rc.Cohort) == 0 && rc.Tip == ""
+}
+
+// publishRunContext stores a freshly-built snapshot for the reader to load. Called
+// ONLY on the main goroutine (Run / dispatch), under snapMu. rc must be built from
+// runState by buildRunContext so it owns its own slices.
+func (s *Supervisor) publishRunContext(rc RunContext) {
+	s.snapMu.Lock()
+	s.snap = rc
+	s.snapMu.Unlock()
+}
+
+// loadRunContext returns a by-value copy of the published snapshot. Called ONLY on
+// the reader goroutine (answerBody). The copy shares no backing array with the live
+// snapshot (Cohort is replaced wholesale on each publish, never mutated in place), so
+// the reader never races the main goroutine's runState. A non-blocking mutex copy —
+// it never touches the parked main goroutine and can never hang.
+func (s *Supervisor) loadRunContext() RunContext {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	return s.snap
+}
+
+// buildRunContext renders a consistent point-in-time RunContext from runState. Pure
+// over runState (walks st.handles once); called ONLY on the main goroutine at the
+// existing single-owner mutation points, so it adds no new race surface. The cohort
+// state is derived from each handle's Done/Result so it reflects exactly what has
+// been folded so far.
+func (s *Supervisor) buildRunContext(st *runState) RunContext {
+	cohort := make([]CohortEntry, 0, len(st.handles))
+	for id, h := range st.handles {
+		state := "running"
+		branch, report := "", ""
+		if h.Done {
+			if h.Result.Passed {
+				state, branch = "passed", h.Result.Branch
+				report = clip(strings.ReplaceAll(strings.TrimSpace(h.Result.Summary), "\n", " "), 160)
+			} else {
+				state = "failed"
+			}
+		}
+		cohort = append(cohort, CohortEntry{ID: id, Role: string(h.Spec.Role),
+			State: state, Branch: branch, Report: report})
+	}
+	sort.Slice(cohort, func(i, j int) bool { return cohort[i].ID < cohort[j].ID })
+	return RunContext{Goal: st.goal, Plan: st.planDigest, Cohort: cohort, Tip: st.branch}
 }
 
 // Inbox is the minimal handle the supervisor loop needs onto the conversational
@@ -194,7 +295,11 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 	st := &runState{
 		handles:  map[string]*Handle{},
 		findings: nil,
+		goal:     goal,
 	}
+	// Publish the initial grounding (goal only) so a very early ask_supervisor — before
+	// any plan/spawn — is still answered with the goal in context.
+	s.publishRunContext(s.buildRunContext(st))
 
 	toolset := append(toolDefs(), s.readToolDefs()...)
 
@@ -415,10 +520,12 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 // only by the single supervisor goroutine (the reader has its own mutex-guarded
 // queue), so it needs no lock of its own.
 type runState struct {
-	handles  map[string]*Handle
-	findings []string
-	spawned  int    // total spawned this run (for Outcome + logging)
-	branch   string // last integration tip the supervisor converged on
+	handles    map[string]*Handle
+	findings   []string
+	spawned    int    // total spawned this run (for Outcome + logging)
+	branch     string // last integration tip the supervisor converged on
+	goal       string // the run's goal, kept so every publish can rebuild RunContext
+	planDigest string // compact digest of the latest plan tree (set by doPlan)
 }
 
 // depthCap returns the effective spawn-depth ceiling (default 1: only the
@@ -632,7 +739,7 @@ func (s *Supervisor) dispatchOne(ctx context.Context, round int, st *runState, b
 		return ok(b.ID, "noted"), true, in.Summary
 
 	case toolPlan:
-		return s.doPlan(ctx, b), false, ""
+		return s.doPlan(ctx, st, b), false, ""
 
 	case toolMessageSubagent:
 		return s.doMessage(ctx, b), false, ""
