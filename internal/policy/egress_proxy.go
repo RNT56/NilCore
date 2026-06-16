@@ -179,3 +179,42 @@ func pipe(dst io.WriteCloser, src io.ReadCloser) {
 // ProxyURL is the env value the sandbox should use for HTTP(S)_PROXY when running
 // the proxy at addr (host:port).
 func ProxyURL(addr string) string { return fmt.Sprintf("http://%s", addr) }
+
+// Start binds a listener and serves the proxy in a background goroutine until ctx
+// is cancelled or the returned stop func is called. It is the LIFECYCLE around
+// ServeHTTP (which is only an http.Handler): a listener, a bounded goroutine, and
+// a clean shutdown. It returns the bound address (host:port — feed it to ProxyURL)
+// and an idempotent stop func.
+//
+// bindAddr selects the interface: "127.0.0.1:0" (the default when empty) is right
+// when the sandbox shares the host's network namespace; a bridged container that
+// must reach the host across a bridge needs an address reachable from inside it
+// (e.g. "0.0.0.0:0" plus the runtime's host alias for the proxy URL) — that
+// trade-off is the caller's to make, since only it knows the sandbox backend. The
+// allowlist + SSRF guard in ServeHTTP still gate every request regardless of bind.
+func (p *EgressProxy) Start(ctx context.Context, bindAddr string) (addr string, stop func(), err error) {
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1:0"
+	}
+	ln, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		return "", nil, fmt.Errorf("egress proxy listen on %s: %w", bindAddr, err)
+	}
+	srv := &http.Server{Handler: p, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }() // returns ErrServerClosed on shutdown
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	var once sync.Once
+	stop = func() { once.Do(func() { close(done) }) }
+	return ln.Addr().String(), stop, nil
+}

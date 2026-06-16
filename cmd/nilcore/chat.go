@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -74,8 +75,9 @@ const chatDefaultBudget = 10.0
 // -max-steps, -backend, -config, -log behave exactly as for run) and adds the
 // conversation budget ceiling.
 type chatFlags struct {
-	common commonFlags
-	budget *float64
+	common      commonFlags
+	budget      *float64
+	allowEgress *string
 }
 
 // chatMain is the `nilcore chat` entry point and the bare-`nilcore` default. It
@@ -86,8 +88,9 @@ type chatFlags struct {
 func chatMain(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	cf := chatFlags{
-		common: registerCommon(fs),
-		budget: fs.Float64("budget", chatDefaultBudget, "global dollar ceiling for the whole conversation (a hard wall via the meter)"),
+		common:      registerCommon(fs),
+		budget:      fs.Float64("budget", chatDefaultBudget, "global dollar ceiling for the whole conversation (a hard wall via the meter)"),
+		allowEgress: fs.String("allow-egress", "", "comma-separated host allowlist for sandboxed web access (e.g. \"example.com,*.docs.io\"); empty = no network (default-deny). Enables the web_fetch tool."),
 	}
 	_ = fs.Parse(args)
 
@@ -117,23 +120,33 @@ func chatMain(args []string) {
 	console := termui.New(os.Stdout)
 	emitter := termui.NewEmitter(console, verb.General)
 
-	sess, err := buildChatSession(chatDeps{
-		flags:    cf,
-		provider: prov,
-		boot:     b,
-		log:      log,
-		baseRepo: absDir,
-		emitter:  emitter,
-	})
-	if err != nil {
-		fatal(err)
-	}
-
 	// Ctrl-C / SIGTERM cancels the whole conversation ctx, so the in-flight drive
 	// unwinds to a clean interrupted result and the REPL exits. (To abort only the
 	// current run and keep talking, use /cancel — see runChatCommand.)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Sandboxed web access (-allow-egress): default-deny stays the norm — only when
+	// the operator passes an allowlist do we stand up the allowlist proxy and enable
+	// the web_fetch tool. The proxy is bound to the conversation ctx, so it shuts
+	// down when the REPL exits. A namespace-backend sandbox has no proxy egress path
+	// (CLONE_NEWNET with no interfaces), so web access requires the container backend.
+	egress, proxyAddr, stopProxy := startEgress(ctx, *cf.allowEgress, console)
+	defer stopProxy()
+
+	sess, err := buildChatSession(chatDeps{
+		flags:           cf,
+		provider:        prov,
+		boot:            b,
+		log:             log,
+		baseRepo:        absDir,
+		emitter:         emitter,
+		egress:          egress,
+		egressProxyAddr: proxyAddr,
+	})
+	if err != nil {
+		fatal(err)
+	}
 
 	console.Line(console.Style().Dim(chatBanner))
 	if err := chatREPL(ctx, sess, os.Stdin, console, emitter); err != nil && err != io.EOF {
@@ -171,6 +184,20 @@ type chatDeps struct {
 	baseRepo string
 	emitter  emit.Emitter    // the reasoning sink (REPL: a termui.ConsoleEmitter; TUI: its own; nil ⇒ none)
 	approver policy.Approver // irreversible-action gate (nil ⇒ the console approver)
+
+	// egress is the sandbox network allowlist (from -allow-egress). Empty ⇒ default-
+	// deny: no network, and the web_fetch tool is not advertised. egressProxyAddr is
+	// the host:port of the running allowlist proxy (set when egress is non-empty), fed
+	// to a container box via AllowEgressVia so a denied host is simply unreachable (I4).
+	egress          policy.Egress
+	egressProxyAddr string
+}
+
+// webEnabled reports whether sandboxed web access is configured (a non-empty
+// allowlist and a running proxy). When false the web_fetch tool is not advertised
+// and the sandbox stays --network none (default-deny).
+func (d chatDeps) webEnabled() bool {
+	return !d.egress.Empty() && d.egressProxyAddr != ""
 }
 
 // approverOr returns the wired approver, or the console approver when none is set
@@ -181,6 +208,69 @@ func (d chatDeps) approverOr() policy.Approver {
 		return d.approver
 	}
 	return policy.NewConsoleApprover(os.Stdin, os.Stdout)
+}
+
+// startEgress resolves the -allow-egress allowlist and, when non-empty, stands up
+// the allowlist proxy bound to ctx. It returns the resolved Egress, the proxy's
+// bound host:port (empty when egress is off), and an idempotent stop func (a no-op
+// when off). Default-deny is preserved: an empty/blank allowlist yields no proxy,
+// no network, and no web_fetch tool. The proxy binds to 0.0.0.0 so a bridged
+// sandbox container can reach it across the bridge; it only ever forwards to the
+// allowlisted hosts and refuses private/loopback destinations (the SSRF guard), so
+// it is never an open relay.
+func startEgress(ctx context.Context, allow string, con *termui.Console) (policy.Egress, string, func()) {
+	hosts := splitHosts(allow)
+	if len(hosts) == 0 {
+		return policy.Egress{}, "", func() {}
+	}
+	egress := policy.Egress{Allowed: hosts}
+	proxy := &policy.EgressProxy{Egress: egress}
+	addr, stop, err := proxy.Start(ctx, "0.0.0.0:0")
+	if err != nil {
+		// Fail-closed: if the proxy cannot bind, run with no egress rather than
+		// silently leaving the sandbox networked.
+		con.Line(con.Style().Warn("  web access disabled: could not start egress proxy: " + err.Error()))
+		return policy.Egress{}, "", func() {}
+	}
+	con.Line(con.Style().Dim(fmt.Sprintf("  web access enabled for %d host(s) via the allowlist proxy", len(hosts))))
+	return egress, addr, stop
+}
+
+// splitHosts parses a comma-separated host allowlist, trimming blanks.
+func splitHosts(s string) []string {
+	var out []string
+	for _, h := range strings.Split(s, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// applyContainerEgress routes a CONTAINER box through the allowlist proxy. The
+// namespace backend has no proxy egress path (it runs in a fresh empty network
+// namespace), so it is left untouched and web_fetch fails closed there — egress is
+// a container-backend capability. The container reaches the host-side proxy via the
+// runtime's host alias (host.containers.internal for podman, host.docker.internal
+// for docker, with an --add-host so it resolves on docker-Linux too).
+func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, runtime string) {
+	if egress.Empty() || proxyAddr == "" {
+		return
+	}
+	c, ok := box.(*sandbox.Container)
+	if !ok {
+		return
+	}
+	_, port, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		return
+	}
+	hostAlias := "host.containers.internal" // podman (rootless) provides this by default
+	if runtime == "docker" {
+		hostAlias = "host.docker.internal"
+		c.ExtraHosts = append(c.ExtraHosts, "host.docker.internal:host-gateway")
+	}
+	c.AllowEgressVia(policy.ProxyURL(net.JoinHostPort(hostAlias, port)))
 }
 
 // buildChatSession assembles the one conversation Session for the terminal front
@@ -338,6 +428,9 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 		// Execute/Auto get the full write-capable backend gated by the real verifier.
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*d.flags.common.sandboxPref, *d.flags.common.runtime, *d.flags.common.image, dir)
+			// Route a container box through the allowlist proxy when web access is on
+			// (no-op otherwise; default-deny stays the norm).
+			applyContainerEgress(box, d.egress, d.egressProxyAddr, *d.flags.common.runtime)
 			var v verify.Verifier = verify.New(box, *d.flags.common.checkCmd)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
@@ -399,6 +492,17 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	// no code" is structural (no registered write/edit/git tool and no shell escape),
 	// not a prompt the model might ignore (I7). Execute/Auto get today's full set.
 	reg, guard, disableShell := capabilityForMode(in.Mode)
+	// The sandboxed web_fetch tool is wired in here (it must bind to THIS drive's
+	// box, which only exists now) when web access is enabled. It is read-only/
+	// non-mutating — it fetches a URL inside the box under the egress allowlist and
+	// fences the body as untrusted data (I7) — so it preserves the write-free
+	// guarantee even in the read-only Discuss/Plan modes. Without -allow-egress it is
+	// never advertised, so the tool surface stays honest (a fetch would fail closed).
+	if d.webEnabled() {
+		if _, ok := box.(*sandbox.Container); ok {
+			reg.Register(tools.WebFetchTool{Box: box})
+		}
+	}
 	n := &backend.Native{
 		Model:        prov,
 		Box:          box,

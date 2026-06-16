@@ -14,6 +14,8 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
+	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
 	"nilcore/internal/verb"
@@ -349,6 +351,60 @@ func clip(s string) string {
 		return s[:40] + "…"
 	}
 	return s
+}
+
+// TestApplyContainerEgress proves the egress wiring: a container box is routed
+// through the allowlist proxy (bridge network + HTTP_PROXY via the runtime host
+// alias), docker additionally gets the --add-host so it resolves on Linux, and an
+// empty allowlist leaves the box default-deny (no network).
+func TestApplyContainerEgress(t *testing.T) {
+	egress := policy.Egress{Allowed: []string{"example.com"}}
+
+	// podman: host.containers.internal, no --add-host.
+	pod := sandbox.NewContainer("podman", "img", "/work")
+	applyContainerEgress(pod, egress, "0.0.0.0:54321", "podman")
+	if pod.Network != "bridge" {
+		t.Errorf("podman egress: Network = %q, want bridge", pod.Network)
+	}
+	if pod.Env["HTTP_PROXY"] != "http://host.containers.internal:54321" {
+		t.Errorf("podman proxy url = %q", pod.Env["HTTP_PROXY"])
+	}
+	if len(pod.ExtraHosts) != 0 {
+		t.Errorf("podman should need no --add-host, got %v", pod.ExtraHosts)
+	}
+
+	// docker: host.docker.internal + --add-host.
+	dock := sandbox.NewContainer("docker", "img", "/work")
+	applyContainerEgress(dock, egress, "0.0.0.0:54321", "docker")
+	if dock.Env["HTTP_PROXY"] != "http://host.docker.internal:54321" {
+		t.Errorf("docker proxy url = %q", dock.Env["HTTP_PROXY"])
+	}
+	if len(dock.ExtraHosts) != 1 || dock.ExtraHosts[0] != "host.docker.internal:host-gateway" {
+		t.Errorf("docker --add-host = %v", dock.ExtraHosts)
+	}
+
+	// Empty allowlist ⇒ untouched (default-deny stays).
+	deny := sandbox.NewContainer("podman", "img", "/work")
+	applyContainerEgress(deny, policy.Egress{}, "", "podman")
+	if deny.Network != "none" {
+		t.Errorf("no allowlist must stay --network none, got %q", deny.Network)
+	}
+}
+
+func TestWebEnabled(t *testing.T) {
+	off := chatDeps{}
+	if off.webEnabled() {
+		t.Error("no egress configured: webEnabled must be false")
+	}
+	on := chatDeps{egress: policy.Egress{Allowed: []string{"x.com"}}, egressProxyAddr: "0.0.0.0:1"}
+	if !on.webEnabled() {
+		t.Error("egress + proxy addr: webEnabled must be true")
+	}
+	// Allowlist but no proxy (proxy failed to start) ⇒ still off (fail-closed).
+	half := chatDeps{egress: policy.Egress{Allowed: []string{"x.com"}}}
+	if half.webEnabled() {
+		t.Error("allowlist without a running proxy must be treated as off")
+	}
 }
 
 // TestParseModeVerb covers the front-door mode control verbs and the "/plan <text>"

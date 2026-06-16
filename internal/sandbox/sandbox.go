@@ -45,6 +45,12 @@ type Container struct {
 	Hardened bool              // apply the hardening flags (default true)
 	UID, GID int               // host uid/gid the container maps to
 	Env      map[string]string // per-run env injected into the container (P2-T03)
+
+	// ExtraHosts are `--add-host` entries (e.g. "host.docker.internal:host-gateway")
+	// so a bridged container can resolve the host running the egress allowlist proxy.
+	// Empty by default; set only when egress is enabled and the runtime needs it
+	// (docker on Linux — podman and Docker Desktop provide the host alias already).
+	ExtraHosts []string
 }
 
 // NewContainer returns a hardened container executor for the given worktree.
@@ -107,6 +113,12 @@ func (c *Container) runArgs(cmd string, perRun map[string]string) []string {
 		} else if c.UID >= 0 {
 			args = append(args, "--user", fmt.Sprintf("%d:%d", c.UID, c.GID))
 		}
+	}
+
+	// Host aliases for a bridged container to reach the host (e.g. the egress proxy
+	// on docker-Linux). Empty unless egress wiring set them.
+	for _, h := range c.ExtraHosts {
+		args = append(args, "--add-host", h)
 	}
 
 	// Per-run secret injection (P2-T03): keys reach the container only for this

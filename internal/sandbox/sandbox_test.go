@@ -95,3 +95,17 @@ func TestAllowEgressVia(t *testing.T) {
 		t.Errorf("proxy env not set: %s", got)
 	}
 }
+
+func TestExtraHostsAddHost(t *testing.T) {
+	c := NewContainer("docker", "img", "/work")
+	c.ExtraHosts = []string{"host.docker.internal:host-gateway"}
+	got := argsString(c, "x")
+	if !strings.Contains(got, "--add-host host.docker.internal:host-gateway") {
+		t.Errorf("--add-host not wired for ExtraHosts: %s", got)
+	}
+	// No ExtraHosts ⇒ no --add-host (byte-identical default).
+	c2 := NewContainer("podman", "img", "/work")
+	if strings.Contains(argsString(c2, "x"), "--add-host") {
+		t.Errorf("--add-host present with no ExtraHosts set")
+	}
+}
