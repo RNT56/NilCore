@@ -71,6 +71,11 @@ const chatPrincipal = "local"
 // interactive session rather than an unattended build.
 const chatDefaultBudget = 10.0
 
+// searchKeyEnv is the environment variable (and SecretStore ref name) for the
+// web-search API key. Resolved env-first then SecretStore (I3); only used when web
+// access is enabled and the search host is allowlisted.
+const searchKeyEnv = "BRAVE_API_KEY"
+
 // chatFlags are the chat subcommand's flags. It reuses registerCommon for the
 // shared boot/runtime/verifier knobs (so -dir, -runtime, -image, -verify,
 // -max-steps, -backend, -config, -log behave exactly as for run) and adds the
@@ -91,7 +96,7 @@ func chatMain(args []string) {
 	cf := chatFlags{
 		common:      registerCommon(fs),
 		budget:      fs.Float64("budget", chatDefaultBudget, "global dollar ceiling for the whole conversation (a hard wall via the meter)"),
-		allowEgress: fs.String("allow-egress", "", "comma-separated host allowlist for sandboxed web access (e.g. \"example.com,*.docs.io\"); empty = no network (default-deny). Enables the web_fetch tool."),
+		allowEgress: fs.String("allow-egress", "", "comma-separated host allowlist for sandboxed web access (e.g. \"example.com,*.docs.io\"); empty = no network (default-deny). Enables web_fetch; add api.search.brave.com + set BRAVE_API_KEY to enable web_search."),
 	}
 	_ = fs.Parse(args)
 
@@ -144,6 +149,9 @@ func chatMain(args []string) {
 		emitter:         emitter,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
+		// Web-search key resolved env-first then SecretStore (I3). Only matters when
+		// web access is enabled and the Brave host is in -allow-egress.
+		searchKey: b.cred(searchKeyEnv),
 	})
 	if err != nil {
 		fatal(err)
@@ -193,6 +201,12 @@ type chatDeps struct {
 	// to a container box via AllowEgressVia so a denied host is simply unreachable (I4).
 	egress          policy.Egress
 	egressProxyAddr string
+
+	// searchKey is the web-search API key (resolved env-first then SecretStore, I3;
+	// never logged, never placed in a prompt). When set AND web access is enabled AND
+	// the search host is allowlisted, the web_search tool is advertised; the key is
+	// injected into the in-box request via per-run env, never the command string.
+	searchKey string
 }
 
 // webEnabled reports whether sandboxed web access is configured (a non-empty
@@ -273,6 +287,21 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 		c.ExtraHosts = append(c.ExtraHosts, "host.docker.internal:host-gateway")
 	}
 	c.AllowEgressVia(policy.ProxyURL(net.JoinHostPort(hostAlias, port)))
+}
+
+// applyContainerReadRoots bind-mounts the user's /add <path> context roots into a
+// CONTAINER box READ-ONLY (identity-mapped), so the execute-mode `run` shell can
+// read them at the same absolute path the host-side file tools use. The structured
+// read/search tools already see the roots host-side (so this is only for the shell);
+// the namespace backend has no such mount and degrades to tools-only access. No-op
+// for an empty root set or a non-container box.
+func applyContainerReadRoots(box sandbox.Sandbox, roots []string) {
+	if len(roots) == 0 {
+		return
+	}
+	if c, ok := box.(*sandbox.Container); ok {
+		c.ExtraReadRoots = append(c.ExtraReadRoots, roots...)
+	}
 }
 
 // buildChatSession assembles the one conversation Session for the terminal front
@@ -433,6 +462,9 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			// Route a container box through the allowlist proxy when web access is on
 			// (no-op otherwise; default-deny stays the norm).
 			applyContainerEgress(box, d.egress, d.egressProxyAddr, *d.flags.common.runtime)
+			// Bind /add'd context roots into a container READ-ONLY so the execute-mode
+			// shell can read them too (the file tools already see them host-side).
+			applyContainerReadRoots(box, in.ReadRoots)
 			var v verify.Verifier = verify.New(box, *d.flags.common.checkCmd)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
@@ -503,6 +535,12 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if d.webEnabled() {
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
+			// web_search is advertised only when a key is configured AND its host is
+			// in the allowlist (otherwise the request fails closed at the proxy, so
+			// advertising it would be dishonest surface).
+			if d.searchKey != "" && d.egress.Allow(tools.WebSearchHost()) {
+				reg.Register(tools.WebSearchTool{Box: box, APIKey: d.searchKey})
+			}
 		}
 	}
 	// Added read-only context roots (/add <path>): re-register the read/search tools

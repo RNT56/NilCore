@@ -51,6 +51,16 @@ type Container struct {
 	// Empty by default; set only when egress is enabled and the runtime needs it
 	// (docker on Linux — podman and Docker Desktop provide the host alias already).
 	ExtraHosts []string
+
+	// ExtraReadRoots are additional host directories bind-mounted READ-ONLY into the
+	// container at the SAME absolute path (identity-mapped, so a path the host-side
+	// file tools already resolved is the same path the in-box `run` shell sees). They
+	// back the user's `/add <path>` context roots so an execute-mode shell can read
+	// them too. Each is mounted `:ro`, so /work stays the single WRITABLE mount (I4).
+	// Empty by default — non-/add runs are byte-identical. Note: under rootless
+	// podman (--userns=keep-id) a root owned by another user reads as empty inside the
+	// box (a uid-mapping limitation, not an error); we do not chown.
+	ExtraReadRoots []string
 }
 
 // NewContainer returns a hardened container executor for the given worktree.
@@ -128,6 +138,13 @@ func (c *Container) runArgs(cmd string, perRun map[string]string) []string {
 	}
 	for k, v := range perRun {
 		args = append(args, "-e", k+"="+v)
+	}
+
+	// Extra READ-ONLY context roots (the user's /add <path>), identity-mapped so the
+	// in-box path equals the host path. Mounted before /work; each is :ro so the
+	// worktree at /work stays the only writable mount (I4).
+	for _, r := range c.ExtraReadRoots {
+		args = append(args, "-v", fmt.Sprintf("%s:%s:ro", r, r))
 	}
 
 	args = append(args, "-v", fmt.Sprintf("%s:/work", c.HostDir), "-w", "/work", c.Image, "sh", "-c", cmd)

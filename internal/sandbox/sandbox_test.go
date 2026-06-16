@@ -96,6 +96,29 @@ func TestAllowEgressVia(t *testing.T) {
 	}
 }
 
+func TestExtraReadRootsMountedReadOnly(t *testing.T) {
+	c := NewContainer("podman", "img", "/work/tree")
+	c.ExtraReadRoots = []string{"/host/lib", "/host/docs"}
+	got := argsString(c, "x")
+	for _, r := range []string{"/host/lib", "/host/docs"} {
+		if !strings.Contains(got, "-v "+r+":"+r+":ro") {
+			t.Errorf("extra read root %q not mounted identity + :ro: %s", r, got)
+		}
+	}
+	// The worktree is still the only WRITABLE mount, and the extra mounts precede it.
+	if !strings.Contains(got, "/work/tree:/work") {
+		t.Errorf("worktree mount missing: %s", got)
+	}
+	if i, j := strings.Index(got, "/host/lib:/host/lib:ro"), strings.Index(got, "/work/tree:/work"); i < 0 || j < 0 || i > j {
+		t.Errorf("extra read roots must be mounted before /work: %s", got)
+	}
+	// No ExtraReadRoots ⇒ no extra -v (byte-identical default).
+	c2 := NewContainer("podman", "img", "/work/tree")
+	if n := strings.Count(argsString(c2, "x"), " -v "); n != 1 {
+		t.Errorf("default should have exactly one -v (the worktree), got %d", n)
+	}
+}
+
 func TestExtraHostsAddHost(t *testing.T) {
 	c := NewContainer("docker", "img", "/work")
 	c.ExtraHosts = []string{"host.docker.internal:host-gateway"}
