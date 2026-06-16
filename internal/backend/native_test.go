@@ -170,6 +170,7 @@ func toolResultContents(msgs []model.Message) []string {
 type fakePeer struct {
 	reply      string
 	dispatched []string
+	inputs     []string // raw input JSON per Dispatch, for asserting enrichment
 }
 
 func (p *fakePeer) Tools() []model.Tool {
@@ -180,9 +181,78 @@ func (p *fakePeer) Tools() []model.Tool {
 	}
 }
 
-func (p *fakePeer) Dispatch(_ context.Context, name string, _ json.RawMessage) (string, error) {
+func (p *fakePeer) Dispatch(_ context.Context, name string, input json.RawMessage) (string, error) {
 	p.dispatched = append(p.dispatched, name)
+	p.inputs = append(p.inputs, string(input))
 	return p.reply, nil
+}
+
+// systemFor composes base + role System + (when a Peer is wired) the ask-encouragement.
+// With neither set it is byte-identical to the base prompt (single-task path).
+func TestNativeSystemForComposition(t *testing.T) {
+	base := (&Native{}).systemFor()
+	if base != systemPrompt {
+		t.Errorf("no role/peer must yield the base prompt byte-identical")
+	}
+	role := (&Native{System: "ROLE-MARKER-XYZ"}).systemFor()
+	if !strings.Contains(role, systemPrompt) || !strings.Contains(role, "ROLE-MARKER-XYZ") {
+		t.Errorf("role prompt should append the role System:\n%s", role)
+	}
+	peer := (&Native{Peer: &fakePeer{}}).systemFor()
+	if !strings.Contains(peer, "ask_supervisor") || !strings.Contains(peer, "PROACTIVELY") {
+		t.Errorf("a peer worker's prompt must ENCOURAGE proactively asking the supervisor:\n%s", peer)
+	}
+	both := (&Native{System: "ROLE-MARKER-XYZ", Peer: &fakePeer{}}).systemFor()
+	if !strings.Contains(both, "ROLE-MARKER-XYZ") || !strings.Contains(both, "ask_supervisor") {
+		t.Errorf("role + peer must compose both:\n%s", both)
+	}
+}
+
+// When WorkContext is set, a worker's ask_supervisor / request_review carries its
+// work-in-progress, auto-attached to the question — so the supervisor answers
+// grounded in what the worker actually did (#1/#2). share_finding is NOT enriched.
+func TestNativeAttachesWorkContext(t *testing.T) {
+	const wip = "WIP-DIFF-SENTINEL-42"
+	peer := &fakePeer{reply: "noted"}
+	m := &toolCapturingModel{responses: []model.Response{
+		{Content: []model.Block{toolUse("u1", "ask_supervisor", map[string]string{"question": "which lib?"})}, StopReason: "tool_use"},
+		{Content: []model.Block{toolUse("u2", "share_finding", map[string]string{"finding": "fyi"})}, StopReason: "tool_use"},
+		{Content: []model.Block{toolUse("u3", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, Peer: peer, MaxSteps: 6,
+		WorkContext: func(context.Context) string { return wip }}
+	if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(peer.inputs) < 2 {
+		t.Fatalf("expected ask + share dispatched, got %v", peer.dispatched)
+	}
+	// First dispatch is ask_supervisor — its question must carry the WIP snapshot.
+	if !strings.Contains(peer.inputs[0], wip) || !strings.Contains(peer.inputs[0], "which lib?") {
+		t.Errorf("ask_supervisor question should carry the WIP snapshot + the question; got %s", peer.inputs[0])
+	}
+	// share_finding (async, second dispatch) must NOT be enriched.
+	if strings.Contains(peer.inputs[1], wip) {
+		t.Errorf("share_finding must not carry the WIP snapshot; got %s", peer.inputs[1])
+	}
+}
+
+// enrichBusField appends to a real question but must LEAVE A MALFORMED ASK UNTOUCHED
+// (missing / empty / non-string / non-JSON), so the peer's empty-guard still rejects
+// it and the model gets a corrective error instead of a laundered contentless ask.
+func TestEnrichBusFieldGuards(t *testing.T) {
+	// A real question is enriched.
+	got := string(enrichBusField(json.RawMessage(`{"question":"which lib?"}`), "question", " EXTRA"))
+	if !strings.Contains(got, "which lib?") || !strings.Contains(got, "EXTRA") {
+		t.Errorf("a real question should be enriched: %s", got)
+	}
+	// Malformed shapes are returned UNCHANGED (no EXTRA laundered in).
+	for _, in := range []string{`{}`, `{"question":""}`, `{"question":"   "}`, `{"question":42}`, `not json`} {
+		out := string(enrichBusField(json.RawMessage(in), "question", " EXTRA"))
+		if strings.Contains(out, "EXTRA") {
+			t.Errorf("malformed ask %q must NOT be enriched (would bypass the empty-guard); got %s", in, out)
+		}
+	}
 }
 
 func hasTool(tools []model.Tool, name string) bool {

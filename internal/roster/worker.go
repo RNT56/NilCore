@@ -128,6 +128,7 @@ func NewWorker(p Profile, box sandbox.Sandbox, v verify.Verifier, log *eventlog.
 		Advisor:       adv,
 		EscalateAfter: esc,
 		Peer:          peer,
+		System:        p.System, // the role's system guidance (was previously dropped)
 	}
 }
 

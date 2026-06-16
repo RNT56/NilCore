@@ -632,6 +632,16 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		defer msgBus.Deregister(bus.AgentID(spec.ID))
 
 		worker := roster.NewWorker(prof, env.Box, env.Verifier, d.log, exec, peer)
+		// Auto-attach this worker's work-in-progress to its ask_supervisor/request_review
+		// (#1/#2): the SpawnFunc owns the worktree, so it provides the consistent
+		// (worker-parked) diff snapshot the loop folds into the blocking question.
+		worker.WorkContext = func(wctx context.Context) string {
+			diff, derr := wt.WorkingDiff(wctx, 0)
+			if derr != nil {
+				return ""
+			}
+			return diff
+		}
 
 		res, rerr := worker.Run(ctx, backendTask(spec))
 		if rerr != nil {

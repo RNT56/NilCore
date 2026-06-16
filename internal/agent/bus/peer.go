@@ -71,8 +71,13 @@ func (p *AgentPeer) Tools() []model.Tool {
 	return []model.Tool{
 		{
 			Name: toolAskSupervisor,
-			Description: "Ask the supervisor a focused question and block until it answers. " +
-				"Use when blocked, ambiguous, or needing a decision above your scope.",
+			Description: "Ask the supervisor a focused question and block briefly until it answers. " +
+				"Use it PROACTIVELY whenever you are uncertain about a design decision or interface, " +
+				"your change might conflict with or duplicate a sibling's work, you are about to assume " +
+				"something that would waste effort if wrong, or its input would change your approach. " +
+				"The supervisor has the full plan and sees the integrated tree; asking early is cheap and " +
+				"expected (not a failure). Your current work-in-progress is attached automatically — just " +
+				"state your specific question.",
 			InputSchema: json.RawMessage(`{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}`),
 		},
 		{
