@@ -154,6 +154,12 @@ func (r *factoryRec) sessionCount() int {
 	return len(r.sessions)
 }
 
+func (r *factoryRec) session(id string) *session.Session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sessions[id]
+}
+
 // newServer wires a Server whose factory builds a real session.Session driven by
 // the supplied Driver, so the test exercises the genuine Turn/Inbox path.
 func newServer(fc *fakeChannel, auth server.Authorizer, drv session.Driver) (*server.Server, *factoryRec) {
@@ -223,6 +229,40 @@ func TestFirstMessageStartsDriveQueueAndSteer(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not shut down on cancel")
 	}
+}
+
+// TestServeControlVerbPinsMode proves serve-channel parity: a "/plan" over the
+// channel pins the thread's mode and is NOT run as a task (no drive started, no
+// "Starting:" announced) — it is a control, acked via Channel.Update.
+func TestServeControlVerbPinsMode(t *testing.T) {
+	fc := &fakeChannel{reqs: make(chan channel.TaskRequest, 2)}
+	drv := &blockingDriver{started: make(chan struct{}, 1), release: make(chan struct{}), steered: make(chan struct{}, 1)}
+	srv, rec := newServer(fc, allowlist{"u1": true}, drv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	fc.reqs <- channel.TaskRequest{Goal: "/plan", ThreadID: "t1", Sender: "u1"}
+	waitFor(t, func() bool { return fc.sawUpdateContaining("mode → plan") }, "no mode ack over the channel")
+
+	// The thread's Session is pinned to plan, NO drive started, and the control-only
+	// first message was not announced as a task.
+	if s := rec.session("t1"); s == nil || s.CurrentMode() != session.ModePlan {
+		t.Fatalf("thread mode not pinned to plan via /plan over the channel")
+	}
+	select {
+	case <-drv.started:
+		t.Fatal("a control verb must not start a drive")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if fc.sawUpdateContaining("Starting:") {
+		t.Error("a control-only first message must not announce 'Starting:'")
+	}
+
+	cancel()
+	<-done
 }
 
 // TestUnauthorizedRefusedBeforeTurn proves the trust line: an unauthorized sender's

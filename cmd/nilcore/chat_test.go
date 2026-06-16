@@ -42,14 +42,17 @@ func TestParseChatLine(t *testing.T) {
 		{"/quit", "quit", true},
 		{"/exit", "quit", true},
 		{"  /quit  ", "quit", true}, // surrounding space tolerated
-		{"/status", "status", true},
-		{"/mode", "mode", true},
 		{"/help", "help", true},
 		{"/?", "help", true},
+		// The shared verbs (/status /mode /cancel /clear /add /discuss …) are handled
+		// by session.ParseControl now, NOT parseChatLine — so they read as unhandled here.
+		{"/status", "", false},
+		{"/mode", "", false},
+		{"/cancel", "", false},
 		{"fix the failing test", "", false}, // ordinary message
 		{"!the path is wrong", "", false},   // a steer is NOT a control verb
 		{"/steer use ./service", "", false}, // /steer flows to Turn, not handled here
-		{"/plan", "", false},                // mode verbs are handled by parseModeVerb, not here
+		{"/plan", "", false},                // mode verbs are handled by ParseControl, not here
 		{"", "", false},                     // blank line
 	}
 	for _, c := range cases {
@@ -355,27 +358,6 @@ func clip(s string) string {
 }
 
 // TestParseAddVerb covers the /add control verb parse (path or URL argument).
-func TestParseAddVerb(t *testing.T) {
-	cases := []struct {
-		in      string
-		wantArg string
-		wantOK  bool
-	}{
-		{"/add", "", true},                              // bare: handler prints usage
-		{"/add /tmp/lib", "/tmp/lib", true},             // path
-		{"  /add   /tmp/lib  ", "/tmp/lib", true},       // trimmed
-		{"/add https://x.io/p", "https://x.io/p", true}, // URL
-		{"/added thing", "", false},                     // not the exact verb
-		{"fix the bug", "", false},                      // ordinary message
-	}
-	for _, c := range cases {
-		arg, ok := parseAddVerb(c.in)
-		if arg != c.wantArg || ok != c.wantOK {
-			t.Errorf("parseAddVerb(%q) = (%q,%v), want (%q,%v)", c.in, arg, ok, c.wantArg, c.wantOK)
-		}
-	}
-}
-
 // TestResolveReadRoot validates that an existing path resolves to an absolute,
 // symlink-resolved root and a missing path errors (so /add never registers a root
 // the read/search tools cannot reach).
@@ -503,34 +485,8 @@ func TestIsUnknownSlash(t *testing.T) {
 	}
 }
 
-// TestParseModeVerb covers the front-door mode control verbs and the "/plan <text>"
-// shorthand (set the mode AND submit a request on one line).
-func TestParseModeVerb(t *testing.T) {
-	cases := []struct {
-		in       string
-		wantMode session.Mode
-		wantRest string
-		wantOK   bool
-	}{
-		{"/discuss", session.ModeDiscuss, "", true},
-		{"/plan", session.ModePlan, "", true},
-		{"/execute", session.ModeExecute, "", true},
-		{"/auto", session.ModeAuto, "", true},
-		{"  /plan  ", session.ModePlan, "", true},                                  // surrounding space tolerated
-		{"/plan add a rate limiter", session.ModePlan, "add a rate limiter", true}, // verb + request
-		{"/planning ahead", session.ModeAuto, "", false},                           // not an exact verb token
-		{"fix the bug", session.ModeAuto, "", false},                               // ordinary message
-		{"/steer correct it", session.ModeAuto, "", false},                         // steer is not a mode verb
-		{"", session.ModeAuto, "", false},
-	}
-	for _, c := range cases {
-		mode, rest, ok := parseModeVerb(c.in)
-		if mode != c.wantMode || rest != c.wantRest || ok != c.wantOK {
-			t.Errorf("parseModeVerb(%q) = (%v,%q,%v), want (%v,%q,%v)",
-				c.in, mode, rest, ok, c.wantMode, c.wantRest, c.wantOK)
-		}
-	}
-}
+// (Mode-verb and /add parsing now live in session.ParseControl — see
+// internal/session/control_test.go for the full table, shared by both front doors.)
 
 // TestCapabilityForMode is the enforcement assertion: the read-only modes
 // (Discuss/Plan) get a write-free registry AND the shell switched off, so there is

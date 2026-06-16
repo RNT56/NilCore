@@ -12,6 +12,7 @@ import (
 	"nilcore/internal/inbox"
 	"nilcore/internal/memory"
 	"nilcore/internal/model"
+	"nilcore/internal/summarize"
 )
 
 // Routing-failure sentinels: an Idle Turn that cannot reach a router or a wired
@@ -472,6 +473,29 @@ func (s *Session) ReadRootsNow() []string {
 	out := make([]string, len(s.readRoots))
 	copy(out, s.readRoots)
 	return out
+}
+
+// Clear resets the conversation's in-memory context — the turn History and the
+// bounded WorkState summary/outcome — so the next turn starts fresh (the `/clear`
+// command, and the manual sibling of auto-compaction). It deliberately PRESERVES
+// the pinned Mode and the attached read roots: clearing context is not a change of
+// safety posture or of what's attached. It REFUSES while a drive is in flight — a
+// drive was seeded from the old History, so clearing under it would desync — and
+// records a metadata-only session_clear audit event (the in-memory seed is reset;
+// the append-only event log is never mutated, I5). Returns an error if not Idle.
+func (s *Session) Clear() error {
+	s.mu.Lock()
+	if s.Phase != Idle {
+		s.mu.Unlock()
+		return errors.New("session: cannot clear while a run is in flight (cancel it first)")
+	}
+	s.History = nil
+	s.State.Summary = summarize.ContextSummary{}
+	s.State.LastOutcome = ""
+	s.State.Branch = ""
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_clear"})
+	return nil
 }
 
 // classifyInterrupt is the local queue-vs-steer rule for an in-flight message —

@@ -771,14 +771,12 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 				prompt()
 			}
 		case line := <-lines:
-			if mode, rest, ok := parseModeVerb(line); ok {
-				// A mode control verb (/discuss /plan /execute /auto), optionally
-				// followed by a request on the same line ("/plan add a limiter").
-				applyModeVerb(ctx, sess, con, mode, rest)
-			} else if arg, ok := parseAddVerb(line); ok {
-				// /add <path|url> — attach read-only context.
-				applyAddVerb(ctx, sess, con, arg)
+			if c, ok := session.ParseControl(line); ok {
+				// A shared control verb (mode / add / clear / mode-show / status /
+				// cancel) — the SAME parser the serve path uses, so the surfaces agree.
+				applyControl(ctx, sess, con, c)
 			} else if cmd, handled := parseChatLine(line); handled {
+				// Terminal-only verbs (/quit, /help) the serve path has no use for.
 				if quit := runChatCommand(ctx, sess, cmd, con); quit {
 					settle()
 					return nil
@@ -810,6 +808,7 @@ type chatSession interface {
 	CurrentMode() session.Mode
 	AddReadRoot(resolvedPath string)
 	ReadRootsNow() []string
+	Clear() error
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).
@@ -821,12 +820,6 @@ func parseChatLine(line string) (cmd string, handled bool) {
 	switch strings.TrimSpace(line) {
 	case "/quit", "/exit":
 		return "quit", true
-	case "/cancel", "/stop":
-		return "cancel", true
-	case "/status":
-		return "status", true
-	case "/mode":
-		return "mode", true
 	case "/help", "/?":
 		return "help", true
 	default:
@@ -834,33 +827,39 @@ func parseChatLine(line string) (cmd string, handled bool) {
 	}
 }
 
-// chatModeVerbs maps each mode control verb to the Mode it pins.
-var chatModeVerbs = map[string]session.Mode{
-	"/discuss": session.ModeDiscuss,
-	"/plan":    session.ModePlan,
-	"/execute": session.ModeExecute,
-	"/auto":    session.ModeAuto,
-}
-
-// parseModeVerb recognizes a leading mode control verb and returns the Mode it
-// pins plus any trailing text, so "/plan add a limiter" both switches to plan mode
-// AND submits the request as a turn. ok is false for any line not starting with a
-// mode verb. These are PRINCIPAL controls, parsed ONLY here at the front door —
-// never from Turn text, an inbox follow-up, or tool output — so untrusted content
-// can never flip the mode (I7). "/mode" (no target) is a status read, handled as a
-// control verb in parseChatLine, not here.
-func parseModeVerb(line string) (mode session.Mode, rest string, ok bool) {
-	t := strings.TrimSpace(line)
-	first := t
-	if i := strings.IndexAny(t, " \t"); i >= 0 {
-		first = t[:i]
-		rest = strings.TrimSpace(t[i+1:])
+// applyControl renders a parsed session.Control on the terminal surface. It is the
+// REPL's half of the SHARED control verbs — the serve path runs the same
+// session.ParseControl and acts on the same Session, so the two front doors agree
+// by construction. (/quit and /help stay terminal-local in runChatCommand.)
+func applyControl(ctx context.Context, sess chatSession, con *termui.Console, c session.Control) {
+	st := con.Style()
+	switch c.Kind {
+	case session.CtrlMode:
+		applyModeVerb(ctx, sess, con, c.Mode, c.Arg)
+	case session.CtrlAdd:
+		applyAddVerb(ctx, sess, con, c.Arg)
+	case session.CtrlClear:
+		if err := sess.Clear(); err != nil {
+			con.Line(st.Warn("  " + err.Error()))
+			return
+		}
+		con.Line(st.Info("  context cleared — fresh conversation (mode and attached roots kept)"))
+	case session.CtrlModeShow:
+		m := sess.CurrentMode()
+		con.Line(st.Info("  mode: " + m.String() + modeBlurb(m)))
+	case session.CtrlStatus:
+		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · context roots: %d",
+			sess.PhaseNow(), sess.CurrentMode(), len(sess.ReadRootsNow()))))
+	case session.CtrlCancel:
+		if sess.PhaseNow() == session.Idle {
+			con.Line(st.Dim("  nothing running."))
+			return
+		}
+		con.Line(st.Warn("  cancelling current run…"))
+		if sess.Cancel() {
+			con.Line(st.Warn("  cancelled — back to you."))
+		}
 	}
-	m, found := chatModeVerbs[first]
-	if !found {
-		return session.ModeAuto, "", false
-	}
-	return m, rest, true
 }
 
 // applyModeVerb pins the mode, acks it, and — if the verb carried trailing text —
@@ -883,21 +882,6 @@ func applyModeVerb(ctx context.Context, sess chatSession, con *termui.Console, m
 			con.Line(st.Dim("  (routing failed: " + err.Error() + ")"))
 		}
 	}
-}
-
-// parseAddVerb recognizes "/add <arg>" (a path or URL) and returns the argument.
-// Bare "/add" returns ("", true) so the handler can print usage. It is a principal
-// control verb parsed only here — never from Turn/inbox/tool text (I7).
-func parseAddVerb(line string) (arg string, ok bool) {
-	t := strings.TrimSpace(line)
-	if t == "/add" {
-		return "", true
-	}
-	const p = "/add "
-	if strings.HasPrefix(t, p) {
-		return strings.TrimSpace(t[len(p):]), true
-	}
-	return "", false
 }
 
 // applyAddVerb attaches read-only context. A path becomes an additional read-only
@@ -963,35 +947,16 @@ func isURLArg(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// runChatCommand executes a local control verb and reports whether the REPL should
-// quit. It touches the session only through the read-only PhaseNow accessor (a
-// status read never mutates conversation state).
+// runChatCommand executes a TERMINAL-LOCAL control verb (/quit, /help) and reports
+// whether the REPL should quit. The shared verbs (mode/add/clear/status/cancel) are
+// handled by applyControl via session.ParseControl; this handles only the two that
+// are meaningless over a serve channel.
 func runChatCommand(_ context.Context, sess chatSession, cmd string, con *termui.Console) (quit bool) {
 	st := con.Style()
 	switch cmd {
 	case "quit":
 		con.Line("bye.")
 		return true
-	case "cancel":
-		// Abort the current run but stay in the conversation (distinct from queue /
-		// steer and from Ctrl-C, which exits). Cancel blocks until the drive unwinds.
-		if sess.PhaseNow() == session.Idle {
-			con.Line(st.Dim("  nothing running."))
-			return false
-		}
-		con.Line(st.Warn("  cancelling current run…"))
-		if sess.Cancel() {
-			con.Line(st.Warn("  cancelled — back to you."))
-		}
-		return false
-	case "status":
-		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · context roots: %d",
-			sess.PhaseNow(), sess.CurrentMode(), len(sess.ReadRootsNow()))))
-		return false
-	case "mode":
-		m := sess.CurrentMode()
-		con.Line(st.Info("  mode: " + m.String() + modeBlurb(m)))
-		return false
 	case "help":
 		con.Line(st.Dim(chatBanner))
 		return false
