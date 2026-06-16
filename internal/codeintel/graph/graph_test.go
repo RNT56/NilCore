@@ -89,3 +89,41 @@ func Run() int { return helper() + helper() }
 		t.Errorf("Run callees = %v, want [helper] (deduped)", callees)
 	}
 }
+
+// TestBuildFilePrunesRemovedSymbols is the regression for the additive-only bug:
+// re-indexing a file after an edit that DELETES a symbol must drop that symbol's
+// node and its outgoing edges, not leave them lingering — the incremental `live`
+// re-index relies on this to reflect the agent's own edits.
+func TestBuildFilePrunesRemovedSymbols(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.go")
+	g := openMem(t)
+	ctx := context.Background()
+
+	// v1: Run calls helper.
+	if err := os.WriteFile(path, []byte("package p\nfunc helper() int { return 1 }\nfunc Run() int { return helper() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	if callees, _ := g.Callees(ctx, "Run"); len(callees) != 1 || callees[0] != "helper" {
+		t.Fatalf("v1 Run callees = %v, want [helper]", callees)
+	}
+
+	// v2: helper deleted, Run no longer calls it.
+	if err := os.WriteFile(path, []byte("package p\nfunc Run() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	if callees, _ := g.Callees(ctx, "Run"); len(callees) != 0 {
+		t.Errorf("after re-index, Run callees = %v, want [] (stale call pruned)", callees)
+	}
+	nodes, _ := g.Nodes(ctx)
+	for _, n := range nodes {
+		if n.ID == "helper" {
+			t.Errorf("deleted symbol 'helper' still present after re-index: %+v", n)
+		}
+	}
+}
