@@ -212,6 +212,8 @@ These tasks use a **distinct `U<tier>-T<NN>` namespace** so they never collide w
 
 ## 5. Tier 2 — Context depth, trusted steering, distribution
 
+> **Promoted (2026-06-16).** Tier 2 is now in the canonical queue as **Phase 10** in `docs/TASKS.md`: `U2-T01..07` → `P10-T01..07` (same order, same specs). Track status there. This section remains the authoritative deep rationale + file:line sourcing.
+
 **Goal of the tier.** Three philosophy-consistent upgrades: (a) give the operator an **authoritative steering file** (the `AGENTS.md`/`CLAUDE.md` convention every leader has) as a new *trusted* input class — without weakening `I7`; (b) **activate and scale** the semantic index that is built-but-unwired today, staying CGO-free; (c) turn the existing skills/MCP primitives into a **versioned, verified-install registry** so capability becomes a shareable artifact. None of these touch the frozen contract; all are nil/flag-gated.
 
 ### 5.1 DAG
@@ -315,6 +317,8 @@ These tasks use a **distinct `U<tier>-T<NN>` namespace** so they never collide w
 ---
 
 ## 6. Tier 3 — Architectural (gated; specs in the external-infra roadmap)
+
+> **Registered as GATED (2026-06-16).** Tier 3's items are tracked in `docs/ROADMAP-EXTERNAL-INFRA.md` as `EXT-01..08` and registered in `docs/TASKS.md` under **"External infrastructure — GATED"** as **not-eligible** work, blocked behind the §0 thesis gate. They are intentionally *not* promoted into the active queue and must not be picked up by the work-selection rule until that gate clears.
 
 These three close real gaps but **require external infrastructure and/or a change to NilCore's identity** ("one static binary, runs anywhere", `docs/ARCHITECTURE.md:81`; the anti-principle "bolting on features that dilute the core"). They are presented here as **goals only**; the gated, detailed specs — what infra each needs, which invariants it stresses, and the explicit decision gate that must clear before any code is written — live in **`docs/ROADMAP-EXTERNAL-INFRA.md`**.
 
