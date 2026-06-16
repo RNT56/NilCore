@@ -423,6 +423,29 @@ func modePreamble(m session.Mode) string {
 	}
 }
 
+// modeGlyph maps a mode to a distinct prompt glyph and a Style paint func, so the
+// user can SEE at a glance which mode they're in (the prompt is the always-visible
+// signal) and so an ack and the prompt agree. The mapping lives here in cmd, not in
+// termui, so the renderer stays free of session knowledge (no import cycle, I6).
+func modeGlyph(m session.Mode, st termui.Style) (glyph string, paint func(string) string) {
+	switch m {
+	case session.ModeDiscuss:
+		return "◆ ❯ ", st.Info // cyan — research & converse
+	case session.ModePlan:
+		return "▣ ❯ ", st.Blue // blue — research & plan
+	case session.ModeExecute:
+		return "▶ ❯ ", st.Warn // amber — full capability
+	default:
+		return "◇ ❯ ", st.Dim // dim — auto (agent infers)
+	}
+}
+
+// modePrompt renders the mode-colored input prompt for the current mode.
+func modePrompt(con *termui.Console, m session.Mode) string {
+	glyph, paint := modeGlyph(m, con.Style())
+	return paint(glyph)
+}
+
 // modeBlurb is the one-line description shown when the user switches mode, so the
 // control surface explains what each mode does without a docs trip.
 func modeBlurb(m session.Mode) string {
@@ -702,7 +725,10 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 	// the thinking spinner and hides the prompt; settling stops the spinner and
 	// re-offers it. Only this goroutine touches `working`.
 	working := false
-	prompt := func() { con.Prompt(con.Style().Info(chatPromptGlyph)) }
+	// The prompt is painted in the current mode's color/glyph, so the mode the user
+	// pinned is always visible at the input line (auto=dim, discuss=cyan, plan=blue,
+	// execute=amber). It re-reads the mode each time, so a /plan updates the next prompt.
+	prompt := func() { con.Prompt(modePrompt(con, sess.CurrentMode())) }
 	settle := func() {
 		if working {
 			working = false
@@ -757,6 +783,10 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 					settle()
 					return nil
 				}
+			} else if isUnknownSlash(line) {
+				// A leading "/" that matched no verb (and is not a steer): tell the user
+				// rather than silently sending the typo to the model as a chat turn.
+				con.Line(con.Style().Warn("  unknown command: " + firstToken(line) + " — try /help"))
 			} else if strings.TrimSpace(line) != "" {
 				// Ack the mode BEFORE Turn dispatches (it may launch a streaming drive).
 				ackChatMode(con, line)
@@ -768,10 +798,6 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 		}
 	}
 }
-
-// chatPromptGlyph is the input prompt. Kept short so agent reasoning lines (which
-// carry their own glyphs) read cleanly interleaved; styled cyan by the Console.
-const chatPromptGlyph = "❯ "
 
 // chatSession is the minimal Session surface the REPL drives, so the hermetic test
 // can substitute a fake that records Turn calls (line + classified mode) without
@@ -849,7 +875,8 @@ func applyModeVerb(ctx context.Context, sess chatSession, con *termui.Console, m
 	if working && rest == "" {
 		note = " (applies to your next turn; the current run keeps its capability)"
 	}
-	con.Line(st.Info("  mode → " + mode.String() + modeBlurb(mode) + note))
+	_, paint := modeGlyph(mode, st)
+	con.Line(paint("  mode → "+mode.String()) + st.Dim(modeBlurb(mode)+note))
 	if rest != "" {
 		ackChatMode(con, rest)
 		if err := sess.Turn(ctx, rest); err != nil {
@@ -997,4 +1024,23 @@ func chatIsSteer(line string) bool {
 		return true
 	}
 	return t == "/steer" || strings.HasPrefix(t, "/steer ")
+}
+
+// isUnknownSlash reports whether a line looks like a control command (leading '/')
+// but matched no parser — so the REPL should warn rather than send the typo to the
+// model. A '/steer' is NOT unknown (it is a deliberate steer message), so it is
+// excluded; this branch runs only after every real verb parser has declined.
+func isUnknownSlash(line string) bool {
+	t := strings.TrimSpace(line)
+	return strings.HasPrefix(t, "/") && !chatIsSteer(line)
+}
+
+// firstToken returns the first whitespace-delimited token of line (the verb), for
+// the unknown-command message.
+func firstToken(line string) string {
+	t := strings.TrimSpace(line)
+	if i := strings.IndexAny(t, " \t"); i >= 0 {
+		return t[:i]
+	}
+	return t
 }

@@ -252,3 +252,5 @@ func (s Style) Info(t string) string    { return s.wrap("36", t) } // cyan
 func (s Style) Success(t string) string { return s.wrap("32", t) } // green
 func (s Style) Danger(t string) string  { return s.wrap("31", t) } // red
 func (s Style) Warn(t string) string    { return s.wrap("33", t) } // amber
+func (s Style) Blue(t string) string    { return s.wrap("34", t) } // blue
+func (s Style) Magenta(t string) string { return s.wrap("35", t) } // magenta

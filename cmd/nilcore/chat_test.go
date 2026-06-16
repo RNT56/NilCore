@@ -466,6 +466,43 @@ func TestWebEnabled(t *testing.T) {
 	}
 }
 
+// TestModeGlyphDistinct asserts each mode maps to a DISTINCT prompt glyph, so the
+// user can see at a glance which mode they're in.
+func TestModeGlyphDistinct(t *testing.T) {
+	st := termui.New(io.Discard).Style()
+	seen := map[string]session.Mode{}
+	for _, m := range []session.Mode{session.ModeAuto, session.ModeDiscuss, session.ModePlan, session.ModeExecute} {
+		g, paint := modeGlyph(m, st)
+		if g == "" || paint == nil {
+			t.Fatalf("mode %v: empty glyph or nil paint", m)
+		}
+		if prev, dup := seen[g]; dup {
+			t.Errorf("mode %v shares glyph %q with %v — modes must look distinct", m, g, prev)
+		}
+		seen[g] = m
+	}
+}
+
+// TestIsUnknownSlash: a leading-'/' typo that is not a real verb and not a steer is
+// flagged as unknown (so the REPL warns instead of sending it to the model).
+func TestIsUnknownSlash(t *testing.T) {
+	cases := map[string]bool{
+		"/foo":           true,  // a typo
+		"/discus":        true,  // misspelled mode verb
+		"/steer fix it":  false, // a steer message, not a command
+		"/steer":         false, // bare steer
+		"!correct it":    false, // bang-steer
+		"just a message": false, // ordinary text
+		"  /bar  ":       true,  // trimmed
+		"":               false,
+	}
+	for in, want := range cases {
+		if got := isUnknownSlash(in); got != want {
+			t.Errorf("isUnknownSlash(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
 // TestParseModeVerb covers the front-door mode control verbs and the "/plan <text>"
 // shorthand (set the mode AND submit a request on one line).
 func TestParseModeVerb(t *testing.T) {
