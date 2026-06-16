@@ -115,7 +115,11 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	// DependsOn propagation: cut a dependent's worktree from its dependency's
 	// (already-passing) branch so it codes ON TOP of that work, not against base
 	// HEAD. Serial dispatch guarantees the dependency reported before this runs.
+	// BaseRef carries the single-dep case; BaseRefs carries the multi-dep set the
+	// SpawnFunc octopus-merges into a throwaway re-base tip (Phase 2). branches is
+	// nil here — serial resolution reads st.handles only.
 	spec.BaseRef = s.depTip(st, spec)
+	spec.BaseRefs = s.resolveBaseRefs(st, nil, spec)
 	res := s.Spawn(ctx, spec)
 	res.ID = spec.ID
 	h.Result = res
@@ -285,11 +289,19 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 		MaxConcurrent: s.concurrency(),
 		RunSub: func(rctx context.Context, t spawn.Subtask) spawn.Result {
 			spec := specByID[t.ID]
-			// Re-base only matters for a single-dependency node; independent nodes
-			// (the common case) skip the lock entirely (resolveBaseRef would no-op).
-			if len(spec.DependsOn) == 1 {
+			// Re-base resolution: a single-dep node sets BaseRef; a multi-dep node
+			// sets BaseRefs (the SpawnFunc octopus-merges them, Phase 2). Independent
+			// nodes (the common case) skip the lock entirely. branches is read under mu
+			// (a sibling that passed earlier in this batch); st.handles is stable for
+			// the wave (cross-round deps) — identical discipline to Phase 1.
+			switch {
+			case len(spec.DependsOn) == 1:
 				mu.Lock()
 				spec.BaseRef = s.resolveBaseRef(st, branches, spec)
+				mu.Unlock()
+			case len(spec.DependsOn) > 1:
+				mu.Lock()
+				spec.BaseRefs = s.resolveBaseRefs(st, branches, spec)
 				mu.Unlock()
 			}
 			res := s.Spawn(rctx, spec)
@@ -346,6 +358,39 @@ func (s *Supervisor) resolveBaseRef(st *runState, branches map[string]string, sp
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_base",
 		Detail: map[string]any{"depends_on": dep, "base": base}})
 	return base
+}
+
+// resolveBaseRefs collects the verified branch of EVERY passed dependency of a
+// MULTI-dependency spec (Phase 2, docs/CONCURRENCY.md §5) — the generalization of
+// resolveBaseRef/depTip. The wiring seam octopus-merges these into a throwaway,
+// unverified re-base tip so a multi-dep worker codes on top of the UNION of its
+// deps' work rather than base HEAD; the serial Integrator stays the sole verified
+// merge path (I2). A dep is included only when Done && Passed && Branch != ""
+// (intra-wave via branches, cross-round via st.handles); a not-yet-passed dep is
+// omitted, so a partial set degrades gracefully (the seam builds a tip only for ≥2,
+// uses BaseRef for 1, HEAD for 0). Order follows spec.DependsOn for determinism.
+// Returns nil for <2 deps — the single-dep BaseRef path (depTip) is unchanged.
+func (s *Supervisor) resolveBaseRefs(st *runState, branches map[string]string, spec SubagentSpec) []string {
+	if len(spec.DependsOn) < 2 {
+		return nil
+	}
+	var refs []string
+	for _, dep := range spec.DependsOn {
+		if branches != nil {
+			if br, ok := branches[dep]; ok && br != "" {
+				refs = append(refs, br)
+				continue
+			}
+		}
+		if h, ok := st.handles[dep]; ok && h.Done && h.Result.Passed && h.Result.Branch != "" {
+			refs = append(refs, h.Result.Branch)
+		}
+	}
+	if len(refs) >= 2 {
+		s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_rebase",
+			Detail: map[string]any{"deps": len(spec.DependsOn), "refs": len(refs)}})
+	}
+	return refs
 }
 
 // depTip resolves the git ref a dependent worker should branch from so it sees its
