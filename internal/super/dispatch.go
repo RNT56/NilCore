@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/emit"
@@ -69,28 +70,16 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	if spec.ID == "" || strings.TrimSpace(spec.Goal) == "" {
 		return errf(b.ID, "spawn_subagent: id and goal are required")
 	}
-	if _, exists := st.handles[spec.ID]; exists {
-		return errf(b.ID, "spawn_subagent: id "+spec.ID+" already spawned")
-	}
 
-	// Role must be a real, resolvable role — never a silent fallback to a more
-	// privileged one (the roster decides capability, not the supervisor's prose).
-	if s.Roster != nil {
-		if _, ok := s.Roster.Resolve(spec.Role); !ok {
-			return s.denySpawn(b.ID, spec, "unknown role "+string(spec.Role))
+	// Spawn rails (id-uniqueness + role/depth/fanout), defined once in checkSpawnRails
+	// so the serial path here and the concurrent pre-wave validation enforce the same
+	// gates. A denial is audited via spawn_denied (the rail working as designed); a
+	// plain input error (a duplicate id) is a structured errf.
+	if reason, denial := s.checkSpawnRails(st, spec); reason != "" {
+		if denial {
+			return s.denySpawn(b.ID, spec, reason)
 		}
-	}
-
-	// Depth rail: the dotted ID encodes parentage/depth. At depth==cap a node is a
-	// leaf and cannot spawn (design §6). The top-level supervisor is depth 0; a
-	// child "super.t1" is depth 1; "super.t1.r2" is depth 2.
-	if depth := idDepth(spec.ID); depth > s.depthCap() {
-		return s.denySpawn(b.ID, spec, fmt.Sprintf("max_depth: id depth %d exceeds cap %d", depth, s.depthCap()))
-	}
-
-	// Fanout rail: bound concurrently-outstanding subagents in one decomposition.
-	if s.MaxFanout > 0 && s.outstanding(st) >= s.MaxFanout {
-		return s.denySpawn(b.ID, spec, fmt.Sprintf("max_fanout: %d outstanding subagents (cap %d)", s.outstanding(st), s.MaxFanout))
+		return errf(b.ID, reason)
 	}
 
 	// Agent rail: tree-wide atomic ceiling. Reserve first; refuse cleanly if over.
@@ -141,6 +130,222 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	// The worker's summary is UNTRUSTED data — fence it. We surface only typed
 	// fields (passed/branch) as trusted control data; the prose is fenced (I7).
 	return ok(b.ID, s.renderReport(res))
+}
+
+// checkSpawnRails runs the pure spawn gates — id-uniqueness, role, depth, fanout —
+// against the current runState and returns a non-empty refusal reason on the first
+// failure (or "" when the spec may run). denial distinguishes a RAIL denial
+// (role/depth/fanout — audited via denySpawn, the runaway-prevention path) from a
+// plain INPUT error (a duplicate id — a structured errf). It has NO side effects:
+// the caller reserves the agent slot and registers the handle. Defined once so the
+// serial doSpawn and the concurrent pre-wave validation enforce identical gates.
+func (s *Supervisor) checkSpawnRails(st *runState, spec SubagentSpec) (reason string, denial bool) {
+	if _, exists := st.handles[spec.ID]; exists {
+		return "spawn_subagent: id " + spec.ID + " already spawned", false
+	}
+	// Role must be a real, resolvable role — never a silent fallback to a more
+	// privileged one (the roster decides capability, not the supervisor's prose).
+	if s.Roster != nil {
+		if _, ok := s.Roster.Resolve(spec.Role); !ok {
+			return "unknown role " + string(spec.Role), true
+		}
+	}
+	// Depth rail: the dotted ID encodes parentage/depth. At depth==cap a node is a
+	// leaf and cannot spawn (design §6). The top-level supervisor is depth 0; a
+	// child "super.t1" is depth 1; "super.t1.r2" is depth 2.
+	if depth := idDepth(spec.ID); depth > s.depthCap() {
+		return fmt.Sprintf("max_depth: id depth %d exceeds cap %d", depth, s.depthCap()), true
+	}
+	// Fanout rail: bound concurrently-outstanding subagents in one decomposition.
+	if s.MaxFanout > 0 && s.outstanding(st) >= s.MaxFanout {
+		return fmt.Sprintf("max_fanout: %d outstanding subagents (cap %d)", s.outstanding(st), s.MaxFanout), true
+	}
+	return "", false
+}
+
+// dispatchConcurrent is the in-wave-concurrency dispatch (P8-T04, concurrency > 1).
+// It processes the turn's tool_use blocks IN ORDER, but batches CONSECUTIVE
+// spawn_subagent blocks and runs each batch as one concurrent wave-DAG (runSpawnWave)
+// before the next non-spawn tool. Batching-then-flushing on a non-spawn boundary
+// preserves serial semantics exactly: a turn's spawns resolve before an integrate /
+// await / finish that follows them, and the tool_results stay in tool_use order. The
+// supervisor goroutine is the SOLE owner of runState — it is parked in runSpawnWave
+// for the wave's duration; workers fold back through it single-goroutine, never
+// concurrently (docs/CONCURRENCY.md §2 "runState stays single-owner").
+func (s *Supervisor) dispatchConcurrent(ctx context.Context, round int, st *runState, content []model.Block) (results []model.Block, finished bool, summary string) {
+	var batch []model.Block // consecutive spawn_subagent blocks awaiting a wave
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		results = append(results, s.runSpawnWave(ctx, round, st, batch)...)
+		batch = nil
+	}
+	for _, b := range content {
+		if b.Type != "tool_use" {
+			continue
+		}
+		if b.Name == toolSpawnSubagent {
+			batch = append(batch, b)
+			continue
+		}
+		// A non-spawn tool: resolve any pending spawn wave FIRST so its handles are
+		// visible to a following integrate/await and the result order is preserved.
+		flush()
+		res, fin, sum := s.dispatchOne(ctx, round, st, b)
+		results = append(results, res)
+		if fin {
+			finished, summary = true, sum
+		}
+	}
+	flush() // trailing spawn batch (the common all-spawns turn)
+	return results, finished, summary
+}
+
+// runSpawnWave admits a batch of spawn_subagent blocks through the rails
+// (single-goroutine pre-wave validation — so two workers can never collide on
+// task/<id>), runs the admitted specs concurrently as a wave-DAG honoring
+// depends_on, and folds each terminal Result back into runState single-owner. It
+// returns one tool_result per input block, in input order. Rejected specs get their
+// structured refusal in place; admitted specs get the fenced renderReport (I7).
+//
+// The DAG releases a node only once its deps Passed, and OnReady (here, the RunSub's
+// resolveBaseRef) cuts a dependent from its dependency's verified branch — the
+// concurrent analog of the serial depTip. A worker NEVER writes runState: it returns
+// a Result; this goroutine folds it after spawn.DAGScheduler.Run drains.
+func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, batch []model.Block) []model.Block {
+	results := make([]model.Block, len(batch))
+
+	// 1. Pre-wave validation (single-goroutine). Parse + gate each block; register the
+	//    handle for every admitted spec BEFORE validating the next, so an intra-batch
+	//    duplicate id is rejected exactly as the serial path rejects a cross-block dup.
+	type admitted struct {
+		idx    int // index into batch/results, for in-order placement
+		toolID string
+		spec   SubagentSpec
+		handle *Handle
+	}
+	var adm []admitted
+	for i, b := range batch {
+		var spec SubagentSpec
+		if err := json.Unmarshal(b.Input, &spec); err != nil {
+			results[i] = errf(b.ID, "spawn_subagent: bad input: "+err.Error())
+			continue
+		}
+		spec.ID = strings.TrimSpace(spec.ID)
+		if spec.ID == "" || strings.TrimSpace(spec.Goal) == "" {
+			results[i] = errf(b.ID, "spawn_subagent: id and goal are required")
+			continue
+		}
+		if reason, denial := s.checkSpawnRails(st, spec); reason != "" {
+			if denial {
+				results[i] = s.denySpawn(b.ID, spec, reason)
+			} else {
+				results[i] = errf(b.ID, reason)
+			}
+			continue
+		}
+		if _, okReserve := s.reserveAgent(); !okReserve {
+			results[i] = s.denySpawn(b.ID, spec, fmt.Sprintf("max_agents: ceiling %d reached", s.MaxAgents))
+			continue
+		}
+		if s.Spawn == nil {
+			results[i] = errf(b.ID, "spawn_subagent: no spawn backend wired")
+			continue
+		}
+		s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_spawn",
+			Detail: map[string]any{"role": string(spec.Role), "depends_on": spec.DependsOn,
+				"depth": idDepth(spec.ID)}})
+		h := &Handle{Spec: spec}
+		st.handles[spec.ID] = h
+		st.spawned++
+		// Action intent BEFORE the worker runs (C2-T04), same as the serial path.
+		s.emit(emit.Event{Kind: emit.KindTool, Step: round,
+			Text: "spawning " + string(spec.Role) + " for: " + clip(spec.Goal, 80)})
+		adm = append(adm, admitted{idx: i, toolID: b.ID, spec: spec, handle: h})
+	}
+	if len(adm) == 0 {
+		return results
+	}
+
+	// 2. Run the admitted specs as a concurrent wave-DAG. The RunSub closure resolves
+	//    each node's BaseRef (intra-wave via branches, cross-round via st.handles) and
+	//    runs the worker; runState is read-only for the wave's duration (this goroutine
+	//    is parked in Run), so the reads are race-free. branches is the only mutable
+	//    shared state, guarded by mu.
+	subs := make([]spawn.Subtask, len(adm))
+	specByID := make(map[string]SubagentSpec, len(adm))
+	for j, a := range adm {
+		subs[j] = spawn.Subtask{ID: a.spec.ID, Goal: a.spec.Goal, DependsOn: a.spec.DependsOn}
+		specByID[a.spec.ID] = a.spec
+	}
+	var mu sync.Mutex
+	branches := make(map[string]string, len(adm)) // id → verified branch of a passed node
+	dag := &spawn.DAGScheduler{
+		MaxConcurrent: s.concurrency(),
+		RunSub: func(rctx context.Context, t spawn.Subtask) spawn.Result {
+			spec := specByID[t.ID]
+			// Re-base only matters for a single-dependency node; independent nodes
+			// (the common case) skip the lock entirely (resolveBaseRef would no-op).
+			if len(spec.DependsOn) == 1 {
+				mu.Lock()
+				spec.BaseRef = s.resolveBaseRef(st, branches, spec)
+				mu.Unlock()
+			}
+			res := s.Spawn(rctx, spec)
+			res.ID = spec.ID
+			if res.Passed && res.Branch != "" {
+				mu.Lock()
+				branches[spec.ID] = res.Branch
+				mu.Unlock()
+			}
+			return res
+		},
+	}
+	waveResults := dag.Run(ctx, subs)
+
+	// 3. Fold every result back into runState SINGLE-OWNER (this goroutine, after the
+	//    pool has drained), in admission order, and build the fenced tool_result.
+	for _, a := range adm {
+		res := waveResults[a.spec.ID]
+		res.ID = a.spec.ID
+		a.handle.Result = res
+		a.handle.Done = true
+		if res.Branch != "" {
+			st.branch = res.Branch
+		}
+		s.Log.Append(eventlog.Event{Task: a.spec.ID, Kind: "subagent_report",
+			Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
+		results[a.idx] = ok(a.toolID, s.renderReport(res))
+	}
+	return results
+}
+
+// resolveBaseRef is the concurrent analog of depTip: the git ref a dependent worker
+// should branch from so it codes ON TOP of its single dependency's verified work. It
+// consults BOTH the intra-wave branches map (a sibling that passed in an earlier wave
+// of this batch) AND st.handles (a dependency that passed in a previous round) — so a
+// dependent re-bases whether its dependency is in the same turn or an earlier one.
+// 0 / multiple / not-yet-passed deps return "" ⇒ base HEAD (the documented limitation
+// — a single ref can't represent "all of them"; the integrator merges those). Called
+// under mu (branches), inside a worker goroutine; st.handles is stable for the wave.
+func (s *Supervisor) resolveBaseRef(st *runState, branches map[string]string, spec SubagentSpec) string {
+	if len(spec.DependsOn) != 1 {
+		return ""
+	}
+	dep := spec.DependsOn[0]
+	base := ""
+	if br, ok := branches[dep]; ok && br != "" {
+		base = br // intra-wave: the dependency just passed in this batch
+	} else if h, ok := st.handles[dep]; ok && h.Done && h.Result.Passed && h.Result.Branch != "" {
+		base = h.Result.Branch // cross-round: a dependency folded in a previous turn
+	}
+	if base == "" {
+		return ""
+	}
+	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_base",
+		Detail: map[string]any{"depends_on": dep, "base": base}})
+	return base
 }
 
 // depTip resolves the git ref a dependent worker should branch from so it sees its
