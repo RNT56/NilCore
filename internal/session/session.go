@@ -57,6 +57,14 @@ type Session struct {
 	// and reused across drives so a mid-work Turn always has somewhere to push.
 	Inbox *inbox.Box
 
+	// Sizer is the native-vs-supervise sizing heuristic used ONLY when the user has
+	// pinned ModeExecute (which bypasses the auto-router): a complex goal routes to
+	// the supervisor, otherwise the single native loop. It is the SAME pure function
+	// the SupervisorFirstRouter holds (chatShouldSupervise), injected here so the
+	// session need not depend on the concrete router type. nil ⇒ "not complex" (the
+	// conservative single-loop default). Unused in ModeAuto (the router sizes there).
+	Sizer func(goal string) bool
+
 	mu      sync.Mutex      // guards Phase + History + driveCancel
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
@@ -351,6 +359,35 @@ func (s *Session) PhaseNow() Phase {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Phase
+}
+
+// SetMode pins the conversation's behavioral mode (auto/discuss/plan/execute). It
+// is called ONLY by a principal control verb at the front door — never from Turn
+// text, an inbox follow-up, or tool output — so untrusted content can never flip
+// the mode (I7); the front door's verb parser is the single authority. A change
+// while a drive is Working affects only the NEXT drive: the running drive captured
+// its mode in DriveInput at launch, so capability is fixed for a drive's lifetime
+// (a write-capable run is never silently downgraded mid-flight, nor vice versa).
+// The mode lives on WorkState, so it is persisted and survives a restart.
+func (s *Session) SetMode(m Mode) {
+	s.mu.Lock()
+	prev := s.State.Mode
+	s.State.Mode = m
+	working := s.Phase != Idle
+	s.mu.Unlock()
+	s.Log.Append(eventlog.Event{
+		Task:   s.ID,
+		Kind:   "session_mode",
+		Detail: map[string]any{"mode": m.String(), "prev": prev.String(), "working": working},
+	})
+}
+
+// CurrentMode reads the pinned mode under s.mu. The front door uses it to ack the
+// active mode and to tell the user when a switch applies only to the next turn.
+func (s *Session) CurrentMode() Mode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State.Mode
 }
 
 // classifyInterrupt is the local queue-vs-steer rule for an in-flight message —

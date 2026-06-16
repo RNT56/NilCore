@@ -106,12 +106,78 @@ func (r Route) String() string {
 // replayed history. Active names which driver currently or last owned the work
 // (so RouteContinue knows where to re-enter); Branch is the integration tip when
 // a project/supervisor drive is mid-flight; LastOutcome is the data-only tail of
-// the last terminal result.
+// the last terminal result; Mode is the user-set behavioral policy (sticky across
+// drives and persisted, so a safety posture like "plan only" survives a restart).
 type WorkState struct {
 	Summary     summarize.ContextSummary // bounded handoff (no raw transcripts)
 	Active      Route                    // driver that currently/last owned the work
 	Branch      string                   // integration tip when project/super mid-flight
 	LastOutcome string                   // data-only tail of the last terminal result
+	Mode        Mode                     // user-set behavioral policy (auto/discuss/plan/execute)
+}
+
+// Mode is a USER-SET behavioral policy that governs what CAPABILITY a drive is
+// given, orthogonal to WHICH machine (native/supervise/project) runs it. The user
+// pins a mode with a front-door control verb (/discuss, /plan, /execute) and it
+// sticks across turns until changed. The capability difference is enforced
+// STRUCTURALLY at the wiring site (a read-only registry + no shell for the
+// read-only modes), never by trusting the model to obey — so "Plan writes no
+// code" is a property of the tools the drive is handed, not of the prompt (I7).
+//
+// ModeAuto — the zero value and default — means "no pin": the auto-router decides
+// the machine and the drive gets full capability, exactly as before modes
+// existed. A fresh Session is therefore byte-identical to pre-mode behavior.
+type Mode int
+
+const (
+	// ModeAuto: the auto-router infers the machine; the drive has full capability.
+	// The default, and the zero value, so an unset mode changes nothing.
+	ModeAuto Mode = iota
+	// ModeDiscuss: converse + research. READ-ONLY capability (read/search/codeintel,
+	// no shell, no write/edit/git) so it can navigate the codebase and talk back but
+	// cannot change it. No verifier gate — a conversation ships nothing.
+	ModeDiscuss
+	// ModePlan: research + produce a plan. Identical READ-ONLY capability to Discuss
+	// with a planning-oriented framing; the "no code written" guarantee is structural.
+	ModePlan
+	// ModeExecute: full capability — design, write, run, verify — gated by the
+	// verifier (I2) and the human promote exactly as a default drive.
+	ModeExecute
+)
+
+// ReadOnly reports whether the mode forbids all writes (Discuss and Plan). The
+// wiring site uses it to pick the write-free registry + shell-off backend, so the
+// no-write guarantee follows from the mode structurally.
+func (m Mode) ReadOnly() bool { return m == ModeDiscuss || m == ModePlan }
+
+// String renders the mode for control acks, /status, and the persisted snapshot.
+func (m Mode) String() string {
+	switch m {
+	case ModeDiscuss:
+		return "discuss"
+	case ModePlan:
+		return "plan"
+	case ModeExecute:
+		return "execute"
+	default:
+		return "auto"
+	}
+}
+
+// ModeFromString maps a stored/typed mode name back to a Mode. An unrecognized
+// name yields ModeAuto (the safe, router-decides default), so a stale snapshot or
+// a typo never pins an unexpected capability.
+func ModeFromString(s string) Mode {
+	switch s {
+	case "discuss":
+		return ModeDiscuss
+	case "plan":
+		return ModePlan
+	case "execute":
+		return ModeExecute
+	default:
+		return ModeAuto
+	}
 }
 
 // Router chooses which machine runs a new (non-in-flight) drive. It is injected
