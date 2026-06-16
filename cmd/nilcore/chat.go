@@ -43,6 +43,7 @@ import (
 	"nilcore/internal/budget"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/meter"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
@@ -177,6 +178,8 @@ const chatBanner = `nilcore chat — talk to the agent; it picks the machine and
                     a mode sticks until you change it; "/plan <text>" sets it and asks
   /mode             show the current mode
   /add <path|url>   attach a file/folder (read-only context) or a URL to fetch
+  /context          show context-window usage (auto-compacts near full)
+  /clear            reset the conversation (keeps mode + attached context)
   /cancel  /stop    abort the current run (and stay in the conversation)
   /status           show what the agent is working on
   /quit  (Ctrl-D)   leave`
@@ -322,11 +325,19 @@ func buildChatSession(d chatDeps) (*session.Session, error) {
 	ledger := budget.New()
 	ledger.SetGlobalCeiling(*d.flags.budget)
 
-	// One metered provider keyed by the conversation id. Reused for routing,
-	// chat replies, and the summarize fold-back so all of it charges one ceiling.
-	metered := meterProvider(d.provider, ledger, chatConvoID)
+	// One metered provider keyed by the conversation id, built concretely so its
+	// OnUsage seam can feed the conversation's context-usage tracker. Reused for
+	// routing, chat replies, and the summarize fold-back so all of it charges one
+	// ceiling AND every call updates the gauge.
+	metered := &meter.Provider{Inner: d.provider, Ledger: ledger, Task: chatConvoID, Price: meter.NewTable()}
 
 	sess := session.New(chatConvoID, chatPrincipal, d.baseRepo, d.log)
+	// Context-usage: every model call reports its token split to the session, which
+	// divides the latest input count by the model's window (meter.CtxWindow) for the
+	// gauge, and auto-compacts the History near the limit using the metered provider.
+	sess.CtxWindow = meter.CtxWindow
+	sess.Summarizer = metered
+	metered.OnUsage = sess.RecordUsage
 	// Live reasoning/tokens render through the styled Console (the steer surface,
 	// §5.3). A nil emitter leaves Out unset — the loops gate on it and stay
 	// byte-identical, so the hermetic test wires no sink.
@@ -444,6 +455,22 @@ func modeGlyph(m session.Mode, st termui.Style) (glyph string, paint func(string
 func modePrompt(con *termui.Console, m session.Mode) string {
 	glyph, paint := modeGlyph(m, con.Style())
 	return paint(glyph)
+}
+
+// gaugePrefix renders the context-usage gauge for the prompt — "◔ 35% " — once at
+// least one model call has measured the window, plus a "/clear" nudge when it is
+// nearly full. Returns "" before anything is measured (a fresh conversation shows a
+// clean prompt). It reads the live usage each draw.
+func gaugePrefix(con *termui.Console, sess chatSession) string {
+	pct, _, window := sess.ContextUsage()
+	if window == 0 {
+		return ""
+	}
+	g := con.Gauge(pct) + " "
+	if pct >= 85 {
+		g += con.Style().Danger("/clear ")
+	}
+	return g
 }
 
 // modeBlurb is the one-line description shown when the user switches mode, so the
@@ -725,10 +752,10 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 	// the thinking spinner and hides the prompt; settling stops the spinner and
 	// re-offers it. Only this goroutine touches `working`.
 	working := false
-	// The prompt is painted in the current mode's color/glyph, so the mode the user
-	// pinned is always visible at the input line (auto=dim, discuss=cyan, plan=blue,
-	// execute=amber). It re-reads the mode each time, so a /plan updates the next prompt.
-	prompt := func() { con.Prompt(modePrompt(con, sess.CurrentMode())) }
+	// The prompt shows, left to right: the context-usage gauge (once measured) and a
+	// mode-painted glyph — so the user always sees how full the context is and which
+	// mode they're in. Both re-read live state each time the prompt is drawn.
+	prompt := func() { con.Prompt(gaugePrefix(con, sess) + modePrompt(con, sess.CurrentMode())) }
 	settle := func() {
 		if working {
 			working = false
@@ -809,6 +836,7 @@ type chatSession interface {
 	AddReadRoot(resolvedPath string)
 	ReadRootsNow() []string
 	Clear() error
+	ContextUsage() (pct, used, window int)
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).
@@ -848,8 +876,19 @@ func applyControl(ctx context.Context, sess chatSession, con *termui.Console, c 
 		m := sess.CurrentMode()
 		con.Line(st.Info("  mode: " + m.String() + modeBlurb(m)))
 	case session.CtrlStatus:
-		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · context roots: %d",
-			sess.PhaseNow(), sess.CurrentMode(), len(sess.ReadRootsNow()))))
+		pct, _, _ := sess.ContextUsage()
+		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · context roots: %d · %s",
+			sess.PhaseNow(), sess.CurrentMode(), len(sess.ReadRootsNow()), con.Gauge(pct))))
+	case session.CtrlContext:
+		pct, used, window := sess.ContextUsage()
+		if window == 0 {
+			con.Line(st.Dim("  context: not measured yet (no model call this conversation)"))
+			return
+		}
+		con.Line(st.Dim(fmt.Sprintf("  %s — %d / %d tokens of the model's context window", con.Gauge(pct), used, window)))
+		if pct >= 80 {
+			con.Line(st.Warn("  context is filling — it will auto-compact soon, or /clear to reset now"))
+		}
 	case session.CtrlCancel:
 		if sess.PhaseNow() == session.Idle {
 			con.Line(st.Dim("  nothing running."))

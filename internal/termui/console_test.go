@@ -45,6 +45,28 @@ func TestBlueMagentaStyle(t *testing.T) {
 	}
 }
 
+// The gauge degrades to plain "context NN%" with no escapes off a terminal (I6),
+// clamps out-of-range input, and buckets the ring on a styled console.
+func TestGauge(t *testing.T) {
+	var buf bytes.Buffer
+	plain := New(&buf) // a buffer is not a TTY
+	for in, want := range map[int]string{0: "context 0%", 42: "context 42%", 100: "context 100%", -5: "context 0%", 150: "context 100%"} {
+		if got := plain.Gauge(in); got != want {
+			t.Errorf("plain Gauge(%d) = %q, want %q", in, got, want)
+		}
+		if strings.Contains(plain.Gauge(in), "\033[") {
+			t.Errorf("plain gauge must contain no ANSI escapes: %q", plain.Gauge(in))
+		}
+	}
+	// On a styled console the ring bucket reflects the band.
+	styled := &Console{w: &buf, st: Style{on: true}}
+	for in, ring := range map[int]string{10: "○", 30: "◔", 55: "◑", 80: "◕", 100: "●"} {
+		if got := styled.Gauge(in); !strings.Contains(got, ring) {
+			t.Errorf("styled Gauge(%d) = %q, want ring %q", in, got, ring)
+		}
+	}
+}
+
 // Streamed tokens flow inline; a following finalized line closes the stream with
 // a newline so it never runs onto the token text.
 func TestStreamThenLine(t *testing.T) {

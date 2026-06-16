@@ -105,6 +105,50 @@ func (Table) Price(modelID string, in, out int) float64 {
 	return float64(in)/1000*r.inPer1k + float64(out)/1000*r.outPer1k
 }
 
+// knownWindows maps a model-id prefix to its context-window size in tokens
+// (longest-prefix match, same discipline as knownRates). It powers the context-
+// usage gauge and auto-compaction (the front door divides the last call's input
+// tokens by this). Unlike pricing — which rounds UP for safety — the window
+// FALLBACK rounds DOWN (a small conservative window) so an unknown model compacts
+// EARLY rather than overruns its real limit. Values are approximate published
+// context limits; re-verify against the vendor before relying on them.
+var knownWindows = []struct {
+	prefix string
+	window int
+}{
+	{"claude-fable", 200_000},
+	{"claude-opus", 200_000},
+	{"claude-sonnet", 200_000},
+	{"claude-haiku", 200_000},
+	{"claude", 200_000},
+	{"gpt-5.5", 400_000},
+	{"gpt-5.4", 400_000},
+	{"gpt", 400_000},
+	{"openrouter", 128_000},
+}
+
+// fallbackWindow is the conservative window for an unknown id — small, so an
+// unfamiliar model triggers compaction early rather than silently overrunning.
+const fallbackWindow = 128_000
+
+// CtxWindow returns the context-window size (in tokens) for a model id. The 1M-
+// context variants advertise it in the id ("[1m]" / "-1m" suffix), so those win
+// outright; otherwise it is the longest matching prefix, or the conservative
+// fallback. Stdlib-only arithmetic (I6).
+func CtxWindow(modelID string) int {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if strings.Contains(id, "[1m]") || strings.Contains(id, "-1m") {
+		return 1_000_000
+	}
+	best, bestLen := fallbackWindow, -1
+	for _, kw := range knownWindows {
+		if strings.HasPrefix(id, kw.prefix) && len(kw.prefix) > bestLen {
+			best, bestLen = kw.window, len(kw.prefix)
+		}
+	}
+	return best
+}
+
 // rateFor resolves the rate for a model id: the longest matching known prefix,
 // or the conservative fallback. Matching is case-insensitive on the id so a
 // vendor that capitalizes differently still resolves to a known tier.

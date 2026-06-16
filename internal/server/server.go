@@ -218,8 +218,24 @@ func (s *Server) applyControl(ctx context.Context, th *thread, req channel.TaskR
 	case session.CtrlModeShow:
 		reply("mode: " + th.sess.CurrentMode().String())
 	case session.CtrlStatus:
-		reply(fmt.Sprintf("status: %s · mode: %s · context roots: %d",
-			th.sess.PhaseNow(), th.sess.CurrentMode(), len(th.sess.ReadRootsNow())))
+		pct, _, window := th.sess.ContextUsage()
+		ctxMsg := "context not measured yet"
+		if window > 0 {
+			ctxMsg = fmt.Sprintf("context %d%%", pct)
+		}
+		reply(fmt.Sprintf("status: %s · mode: %s · context roots: %d · %s",
+			th.sess.PhaseNow(), th.sess.CurrentMode(), len(th.sess.ReadRootsNow()), ctxMsg))
+	case session.CtrlContext:
+		pct, used, window := th.sess.ContextUsage()
+		if window == 0 {
+			reply("context: not measured yet (no model call this conversation)")
+			return
+		}
+		msg := fmt.Sprintf("context %d%% — %d / %d tokens", pct, used, window)
+		if pct >= 80 {
+			msg += " — filling; will auto-compact soon, or /clear to reset"
+		}
+		reply(msg)
 	}
 }
 

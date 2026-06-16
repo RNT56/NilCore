@@ -74,6 +74,14 @@ type Session struct {
 	// single-writable-root invariant (I4).
 	readRoots []string
 
+	// CtxWindow resolves a model id to its context-window size in tokens (injected
+	// from meter.CtxWindow so this leaf does not import meter). nil ⇒ no gauge and no
+	// auto-compaction. Summarizer is the metered provider auto-compaction summarizes
+	// History with when the window nears full; nil ⇒ compaction off (byte-identical).
+	CtxWindow  func(modelID string) int
+	Summarizer model.Provider
+	usage      usageState // latest model usage (the context-gauge signal); guarded by mu
+
 	mu      sync.Mutex      // guards Phase + History + driveCancel
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
@@ -208,6 +216,12 @@ func (s *Session) clearDriveCancelLocked() {
 // routing failure it returns the Session to Idle so the conversation is not
 // wedged in Routing.
 func (s *Session) route(ctx context.Context, text string, st WorkState, history []model.Message) error {
+	// Auto-compaction: if the context window is near full, summarize the prior
+	// conversation into a compact seed before launching, so a long conversation
+	// continues rather than overrunning the window. No-op unless a Summarizer is
+	// wired and the window is ≥ the threshold (so fake-driven paths are unchanged).
+	history = s.maybeCompact(ctx, st, history)
+
 	// A pinned mode OVERRIDES the auto-router: the user has declared intent, so it
 	// governs which machine runs (and the read-only modes pin the capability the
 	// driver builds). ModeAuto falls through to the classifier exactly as before, so

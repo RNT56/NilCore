@@ -35,6 +35,8 @@ const (
 	CtrlModeShow
 	// CtrlStatus: report phase + mode + attached context.
 	CtrlStatus
+	// CtrlContext: report context-window usage (the gauge as text).
+	CtrlContext
 	// CtrlCancel: abort the in-flight run, stay in the conversation.
 	CtrlCancel
 )
@@ -76,6 +78,8 @@ func ParseControl(line string) (Control, bool) {
 		return Control{Kind: CtrlClear}, true
 	case "/status":
 		return Control{Kind: CtrlStatus}, true
+	case "/context":
+		return Control{Kind: CtrlContext}, true
 	case "/mode":
 		return Control{Kind: CtrlModeShow}, true
 	case "/add":

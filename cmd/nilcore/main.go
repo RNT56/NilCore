@@ -40,6 +40,7 @@ import (
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/memory"
+	"nilcore/internal/meter"
 	"nilcore/internal/model"
 	"nilcore/internal/onboard"
 	"nilcore/internal/paths"
@@ -651,11 +652,15 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 		// fold-back all charge this single wall (§6).
 		ledger := budget.New()
 		ledger.SetGlobalCeiling(d.budget)
-		metered := meterProvider(d.provider, ledger, threadID)
+		metered := &meter.Provider{Inner: d.provider, Ledger: ledger, Task: threadID, Price: meter.NewTable()}
 
 		sess := session.New(threadID, sender, d.baseRepo, d.log)
 		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
 		sess.Budget = ledger
+		// Context-usage tracking + auto-compaction parity with the chat front door.
+		sess.CtxWindow = meter.CtxWindow
+		sess.Summarizer = metered
+		metered.OnUsage = sess.RecordUsage
 
 		sess.Router = &session.SupervisorFirstRouter{
 			Classifier:      metered,

@@ -122,6 +122,45 @@ func (c *Console) Prompt(s string) {
 	_, _ = io.WriteString(c.w, s)
 }
 
+// Gauge renders a context-usage indicator for pct (0–100, clamped). On a styled
+// terminal it is a clockwise-filling ring (◔◑◕● at the 25/50/75/100 buckets, ○ for
+// near-empty) tinted by pressure (green <60, amber 60–85, red >85) followed by the
+// percentage. Off a terminal it degrades to a plain "context NN%" with no escapes
+// (the I6 SSH/CI/pipe guarantee). The ring is deliberately bucketed, not smooth —
+// it is a pressure signal ("time to /clear?"), not a precise meter.
+func (c *Console) Gauge(pct int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	if !c.st.on {
+		return fmt.Sprintf("context %d%%", pct)
+	}
+	var ring string
+	switch {
+	case pct >= 100:
+		ring = "●"
+	case pct >= 75:
+		ring = "◕"
+	case pct >= 50:
+		ring = "◑"
+	case pct >= 25:
+		ring = "◔"
+	default:
+		ring = "○"
+	}
+	paint := c.st.Success
+	switch {
+	case pct > 85:
+		paint = c.st.Danger
+	case pct >= 60:
+		paint = c.st.Warn
+	}
+	return paint(fmt.Sprintf("%s %d%%", ring, pct))
+}
+
 // --- internals (all callers hold c.mu) ---
 
 type spinState struct {
