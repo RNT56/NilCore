@@ -78,6 +78,23 @@ type Native struct {
 	// never hand instructions straight into the loop's context.
 	Peer Peer
 
+	// System, if set, is the ROLE-specific system guidance prepended to the base
+	// worker prompt (e.g. researcher / implementer / reviewer). The roster sets it
+	// per role; empty leaves the base prompt alone — byte-identical to the
+	// single-task path. (Previously the roster's per-role System was dropped on the
+	// floor; this wires it so a role-worker actually gets its role guidance.)
+	System string
+
+	// WorkContext, if set, returns a bounded, consistent snapshot of this worker's
+	// current work-in-progress (its worktree diff). When the worker asks the
+	// supervisor (ask_supervisor / request_review) the loop auto-attaches it to the
+	// question, so the supervisor answers grounded in what the worker has actually
+	// done — without the worker having to remember to paste it (#1/#2). It is read
+	// at the moment of the ask, when the worker is PARKED on the blocking call, so
+	// the snapshot is consistent. nil ⇒ nothing attached (byte-identical). The wiring
+	// site (the SpawnFunc, which owns the worktree) provides it.
+	WorkContext func(ctx context.Context) string
+
 	// Inbox, if set, is the conversational front door's user→agent seam (C1-T03):
 	// the running loop drains it for queued user turns at each boundary and checks
 	// its Steer signal to PAUSE-AND-RECONSIDER (CV-T01). A steer NEVER cancels an
@@ -168,6 +185,40 @@ stdout, stderr, and the exit code. Make the smallest change that satisfies the
 goal. Inspect files before editing them. When you believe the goal is met and
 the project's checks should pass, call the "finish" tool with a short summary.
 Do not ask the user questions; act.`
+
+// peerGuidance is appended to the worker prompt ONLY when a Peer (a supervisor) is
+// wired — multi-agent mode. It is the encouragement to actually escalate: a worker
+// that guesses in isolation wastes effort, so asking is framed as cheap, expected,
+// and well-supported (the supervisor has context the worker lacks, and the worker's
+// work-in-progress is auto-attached to the question). The base prompt's "do not ask
+// the user" is about the human operator; the supervisor is a peer agent, not the
+// user — this clarifies that distinction.
+const peerGuidance = `You are part of a multi-agent run with a SUPERVISOR (a peer agent, not the user).
+The supervisor holds the full plan, sees the other subagents' progress, and can read
+the integrated tree — context you do not have. Use ask_supervisor PROACTIVELY (it
+blocks only briefly and is answered quickly) whenever: you are uncertain about a
+design decision or an interface; your change might conflict with or duplicate a
+sibling's work; you are about to assume something that, if wrong, would waste effort;
+or the supervisor's input would change your approach. Asking early is cheap and
+expected — it is NOT a failure, and guessing in isolation is the costlier mistake.
+When you ask, your current work-in-progress is shown to the supervisor automatically,
+so just state your specific question. Use share_finding for durable facts other
+agents should know, and request_review for a cross-model check of your diff.`
+
+// systemFor composes the worker's effective system prompt: the base operational
+// prompt, plus the role-specific System (when the roster set one), plus the
+// multi-agent peerGuidance (only when a Peer is wired). With neither set it returns
+// the base prompt unchanged, so the single-task path stays byte-identical.
+func (n *Native) systemFor() string {
+	s := systemPrompt
+	if strings.TrimSpace(n.System) != "" {
+		s += "\n\n" + n.System
+	}
+	if n.Peer != nil {
+		s += "\n\n" + peerGuidance
+	}
+	return s
+}
 
 func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	steps := n.MaxSteps
@@ -264,6 +315,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 	var recent []string      // bounded trail of recent actions, for advisor context
 	consecutiveFailures := 0 // verifier failures in a row, for auto-escalation
+	sys := n.systemFor()     // base + role + (peer ask-guidance), computed once
 
 	for i := 0; i < steps; i++ {
 		// QUEUE drain FIRST, at the boundary: any user turns the principal typed
@@ -349,7 +401,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					// Iteration teardown: Stream returned normally; exit the watcher.
 				}
 			}()
-			resp, err = streamer.Stream(streamCtx, systemPrompt, msgs, toolDefs, 4096, func(c model.Chunk) {
+			resp, err = streamer.Stream(streamCtx, sys, msgs, toolDefs, 4096, func(c model.Chunk) {
 				if c.Text != "" {
 					n.emit(emit.Event{Kind: emit.KindToken, Step: streamStep, Text: c.Text})
 				}
@@ -411,7 +463,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			// in-flight think — its reasoning is preserved. The task ctx still cancels on
 			// shutdown/deadline (SIGTERM, a parent timeout), unchanged. When Inbox is nil
 			// there is no steer to check at all — byte-identical to the original path.
-			resp, err = n.Model.Complete(ctx, systemPrompt, msgs, toolDefs, 4096)
+			resp, err = n.Model.Complete(ctx, sys, msgs, toolDefs, 4096)
 
 			if err != nil {
 				// Steer no longer cancels the model call (CV-T01), so the only context
@@ -570,7 +622,29 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
 					continue
 				}
-				reply, err := n.Peer.Dispatch(ctx, b.Name, b.Input)
+				// Auto-attach this worker's work-in-progress to a blocking ask
+				// (ask_supervisor → "question", request_review → "request") so the
+				// supervisor answers grounded in what the worker has actually done (#1/#2).
+				// The worker is PARKED on the ask, so the snapshot is consistent. The
+				// supervisor fences the whole question as untrusted (I7); share_finding is
+				// async and not enriched. A nil WorkContext leaves the input untouched.
+				input := b.Input
+				if n.WorkContext != nil {
+					field := ""
+					switch b.Name {
+					case "ask_supervisor":
+						field = "question"
+					case "request_review":
+						field = "request"
+					}
+					if field != "" {
+						if wc := strings.TrimSpace(n.WorkContext(ctx)); wc != "" {
+							input = enrichBusField(input, field,
+								"\n\n--- my current work-in-progress (auto-attached for your reference) ---\n"+wc)
+						}
+					}
+				}
+				reply, err := n.Peer.Dispatch(ctx, b.Name, input)
 				if err != nil {
 					results = append(results, errorResult(b.ID, b.Name+": "+err.Error()))
 					continue
@@ -670,6 +744,40 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 func errorResult(id, msg string) model.Block {
 	return model.Block{Type: "tool_result", ToolUseID: id, Content: msg, IsError: true}
+}
+
+// enrichBusField appends extra to a named string field of a bus-tool input object
+// (e.g. the "question" of ask_supervisor), re-encoding the object. It is how the loop
+// auto-attaches a worker's work-in-progress to its question. On any decode/encode
+// problem it returns the input UNCHANGED — enrichment is best-effort and must never
+// break the ask. The appended text is the worker's OWN content; the supervisor fences
+// the whole question as untrusted on receipt (I7), so no fencing is needed here.
+func enrichBusField(input json.RawMessage, field, extra string) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(input, &obj); err != nil {
+		return input
+	}
+	var cur string
+	if raw, ok := obj[field]; ok {
+		_ = json.Unmarshal(raw, &cur)
+	}
+	// Only enrich a field that ALREADY carries a real question/request. A missing,
+	// empty, or non-string field is a malformed ask — leave the input untouched so the
+	// peer's empty-guard (decodeField) still rejects it and the model gets the
+	// corrective error, rather than laundering a contentless "question" onto the bus.
+	if strings.TrimSpace(cur) == "" {
+		return input
+	}
+	merged, err := json.Marshal(cur + extra)
+	if err != nil {
+		return input
+	}
+	obj[field] = merged
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return input
+	}
+	return out
 }
 
 // steerPending non-blocking checks the inbox's steer signal: true iff a steer is

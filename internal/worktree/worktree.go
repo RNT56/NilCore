@@ -220,6 +220,56 @@ func (w *Worktree) ListFiles(ctx context.Context, maxBytes int) (string, error) 
 // non-positive cap — enough for a real file tree, small enough not to bloat a prompt.
 const defaultListFilesBytes = 3072
 
+// WorkingDiff reports a worker's UNCOMMITTED work-in-progress: the diff of the
+// working tree against the worktree's create-time baseline (tracked edits, committed
+// or not) plus the names of any new untracked files. It is the consistent "here is
+// what I've done so far" snapshot a subagent attaches when it asks the supervisor —
+// consistent because a worker only asks while PARKED on the blocking call, so its
+// tree is quiescent at read time (no torn read; no scratch ref needed). Read-only
+// (never stages or commits), bounded to maxBytes (on a line boundary), hardened git
+// (I4). Empty (not an error) when the worker has changed nothing yet.
+func (w *Worktree) WorkingDiff(ctx context.Context, maxBytes int) (string, error) {
+	if w == nil {
+		return "", nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultWorkingDiffBytes
+	}
+	base := w.baseSHA
+	if base == "" {
+		base = "HEAD"
+	}
+	// Tracked modifications since the baseline — `git diff <commit>` compares the
+	// WORKING TREE to that commit, so uncommitted edits are included.
+	diff, err := git(ctx, w.path, "diff", base)
+	if err != nil {
+		return "", fmt.Errorf("worktree working diff: %w", err)
+	}
+	// New untracked files (names only — read-only; we never `git add`).
+	untracked, _ := git(ctx, w.path, "ls-files", "--others", "--exclude-standard")
+
+	var b strings.Builder
+	if d := strings.TrimSpace(diff); d != "" {
+		b.WriteString(d)
+	}
+	if u := strings.TrimSpace(untracked); u != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("new (untracked) files:\n")
+		b.WriteString(u)
+	}
+	if b.Len() == 0 {
+		return "", nil
+	}
+	return clampBytes(b.String(), maxBytes), nil
+}
+
+// defaultWorkingDiffBytes bounds a WorkingDiff snapshot so a large work-in-progress
+// can never bloat the supervisor's answer prompt; the worker's own question carries
+// the specific concern, this is the supporting context.
+const defaultWorkingDiffBytes = 6144
+
 // DiffStat reports WHAT CHANGED in this worktree since it was created: the
 // changed-file name-status list plus the `git diff --stat` summary, taken
 // between the pinned create-time start-point (baseSHA) and the worktree's
