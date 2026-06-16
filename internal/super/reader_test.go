@@ -65,7 +65,7 @@ func TestSubagentAskAnsweredWhileSupervisorBusy(t *testing.T) {
 	s.Spawn = spawnFn
 	// The supervisor answers the subagent's question with a concrete steer. This
 	// runs ON THE READER GOROUTINE while s.Run is parked inside spawnFn's Ask.
-	s.Answer = func(_ context.Context, q bus.Message) string {
+	s.Answer = func(_ context.Context, q bus.Message, _ RunContext) string {
 		if q.Kind != bus.KindQuestion {
 			t.Errorf("answer hook saw kind %q, want question", q.Kind)
 		}

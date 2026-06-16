@@ -799,6 +799,84 @@ const (
 	answerTimeout   = 30 * time.Second
 )
 
+// renderGrounding renders the supervisor's grounded run-context (goal + plan digest
+// + live cohort state + integration tip) as a TRUSTED control-data preamble for the
+// answer (the grounded-answer seam). It is the supervisor's OWN harness-derived state
+// — never laundered subagent output — so it is NOT guard.Wrap'd (only the question
+// is). Empty when nothing has been published yet, keeping the prompt byte-identical
+// to the ungrounded path. The whole block is byte-capped so it can never bloat the
+// answer's token budget; each field is already clipped at capture.
+func renderGrounding(rc super.RunContext) string {
+	if rc.Empty() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Run context — YOUR OWN plan and cohort state, trusted control data (use it to steer the subagent; do not repeat it verbatim):")
+	if rc.Goal != "" {
+		fmt.Fprintf(&b, "\n- goal: %s", clipRunes(rc.Goal, 240))
+	}
+	if rc.Plan != "" {
+		fmt.Fprintf(&b, "\n- plan:\n%s", rc.Plan)
+	}
+	if len(rc.Cohort) > 0 {
+		// Only the HARNESS-derived fields go in the trusted preamble: id/role are the
+		// supervisor's own spec, state is the verifier's verdict, branch is a harness
+		// ref. The subagent's prose Report is UNTRUSTED — it is fenced separately
+		// (renderCohortReports), never laundered into trusted control data (I7).
+		b.WriteString("\n- subagents:")
+		for _, c := range rc.Cohort {
+			fmt.Fprintf(&b, "\n  - %s (%s): %s", c.ID, c.Role, c.State)
+			if c.Branch != "" {
+				fmt.Fprintf(&b, " branch=%s", c.Branch)
+			}
+		}
+	}
+	if rc.Tip != "" {
+		fmt.Fprintf(&b, "\n- integration tip (merged+verified work): %s", rc.Tip)
+	}
+	return clipRunes(b.String(), maxGroundingBytes)
+}
+
+// renderCohortReports renders the subagents' work-report clips as a SINGLE
+// guard.Wrap-fenced block of UNTRUSTED data (I7): a Report is a clip of the worker's
+// Result.Summary, which mixes the harness diff-stat with the model's own prose, so it
+// is fenced exactly as renderReport fences it — never placed in the trusted grounding
+// preamble where it could be read as an instruction. Returns "" when no cohort entry
+// carries a report, keeping the prompt byte-identical to the no-report path.
+func renderCohortReports(rc super.RunContext) string {
+	var b strings.Builder
+	for _, c := range rc.Cohort {
+		if c.Report != "" {
+			fmt.Fprintf(&b, "%s: %s\n", c.ID, c.Report)
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return guard.Wrap("subagent work reports", clipRunes(b.String(), maxGroundingBytes))
+}
+
+// maxGroundingBytes is a defensive total cap on the grounding preamble (and the
+// fenced reports block) so a large cohort or plan can never blow the answer's token
+// budget (each field is also clipped at capture). clipRunes cuts on a rune boundary
+// so the prompt never carries invalid UTF-8.
+const maxGroundingBytes = 6000
+
+// clipRunes truncates s to at most n bytes, cutting on a rune boundary so the result
+// is always valid UTF-8 (byte-slicing could split a multi-byte rune). It mirrors the
+// rune-safe clip used elsewhere; truncate (byte-exact) is kept for the diff-stat
+// caps that are already newline-bounded.
+func clipRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 // buildAnswerFunc returns the supervisor's Answer seam (CV-T02): given a subagent's
 // blocking question (delivered on the reader goroutine), it asks the supervisor's
 // STRONG model for a concise reply and returns it. Four properties are load-bearing:
@@ -818,8 +896,8 @@ const (
 //
 // It logs ONE metadata-only super_answer event (sender, kind, ok, sizes) — never
 // the question or the answer body (I5).
-func buildAnswerFunc(prov model.Provider, log *eventlog.Log) func(ctx context.Context, q bus.Message) string {
-	return func(ctx context.Context, q bus.Message) string {
+func buildAnswerFunc(prov model.Provider, log *eventlog.Log) func(ctx context.Context, q bus.Message, rc super.RunContext) string {
+	return func(ctx context.Context, q bus.Message, rc super.RunContext) string {
 		if prov == nil {
 			return "" // no strong tier wired: defer to the reader's graceful fallback
 		}
@@ -830,9 +908,25 @@ func buildAnswerFunc(prov model.Provider, log *eventlog.Log) func(ctx context.Co
 		if q.Kind == bus.KindReviewRequest {
 			kind = "review_request"
 		}
-		msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text",
-			Text: "A subagent (" + safeSender(q.Sender) + ") sent this " + kind + ". Give it a concise steer.\n\n" +
-				guard.Wrap("subagent "+kind, q.Payload)}}}}
+		// Ground the steer in the supervisor's OWN plan + cohort state + integration tip
+		// (rc — trusted control data, the grounded-answer seam) when published, ABOVE the
+		// still-fenced UNTRUSTED question (I7 boundary unchanged). An empty rc renders
+		// nothing, so the prompt is byte-identical to the ungrounded path.
+		var sb strings.Builder
+		if g := renderGrounding(rc); g != "" {
+			sb.WriteString(g)
+			sb.WriteString("\n\n")
+		}
+		// The cohort's work-report prose is UNTRUSTED — fence it as a distinct block
+		// BELOW the trusted grounding (never inside it, I7), so the answer model can
+		// countercheck what siblings produced as DATA, never obey it.
+		if r := renderCohortReports(rc); r != "" {
+			sb.WriteString(r)
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("A subagent (" + safeSender(q.Sender) + ") sent this " + kind + ". Give it a concise steer.\n\n")
+		sb.WriteString(guard.Wrap("subagent "+kind, q.Payload))
+		msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: sb.String()}}}}
 
 		resp, err := prov.Complete(actx, answerSystem, msgs, nil, maxAnswerTokens)
 		if err != nil {

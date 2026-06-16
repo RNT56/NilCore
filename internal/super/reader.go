@@ -157,7 +157,12 @@ func (r *reader) stop() {
 // on delivery and the peer fences it again at the tool_result seam.
 func (s *Supervisor) answerBody(ctx context.Context, q bus.Message) string {
 	if s.Answer != nil {
-		if body := s.Answer(ctx, q); body != "" {
+		// Load the grounded run-context snapshot (goal + plan + cohort + integration
+		// tip) under snapMu and hand it to Answer BY VALUE, so the reply is grounded in
+		// the supervisor's own plan and the cohort's actual state. loadRunContext is a
+		// non-blocking mutex copy — it never touches the parked main goroutine and can
+		// never hang, so deadlock-freedom is untouched.
+		if body := s.Answer(ctx, q, s.loadRunContext()); body != "" {
 			return body
 		}
 	}

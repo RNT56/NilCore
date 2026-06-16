@@ -296,6 +296,53 @@ func TestDAGConcurrencyCap(t *testing.T) {
 	}
 }
 
+// TestDAGCancelledQueuedNodesSkippedNotCycle is the cancel-label fix: when ctx is
+// cancelled, nodes the scheduler skipped while still queued behind MaxConcurrent
+// terminate as Skipped (cancelled) — NOT mislabeled as a dependency cycle. A node
+// that actually ran resolves on its own terminal state; the honest cause of an
+// unreached node under a dead ctx is cancellation.
+func TestDAGCancelledQueuedNodesSkippedNotCycle(t *testing.T) {
+	const n = 8
+	subs := make([]Subtask, n)
+	for i := range subs {
+		subs[i] = Subtask{ID: string(rune('a' + i))} // all independent → one wave
+	}
+	started := make(chan struct{}, n)
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &DAGScheduler{
+		MaxConcurrent: 2, // only 2 run at once; the rest queue
+		RunSub: func(rctx context.Context, st Subtask) Result {
+			started <- struct{}{}
+			<-rctx.Done() // block until cancellation
+			return Result{ID: st.ID, State: StateFailed, Err: rctx.Err()}
+		},
+	}
+	done := make(chan map[string]Result, 1)
+	go func() { done <- d.Run(ctx, subs) }()
+
+	<-started // at least one node is running
+	<-started // both slots are occupied → the other 6 are queued
+	cancel()
+
+	var res map[string]Result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not drain after cancellation")
+	}
+	if len(res) != n {
+		t.Fatalf("every node must terminate, got %d/%d", len(res), n)
+	}
+	for id, r := range res {
+		if r.State == StateCycle {
+			t.Errorf("node %q mislabeled StateCycle under cancellation; want Skipped or Failed", id)
+		}
+		if r.State != StateSkipped && r.State != StateFailed {
+			t.Errorf("node %q = %q, want Skipped (queued+cancelled) or Failed (ran+cancelled)", id, r.State)
+		}
+	}
+}
+
 // --- helpers ---
 
 // runWithDeadline runs the scheduler under a hard deadline so an accidental
