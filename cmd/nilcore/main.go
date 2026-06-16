@@ -665,10 +665,11 @@ func serveMain(args []string) {
 	// Durable resume: re-drive any native task a prior process left running or
 	// interrupted, BEFORE accepting new traffic. Each runs in a fresh disposable
 	// worktree off the current HEAD (idempotent — no committed base state until a
-	// gated merge) under a deny-default approver (a headless resume has no live
-	// thread to answer a gate, so irreversible actions stay denied — I3).
+	// gated merge). On an irreversible gate the resume approver INFORMS the owner's
+	// thread over the channel then denies (escalate-on-gate); irreversible actions
+	// are never auto-approved on a headless resume (I3).
 	if ckpt != nil {
-		resumeInflight(ctx, d)
+		resumeInflight(ctx, d, rawCh)
 	}
 
 	// SCM/CI webhook intake (P9-T04), opt-in via --webhook: a signed GitHub webhook
@@ -728,14 +729,68 @@ type denyAllApprover struct{}
 
 func (denyAllApprover) Approve(string) bool { return false }
 
+// informGateApprover is the resume-path approver when a transport is connected: a
+// headless resumed task still cannot safely BLOCK on a live gate during pre-traffic
+// resume (the server receive loop is not running, so a polling Ask would steal
+// inbound user messages), so on an irreversible gate it INFORMS the owner's thread
+// (send-only Update — no poll) of exactly what is blocking, then DENIES (the task
+// does its reversible work and stops, as before). The owner re-issues the task when
+// attached, where the live channel Ask resolves the gate normally. It NEVER
+// auto-approves (I3); a missing owner thread or a failed push degrades to a silent
+// deny, identical to denyAllApprover.
+type informGateApprover struct {
+	ch     channel.Channel
+	ctx    context.Context
+	taskID string
+	log    *eventlog.Log
+}
+
+func (a informGateApprover) Approve(action string) bool {
+	thread := ownerThreadFromTaskID(a.taskID)
+	informed := false
+	if a.ch != nil && thread != "" {
+		nctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
+		if err := a.ch.Update(nctx, thread,
+			"GATE — a resumed task stopped at an irreversible step:\n"+action+
+				"\nRe-issue this task when you're ready to approve it."); err == nil {
+			informed = true
+		}
+		cancel()
+	}
+	if a.log != nil {
+		a.log.Append(eventlog.Event{Kind: "resume_gate_denied",
+			Detail: map[string]any{"task": a.taskID, "informed": informed}})
+	}
+	return false // never auto-approve a resumed gate (I3)
+}
+
+// ownerThreadFromTaskID recovers the owning channel thread from a serve native task
+// id, which the native driver mints as "<threadID>-<seq>". It returns the threadID
+// prefix when the trailing segment after the last '-' is all digits (the seq), else
+// "" (so the caller degrades to a silent deny rather than push to a wrong thread).
+func ownerThreadFromTaskID(id string) string {
+	i := strings.LastIndexByte(id, '-')
+	if i <= 0 || i == len(id)-1 {
+		return ""
+	}
+	for j := i + 1; j < len(id); j++ {
+		if id[j] < '0' || id[j] > '9' {
+			return ""
+		}
+	}
+	return id[:i]
+}
+
 // resumeInflight re-drives every NATIVE task a prior process left running or
 // interrupted, before serve accepts new traffic. Each runs through a freshly
 // reconstructed single-task orchestrator (the identical verified path as a live
-// serve drive, minus the conversational seams) in a disposable worktree, under the
-// deny-default approver. Checkpoint.Resume records terminal status per task, so a
-// task is resumed at most once per boot. (Supervise/project resume uses the
-// separate multi-agent RunState machinery and is a documented follow-on.)
-func resumeInflight(ctx context.Context, d serveDeps) {
+// serve drive, minus the conversational seams) in a disposable worktree. On an
+// irreversible gate the approver informs the owner's thread then denies (a real Ask
+// can't run safely here — the receive loop is not up yet); with no transport it is a
+// silent deny. Checkpoint.Resume records terminal status per task, so a task is
+// resumed at most once per boot. (Supervise/project resume uses the separate
+// multi-agent RunState machinery and is a documented follow-on.)
+func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) {
 	c := d.flags
 	adv := resolveAdvisor(*c.backendName, d.boot, c)
 	run := func(ctx context.Context, t backend.Task) (bool, error) {
@@ -745,13 +800,19 @@ func resumeInflight(ctx context.Context, d serveDeps) {
 			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo)
 			return agent.Env{Backend: be, Verifier: v}
 		}
+		// A resumed gate INFORMS the owner's thread then denies (escalate-on-gate); with
+		// no transport it stays a silent deny (I3). Never auto-approves either way.
+		var approver policy.Approver = denyAllApprover{}
+		if notifyCh != nil {
+			approver = informGateApprover{ch: notifyCh, ctx: ctx, taskID: t.ID, log: d.log}
+		}
 		orch := &agent.Orchestrator{
 			BaseRepo:   d.baseRepo,
 			NewEnv:     newEnv,
 			Log:        d.log,
 			Router:     agent.SingleRouter{},
 			Spawner:    agent.NoSpawner{},
-			Approver:   denyAllApprover{},
+			Approver:   approver,
 			Checkpoint: d.checkpoint,
 		}
 		out, err := orch.Execute(ctx, t)
