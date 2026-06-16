@@ -289,7 +289,7 @@ func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState
 		Inbox:     s.Inbox,
 		Out:       s.Out,
 		Mode:      st.Mode, // capability captured at launch (fixed for the drive's life)
-		ReadRoots: roots,    // read-only context roots captured at launch
+		ReadRoots: roots,   // read-only context roots captured at launch
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the

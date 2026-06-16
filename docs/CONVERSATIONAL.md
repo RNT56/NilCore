@@ -1,6 +1,16 @@
 # NilCore — One Conversational Front Door (Session · Steer/Queue · Auto-Route)
 
-> **Status: design / plan (not yet implemented).** Produced by a grounded multi-agent design pass
+> **Status: SHIPPED.** The conversational front door is implemented and wired —
+> `cmd/nilcore/chat.go` is a live REPL over `internal/session` (router + four drivers + inbox + emit),
+> with queue/steer mid-work messaging. A later workstream added what the original design did not: a
+> **user-set mode** (`/discuss` `/plan` `/execute` `/auto`) that overrides the auto-router and is
+> enforced structurally (read-only registry + `backend.Native.DisableShell` for the read-only modes),
+> read-only **context attach** (`/add <path>`, the `ReadRoots` tool seam), and sandboxed **web access**
+> (`/add <url>` + `web_fetch` behind the `-allow-egress` allowlist proxy). See §"Modes, context, and
+> web" below and the CHANGELOG. The sections that follow describe the original auto-route design
+> (still the behavior in `ModeAuto`, the default).
+>
+> Produced by a grounded multi-agent design pass
 > (4 architects → adversary → synthesis → plan), validated against the codebase and the seven
 > invariants. Adds a single conversational entrypoint where the agent infers mode from the goal and
 > the user can queue or steer messages mid-work. Nothing changes the frozen `backend.CodingBackend`
@@ -425,3 +435,57 @@ Sizing: every task is one branch with a disjoint `Owns` set. The four contract-f
 
 6. CONCURRENT INTAKE GOROUTINE LIFECYCLE (serve) AND WATCHER GOROUTINE (loop). Two new long-lived/per-iter goroutines (the serve intake reader and the per-iteration steer watcher) are the classic leak/deadlock surface. The watcher must be torn down deterministically every iteration (cancel(nil); <-watcher) and the intake reader must exit on shutdown without writing to a closed Session. The proven prior art is super/reader.go's stopc/done pattern — reuse it verbatim. Mitigation: go test -race + explicit goroutine-leak assertions on C1-T03/T04 and C3-T02.
 
+
+---
+
+## Modes, context, and web (shipped, post-design)
+
+The original design above auto-infers everything. This is the behavior of `ModeAuto`,
+the default. A later workstream added three things the **user** controls directly,
+inside the same one chat loop, without touching the frozen `backend.CodingBackend`
+contract (I1). The full per-task account is in the CHANGELOG; the seams:
+
+### User-set modes (`/discuss` · `/plan` · `/execute` · `/auto`)
+
+`session.Mode` (in `state.go`) is a sticky, user-set behavioral policy carried on
+`WorkState`, set ONLY by a front-door control verb (never from `Turn`/inbox/tool text,
+I7) and overriding the auto-router when pinned. It is a **safety posture**, so it
+round-trips through the persistence snapshot — a `/plan` conversation resumes in plan
+mode, never silently full-capability. A mid-drive switch applies to the next turn
+(capability is fixed at drive launch).
+
+- `/discuss`, `/plan` ⇒ **read-only**. Enforcement is **structural**, not a prompt:
+  - a write-free registry (`tools.ReadOnlyWithCodeintel` — read/search/codeintel, no write/edit/git), **and**
+  - the new additive `backend.Native.DisableShell`, which suppresses the always-on `run` tool entirely (and refuses any `run` the model emits anyway), **and**
+  - a `verify.Pass` pass-through verifier (a research turn ships nothing, so there is nothing to gate — I2 governs only work that ships).
+  So a read-only drive has **no registered path to mutate the tree** regardless of what the model attempts. `backend.Native` is byte-identical when `DisableShell=false`.
+- `/execute` ⇒ full capability, sized native-vs-supervise by the same heuristic the router uses, gated by the real verifier (I2).
+- `/auto` (default) ⇒ the auto-router, byte-identical to before modes existed.
+
+The read-only capability primitives (`tools.ReadOnly`, `tools.ReadOnlyWithCodeintel`,
+`policy.ReadOnlyCommandPolicy`) are shared with the multi-agent roles in `internal/roster`.
+
+### Context attach (`/add <path|url>`)
+
+`ReadTool`/`SearchTool` carry an optional `ReadRoots` field: additional **read-only**
+roots the read/search tools may consult beyond the worktree (they run host-side, so no
+sandbox mount is needed). I4 discipline:
+
+- a **relative** path still resolves only against the worktree (byte-identical default; `../escape` rejected);
+- extra roots are addressed by **absolute** path, allowed only if they resolve symlink-safe inside an added root (`/etc/passwd` is rejected);
+- `WriteTool`/`EditTool` are untouched — they resolve only against the worktree, so **extra roots are never writable** (single-writable-root invariant preserved).
+
+`/add <path>` validates + symlink-resolves the path at the cmd layer and registers it
+on the Session (principal-only, I7; threaded into each drive at launch). `/add <url>`
+asks the agent to fetch the URL via `web_fetch` (below).
+
+### Web access (`-allow-egress` + `web_fetch`)
+
+Default stays **default-deny**. `-allow-egress host,host` stands up the allowlist proxy
+(`policy.EgressProxy.Start` — the listener/goroutine/shutdown lifecycle around the
+existing `ServeHTTP`) bound to the conversation ctx, and routes a **container** sandbox
+through it via `AllowEgressVia` (using the runtime host alias; `sandbox.Container.ExtraHosts`
+adds `--add-host` for docker-Linux). The `web_fetch` tool is advertised only when egress
+is on AND the box is egress-capable; the fetch runs inside the sandbox and its body is
+`guard.Wrap`'d as untrusted data (I7). The namespace backend has no proxy egress path
+(empty netns), so web access requires the container backend (fail-closed).
