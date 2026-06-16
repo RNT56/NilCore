@@ -159,3 +159,25 @@ func TestNamespaceForwardsPerRunEnv(t *testing.T) {
 		t.Fatalf("the sandbox control var should be stripped from the command env, got %q", res.Stdout)
 	}
 }
+
+// TestNamespaceDoesNotLeakHostEnv is the I3 regression: a secret that lives in
+// the HOST process environment (as ANTHROPIC_API_KEY does in an env-based
+// deployment) must never reach a model-emitted command — the namespace backend
+// does not inherit os.Environ(). It also confirms the fixed base env (PATH) is
+// still provided so ordinary commands work.
+func TestNamespaceDoesNotLeakHostEnv(t *testing.T) {
+	box := requireNamespace(t)
+	const hostKey, hostVal = "NILCORE_FAKE_HOST_SECRET", "leaked-api-key-value"
+	t.Setenv(hostKey, hostVal) // restored automatically after the test
+
+	res := runSandbox(t, box, `printf 'secret=[%s] path=[%s]' "$NILCORE_FAKE_HOST_SECRET" "${PATH:+set}"`)
+	if strings.Contains(res.Stdout, hostVal) {
+		t.Fatalf("I3 LEAK: host secret reached the sandboxed command: %q", res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "secret=[]") {
+		t.Fatalf("host env var should be empty in the command, got %q", res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "path=[set]") {
+		t.Fatalf("the command should still get a base PATH, got %q", res.Stdout)
+	}
+}
