@@ -199,6 +199,19 @@ func (s *Session) clearDriveCancelLocked() {
 // routing failure it returns the Session to Idle so the conversation is not
 // wedged in Routing.
 func (s *Session) route(ctx context.Context, text string, st WorkState, history []model.Message) error {
+	// A pinned mode OVERRIDES the auto-router: the user has declared intent, so it
+	// governs which machine runs (and the read-only modes pin the capability the
+	// driver builds). ModeAuto falls through to the classifier exactly as before, so
+	// an unset mode is byte-identical. The mode route needs no model call.
+	if r, ok := s.routeForMode(st.Mode, text); ok {
+		s.Log.Append(eventlog.Event{
+			Task:   s.ID,
+			Kind:   "session_route",
+			Detail: map[string]any{"route": r.String(), "mode": st.Mode.String(), "len_text": len(text)},
+		})
+		return s.launch(ctx, r, text, st, history)
+	}
+
 	if s.Router == nil {
 		s.toIdle()
 		return errNoRouter
@@ -215,15 +228,41 @@ func (s *Session) route(ctx context.Context, text string, st WorkState, history 
 		return err
 	}
 
-	drv := s.driverFor(r, st)
 	s.Log.Append(eventlog.Event{
-		Task: s.ID,
-		Kind: "session_route",
-		Detail: map[string]any{
-			"route":    r.String(),
-			"len_text": len(text),
-		},
+		Task:   s.ID,
+		Kind:   "session_route",
+		Detail: map[string]any{"route": r.String(), "len_text": len(text)},
 	})
+	return s.launch(ctx, r, text, st, history)
+}
+
+// routeForMode maps a pinned Mode to a Route, bypassing the auto-router. The
+// read-only modes (Discuss/Plan) run the single native loop with read-only
+// capability (built by the driver from DriveInput.Mode); Execute sizes
+// native-vs-supervise via the injected Sizer (the same heuristic the router uses),
+// so a large execute request still fans out. ModeAuto returns ok=false so the
+// caller falls through to the classifier — the byte-identical default.
+func (s *Session) routeForMode(mode Mode, text string) (Route, bool) {
+	switch mode {
+	case ModeDiscuss, ModePlan:
+		return RouteNative, true
+	case ModeExecute:
+		if s.Sizer != nil && s.Sizer(text) {
+			return RouteSupervise, true
+		}
+		return RouteNative, true
+	default:
+		return RouteContinue, false
+	}
+}
+
+// launch resolves the Route to a driver, claims Working, and starts the drive
+// goroutine. It is shared by the mode-override path and the auto-router path so
+// the DriveInput (which now carries the pinned Mode) and the Working/Active
+// bookkeeping are built one way. A route with no wired driver returns the Session
+// to Idle with errNoDriver rather than panicking.
+func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState, history []model.Message) error {
+	drv := s.driverFor(r, st)
 	if drv == nil {
 		s.toIdle()
 		return errNoDriver
@@ -236,6 +275,7 @@ func (s *Session) route(ctx context.Context, text string, st WorkState, history 
 		State:   st,
 		Inbox:   s.Inbox,
 		Out:     s.Out,
+		Mode:    st.Mode, // capability captured at launch (fixed for the drive's life)
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the
@@ -249,7 +289,7 @@ func (s *Session) route(ctx context.Context, text string, st WorkState, history 
 	s.Log.Append(eventlog.Event{
 		Task:    s.ID,
 		Kind:    "session_drive_start",
-		Detail:  map[string]any{"route": r.String()},
+		Detail:  map[string]any{"route": r.String(), "mode": st.Mode.String()},
 		Backend: r.String(),
 	})
 

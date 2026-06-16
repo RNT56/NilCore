@@ -45,6 +45,19 @@ func (v *CommandVerifier) Check(ctx context.Context) (Report, error) {
 	return Report{Passed: res.ExitCode == 0, Output: tail(out, 4000)}, nil
 }
 
+// Pass is a no-op verifier that always reports success. It is for drives that
+// produce NO shippable change — the conversational Discuss/Plan modes, which are
+// read-only by construction (write-free tools, no shell). There is nothing for the
+// project's checks to gate, so "done" is whatever the read-only drive reported.
+//
+// Pass NEVER substitutes for the real verifier on an Execute drive: invariant I2
+// (the verifier is the sole authority on "done") governs work that SHIPS, and a
+// read-only drive ships nothing — gating a plan on the repo already being green
+// would be wrong, not safer. It is wired only where the mode is read-only.
+type Pass struct{}
+
+func (Pass) Check(context.Context) (Report, error) { return Report{Passed: true}, nil }
+
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s

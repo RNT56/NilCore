@@ -40,11 +40,13 @@ func TestParseChatLine(t *testing.T) {
 		{"/exit", "quit", true},
 		{"  /quit  ", "quit", true}, // surrounding space tolerated
 		{"/status", "status", true},
+		{"/mode", "mode", true},
 		{"/help", "help", true},
 		{"/?", "help", true},
 		{"fix the failing test", "", false}, // ordinary message
 		{"!the path is wrong", "", false},   // a steer is NOT a control verb
 		{"/steer use ./service", "", false}, // /steer flows to Turn, not handled here
+		{"/plan", "", false},                // mode verbs are handled by parseModeVerb, not here
 		{"", "", false},                     // blank line
 	}
 	for _, c := range cases {
@@ -347,6 +349,71 @@ func clip(s string) string {
 		return s[:40] + "…"
 	}
 	return s
+}
+
+// TestParseModeVerb covers the front-door mode control verbs and the "/plan <text>"
+// shorthand (set the mode AND submit a request on one line).
+func TestParseModeVerb(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantMode session.Mode
+		wantRest string
+		wantOK   bool
+	}{
+		{"/discuss", session.ModeDiscuss, "", true},
+		{"/plan", session.ModePlan, "", true},
+		{"/execute", session.ModeExecute, "", true},
+		{"/auto", session.ModeAuto, "", true},
+		{"  /plan  ", session.ModePlan, "", true},                  // surrounding space tolerated
+		{"/plan add a rate limiter", session.ModePlan, "add a rate limiter", true}, // verb + request
+		{"/planning ahead", session.ModeAuto, "", false},           // not an exact verb token
+		{"fix the bug", session.ModeAuto, "", false},               // ordinary message
+		{"/steer correct it", session.ModeAuto, "", false},         // steer is not a mode verb
+		{"", session.ModeAuto, "", false},
+	}
+	for _, c := range cases {
+		mode, rest, ok := parseModeVerb(c.in)
+		if mode != c.wantMode || rest != c.wantRest || ok != c.wantOK {
+			t.Errorf("parseModeVerb(%q) = (%v,%q,%v), want (%v,%q,%v)",
+				c.in, mode, rest, ok, c.wantMode, c.wantRest, c.wantOK)
+		}
+	}
+}
+
+// TestCapabilityForMode is the enforcement assertion: the read-only modes
+// (Discuss/Plan) get a write-free registry AND the shell switched off, so there is
+// NO structural path to mutate the tree; Execute/Auto get the full write set with
+// the shell on. This is the guarantee "/plan writes no code" rests on — a property
+// of the wiring, not of the model behaving.
+func TestCapabilityForMode(t *testing.T) {
+	writeTools := []string{"write", "edit", "git"}
+
+	for _, m := range []session.Mode{session.ModeDiscuss, session.ModePlan} {
+		reg, _, disableShell := capabilityForMode(m)
+		if !disableShell {
+			t.Errorf("%v: shell must be disabled (DisableShell=false)", m)
+		}
+		for _, name := range writeTools {
+			if reg.Has(name) {
+				t.Errorf("%v: read-only registry must NOT advertise %q", m, name)
+			}
+		}
+		if !reg.Has("read") || !reg.Has("search") || !reg.Has("codeintel") {
+			t.Errorf("%v: read-only registry must offer read/search/codeintel", m)
+		}
+	}
+
+	for _, m := range []session.Mode{session.ModeExecute, session.ModeAuto} {
+		reg, _, disableShell := capabilityForMode(m)
+		if disableShell {
+			t.Errorf("%v: shell must be enabled for a write-capable mode", m)
+		}
+		for _, name := range writeTools {
+			if !reg.Has(name) {
+				t.Errorf("%v: write-capable registry must advertise %q", m, name)
+			}
+		}
+	}
 }
 
 // --- test doubles -----------------------------------------------------------

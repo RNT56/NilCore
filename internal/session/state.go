@@ -200,6 +200,12 @@ type DriveInput struct {
 	State   WorkState
 	Inbox   InboxHandle
 	Out     emit.Emitter
+	// Mode is the capability the wiring closure must build this drive with —
+	// captured at launch, so a mid-drive mode switch never changes a running drive's
+	// capability. The read-only modes (Discuss/Plan) tell the closure to construct a
+	// write-free, shell-off backend with a pass-through verifier; Execute/Auto build
+	// the full write-capable backend gated by the real verifier (I2).
+	Mode Mode
 }
 
 // DriveResult is a driver's terminal outcome, folded into WorkState on

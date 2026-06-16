@@ -77,6 +77,10 @@ type NativeRun struct {
 	Seed    []model.Message // prior History the loop continues on (nil = fresh)
 	Inbox   InboxHandle     // the live user→agent seam wired into backend.Native
 	Emitter emit.Emitter    // the reasoning sink wired into backend.Native
+	// Mode is the capability the closure builds the backend with (captured at drive
+	// launch). ReadOnly modes ⇒ write-free registry + DisableShell + pass-through
+	// verifier; Execute/Auto ⇒ the full write set gated by the real verifier (I2).
+	Mode Mode
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
@@ -128,6 +132,7 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		Seed:    in.History, // continue, not restart (the persistence requirement)
 		Inbox:   in.Inbox,
 		Emitter: in.Out,
+		Mode:    in.Mode, // capability captured at launch (read-only vs full)
 	})
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)

@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -198,6 +199,66 @@ func TestTurnWhileIdleRoutesAndLaunches(t *testing.T) {
 	if s.State.Active != RouteNative {
 		t.Fatalf("State.Active = %v, want native", s.State.Active)
 	}
+}
+
+// --- Mode override: a pinned mode bypasses the router --------------------------
+
+func TestRouteForMode(t *testing.T) {
+	s := New("c", "local", "/repo", nil)
+
+	// Discuss/Plan always run the single native loop (read-only capability is set
+	// from the mode in the DriveInput, not by choosing a different machine).
+	for _, m := range []Mode{ModeDiscuss, ModePlan} {
+		if r, ok := s.routeForMode(m, "anything"); !ok || r != RouteNative {
+			t.Errorf("routeForMode(%v) = (%v,%v), want (native,true)", m, r, ok)
+		}
+	}
+
+	// Execute sizes native-vs-supervise via the injected Sizer.
+	s.Sizer = func(goal string) bool { return strings.Contains(goal, "big") }
+	if r, ok := s.routeForMode(ModeExecute, "small fix"); !ok || r != RouteNative {
+		t.Errorf("execute(small) = (%v,%v), want (native,true)", r, ok)
+	}
+	if r, ok := s.routeForMode(ModeExecute, "big multi-file feature"); !ok || r != RouteSupervise {
+		t.Errorf("execute(big) = (%v,%v), want (supervise,true)", r, ok)
+	}
+
+	// Auto falls through to the classifier (ok=false).
+	if _, ok := s.routeForMode(ModeAuto, "x"); ok {
+		t.Errorf("auto must not override the router (ok=true)")
+	}
+}
+
+// A pinned read-only mode must (a) NOT call the auto-router at all, and (b) thread
+// the mode into the DriveInput so the wiring closure builds a read-only backend.
+// This is the behavioral half of "user sets a mode, agent obeys it."
+func TestPinnedModeBypassesRouterAndThreadsMode(t *testing.T) {
+	rt := &fakeRouter{route: RouteSupervise} // would route elsewhere if ever consulted
+	drv := newFakeDriver(DriveResult{Verified: true})
+	s := New("chat-local", "local", "/repo", nil)
+	s.Router = rt
+	s.Drivers = Drivers{Native: drv}
+	s.SetMode(ModePlan)
+
+	if err := s.Turn(context.Background(), "how should I add rate limiting?"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	waitClosed(t, drv.started)
+	waitPhase(t, s, Working)
+
+	if rt.calls != 0 {
+		t.Fatalf("router was consulted %d times; a pinned mode must bypass it", rt.calls)
+	}
+	in := drv.input()
+	if in.Route != RouteNative {
+		t.Fatalf("drive Route = %v, want native (plan runs the read-only native loop)", in.Route)
+	}
+	if in.Mode != ModePlan {
+		t.Fatalf("drive Mode = %v, want plan (capability must follow the pinned mode)", in.Mode)
+	}
+
+	close(drv.release)
+	s.Wait()
 }
 
 // --- Cancel: abort the in-flight run, stay in the conversation ------------------
