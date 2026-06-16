@@ -537,6 +537,40 @@ every backend gets a swappable sandbox without any code change.
 
 ---
 
+## Phase 8 — Full multi-agent concurrency
+
+Run a decomposition's independent subagents **concurrently** instead of serially,
+honoring `DependsOn`, while keeping reasoning + verified integration serial so no
+invariant weakens. Full design + adversarial review: `docs/CONCURRENCY.md`. The
+model is **dynamic-wave async dispatch**; `-concurrency 1` is byte-identical.
+
+### P8-T01 — Pre-existing fixes the concurrency review surfaced (do first)
+- **Goal:** close two latent bugs independent of concurrency. (1) Route the project-loop reflect advisor and the greenfield-bootstrap advisor through the **metered** strong provider (they use raw `d.strong` at `build.go:329/795`, escaping the budget wall). (2) Make `Spawner.Spawn`'s semaphore acquire honor `ctx` (`spawn.go:79`) and record a cancelled `Result` for the remainder.
+- **Depends on:** —  **Owns:** `cmd/nilcore/build.go`, `internal/spawn/spawn.go`
+- **Acceptance:** advisor spend on reflect/bootstrap charges the ledger (a test asserts `ErrCeiling` reaches them); a pre-cancelled ctx makes `Spawner.Spawn` return promptly with cancelled Results; `make verify` + `-race` green.
+
+### P8-T02 — `-concurrency` flag + pre-wave validation seam
+- **Goal:** add `-concurrency N` (default 1, clamp ≥1; gates the whole concurrent path so 1 is byte-identical) and lift the ID-uniqueness + role/depth/fanout rails out of the serial `doSpawn` into a single-goroutine **pre-wave validation** pass.
+- **Depends on:** P8-T01  **Owns:** `cmd/nilcore/`, `internal/super/`
+- **Acceptance:** at `-concurrency 1` the event log / branches / outcome are byte-identical to today (fixture diff); validation rejects a duplicate `spec.ID` before any dispatch; `make verify` green.
+
+### P8-T03 — Process-global ctx-honoring worker advisor limiter
+- **Goal:** a tiny stdlib `model.Provider` limiter (`sem chan struct{}`, acquire `select`s on `ctx.Done()`, `Stream` passthrough) wrapping the provider **handed to roster workers ONLY** — never the reader `Answer` path or the supervisor `Model`. Sized `< MaxFanout`, **process-global**. Saturation falls through to the existing graceful "proceed" fallback.
+- **Depends on:** P8-T01  **Owns:** `internal/meter/` (or a new `internal/strongcap` leaf), `cmd/nilcore/build.go`, `internal/roster/`
+- **Acceptance:** a correlated `EscalateAfter` herd never hangs and never starves `ask_supervisor`; the limiter degrades to fallback under saturation, never blocks; `ask_advisor` is always reachable; `-race` green.
+
+### P8-T04 — Wire `DAGScheduler` into `dispatch()` (in-turn concurrency)
+- **Goal:** batch a supervisor turn's `spawn_subagent` blocks into a wave-DAG and run it via `spawn.DAGScheduler` + the capped pool (cap = `-concurrency`); `OnReady` cuts a dependent from its dependency's branch; results fold into `runState` single-owner between waves (never worker→`runState`); one `tool_result` per `tool_use`, order preserved. Integration stays serial + supervisor-orchestrated.
+- **Depends on:** P8-T02, P8-T03  **Owns:** `internal/super/`
+- **Acceptance (the property gates):** under N concurrent workers the integration tip is **always** verifier-green and a red combination never poisons it (maximal-green prefix kept); a failed node `Skip`s its dependents; a worker blocking on `ask_supervisor` *and* `ask_advisor` inside a wave still resolves (no deadlock); a budget/deadline breach cancels all in-flight workers and `Wait` drains; peak concurrent sandboxes ≤ the process-global cap; `go test -race` green.
+
+### P8-T05 — Phase 2/3 (follow-on): merged-tip multi-dep re-base · pipelined waves
+- **Goal:** extend `OnReady` to re-base a multi-dependency node on a merged tip; pipeline wave N+1 planning with wave N execution; specify the supervisor's between-wave re-plan policy on a red dependency.
+- **Depends on:** P8-T04  **Owns:** `internal/super/`, `internal/spawn/`, `internal/project/`
+- **Acceptance:** multi-dep dependents see all deps' code; throughput improves with no invariant regression; `make verify` + `-race` green.
+
+---
+
 ## Done-with-everything
 
 When all tasks are merged: tag a release, move `[Unreleased]` in `CHANGELOG.md` into the version section, and NilCore is the agent described in `CLAUDE.md` — a small, verifying, sandboxed, bounded core that plans, parallelizes across three coding backends, remembers across projects, and improves itself under a human gate — and that runs unattended with authorized control, metered budgets, durable resumption, and bounded resources.
