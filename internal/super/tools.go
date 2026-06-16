@@ -33,6 +33,11 @@ type SubagentSpec struct {
 	Role      roster.Role `json:"role"`
 	Goal      string      `json:"goal"`
 	DependsOn []string    `json:"depends_on"`
+	// BaseRef is set by the HARNESS (json:"-" — the model can never set it): the git
+	// ref a dependent worker's worktree is cut from, so it sees its dependency's code
+	// while coding. The dispatcher resolves it from a passing dependency's branch;
+	// empty ⇒ cut from base HEAD (the default, byte-identical to before).
+	BaseRef string `json:"-"`
 }
 
 // Handle is the supervisor's record of one spawned subagent: its spec plus its

@@ -178,6 +178,11 @@ func buildMain(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), *bf.deadline)
 	defer cancel()
 
+	// Sweep the per-worker task/<ID> branches that buildSpawnFunc kept alive via
+	// Release (so dependents could branch from them). Branches are cheap refs;
+	// reclaim them once the run is done.
+	defer worktree.DeleteBranches(context.Background(), stack.repo, "task/")
+
 	out, err := stack.loop.Run(ctx)
 	if err != nil {
 		fatal(err)
@@ -323,6 +328,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Verifier:      func(dir string) verify.Verifier { return newEnv(dir).Verifier },
 		Advisor:       advisorFor(d.strong),
 		Reviewer:      strong,
+		Differ:        func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) },
 		Gate:          buildGateFunc(d.approver, d.log),
 		MaxIterations: d.maxIter,
 		Budget:        ledger,
@@ -430,15 +436,22 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 				Err: fmt.Errorf("spawn: unknown role %q", spec.Role)}
 		}
 
-		// One worktree per worker, branch task/<ID>, cut off the integration tip
-		// (HEAD of the base repo — the project loop advances the tip via promote).
+		// One worktree per worker, branch task/<ID>. Cut from spec.BaseRef when the
+		// dispatcher resolved a dependency's branch (so a dependent codes ON TOP of
+		// its dependency's work), else from base HEAD (the default).
 		branch := "task/" + spec.ID
-		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(spec.ID), "HEAD")
+		base := spec.BaseRef
+		if base == "" {
+			base = "HEAD"
+		}
+		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(spec.ID), base)
 		if err != nil {
 			return spawn.Result{ID: spec.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("spawn: worktree: %w", err)}
 		}
-		defer func() { _ = wt.Cleanup() }()
+		// Release (not Cleanup) — keep the task/<ID> branch alive so a later
+		// dependent can branch from it; the wave's branches are swept at run end.
+		defer func() { _ = wt.Release() }()
 
 		// Sandbox + verifier over the worker's own worktree. The role's egress is
 		// intersected with the tree's (here deny-all) and applied to the box before it

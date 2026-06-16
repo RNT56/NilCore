@@ -5,13 +5,13 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~19,700 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~23,500 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~19.7k%20LOC-1f6feb)](#the-receipts)
+[![Agent size](https://img.shields.io/badge/agent-~23.5k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
@@ -43,7 +43,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~19,700 lines of Go with two small dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
+| **"The framework is too big to trust."** | The entire agent is **~23,500 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
 
 ---
 
@@ -221,12 +221,12 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 | | |
 |--:|:--|
-| **~19,700** | lines of Go — *the agent itself* (~8k core · multi‑agent · conversational front door) |
-| ~14,000 | lines including its tests (58 test files) |
-| **46** | small, single‑responsibility packages |
-| **2** | sanctioned deps — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib) |
+| **~23,500** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent · conversational front door) |
+| ~45,500 | lines including its tests (108 test files) |
+| **55** | small, single‑responsibility packages |
+| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui` |
 | **7 / 7** | invariants held |
-| **56 / 56** | build tasks shipped (Phases 0–6) · `v0.1.0` |
+| **Phases 0–7** | shipped — incl. the conversational front door, live token streaming, and the runs‑unattended tier (resilience · durable resume · maint · adaptive routing) |
 
 </div>
 
