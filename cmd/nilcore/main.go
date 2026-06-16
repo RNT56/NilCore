@@ -1140,6 +1140,13 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 }
 
 // resolveProvider builds the model provider for the native backend and validates
+// modelCallTimeout is the hard per-call ceiling on a single model round-trip in the
+// Resilient wrapper: generous enough that a legitimate large/slow completion never
+// trips it, tight enough that a truly WEDGED call (a stalled connection that never
+// returns) is cut and retried/failed-over rather than hanging a deadline-less
+// chat/serve conversation indefinitely.
+const modelCallTimeout = 10 * time.Minute
+
 // the backend name + required secret up front. The model spec is NILCORE_MODEL,
 // else the configured executor, else the built-in default; the key resolves
 // environment-first then SecretStore via b.cred. A missing key is reported with
@@ -1166,6 +1173,13 @@ func resolveProvider(backendName string, b boot) (model.Provider, error) {
 			MaxRetries:       2,
 			Jitter:           200 * time.Millisecond,
 			BreakerThreshold: 4,
+			// A hard per-call ceiling so a single WEDGED model call (a stalled
+			// connection that never returns and never errors) cannot hang a
+			// deadline-less chat/serve run forever — it times out, then retries/fails
+			// over. Generous: a legitimate large completion (extended thinking + long
+			// output) finishes well within this; only a true hang is cut. build/run
+			// also have their own wall-clock deadline on top.
+			CallTimeout: modelCallTimeout,
 		})
 		if rerr != nil {
 			return p, nil
