@@ -626,6 +626,14 @@ func serveMain(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Periodic maintenance: a long-lived serve accumulates worktree admin entries from
+	// crashed/abandoned drives between restarts, so re-run the crash-safe worktree GC
+	// on a background ticker (not just at startup). Bounded by the serve ctx — it exits
+	// on shutdown. (Log rotation stays a startup-only step: the event-log handle is
+	// already open here, so rotating its path mid-serve would not affect the live
+	// inode; rotation-while-open needs eventlog support and is out of scope.)
+	go runMaintenanceTicker(ctx, absDir, log)
+
 	// One shared concurrency gate caps how many drives run at once across ALL
 	// threads, so a burst of conversations queues rather than overrunning the host's
 	// sandbox/model capacity. Drained and stopped after the serve loop returns.
@@ -697,6 +705,29 @@ func serveMain(args []string) {
 
 // serveLogMaxBytes is the event-log rotation threshold checked at serve startup.
 const serveLogMaxBytes = 64 << 20 // 64 MiB
+
+// serveMaintInterval is how often a running serve re-runs the worktree GC so a
+// multi-day session self-prunes instead of accumulating crashed-drive worktrees
+// between restarts. Hourly is far more often than worktrees leak, and the GC itself
+// only ever reclaims already-gone directories, so it is cheap and crash-safe.
+const serveMaintInterval = time.Hour
+
+// runMaintenanceTicker re-runs serveGC on serveMaintInterval until ctx is cancelled.
+// It is a background goroutine started by serveMain; it owns nothing the request path
+// touches (the GC reads/prunes only crashed worktrees), so it never contends with a
+// live drive. Exits cleanly on shutdown.
+func runMaintenanceTicker(ctx context.Context, baseRepo string, log *eventlog.Log) {
+	t := time.NewTicker(serveMaintInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			serveGC(ctx, baseRepo, log)
+		}
+	}
+}
 
 // serveGC reclaims worktree admin entries left by a crashed prior process, driven
 // through maint.GC so its "never touch an Active item" policy is exercised. The
