@@ -296,6 +296,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			Router:   agent.SingleRouter{},
 			Spawner:  agent.NoSpawner{},
 			Approver: d.approverOr(),
+			RaceN:    *d.flags.common.raceN,
 		}
 
 		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: in.Goal})

@@ -287,6 +287,13 @@ func Prune(ctx context.Context, baseRepo string) error {
 	return err
 }
 
+// Diff returns the unified diff of branch against the base repo's current HEAD —
+// the change a converged integration branch would promote. It runs the hardened
+// git (I4) so a repo-authored hook/config can never execute on the host.
+func Diff(ctx context.Context, baseRepo, branch string) (string, error) {
+	return git(ctx, baseRepo, "diff", "HEAD.."+branch)
+}
+
 // git runs a hardening-clamped git subcommand in dir and returns its combined
 // output. The clamp (HardenArgs `-c` flags + HardenedEnv) is identical to the
 // `git` tool's, so a repo-authored hook/fsmonitor/config can never execute on the

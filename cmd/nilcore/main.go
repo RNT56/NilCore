@@ -459,7 +459,7 @@ func secretMain(args []string) {
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
 	dir, backendName, runtime, image, checkCmd, logPath, config, sandboxPref *string
-	maxSteps, advisorMaxCalls, escalateAfter                                 *int
+	maxSteps, advisorMaxCalls, escalateAfter, raceN                          *int
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
@@ -475,6 +475,7 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		maxSteps:        fs.Int("max-steps", 60, "tool-call budget for the native loop"),
 		advisorMaxCalls: fs.Int("advisor-max-calls", 4, "per-task ceiling on advisor escalations (native backend)"),
 		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
+		raceN:           fs.Int("race-n", 1, "on a verify failure, race N parallel attempts and keep a verifier-green one (1 = off; adaptive — only fires after the single attempt fails)"),
 	}
 }
 
@@ -510,6 +511,7 @@ func runMain(args []string) {
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
 		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
@@ -547,6 +549,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
 		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
@@ -807,8 +810,9 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			Log:        d.log,
 			Router:     agent.SingleRouter{},
 			Spawner:    agent.NoSpawner{},
-			Approver:   approver,     // gates route back to this thread (Channel.Ask)
-			Checkpoint: d.checkpoint, // records running/done so a restart can resume a leftover drive
+			Approver:   approver,       // gates route back to this thread (Channel.Ask)
+			RaceN:      *d.flags.raceN, // escalate a verify failure to a best-of-N race
+			Checkpoint: d.checkpoint,   // records running/done so a restart can resume a leftover drive
 		}
 		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: in.Goal})
 		if err != nil {

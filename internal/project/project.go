@@ -35,6 +35,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
+	"nilcore/internal/route"
 	"nilcore/internal/summarize"
 	"nilcore/internal/verify"
 )
@@ -115,10 +116,11 @@ type Loop struct {
 	// the orchestrator uses). JudgeProject runs it plus each Criterion command.
 	Verifier func(dir string) verify.Verifier
 
-	Advisor  *advisor.Advisor               // strong-tier reasoning for the reflect ladder
-	Reviewer model.Provider                 // cross-model review before a promote (optional)
-	Gate     func(a policy.GateAction) bool // the single gated, irreversible promote
-	Channel  ChannelAsk                     // human stop-and-ask (recovery ladder's last rung)
+	Advisor  *advisor.Advisor                    // strong-tier reasoning for the reflect ladder
+	Reviewer model.Provider                      // cross-model review before a promote (optional)
+	Differ   func(branch string) (string, error) // produces the promote diff for Reviewer (optional; nil ⇒ no review)
+	Gate     func(a policy.GateAction) bool      // the single gated, irreversible promote
+	Channel  ChannelAsk                          // human stop-and-ask (recovery ladder's last rung)
 
 	MaxIterations int // outer-loop iteration ceiling; <1 → a generous default
 	MaxNoProgress int // consecutive no-progress iterations before stop-ask; <1 → default
@@ -314,6 +316,21 @@ func (l *Loop) converge(ctx context.Context, st State) Outcome {
 	out := l.finish(st, true, ReasonConverged, 0)
 	out.Branch = st.Branch
 	if l.Gate != nil && st.Branch != "" {
+		// Cross-model review BEFORE the human gate (adaptive routing, P3-T04): a
+		// strong reviewer model inspects the promote diff and can deny ahead of the
+		// human approver. route.Review denies on any unparseable output (safe
+		// default), so a model failure only ever blocks a promote, never waves one
+		// through. Skipped entirely when no Reviewer/Differ is wired.
+		if l.Reviewer != nil && l.Differ != nil {
+			if diff, derr := l.Differ(st.Branch); derr == nil {
+				approved, notes, rerr := route.Review(ctx, l.Reviewer, diff)
+				l.Log.Append(eventlog.Event{Task: projectTask, Kind: "project_review",
+					Detail: map[string]any{"branch": st.Branch, "approved": approved, "notes": notes}})
+				if rerr != nil || !approved {
+					return out // model review denied → never reach the human gate
+				}
+			}
+		}
 		action := policy.GateAction{Type: policy.PromoteToBase, Branch: st.Branch,
 			Detail: "promote converged, verifier-green integration tip"}
 		if l.Gate(action) {

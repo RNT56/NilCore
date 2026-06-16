@@ -323,6 +323,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Verifier:      func(dir string) verify.Verifier { return newEnv(dir).Verifier },
 		Advisor:       advisorFor(d.strong),
 		Reviewer:      strong,
+		Differ:        func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) },
 		Gate:          buildGateFunc(d.approver, d.log),
 		MaxIterations: d.maxIter,
 		Budget:        ledger,
