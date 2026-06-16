@@ -253,6 +253,84 @@ func (w *Worktree) Cleanup() error {
 	return nil
 }
 
+// Release removes the worktree's checkout (directory + admin entry + scratch) but
+// KEEPS its branch, so a dependent worker can still cut a new worktree from it
+// (the DependsOn-propagation seam). The branch is reclaimed later by the wave's
+// end-of-run sweep (DeleteBranches) — branches are cheap refs. Idempotent.
+func (w *Worktree) Release() error {
+	if w == nil {
+		return nil
+	}
+	ctx := context.Background()
+	if _, err := os.Stat(w.path); err == nil {
+		if _, err := git(ctx, w.baseRepo, "worktree", "remove", "--force", w.path); err != nil {
+			_ = os.RemoveAll(w.path)
+		}
+	}
+	_, _ = git(ctx, w.baseRepo, "worktree", "prune")
+	_ = os.RemoveAll(w.tmpBase)
+	if _, err := os.Stat(w.path); err == nil {
+		return fmt.Errorf("worktree %s still present after release", w.path)
+	}
+	return nil
+}
+
+// DeleteBranches removes every local branch under prefix (e.g. "task/") in
+// baseRepo — the end-of-run sweep for worker branches kept alive by Release so
+// dependents could branch from them. Best-effort: a branch already gone is fine.
+func DeleteBranches(ctx context.Context, baseRepo, prefix string) {
+	out, err := git(ctx, baseRepo, "branch", "--list", prefix+"*", "--format=%(refname:short)")
+	if err != nil {
+		return
+	}
+	for _, b := range strings.Split(strings.TrimSpace(out), "\n") {
+		if b = strings.TrimSpace(b); b != "" {
+			_, _ = git(ctx, baseRepo, "branch", "-D", b)
+		}
+	}
+}
+
+// Prunable returns the paths of worktrees registered to baseRepo whose checkout
+// directory no longer exists — left behind by a crashed prior process. These are
+// the ONLY worktrees safe to reclaim blindly: a live worktree's directory is
+// present, so it is never listed (`git worktree list --porcelain` marks a gone
+// worktree with a `prunable` line). Safe to call with other NilCore processes
+// running — their live worktrees are not prunable.
+func Prunable(ctx context.Context, baseRepo string) ([]string, error) {
+	out, err := git(ctx, baseRepo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var prunable []string
+	cur := ""
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			cur = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "prunable") && cur != "":
+			prunable = append(prunable, cur)
+		case line == "":
+			cur = ""
+		}
+	}
+	return prunable, nil
+}
+
+// Prune drops the administrative entries of worktrees whose directories are
+// already gone (`git worktree prune`). It never removes a live worktree, so it is
+// safe at startup even with other NilCore processes active.
+func Prune(ctx context.Context, baseRepo string) error {
+	_, err := git(ctx, baseRepo, "worktree", "prune")
+	return err
+}
+
+// Diff returns the unified diff of branch against the base repo's current HEAD —
+// the change a converged integration branch would promote. It runs the hardened
+// git (I4) so a repo-authored hook/config can never execute on the host.
+func Diff(ctx context.Context, baseRepo, branch string) (string, error) {
+	return git(ctx, baseRepo, "diff", "HEAD.."+branch)
+}
+
 // git runs a hardening-clamped git subcommand in dir and returns its combined
 // output. The clamp (HardenArgs `-c` flags + HardenedEnv) is identical to the
 // `git` tool's, so a repo-authored hook/fsmonitor/config can never execute on the

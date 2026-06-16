@@ -39,6 +39,7 @@ import (
 	"nilcore/internal/channel/telegram"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/maint"
 	"nilcore/internal/memory"
 	"nilcore/internal/meter"
 	"nilcore/internal/model"
@@ -54,6 +55,7 @@ import (
 	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
+	"nilcore/internal/worktree"
 )
 
 // version is the build version, overridable at release time via
@@ -464,7 +466,7 @@ func secretMain(args []string) {
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
 	dir, backendName, runtime, image, checkCmd, logPath, config, sandboxPref *string
-	maxSteps, advisorMaxCalls, escalateAfter                                 *int
+	maxSteps, advisorMaxCalls, escalateAfter, raceN                          *int
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
@@ -480,6 +482,7 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		maxSteps:        fs.Int("max-steps", 60, "tool-call budget for the native loop"),
 		advisorMaxCalls: fs.Int("advisor-max-calls", 4, "per-task ceiling on advisor escalations (native backend)"),
 		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
+		raceN:           fs.Int("race-n", 1, "on a verify failure, race N parallel attempts and keep a verifier-green one (1 = off; adaptive — only fires after the single attempt fails)"),
 	}
 }
 
@@ -515,6 +518,7 @@ func runMain(args []string) {
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
 		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
@@ -552,6 +556,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
 		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
@@ -576,8 +581,19 @@ func serveMain(args []string) {
 
 	absDir := mustAbs(*c.dir)
 	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
+	// Rotate an over-large event log BEFORE opening the handle, so the fresh handle
+	// appends to the rotated (or recreated) path rather than a renamed inode.
+	_ = maint.RotateLog(*c.logPath, serveLogMaxBytes)
 	log := openLog(*c.logPath)
 	defer log.Close()
+	// Persistence backbone (best-effort): durable event-log mirroring + cross-project
+	// memory (the opt-in live tool) + the checkpointer that gives serve threads
+	// conversation persistence and leftover-task resume across a restart.
+	mem, ckpt := setupPersistence(log)
+	// Reclaim worktree admin entries left by a crashed prior process. SAFE: only
+	// worktrees whose directory is already gone are candidates (a live run's
+	// worktree directory is present), so this never collects an active worktree.
+	serveGC(context.Background(), absDir, log)
 	prov, err := resolveProvider(*c.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -623,7 +639,7 @@ func serveMain(args []string) {
 		fmt.Fprintf(os.Stderr, "nilcore serve: web access on — search: %s, %d allowed host(s)\n", searchBackend, len(webAllow))
 	}
 
-	factory := serveSessionFactory(serveDeps{
+	d := serveDeps{
 		flags:           c,
 		provider:        prov,
 		boot:            b,
@@ -631,16 +647,106 @@ func serveMain(args []string) {
 		baseRepo:        absDir,
 		budget:          *budgetCeil,
 		gate:            gate,
+		mem:             mem,
+		checkpoint:      ckpt,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
 		searchBackend:   searchBackend,
 		searchKey:       searchKey,
-	})
+	}
+	factory := serveSessionFactory(d)
+
+	// Durable resume: re-drive any native task a prior process left running or
+	// interrupted, BEFORE accepting new traffic. Each runs in a fresh disposable
+	// worktree off the current HEAD (idempotent — no committed base state until a
+	// gated merge) under a deny-default approver (a headless resume has no live
+	// thread to answer a gate, so irreversible actions stay denied — I3).
+	if ckpt != nil {
+		resumeInflight(ctx, d)
+	}
 
 	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
-	if err := srv.Serve(ctx); err != nil {
-		fatal(err)
+	serveErr := srv.Serve(ctx)
+
+	// Clean SIGTERM checkpoint: mark any task still "running" as "interrupted" so the
+	// NEXT process resumes it. Uses a fresh detached context — the serve ctx is
+	// already cancelled here, and the store write must still land.
+	if ckpt != nil {
+		ic, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = ckpt.Interrupt(ic)
+		cancel()
+	}
+	if serveErr != nil {
+		fatal(serveErr)
+	}
+}
+
+// serveLogMaxBytes is the event-log rotation threshold checked at serve startup.
+const serveLogMaxBytes = 64 << 20 // 64 MiB
+
+// serveGC reclaims worktree admin entries left by a crashed prior process, driven
+// through maint.GC so its "never touch an Active item" policy is exercised. The
+// only candidates are worktrees whose directory is already gone, so it can never
+// collect a live run's worktree — safe even with other NilCore processes running.
+func serveGC(ctx context.Context, baseRepo string, log *eventlog.Log) {
+	gc := maint.GC{
+		List: func() ([]maint.Item, error) {
+			paths, err := worktree.Prunable(ctx, baseRepo)
+			items := make([]maint.Item, len(paths))
+			for i, p := range paths {
+				items[i] = maint.Item{ID: p}
+			}
+			return items, err
+		},
+		Remove: func(string) error { return worktree.Prune(ctx, baseRepo) },
+	}
+	if removed, err := gc.Collect(ctx); err != nil {
+		log.Append(eventlog.Event{Kind: "maint_error", Detail: map[string]any{"op": "worktree_gc", "error": err.Error()}})
+	} else if len(removed) > 0 {
+		log.Append(eventlog.Event{Kind: "maint_gc", Detail: map[string]any{"reclaimed_worktrees": len(removed)}})
+	}
+}
+
+// denyAllApprover refuses every irreversible action — the approver for a headless
+// durable-resume. A resumed task has no live channel thread to answer a gate, so
+// the safe default (I3) is to deny: the task does its reversible work and stops at
+// the first gate rather than blocking or silently auto-approving.
+type denyAllApprover struct{}
+
+func (denyAllApprover) Approve(string) bool { return false }
+
+// resumeInflight re-drives every NATIVE task a prior process left running or
+// interrupted, before serve accepts new traffic. Each runs through a freshly
+// reconstructed single-task orchestrator (the identical verified path as a live
+// serve drive, minus the conversational seams) in a disposable worktree, under the
+// deny-default approver. Checkpoint.Resume records terminal status per task, so a
+// task is resumed at most once per boot. (Supervise/project resume uses the
+// separate multi-agent RunState machinery and is a documented follow-on.)
+func resumeInflight(ctx context.Context, d serveDeps) {
+	c := d.flags
+	adv := resolveAdvisor(*c.backendName, d.boot, c)
+	run := func(ctx context.Context, t backend.Task) (bool, error) {
+		newEnv := func(dir string) agent.Env {
+			box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+			v := verify.New(box, *c.checkCmd)
+			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo)
+			return agent.Env{Backend: be, Verifier: v}
+		}
+		orch := &agent.Orchestrator{
+			BaseRepo:   d.baseRepo,
+			NewEnv:     newEnv,
+			Log:        d.log,
+			Router:     agent.SingleRouter{},
+			Spawner:    agent.NoSpawner{},
+			Approver:   denyAllApprover{},
+			Checkpoint: d.checkpoint,
+		}
+		out, err := orch.Execute(ctx, t)
+		return out.Verified, err
+	}
+	if err := d.checkpoint.Resume(ctx, run); err != nil {
+		d.log.Append(eventlog.Event{Kind: "resume_error", Detail: map[string]any{"error": err.Error()}})
 	}
 }
 
@@ -649,13 +755,15 @@ func serveMain(args []string) {
 // the serve-mode budget ceiling and is keyed per CONVERSATION (the channel
 // threadID) rather than the single "chat-local".
 type serveDeps struct {
-	flags    commonFlags
-	provider model.Provider
-	boot     boot
-	log      *eventlog.Log
-	baseRepo string
-	budget   float64
-	gate     *driveGate // shared serve drive-concurrency cap
+	flags      commonFlags
+	provider   model.Provider
+	boot       boot
+	log        *eventlog.Log
+	baseRepo   string
+	budget     float64
+	gate       *driveGate        // shared serve drive-concurrency cap
+	mem        *memory.Memory    // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
+	checkpoint *agent.Checkpoint // durable task/conversation persistence (nil ⇒ in-memory only, no resume)
 
 	// Web access, resolved once from config (nilcore init) and applied to every
 	// thread's drives — parity with the chat front door. egress empty ⇒ default-deny.
@@ -691,6 +799,14 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 		sess := session.New(threadID, sender, d.baseRepo, d.log)
 		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
 		sess.Budget = ledger
+		// Conversation persistence: with a checkpointer, this thread's bounded
+		// WorkState is saved after every drive fold and re-hydrated here on a
+		// restart (the threadID is the stable conversation key) — so a restarted
+		// serve continues each thread rather than starting it blank.
+		if d.checkpoint != nil {
+			sess.Store = d.checkpoint
+			sess.Restore(ctx)
+		}
 		// Context-usage tracking + auto-compaction parity with the chat front door.
 		sess.CtxWindow = meter.CtxWindow
 		sess.Summarizer = metered
@@ -742,12 +858,14 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			return agent.Env{Backend: n, Verifier: v}
 		}
 		orch := &agent.Orchestrator{
-			BaseRepo: d.baseRepo,
-			NewEnv:   newEnv,
-			Log:      d.log,
-			Router:   agent.SingleRouter{},
-			Spawner:  agent.NoSpawner{},
-			Approver: approver, // gates route back to this thread (Channel.Ask)
+			BaseRepo:   d.baseRepo,
+			NewEnv:     newEnv,
+			Log:        d.log,
+			Router:     agent.SingleRouter{},
+			Spawner:    agent.NoSpawner{},
+			Approver:   approver,       // gates route back to this thread (Channel.Ask)
+			RaceN:      *d.flags.raceN, // escalate a verify failure to a best-of-N race
+			Checkpoint: d.checkpoint,   // records running/done so a restart can resume a leftover drive
 		}
 		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
 		if err != nil {
@@ -802,6 +920,11 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if adv.prov != nil {
 		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
+	}
+	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX —
+	// the serve loop gets the same `live` tool as the run/chat paths.
+	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
 	return n
 }

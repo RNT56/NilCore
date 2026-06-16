@@ -43,6 +43,7 @@ import (
 	"nilcore/internal/budget"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/memory"
 	"nilcore/internal/meter"
 	"nilcore/internal/model"
 	"nilcore/internal/onboard"
@@ -110,10 +111,11 @@ func chatMain(args []string) {
 	log := openLog(*cf.common.logPath)
 	defer log.Close()
 
-	// Persistence backbone (best-effort): a checkpointer that lets the conversation
-	// survive a restart (set as the Session.Store below) and durable event-log
-	// mirroring. A nil checkpoint keeps the conversation in-memory only.
-	_, ckpt := setupPersistence(log)
+	// Persistence backbone (best-effort): the cross-project memory + a checkpointer
+	// that lets the conversation survive a restart (set as the Session.Store below)
+	// and durable event-log mirroring. Nils keep the conversation in-memory only and
+	// the live tool off.
+	mem, ckpt := setupPersistence(log)
 
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
@@ -157,6 +159,7 @@ func chatMain(args []string) {
 		boot:            b,
 		log:             log,
 		baseRepo:        absDir,
+		mem:             mem,
 		emitter:         emitter,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
@@ -222,6 +225,7 @@ type chatDeps struct {
 	boot     boot
 	log      *eventlog.Log
 	baseRepo string
+	mem      *memory.Memory  // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
 	emitter  emit.Emitter    // the reasoning sink (REPL: a termui.ConsoleEmitter; TUI: its own; nil ⇒ none)
 	approver policy.Approver // irreversible-action gate (nil ⇒ the console approver)
 
@@ -623,6 +627,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			Router:   agent.SingleRouter{},
 			Spawner:  agent.NoSpawner{},
 			Approver: d.approverOr(),
+			RaceN:    *d.flags.common.raceN,
 		}
 
 		// The mode preamble is harness-authored, principal-trusted framing prepended
@@ -716,6 +721,13 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 		// exactly as the run path's buildBackend does.
 		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
+	}
+	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
+	// the conversational loop gets the same worktree-aware `live` tool the run path
+	// has — previously only `buildBackend` (run/watch/propose-edit) wired it, so the
+	// advertised front door silently lacked it. Off by default (nil seam).
+	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
 	return n
 }

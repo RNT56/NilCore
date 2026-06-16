@@ -8,11 +8,13 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/policy"
 	"nilcore/internal/project"
+	"nilcore/internal/route"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -61,6 +63,14 @@ type Orchestrator struct {
 	Router   Router          // defaults to SingleRouter
 	Spawner  Spawner         // defaults to NoSpawner
 	Approver policy.Approver // consulted for irreversible actions; nil denies them
+
+	// RaceN, when > 1, escalates a VERIFY-FAILED single task to a best-of-N race
+	// (P3-T04, internal/route): N fresh worktrees run a backend in parallel and the
+	// first to pass the verifier wins (route.Race judges by the verifier — I2). It is
+	// ADAPTIVE — it fires ONLY after the cheap single path fails, so easy tasks (which
+	// pass first try) never pay the N× multiplier. <= 1 (the default) ⇒ no race,
+	// byte-identical to before.
+	RaceN int
 
 	// Phase 5 supervision seam (P5-T01) — both optional; when unset, Execute is the
 	// single-task path (BYTE-IDENTICAL to today). When Project + ShouldSupervise are
@@ -191,6 +201,14 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify",
 		Detail: map[string]any{"passed": rep.Passed}})
 
+	// Adaptive escalation: the cheap single path failed verification — race a
+	// best-of-N to recover (only when RaceN > 1; easy tasks never reach here).
+	if !rep.Passed && o.RaceN > 1 {
+		if rout, ok := o.raceEscalate(ctx, t); ok {
+			return rout, nil
+		}
+	}
+
 	out := Outcome{
 		Backend:  res.Backend,
 		Summary:  res.Summary,
@@ -204,4 +222,42 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		o.OnSuccess(ctx, t, out) // write durable facts back to memory (P4-T05)
 	}
 	return out, nil
+}
+
+// raceEscalate runs a best-of-N race after a single-task verify failure: it cuts
+// RaceN fresh worktrees off the base HEAD, runs a backend in each, and returns the
+// first whose verifier passes (route.Race is the judge — I2). It is ONE-SHOT per
+// task (a race never re-races) and, like the single path, report-only — the
+// winning worktree is disposable. Returns (_, false) when none pass, leaving the
+// caller to return the original failed Outcome.
+func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcome, bool) {
+	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate", Detail: map[string]any{"n": o.RaceN}})
+	var cands []route.Candidate
+	for i := 0; i < o.RaceN; i++ {
+		rwt, err := worktree.CreateFrom(ctx, o.BaseRepo,
+			"race/"+t.ID+"-"+strconv.Itoa(i), t.ID+"-race-"+strconv.Itoa(i), "HEAD")
+		if err != nil {
+			continue
+		}
+		defer func() { _ = rwt.Cleanup() }()
+		rt := t
+		rt.Dir = rwt.Path()
+		renv := o.NewEnv(rt.Dir)
+		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+	}
+	if len(cands) == 0 {
+		return Outcome{}, false
+	}
+	rres, ok := route.Race(ctx, cands, o.Log)
+	if !ok {
+		return Outcome{}, false
+	}
+	out := Outcome{Backend: rres.Backend, Summary: rres.Summary, Verified: true}
+	if o.Checkpoint != nil {
+		_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, true)
+	}
+	if o.OnSuccess != nil {
+		o.OnSuccess(ctx, t, out)
+	}
+	return out, true
 }

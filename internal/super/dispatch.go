@@ -123,6 +123,10 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	// keeps answering this worker's bus questions while it runs — that is what makes
 	// a blocking ask_supervisor inside the worker resolve even though the supervisor
 	// goroutine is parked here in doSpawn.
+	// DependsOn propagation: cut a dependent's worktree from its dependency's
+	// (already-passing) branch so it codes ON TOP of that work, not against base
+	// HEAD. Serial dispatch guarantees the dependency reported before this runs.
+	spec.BaseRef = s.depTip(st, spec)
 	res := s.Spawn(ctx, spec)
 	res.ID = spec.ID
 	h.Result = res
@@ -137,6 +141,26 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	// The worker's summary is UNTRUSTED data — fence it. We surface only typed
 	// fields (passed/branch) as trusted control data; the prose is fenced (I7).
 	return ok(b.ID, s.renderReport(res))
+}
+
+// depTip resolves the git ref a dependent worker should branch from so it sees its
+// dependency's code while coding (the narrow DependsOn-propagation fix; spawn stays
+// serial). For exactly ONE dependency that has already PASSED, it is that
+// dependency's branch (its verified commit). Zero deps, a not-yet-spawned/failed
+// dependency, or multiple dependencies (a single ref can't represent "all of them"
+// without an integrator merge — a documented limitation) all return "" ⇒ base HEAD,
+// identical to the prior behavior and safe by construction.
+func (s *Supervisor) depTip(st *runState, spec SubagentSpec) string {
+	if len(spec.DependsOn) != 1 {
+		return ""
+	}
+	h, ok := st.handles[spec.DependsOn[0]]
+	if !ok || !h.Done || !h.Result.Passed || h.Result.Branch == "" {
+		return ""
+	}
+	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_base",
+		Detail: map[string]any{"depends_on": spec.DependsOn[0], "base": h.Result.Branch}})
+	return h.Result.Branch
 }
 
 // doMessage relays a supervisor steer/answer to a running subagent. Steer is a
