@@ -3,8 +3,10 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"nilcore/internal/advisor"
 	"nilcore/internal/model"
@@ -206,6 +208,15 @@ func TestNativeSystemForComposition(t *testing.T) {
 	if !strings.Contains(both, "ROLE-MARKER-XYZ") || !strings.Contains(both, "ask_supervisor") {
 		t.Errorf("role + peer must compose both:\n%s", both)
 	}
+	// sleepGuidance only when a Wake hook is wired; absent (and `sleep` not advertised)
+	// otherwise — byte-identical.
+	if strings.Contains(base, "sleep") {
+		t.Errorf("no Wake hook must NOT mention sleep:\n%s", base)
+	}
+	withWake := (&Native{Wake: func(context.Context, time.Duration, string) error { return nil }}).systemFor()
+	if !strings.Contains(withWake, "sleep") {
+		t.Errorf("a Wake-wired prompt must describe the sleep self-timer:\n%s", withWake)
+	}
 }
 
 // When WorkContext is set, a worker's ask_supervisor / request_review carries its
@@ -253,6 +264,89 @@ func TestEnrichBusFieldGuards(t *testing.T) {
 			t.Errorf("malformed ask %q must NOT be enriched (would bypass the empty-guard); got %s", in, out)
 		}
 	}
+}
+
+// The `sleep` tool arms the Wake hook with a clamped duration + note and SUSPENDS the
+// drive (a clean terminal Result, no error, no verify). It is advertised only when
+// Wake is wired; the clamp bounds the duration to [60s, 24h].
+func TestNativeSleepSuspends(t *testing.T) {
+	var gotDur time.Duration
+	var gotNote string
+	calls := 0
+	m := &toolCapturingModel{responses: []model.Response{
+		{Content: []model.Block{sleepUse("u1", 1800, "check CI run 42")}, StopReason: "tool_use"},
+	}}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, MaxSteps: 5,
+		Wake: func(_ context.Context, after time.Duration, note string) error {
+			calls++
+			gotDur, gotNote = after, note
+			return nil
+		}}
+	out, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"})
+	// A suspend returns the ErrSuspended sentinel (NOT nil) so the orchestrator/session
+	// skip verify/verdict/notify — it is neither a completion nor a fault.
+	if !errors.Is(err, ErrSuspended) {
+		t.Fatalf("Run on sleep = %v, want ErrSuspended", err)
+	}
+	if calls != 1 || gotDur != 30*time.Minute || gotNote != "check CI run 42" {
+		t.Errorf("Wake called=%d dur=%v note=%q, want 1 / 30m / note", calls, gotDur, gotNote)
+	}
+	if !strings.Contains(out.Summary, "suspended for") {
+		t.Errorf("suspended drive Summary = %q, want 'suspended for ...'", out.Summary)
+	}
+	// `sleep` was advertised because Wake is set.
+	if !hasTool(m.lastTools, "sleep") {
+		t.Error("sleep tool not advertised with Wake wired")
+	}
+}
+
+// Below the 60s floor and above the 24h ceiling, the duration is clamped.
+func TestNativeSleepClamps(t *testing.T) {
+	for _, tc := range []struct {
+		in   int
+		want time.Duration
+	}{{5, 60 * time.Second}, {999999999, 24 * time.Hour}, {3600, time.Hour}} {
+		var got time.Duration
+		m := &toolCapturingModel{responses: []model.Response{
+			{Content: []model.Block{sleepUse("u1", tc.in, "n")}, StopReason: "tool_use"},
+		}}
+		n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, MaxSteps: 3,
+			Wake: func(_ context.Context, after time.Duration, _ string) error { got = after; return nil }}
+		if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); !errors.Is(err, ErrSuspended) {
+			t.Fatalf("Run = %v, want ErrSuspended", err)
+		}
+		if got != tc.want {
+			t.Errorf("after_seconds=%d clamped to %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A Wake (arm) error keeps the loop running (the agent stays awake), not a terminal.
+func TestNativeSleepArmErrorStaysAwake(t *testing.T) {
+	m := &toolCapturingModel{responses: []model.Response{
+		{Content: []model.Block{sleepUse("u1", 600, "n")}, StopReason: "tool_use"},
+		{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, MaxSteps: 5,
+		Wake: func(context.Context, time.Duration, string) error { return stubErr{} }}
+	out, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.Contains(out.Summary, "suspended") {
+		t.Errorf("an arm error must NOT suspend; got %q", out.Summary)
+	}
+}
+
+type stubErr struct{}
+
+func (stubErr) Error() string { return "stub error" }
+
+// sleepUse builds a `sleep` tool_use block (after_seconds is an int, so the
+// string-only toolUse helper can't express it).
+func sleepUse(id string, secs int, note string) model.Block {
+	in, _ := json.Marshal(map[string]any{"after_seconds": secs, "note": note})
+	return model.Block{Type: "tool_use", ID: id, Name: "sleep", Input: in}
 }
 
 func hasTool(tools []model.Tool, name string) bool {

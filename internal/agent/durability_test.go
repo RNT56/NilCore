@@ -27,6 +27,48 @@ func newCheckpoint(t *testing.T) (*agent.Checkpoint, *store.Store) {
 	return agent.NewCheckpoint(s), s
 }
 
+// SaveWake/LoadWakes/DisarmWake round-trip over the real store; a fired (disarmed)
+// wake is excluded; and the wake rows never cross-contaminate the conversation/
+// running statuses the resume path reads.
+func TestWakeRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	c, s := newCheckpoint(t)
+
+	if err := c.SaveWake(ctx, "thread-A", `{"note":"check CI"}`); err != nil {
+		t.Fatalf("SaveWake: %v", err)
+	}
+	if err := c.SaveWake(ctx, "thread-B", `{"note":"deploy"}`); err != nil {
+		t.Fatalf("SaveWake: %v", err)
+	}
+	// A conversation row + a running task must NOT appear among wakes.
+	if err := c.SaveConversation(ctx, "thread-A", "goal", `{"x":1}`); err != nil {
+		t.Fatal(err) // same threadID, different status — must not collide with the wake row
+	}
+	_ = s.UpsertTask(ctx, store.Task{ID: "job-1", Goal: "g", Status: "running"})
+
+	wakes, err := c.LoadWakes(ctx)
+	if err != nil {
+		t.Fatalf("LoadWakes: %v", err)
+	}
+	if len(wakes) != 2 || wakes["thread-A"] != `{"note":"check CI"}` || wakes["thread-B"] != `{"note":"deploy"}` {
+		t.Fatalf("LoadWakes = %v, want exactly the two armed wakes (no conversation/running rows)", wakes)
+	}
+
+	// Disarm thread-A → excluded; thread-B survives (durable across a fresh Checkpoint).
+	if err := c.DisarmWake(ctx, "thread-A"); err != nil {
+		t.Fatalf("DisarmWake: %v", err)
+	}
+	fresh := agent.NewCheckpoint(s)
+	wakes2, _ := fresh.LoadWakes(ctx)
+	if len(wakes2) != 1 || wakes2["thread-B"] == "" {
+		t.Errorf("after Disarm(A) + restart, want only thread-B armed, got %v", wakes2)
+	}
+	// Disarm with nothing armed is a clean no-op.
+	if err := c.DisarmWake(ctx, "no-such-thread"); err != nil {
+		t.Errorf("Disarm of an unarmed thread should be a no-op, got %v", err)
+	}
+}
+
 func TestSIGTERMCheckpointAndResume(t *testing.T) {
 	cp, s := newCheckpoint(t)
 	ctx := context.Background()

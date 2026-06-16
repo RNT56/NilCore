@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -11,6 +12,53 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/verify"
 )
+
+// suspendBackend returns the self-suspend sentinel (the `sleep` tool's effect).
+type suspendBackend struct{}
+
+func (suspendBackend) Name() string { return "suspend" }
+func (suspendBackend) Run(context.Context, backend.Task) (backend.Result, error) {
+	return backend.Result{Backend: "suspend", Summary: "suspended for 30m0s: check CI"}, backend.ErrSuspended
+}
+
+// A self-suspended drive must NOT run the verifier (the worktree is deliberately
+// incomplete), must propagate ErrSuspended, and must mark the task SUSPENDED (not
+// running/done) so the restart resumer skips it — the wake owns resume.
+func TestExecuteSuspendSkipsVerifyAndMarksSuspended(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initGitRepo(t)
+	ckpt, s := newCheckpoint(t)
+	fv := &fakeVerifier{passed: true}
+	orch := &agent.Orchestrator{
+		BaseRepo:   repo,
+		NewEnv:     func(string) agent.Env { return agent.Env{Backend: suspendBackend{}, Verifier: fv} },
+		Router:     agent.SingleRouter{},
+		Spawner:    agent.NoSpawner{},
+		Checkpoint: ckpt,
+	}
+
+	out, err := orch.Execute(context.Background(), backend.Task{ID: "conv-1-1", Goal: "x"})
+	if !errors.Is(err, backend.ErrSuspended) {
+		t.Fatalf("Execute = %v, want ErrSuspended", err)
+	}
+	if fv.checked {
+		t.Error("a suspended drive must NOT run the verifier (wasted sandbox pass)")
+	}
+	if out.Verified {
+		t.Error("a suspended drive is not verified")
+	}
+	// The task is marked SUSPENDED — the restart resumer (Resume: running/interrupted)
+	// will skip it, so it is not re-driven (the wake owns resume; no double-drive).
+	rec, gerr := s.GetTask(context.Background(), "conv-1-1")
+	if gerr != nil {
+		t.Fatalf("GetTask: %v", gerr)
+	}
+	if rec.Status != "suspended" {
+		t.Errorf("task status = %q, want suspended (not running/done)", rec.Status)
+	}
+}
 
 type fakeBackend struct {
 	name   string

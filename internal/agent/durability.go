@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"nilcore/internal/backend"
 	"nilcore/internal/store"
@@ -35,6 +36,14 @@ func (c *Checkpoint) Complete(ctx context.Context, taskID, goal string, verified
 		status = "done"
 	}
 	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: status})
+}
+
+// Suspend records a drive's task as self-suspended (the agent set a wake timer). It
+// is a non-runnable status that the restart resumer (Resume) skips — it only re-drives
+// "running"/"interrupted" — so the suspended drive is NOT re-driven on a restart; the
+// wake registry owns resume, which would otherwise double it. One UpsertTask write.
+func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal string) error {
+	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: "suspended"})
 }
 
 // Interrupt marks every running task "interrupted" — the clean SIGTERM checkpoint
@@ -242,6 +251,56 @@ func (c *Checkpoint) LoadConversation(ctx context.Context, id string) (detail st
 		return "", false, fmt.Errorf("load conversation %q: %w", id, err)
 	}
 	return t.Detail, true, nil
+}
+
+// WakeStatus / wakeDoneStatus are the store statuses for a self-scheduled timer (the
+// serve `sleep` tool). A pending wake is a "wake" row keyed wake:<threadID> — distinct
+// both from the conversation row (same threadID, status "conversation") and from
+// runnable task statuses, so the resume path and the wake poller never cross. Firing
+// FLIPS the row to "wake_done" (not a delete) so it leaves an audit trail and is
+// excluded from the pending set, and a fired wake can never re-arm. These three
+// methods satisfy wake.Store; they reuse UpsertTask/TasksByStatus/GetTask — no new
+// store surface — mirroring SaveConversation/LoadConversation.
+const (
+	WakeStatus     = "wake"
+	wakeDoneStatus = "wake_done"
+)
+
+func wakeKey(threadID string) string { return "wake:" + threadID }
+
+// SaveWake records (replacing any existing) the single pending wake for threadID with
+// the caller's opaque JSON detail. One crash-atomic UpsertTask write.
+func (c *Checkpoint) SaveWake(ctx context.Context, threadID, detail string) error {
+	return c.store.UpsertTask(ctx, store.Task{ID: wakeKey(threadID), Goal: "wake", Status: WakeStatus, Detail: detail})
+}
+
+// LoadWakes returns every currently-armed wake as threadID -> opaque detail. A
+// wake_done (fired/disarmed) row is excluded by the status filter, so a fired wake
+// never re-arms. Survivors are returned across a restart (durable resume of timers).
+func (c *Checkpoint) LoadWakes(ctx context.Context) (map[string]string, error) {
+	ts, err := c.store.TasksByStatus(ctx, WakeStatus)
+	if err != nil {
+		return nil, fmt.Errorf("load wakes: %w", err)
+	}
+	out := make(map[string]string, len(ts))
+	for _, t := range ts {
+		out[strings.TrimPrefix(t.ID, "wake:")] = t.Detail
+	}
+	return out, nil
+}
+
+// DisarmWake flips a pending wake to wake_done (keeping the row for audit). Safe when
+// none is armed (a store miss is a clean no-op).
+func (c *Checkpoint) DisarmWake(ctx context.Context, threadID string) error {
+	t, err := c.store.GetTask(ctx, wakeKey(threadID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("disarm wake %q: %w", threadID, err)
+	}
+	t.Status = wakeDoneStatus
+	return c.store.UpsertTask(ctx, t)
 }
 
 // ResumePlan is the partition Resume hands the integration layer after a restart.
