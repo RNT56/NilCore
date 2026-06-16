@@ -253,6 +253,40 @@ func (w *Worktree) Cleanup() error {
 	return nil
 }
 
+// Prunable returns the paths of worktrees registered to baseRepo whose checkout
+// directory no longer exists — left behind by a crashed prior process. These are
+// the ONLY worktrees safe to reclaim blindly: a live worktree's directory is
+// present, so it is never listed (`git worktree list --porcelain` marks a gone
+// worktree with a `prunable` line). Safe to call with other NilCore processes
+// running — their live worktrees are not prunable.
+func Prunable(ctx context.Context, baseRepo string) ([]string, error) {
+	out, err := git(ctx, baseRepo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	var prunable []string
+	cur := ""
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			cur = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "prunable") && cur != "":
+			prunable = append(prunable, cur)
+		case line == "":
+			cur = ""
+		}
+	}
+	return prunable, nil
+}
+
+// Prune drops the administrative entries of worktrees whose directories are
+// already gone (`git worktree prune`). It never removes a live worktree, so it is
+// safe at startup even with other NilCore processes active.
+func Prune(ctx context.Context, baseRepo string) error {
+	_, err := git(ctx, baseRepo, "worktree", "prune")
+	return err
+}
+
 // git runs a hardening-clamped git subcommand in dir and returns its combined
 // output. The clamp (HardenArgs `-c` flags + HardenedEnv) is identical to the
 // `git` tool's, so a repo-authored hook/fsmonitor/config can never execute on the
