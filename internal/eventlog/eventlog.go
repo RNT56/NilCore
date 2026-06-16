@@ -117,13 +117,20 @@ func (l *Log) Append(e Event) {
 	l.seq++
 
 	// Second backing: mirror the (already hash-chained, now-durable) event into
-	// the store. Only after the file write landed, so the two backings agree.
+	// the store. Only after the file write landed, so the two backings agree. The
+	// JSONL stays the authoritative export, so a store failure loses no event —
+	// but it IS a degraded second backing, so surface it through the same fail/Err
+	// path a file-write failure uses rather than swallowing it silently. (Append
+	// is fire-and-forget with no ctx, so the mirror uses a background ctx; the
+	// store's busy_timeout makes a contended write wait rather than error.)
 	if l.store != nil {
 		detail, _ := json.Marshal(e.Detail)
-		_ = l.store.InsertEvent(context.Background(), store.Event{
+		if serr := l.store.InsertEvent(context.Background(), store.Event{
 			Time: e.Time, Task: e.Task, Kind: e.Kind, Backend: e.Backend,
 			Detail: string(detail), Prev: e.Prev, Hash: e.Hash,
-		})
+		}); serr != nil {
+			l.fail(fmt.Errorf("mirror event to store: %w", serr))
+		}
 	}
 }
 

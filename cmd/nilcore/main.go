@@ -51,7 +51,6 @@ import (
 	"nilcore/internal/session"
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
-	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
 
@@ -95,6 +94,14 @@ func main() {
 		configMain(args[1:])
 	case "secret":
 		secretMain(args[1:])
+	case "inspect":
+		inspectMain(args[1:])
+	case "mcp-call":
+		mcpCallMain(args[1:])
+	case "propose-edit":
+		proposeEditMain(args[1:])
+	case "watch":
+		watchMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -117,9 +124,13 @@ Usage:
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
   nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
   nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
+  nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
+  nilcore propose-edit -goal "..." -paths ...  gated self-edit of the agent's own prompts/skills/tools
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
+  nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
+  nilcore mcp-call <server> <tool> ...  invoke a configured MCP tool (the runtime bridge for generated wrappers)
   nilcore version                       print the build version
 
 Run 'nilcore <command> -h' for a command's flags.
@@ -481,6 +492,7 @@ func runMain(args []string) {
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*c.dir)
+	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov, err := resolveProvider(*c.backendName, b)
@@ -514,6 +526,30 @@ func runMain(args []string) {
 	}
 }
 
+// buildRunOrchestrator constructs the single-task orchestrator the run-style
+// commands share (run / propose-edit / watch): the native backend via envFactory,
+// the console gate, persistence, and memory write-back. It mirrors runMain's wiring
+// so a self-started or self-edit task runs through the EXACT same verified path —
+// the verifier remains the sole authority on done (I2), the gate on irreversible
+// actions (I3/policy).
+func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string) *agent.Orchestrator {
+	prov, err := resolveProvider(*c.backendName, b)
+	if err != nil {
+		fatal(err)
+	}
+	mem, cp := setupPersistence(log)
+	return &agent.Orchestrator{
+		BaseRepo:   absDir,
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir),
+		Log:        log,
+		Router:     agent.SingleRouter{},
+		Spawner:    agent.NoSpawner{},
+		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		OnSuccess:  memWriteBack(mem, absDir),
+		Checkpoint: cp,
+	}
+}
+
 // serveMain listens on a chat channel and gives every thread the SAME
 // conversational Session the terminal front door uses (C3-T02): Telegram/Slack thus
 // get queue+steer and auto-routing. It builds the deny-all channel gate, a per-
@@ -524,6 +560,7 @@ func serveMain(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	channelName := fs.String("channel", "", "telegram | slack (default: config, else telegram)")
 	budgetCeil := fs.Float64("budget", chatDefaultBudget, "global dollar ceiling per conversation (a hard wall via the meter)")
+	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -531,6 +568,7 @@ func serveMain(args []string) {
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*c.dir)
+	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*c.logPath)
 	defer log.Close()
 	prov, err := resolveProvider(*c.backendName, b)
@@ -556,6 +594,15 @@ func serveMain(args []string) {
 		fatal(err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// One shared concurrency gate caps how many drives run at once across ALL
+	// threads, so a burst of conversations queues rather than overrunning the host's
+	// sandbox/model capacity. Drained and stopped after the serve loop returns.
+	gate := newDriveGate(ctx, *maxConcurrent)
+	defer gate.close()
+
 	factory := serveSessionFactory(serveDeps{
 		flags:    c,
 		provider: prov,
@@ -563,10 +610,8 @@ func serveMain(args []string) {
 		log:      log,
 		baseRepo: absDir,
 		budget:   *budgetCeil,
+		gate:     gate,
 	})
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
@@ -586,6 +631,7 @@ type serveDeps struct {
 	log      *eventlog.Log
 	baseRepo string
 	budget   float64
+	gate     *driveGate // shared serve drive-concurrency cap
 }
 
 // serveSessionFactory returns the server.SessionFactory that builds one wired
@@ -617,9 +663,9 @@ func serveSessionFactory(d serveDeps) server.SessionFactory {
 			ID:              threadID,
 		}
 		sess.Drivers = session.Drivers{
-			Native:    session.NewNativeDriver(serveNativeRun(d, metered, approver, threadID), metered, threadID),
-			Supervise: session.NewSuperviseDriver(serveSuperviseRun(d, ledger, approver), metered),
-			Project:   session.NewProjectDriver(serveProjectRun(d, ledger, approver), metered),
+			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID)), metered, threadID),
+			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver)), metered),
+			Project:   session.NewProjectDriver(gateProject(d.gate, serveProjectRun(d, ledger, approver)), metered),
 			Chat:      session.NewChatDriver(metered),
 		}
 		return sess
@@ -668,7 +714,7 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 		Box:          box,
 		Verifier:     v,
 		Log:          d.log,
-		Tools:        tools.Default(),
+		Tools:        loopTools(),
 		CommandGuard: policy.DefaultCommandPolicy().Check,
 		MaxSteps:     *d.flags.maxSteps,
 		Seed:         in.Seed,
@@ -891,7 +937,7 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			Box:          box,
 			Verifier:     v,
 			Log:          log,
-			Tools:        tools.Default(),
+			Tools:        loopTools(),
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
 		}
@@ -905,6 +951,13 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 				blk, _ := mem.Context(ctx, memory.ScopeProject, project, "", 10)
 				return blk
 			}
+		}
+		// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
+		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
+		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;
+		// no full per-run index cost unless requested).
+		if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+			n.LiveSession = liveSession(mem, project)
 		}
 		return n
 	}

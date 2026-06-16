@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,6 +146,103 @@ func (c *Client) References(ctx context.Context, uri string, line, char int) ([]
 		return nil, fmt.Errorf("references: %w", err)
 	}
 	return parseLocations(raw)
+}
+
+// SymbolHit is one workspace/symbol match: its name and resolved location.
+type SymbolHit struct {
+	Name     string
+	Location Location
+}
+
+// Symbol resolves workspace/symbol for a free-text query — the language server's
+// global symbol search. Unlike Definition/References it needs no source position,
+// so it is the natural precise ENTRY POINT for retrieval-by-need (the graph stores
+// no per-symbol positions, so a name query is what we can ask). A server that does
+// not support the request returns an error; an empty/null result returns no hits.
+func (c *Client) Symbol(ctx context.Context, query string) ([]SymbolHit, error) {
+	raw, err := c.call(ctx, "workspace/symbol", map[string]any{"query": query})
+	if err != nil {
+		return nil, fmt.Errorf("workspace/symbol: %w", err)
+	}
+	return parseSymbols(raw)
+}
+
+// parseSymbols normalizes a workspace/symbol result (null, or an array of
+// SymbolInformation {name, location}) into []SymbolHit.
+func parseSymbols(raw json.RawMessage) ([]SymbolHit, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var arr []struct {
+		Name     string      `json:"name"`
+		Location lspLocation `json:"location"`
+	}
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return nil, fmt.Errorf("decode symbols: %w", err)
+	}
+	out := make([]SymbolHit, 0, len(arr))
+	for _, s := range arr {
+		out = append(out, SymbolHit{Name: s.Name, Location: s.Location.toLocation()})
+	}
+	return out, nil
+}
+
+// Spawn launches a language server as a subprocess and speaks LSP over its stdio,
+// performing the initialize handshake. command is the server program + args (e.g.
+// []string{"gopls"}); rootURI is the workspace root as a file:// URI. It returns a
+// ready Client and a stop func that closes the stream and reaps the process. The
+// server is OPERATOR-configured (never model-emitted) — the LSP analogue of the
+// git tool shelling out to a trusted git binary; a missing binary is a clean error
+// so callers degrade gracefully rather than failing the task.
+func Spawn(ctx context.Context, command []string, rootURI string) (*Client, func(), error) {
+	if len(command) == 0 {
+		return nil, nil, fmt.Errorf("empty language-server command")
+	}
+	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	cmd.Stderr = io.Discard // server diagnostics chatter is not our channel
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start %s: %w", command[0], err)
+	}
+	client := NewClient(&processRW{w: stdin, r: stdout})
+	if err := client.Initialize(ctx, rootURI); err != nil {
+		_ = client.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, nil, fmt.Errorf("initialize %s: %w", command[0], err)
+	}
+	stop := func() {
+		_ = client.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	return client, stop, nil
+}
+
+// processRW bridges a subprocess's separate stdin (writer) and stdout (reader)
+// into one io.ReadWriteCloser for the LSP transport.
+type processRW struct {
+	w io.WriteCloser
+	r io.ReadCloser
+}
+
+func (p *processRW) Read(b []byte) (int, error)  { return p.r.Read(b) }
+func (p *processRW) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p *processRW) Close() error {
+	werr := p.w.Close()
+	rerr := p.r.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
 }
 
 func textDocumentPosition(uri string, line, char int) map[string]any {

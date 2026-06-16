@@ -19,6 +19,26 @@ func openTemp(t *testing.T) *Store {
 	return s
 }
 
+// TestOpenAppliesDurabilityPragmas proves Open hardens the connection: WAL mode
+// (crash-safe + concurrent reads) and synchronous=NORMAL (fsync at checkpoints).
+func TestOpenAppliesDurabilityPragmas(t *testing.T) {
+	s := openTemp(t)
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "wal" {
+		t.Errorf("journal_mode = %q, want wal", mode)
+	}
+	var sync int
+	if err := s.db.QueryRow("PRAGMA synchronous").Scan(&sync); err != nil {
+		t.Fatal(err)
+	}
+	if sync != 1 { // 1 == NORMAL
+		t.Errorf("synchronous = %d, want 1 (NORMAL)", sync)
+	}
+}
+
 func TestEventsRoundTrip(t *testing.T) {
 	s := openTemp(t)
 	ctx := context.Background()

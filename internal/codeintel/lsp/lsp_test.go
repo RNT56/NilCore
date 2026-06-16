@@ -100,6 +100,23 @@ func mockServer(conn net.Conn, errc chan<- error) {
 				errc <- err
 				return
 			}
+		case "workspace/symbol":
+			syms := []map[string]any{{
+				"name": "Run",
+				"location": map[string]any{
+					"uri": "file:///proj/run.go",
+					"range": map[string]any{
+						"start": map[string]any{"line": 10, "character": 0},
+						"end":   map[string]any{"line": 10, "character": 3},
+					},
+				},
+			}}
+			if err := writeFramed(conn, map[string]any{
+				"jsonrpc": "2.0", "id": req.ID, "result": syms,
+			}); err != nil {
+				errc <- err
+				return
+			}
 		default:
 			errc <- fmt.Errorf("unexpected method %q", req.Method)
 			return
@@ -137,6 +154,40 @@ func TestInitializeAndDefinition(t *testing.T) {
 	case err := <-errc:
 		t.Fatalf("mock server error: %v", err)
 	default:
+	}
+}
+
+// TestSymbol covers the workspace/symbol path — the precise entry point retrieval
+// uses (a name query, no source position required).
+func TestSymbol(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	errc := make(chan error, 1)
+	go mockServer(serverConn, errc)
+
+	c := NewClient(clientConn)
+	t.Cleanup(func() { _ = c.Close() })
+	ctx := context.Background()
+	if err := c.Initialize(ctx, "file:///proj"); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	hits, err := c.Symbol(ctx, "Run")
+	if err != nil {
+		t.Fatalf("Symbol: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Name != "Run" || hits[0].Location.URI != "file:///proj/run.go" {
+		t.Fatalf("Symbol = %+v", hits)
+	}
+}
+
+// TestSpawnMissingCommand proves Spawn degrades cleanly (clear error, no hang) for
+// a missing binary or empty command, so the codeintel tool falls back gracefully.
+func TestSpawnMissingCommand(t *testing.T) {
+	if _, _, err := Spawn(context.Background(), []string{"nilcore-no-such-lsp-xyz"}, "file:///p"); err == nil {
+		t.Error("Spawn of a missing binary must error")
+	}
+	if _, _, err := Spawn(context.Background(), nil, "file:///p"); err == nil {
+		t.Error("Spawn with an empty command must error")
 	}
 }
 

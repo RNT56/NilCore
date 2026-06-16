@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"nilcore/internal/advisor"
@@ -87,6 +88,16 @@ type Native struct {
 	// is a stdlib-only leaf type, so holding it keeps backend's import graph a leaf
 	// (emit imports no channel/session machinery), exactly like Advisor/Peer.
 	Emitter Emitter
+
+	// LiveSession, if set, opens a per-run incremental code-intelligence session for
+	// the worktree (P3-T16): update(path) re-indexes one edited file; query(symbol)
+	// returns its current call-graph neighborhood — reflecting the agent's own
+	// uncommitted edits — fused with project memory, already rendered. The loop opens
+	// it at Run start and closes it at Run end, so the graph handle is task-scoped (no
+	// leak) and backend imports no codeintel machinery — the same func-seam discipline
+	// as MemoryContext above. nil ⇒ off: no `live` tool is advertised and no re-index
+	// hook fires, so the loop is byte-identical.
+	LiveSession func(dir string) (update func(context.Context, string), query func(context.Context, string) string, closeFn func())
 }
 
 // Inbox is the minimal handle the native loop needs onto the conversational
@@ -173,6 +184,29 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	// the no-peer (single-agent) loop is byte-identical.
 	if n.Peer != nil {
 		toolDefs = append(toolDefs, n.Peer.Tools()...)
+	}
+	// Live incremental code-intelligence session (P3-T16): opened for THIS run's
+	// worktree and closed when Run returns (task-scoped graph, no leak). The `live`
+	// tool is advertised only when a session is wired, so the loop is byte-identical
+	// when off. liveUpdate/liveQuery stay nil otherwise; every use is nil-gated.
+	var liveUpdate func(context.Context, string)
+	var liveQuery func(context.Context, string) string
+	if n.LiveSession != nil {
+		u, q, closeFn := n.LiveSession(t.Dir)
+		liveUpdate, liveQuery = u, q
+		if closeFn != nil {
+			defer closeFn()
+		}
+		// Advertise the tool only when the session actually opened (a degraded
+		// session returns nil funcs); otherwise the model never sees `live`.
+		if liveQuery != nil {
+			toolDefs = append(toolDefs, model.Tool{
+				Name: "live",
+				Description: "Current code intelligence for a symbol: its call-graph neighborhood in the " +
+					"worktree (reflecting your own uncommitted edits) fused with project memory. Read-only.",
+				InputSchema: json.RawMessage(`{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}`),
+			})
+		}
 	}
 
 	user := "Goal:\n" + t.Goal
@@ -471,6 +505,22 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
 					Content: n.consultAdvisor(ctx, t, recent, in.Question)})
 
+			case "live":
+				// Live code-intelligence query (P3-T16). Advertised only when a session
+				// is wired, so this case is reachable only then; the facts are fenced as
+				// data (I7) before reaching the model, like every other tool result.
+				if liveQuery == nil {
+					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
+					continue
+				}
+				var in struct {
+					Symbol string `json:"symbol"`
+				}
+				_ = json.Unmarshal(b.Input, &in)
+				n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: "live code intelligence: " + clip(in.Symbol, 60)})
+				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
+					Content: guard.Wrap("live code intelligence", liveQuery(ctx, in.Symbol))})
+
 			case "ask_supervisor", "share_finding", "request_review":
 				// Bus tools (multi-agent design §3). ask_supervisor/request_review
 				// block this step on a bus Ask; share_finding is an async Send —
@@ -508,6 +558,22 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_exec",
 						Detail: map[string]any{"tool": b.Name}})
 					results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: guard.Wrap(b.Name+" output", out)})
+					// Incremental re-index (P3-T16): a successful write/edit updates just
+					// that file in the live graph, so the next `live` query reflects the
+					// edit. nil-safe and best-effort — the index is an accelerator, never
+					// on the critical path, so an index miss never fails the step.
+					if liveUpdate != nil && (b.Name == "write" || b.Name == "edit") {
+						var pin struct {
+							Path string `json:"path"`
+						}
+						if json.Unmarshal(b.Input, &pin) == nil && pin.Path != "" {
+							p := pin.Path
+							if !filepath.IsAbs(p) {
+								p = filepath.Join(t.Dir, p)
+							}
+							liveUpdate(ctx, p)
+						}
+					}
 					continue
 				}
 				results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))

@@ -34,6 +34,23 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("ping store: %w", err)
 	}
+	// Durability + concurrency hardening. WAL keeps the secondary event mirror
+	// crash-safe and lets a reader run alongside the single writer; synchronous=
+	// NORMAL fsyncs at every checkpoint (the safe pairing with WAL — only the last
+	// committed txn is at risk on OS/power loss, never corruption); busy_timeout
+	// makes a contended write wait rather than fail with SQLITE_BUSY. A single
+	// writer connection avoids the modernc driver's pool racing two writers.
+	for _, pragma := range []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA busy_timeout=5000",
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
+		}
+	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)

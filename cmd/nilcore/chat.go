@@ -47,7 +47,6 @@ import (
 	"nilcore/internal/session"
 	"nilcore/internal/summarize"
 	"nilcore/internal/termui"
-	"nilcore/internal/tools"
 	"nilcore/internal/verb"
 	"nilcore/internal/verify"
 )
@@ -95,6 +94,7 @@ func chatMain(args []string) {
 	applyConfigDefaults(cf.common, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*cf.common.dir)
+	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*cf.common.logPath)
 	defer log.Close()
 
@@ -316,7 +316,7 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 		Box:          box,
 		Verifier:     v,
 		Log:          d.log,
-		Tools:        tools.Default(),
+		Tools:        loopTools(),
 		CommandGuard: policy.DefaultCommandPolicy().Check,
 		MaxSteps:     *d.flags.common.maxSteps,
 		Seed:         in.Seed,

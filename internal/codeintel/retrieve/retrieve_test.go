@@ -1,12 +1,20 @@
 package retrieve
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"nilcore/internal/codeintel/graph"
+	"nilcore/internal/codeintel/lsp"
 	"nilcore/internal/codeintel/semantic"
 )
 
@@ -69,6 +77,108 @@ func TestRetrieveBundle(t *testing.T) {
 	// ...and its immediate neighborhood (Run calls helper) — structurally coherent.
 	if it, ok := byID["helper"]; !ok || it.Provenance != "graph-neighbor" {
 		t.Errorf("bundle should include helper as a graph-neighbor; got %+v", it)
+	}
+}
+
+// symbolLSPServer is a minimal LSP mock over net.Pipe: it answers the handshake
+// and returns one workspace/symbol match, so the precise lens can be exercised
+// without a real language server.
+func symbolLSPServer(conn net.Conn) {
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	frame := func(v any) error {
+		body, _ := json.Marshal(v)
+		if _, err := io.WriteString(conn, fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))); err != nil {
+			return err
+		}
+		_, err := conn.Write(body)
+		return err
+	}
+	for {
+		n := -1
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				break
+			}
+			if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "Content-Length") {
+				n, _ = strconv.Atoi(strings.TrimSpace(v))
+			}
+		}
+		if n < 0 {
+			return
+		}
+		body := make([]byte, n)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return
+		}
+		var req struct {
+			ID     *int64 `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &req)
+		switch req.Method {
+		case "initialize":
+			_ = frame(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{}})
+		case "workspace/symbol":
+			_ = frame(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": []map[string]any{{
+				"name":     "PreciseHit",
+				"location": map[string]any{"uri": "file:///proj/x.go", "range": map[string]any{"start": map[string]any{"line": 1, "character": 0}, "end": map[string]any{"line": 1, "character": 5}}},
+			}}})
+		}
+	}
+}
+
+// TestRetrievePreciseLens proves a wired LSP client contributes "precise" items
+// (compiler-grade symbol matches), ranked ahead of the heuristic lenses.
+func TestRetrievePreciseLens(t *testing.T) {
+	r := buildFixture(t)
+	clientConn, serverConn := net.Pipe()
+	go symbolLSPServer(serverConn)
+	c := lsp.NewClient(clientConn)
+	t.Cleanup(func() { _ = c.Close() })
+	if err := c.Initialize(context.Background(), "file:///proj"); err != nil {
+		t.Fatal(err)
+	}
+	r.LSP = c
+
+	b, err := r.Retrieve(context.Background(), "Run", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var precise *Item
+	for i := range b.Items {
+		if b.Items[i].Provenance == "precise" {
+			precise = &b.Items[i]
+		}
+	}
+	if precise == nil {
+		t.Fatalf("bundle has no precise item:\n%+v", b.Items)
+	}
+	if precise.Symbol != "PreciseHit" || precise.File != "/proj/x.go" {
+		t.Errorf("precise item = %+v (want PreciseHit @ /proj/x.go)", *precise)
+	}
+	// Precise (compiler-grade) must rank first.
+	if b.Items[0].Provenance != "precise" {
+		t.Errorf("precise item should rank first, got %q", b.Items[0].Provenance)
+	}
+}
+
+// A nil LSP client leaves retrieval byte-identical to the graph-native lenses.
+func TestRetrieveNilLSPUnchanged(t *testing.T) {
+	r := buildFixture(t)
+	b, err := r.Retrieve(context.Background(), "Run", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range b.Items {
+		if it.Provenance == "precise" {
+			t.Error("nil LSP must produce no precise items")
+		}
 	}
 }
 
