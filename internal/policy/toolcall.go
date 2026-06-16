@@ -44,4 +44,50 @@ func DefaultCommandPolicy() CommandPolicy {
 	}}
 }
 
+// ReadOnlyCommandPolicy tightens the default command denylist for a read-only
+// drive: on top of the destructive/host-boundary defaults it denies the obvious
+// in-tree write vectors (redirection, tee, in-place sed, mv/cp), unattended git
+// writes (commit/add), and package installs. It is the command-plane mirror of a
+// write-free registry — defense in depth for any read-only drive that still has a
+// shell, so a `run` that reaches for a file write is denied at the guard.
+//
+// IMPORTANT: a substring denylist is best-effort, NOT a robust write boundary on
+// its own (a determined model can write via a vector not on the list). A drive
+// that must GUARANTEE no writes (the conversational Plan/Discuss modes) therefore
+// removes the shell entirely (backend.Native.DisableShell) and relies on the
+// write-free registry; this policy is the secondary belt, not the only one. It was
+// lifted from internal/roster so the chat front door and the roles share one list.
+func ReadOnlyCommandPolicy() CommandPolicy {
+	denied := append([]string{}, DefaultCommandPolicy().Denied...)
+	denied = append(denied,
+		" > ",        // output redirection into the tree
+		" >>",        // append redirection
+		">>",         // append redirection (no leading space)
+		"tee ",       // tee into a file
+		"sed -i",     // in-place edit
+		"perl -i",    // in-place edit
+		"mv ",        // move into/over tree files
+		"cp ",        // copy into the tree
+		"truncate ",  // truncate a file
+		"install ",   // install a file
+		"git commit", // unattended git write
+		"git add",    // staging is a write step toward commit
+		"git apply",  // apply a patch into the tree
+		"git checkout",
+		"git reset",
+		"git clean",
+		"pip install",
+		"npm install",
+		"npm i ",
+		"go install",
+		"apt-get install",
+		"apt install",
+		"yum install",
+		"brew install",
+		"cargo install",
+		"gem install",
+	)
+	return CommandPolicy{Denied: denied}
+}
+
 func strconvQuote(s string) string { return "\"" + s + "\"" }

@@ -127,8 +127,12 @@ func (role Role) ReadOnly() bool {
 // no path to mutate the tree — capability is structural, not prompt-gated. A
 // read-only role inspects history through the sandboxed `run` shell (git status,
 // git diff, git log), which the tightened CommandPolicy still permits.
+//
+// The set itself now lives in internal/tools (tools.ReadOnly), shared with the
+// conversational front door's read-only modes; this wrapper keeps the role names
+// stable.
 func readToolset() *tools.Registry {
-	return tools.NewRegistry(tools.ReadTool{}, tools.SearchTool{})
+	return tools.ReadOnly()
 }
 
 // understanderToolset is the read-only set for the code-understanding role: the
@@ -139,8 +143,11 @@ func readToolset() *tools.Registry {
 // adding it keeps the role's write-free structural guarantee intact (NewWorker's
 // hasWriteTool check still passes). The web_fetch tool is deliberately absent here:
 // the understander has deny-all egress, and codeintel is purely local.
+//
+// The set itself now lives in internal/tools (tools.ReadOnlyWithCodeintel), shared
+// with the chat front door's Plan/Discuss modes.
 func understanderToolset() *tools.Registry {
-	return tools.NewRegistry(tools.ReadTool{}, tools.SearchTool{}, tools.CodeintelTool{})
+	return tools.ReadOnlyWithCodeintel()
 }
 
 // writeToolset is the implementer's full set: the standard read/write/edit/
@@ -150,42 +157,13 @@ func writeToolset() *tools.Registry {
 }
 
 // readOnlyCommandPolicy tightens the default command denylist for read-only
-// roles: on top of the destructive/host-boundary defaults it denies the obvious
-// in-tree write vectors (redirection, tee, in-place sed, mv/cp), unattended git
-// writes (commit/add), and package installs. This is the command-plane mirror of
-// the write-free registry: a read-only worker that reaches for `run` to write a
-// file is denied at the guard, so read-only holds even through the shell escape.
+// roles. The list itself now lives in internal/policy (policy.ReadOnlyCommandPolicy),
+// shared with the conversational front door's read-only modes; this wrapper keeps
+// the role-wiring call site stable. See policy.ReadOnlyCommandPolicy for the
+// rationale (the command-plane mirror of a write-free registry — defense in depth,
+// never the only write boundary).
 func readOnlyCommandPolicy() policy.CommandPolicy {
-	denied := append([]string{}, policy.DefaultCommandPolicy().Denied...)
-	denied = append(denied,
-		" > ",        // output redirection into the tree
-		" >>",        // append redirection
-		">>",         // append redirection (no leading space)
-		"tee ",       // tee into a file
-		"sed -i",     // in-place edit
-		"perl -i",    // in-place edit
-		"mv ",        // move into/over tree files
-		"cp ",        // copy into the tree
-		"truncate ",  // truncate a file
-		"install ",   // install a file
-		"git commit", // unattended git write
-		"git add",    // staging is a write step toward commit
-		"git apply",  // apply a patch into the tree
-		"git checkout",
-		"git reset",
-		"git clean",
-		"pip install",
-		"npm install",
-		"npm i ",
-		"go install",
-		"apt-get install",
-		"apt install",
-		"yum install",
-		"brew install",
-		"cargo install",
-		"gem install",
-	)
-	return policy.CommandPolicy{Denied: denied}
+	return policy.ReadOnlyCommandPolicy()
 }
 
 // intersectEgress returns the allowlist a role actually gets: only hosts BOTH
