@@ -43,6 +43,16 @@ type Session struct {
 
 	Out emit.Emitter // reasoning/intent sink (terminal stdout / channel); nil-safe
 
+	// Notify, if set, is called once with the TERMINAL outcome of every WORK drive
+	// (native/supervise/project — not a plain chat reply), AFTER the fold. It is how a
+	// DETACHED principal learns a long job finished (done / stopped / error) without
+	// re-attaching: the serve front door wires it to push a one-line status to the
+	// owning channel thread over a durable ctx. nil ⇒ no-op (the attached terminal/chat
+	// path already shows the result live), so it is byte-identical when unwired. It
+	// runs on the drive goroutine after Phase returned to Idle — best-effort; a slow
+	// push must not wedge the conversation, so the wired closure bounds its own call.
+	Notify func(Notification)
+
 	Log    *eventlog.Log  // append-only audit; Append is nil-safe
 	Mem    *memory.Memory // optional, nil-safe
 	Budget *budget.Ledger // CONVERSATION-scoped ledger (keyed by ID)
@@ -374,6 +384,30 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 		Kind:   "session_fold",
 		Detail: map[string]any{"verified": err == nil && res.Verified},
 	})
+
+	// Notify the (possibly detached) principal of the terminal outcome of a WORK
+	// drive — the "tell me when it's done / stopped / errored" push. A plain chat
+	// reply is streamed live and needs no terminal push, so it is skipped. nil Notify
+	// ⇒ no-op (attached terminal/chat). The wired closure owns its own ctx/timeout.
+	if s.Notify != nil && in.Route != RouteChat {
+		s.Notify(Notification{
+			Verified: err == nil && res.Verified,
+			Failed:   err != nil,
+			Summary:  res.Summary.String(),
+			Branch:   res.Branch,
+		})
+	}
+}
+
+// Notification is the terminal outcome of a WORK drive, pushed to a detached
+// principal via Session.Notify. Verified is the verifier's verdict (done + green);
+// Failed means the drive errored; neither set means it stopped without converging
+// (likely needs attention). Summary/Branch carry the bounded result for the message.
+type Notification struct {
+	Verified bool
+	Failed   bool
+	Summary  string
+	Branch   string
 }
 
 // driverFor resolves a Route to an injected Driver. RouteContinue re-enters the
