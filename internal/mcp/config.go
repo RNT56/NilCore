@@ -15,6 +15,9 @@ import (
 type ServerSpec struct {
 	Name    string   `json:"name"`
 	Command []string `json:"command"`
+	// Version is optional metadata tracked by the registry (P10-T06); omitted when
+	// absent so existing mcp.json files are byte-identical.
+	Version string `json:"version,omitempty"`
 }
 
 // Config is the set of configured MCP servers, loaded from an mcp.json file.

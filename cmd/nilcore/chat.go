@@ -50,6 +50,7 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
+	"nilcore/internal/steering"
 	"nilcore/internal/summarize"
 	"nilcore/internal/termui"
 	"nilcore/internal/tools"
@@ -612,7 +613,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			// Bind /add'd context roots into a container READ-ONLY so the execute-mode
 			// shell can read them too (the file tools already see them host-side).
 			applyContainerReadRoots(box, in.ReadRoots)
-			var v verify.Verifier = verify.New(box, *d.flags.common.checkCmd)
+			v := behavioralVerifier(box, *d.flags.common.checkCmd)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
@@ -688,6 +689,14 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
+			// browser_view (P9-T02) is opt-in via NILCORE_BROWSER (the in-sandbox
+			// driver command), mirroring NILCORE_LSP_COMMAND: it is advertised only
+			// when the operator signals the sandbox image carries a headless browser,
+			// so the loop never surfaces a tool that would only ever fail closed. It
+			// is read-only (no in-tree write), so it is safe in every mode.
+			if drv := os.Getenv("NILCORE_BROWSER"); drv != "" {
+				reg.Register(tools.BrowserViewTool{Box: box, DriverCmd: drv})
+			}
 		}
 	}
 	// Added read-only context roots (/add <path>): re-register the read/search tools
@@ -728,6 +737,13 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	// advertised front door silently lacked it. Off by default (nil seam).
 	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
+	}
+	// Operator steering (P10-T01): an authoritative project steering file
+	// (NILCORE.md / AGENTS.md) committed at the repo root is loaded ONCE at launch
+	// from the operator's own repo — front-door origin, never tool/inbox text — and
+	// prepended as TRUSTED instructions (the I7 exception). nil/empty ⇒ byte-identical.
+	if steer, _ := steering.DiscoverAndLoad(d.baseRepo); steer != "" {
+		n.SteeringContext = func() string { return steer }
 	}
 	return n
 }

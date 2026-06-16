@@ -51,6 +51,7 @@ import (
 	"nilcore/internal/secrets"
 	"nilcore/internal/server"
 	"nilcore/internal/session"
+	"nilcore/internal/steering"
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
@@ -106,6 +107,10 @@ func main() {
 		proposeEditMain(args[1:])
 	case "watch":
 		watchMain(args[1:])
+	case "schedule":
+		scheduleMain(args[1:])
+	case "registry":
+		registryMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -573,6 +578,7 @@ func serveMain(args []string) {
 	channelName := fs.String("channel", "", "telegram | slack (default: config, else telegram)")
 	budgetCeil := fs.Float64("budget", chatDefaultBudget, "global dollar ceiling per conversation (a hard wall via the meter)")
 	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
+	webhookAddr := fs.String("webhook", "", "address for the SCM/CI webhook intake (e.g. 127.0.0.1:8099); needs NILCORE_WEBHOOK_SECRET")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -665,6 +671,12 @@ func serveMain(args []string) {
 		resumeInflight(ctx, d)
 	}
 
+	// SCM/CI webhook intake (P9-T04), opt-in via --webhook: a signed GitHub webhook
+	// becomes a trigger.Signal on the same gated machinery, bounded by the serve ctx.
+	if *webhookAddr != "" {
+		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"))
+	}
+
 	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	serveErr := srv.Serve(ctx)
@@ -729,7 +741,7 @@ func resumeInflight(ctx context.Context, d serveDeps) {
 	run := func(ctx context.Context, t backend.Task) (bool, error) {
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
-			v := verify.New(box, *c.checkCmd)
+			v := behavioralVerifier(box, *c.checkCmd)
 			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo)
 			return agent.Env{Backend: be, Verifier: v}
 		}
@@ -850,7 +862,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			applyContainerReadRoots(box, in.ReadRoots)
 			// Read-only modes ship nothing, so there is nothing to gate (I2) — a
 			// pass-through verifier; Execute/Auto get the real project verifier.
-			var v verify.Verifier = verify.New(box, *d.flags.checkCmd)
+			v := behavioralVerifier(box, *d.flags.checkCmd)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
@@ -897,6 +909,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 			reg.Register(tools.WebFetchTool{Box: box})
 			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
+			}
+			// browser_view (P9-T02): opt-in via NILCORE_BROWSER, same as chat.
+			if drv := os.Getenv("NILCORE_BROWSER"); drv != "" {
+				reg.Register(tools.BrowserViewTool{Box: box, DriverCmd: drv})
 			}
 		}
 	}
@@ -1132,8 +1148,16 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
 	return func(dir string) agent.Env {
 		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
-		v := verify.New(box, *c.checkCmd)
+		v := behavioralVerifier(box, *c.checkCmd)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project)
+		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
+		// the worktree checkout; load it once and prepend as trusted instructions on
+		// the native backend. nil/empty ⇒ byte-identical; only the native loop reads it.
+		if n, ok := be.(*backend.Native); ok {
+			if steer, _ := steering.DiscoverAndLoad(dir); steer != "" {
+				n.SteeringContext = func() string { return steer }
+			}
+		}
 		return agent.Env{Backend: be, Verifier: v}
 	}
 }

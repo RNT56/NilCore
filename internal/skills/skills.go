@@ -19,11 +19,15 @@ import (
 )
 
 // Skill is an Agent Skill: a name, a one-line description, and a body of
-// instructions surfaced to the model on demand.
+// instructions surfaced to the model on demand. Version is optional metadata from
+// the SKILL.md frontmatter (a semver-ish string), used by the registry (P10-T06)
+// to track and update installed skills; empty when absent (byte-identical for
+// existing skills).
 type Skill struct {
 	Name         string
 	Description  string
 	Instructions string
+	Version      string
 }
 
 // Plugin is a native capability: it contributes a structured tool directly.
@@ -122,6 +126,8 @@ func parseSkill(text string) (Skill, error) {
 			s.Name = strings.TrimSpace(v)
 		case "description":
 			s.Description = strings.TrimSpace(v)
+		case "version":
+			s.Version = strings.TrimSpace(v)
 		}
 	}
 	s.Instructions = strings.TrimSpace(strings.Join(lines[i:], "\n"))

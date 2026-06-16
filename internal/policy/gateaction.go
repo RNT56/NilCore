@@ -32,6 +32,12 @@ const (
 	Push
 	// Deploy ships to a running environment.
 	Deploy
+	// OpenPR opens (or updates) a pull request on a remote forge from a verified
+	// working branch. It publishes the agent's work for human review and never
+	// merges, but it is outward-facing and irreversible (it creates state on a
+	// remote), so it is always gated. Added last so the existing iota values are
+	// unchanged.
+	OpenPR
 )
 
 func (t GateActionType) String() string {
@@ -42,6 +48,8 @@ func (t GateActionType) String() string {
 		return "push"
 	case Deploy:
 		return "deploy"
+	case OpenPR:
+		return "open-pr"
 	default:
 		return "unknown"
 	}
