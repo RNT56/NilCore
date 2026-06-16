@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"nilcore/internal/advisor"
 	"nilcore/internal/emit"
@@ -19,6 +20,14 @@ import (
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
 )
+
+// ErrSuspended is the sentinel a drive returns when the agent SUSPENDS itself on a
+// self-timer (the `sleep` tool). It is neither a completion (no verify, no verdict)
+// nor a fault: callers recognize it with errors.Is and unwind WITHOUT re-verifying,
+// WITHOUT recording a terminal/notifiable outcome, and (the orchestrator) WITHOUT
+// leaving the task runnable — the wake owns resume. The frozen Result/Task shape is
+// untouched (I1): suspension rides this error + the wake side-effect, not a new field.
+var ErrSuspended = errors.New("drive suspended: agent set a wake timer")
 
 // Native is nilcore's own coding loop: the model proposes a shell action, the
 // sandbox runs it, the verifier judges, and the loop repeats until the checks
@@ -133,6 +142,19 @@ type Native struct {
 	// as MemoryContext above. nil ⇒ off: no `live` tool is advertised and no re-index
 	// hook fires, so the loop is byte-identical.
 	LiveSession func(dir string) (update func(context.Context, string), query func(context.Context, string) string, closeFn func())
+
+	// Wake, if set, lets the agent SUSPEND its drive on a self-chosen timer (the
+	// `sleep` tool): it durably arms a wake for `after` and the drive then ends
+	// cleanly, releasing the worktree/sandbox and burning no model calls while asleep;
+	// the wiring site re-engages the conversation when the timer elapses (a fresh drive
+	// resumes from the persisted bounded state + the note). nil ⇒ no `sleep` tool is
+	// advertised — byte-identical, gated exactly like Peer/Inbox. Suspension is carried
+	// purely in this side-effect + the loop's clean terminal Result (no Result/Task
+	// field — I1 frozen). NOTE: a drive's worktree is disposable, so uncommitted edits
+	// are discarded on sleep — the agent commits first or captures state in the note;
+	// `sleep` is for waiting on EXTERNAL async work (CI, a slow gate), not preserving a
+	// local process (a long local suite should just block on a synchronous `run`).
+	Wake func(ctx context.Context, after time.Duration, note string) error
 }
 
 // Inbox is the minimal handle the native loop needs onto the conversational
@@ -205,10 +227,23 @@ When you ask, your current work-in-progress is shown to the supervisor automatic
 so just state your specific question. Use share_finding for durable facts other
 agents should know, and request_review for a cross-model check of your diff.`
 
+// sleepGuidance is appended to the prompt ONLY when a Wake hook is wired — it tells
+// the model the self-timer exists and its one sharp edge. Sleep is for waiting on
+// EXTERNAL async work cheaply, not for preserving a local process across the nap.
+const sleepGuidance = `You can SUSPEND yourself on a timer with the "sleep" tool when there is genuinely
+nothing useful to do for a while — e.g. you kicked off external async work (a CI run,
+a deploy, a slow gate) and must wait. sleep(after_seconds, note) ends this turn and
+re-engages you when the timer elapses; you burn no budget while asleep. Two rules:
+(1) your UNCOMMITTED edits are DISCARDED on sleep (your working tree is disposable) —
+commit them first, or capture what matters in the note; (2) for a long LOCAL command
+(like a test suite), do NOT sleep — just run it: the run tool blocks until it finishes
+and returns the result in one step. Put in the note exactly what to check on waking.`
+
 // systemFor composes the worker's effective system prompt: the base operational
 // prompt, plus the role-specific System (when the roster set one), plus the
-// multi-agent peerGuidance (only when a Peer is wired). With neither set it returns
-// the base prompt unchanged, so the single-task path stays byte-identical.
+// multi-agent peerGuidance (only when a Peer is wired), plus sleepGuidance (only when
+// a Wake hook is wired). With none set it returns the base prompt unchanged, so the
+// single-task path stays byte-identical.
 func (n *Native) systemFor() string {
 	s := systemPrompt
 	if strings.TrimSpace(n.System) != "" {
@@ -216,6 +251,9 @@ func (n *Native) systemFor() string {
 	}
 	if n.Peer != nil {
 		s += "\n\n" + peerGuidance
+	}
+	if n.Wake != nil {
+		s += "\n\n" + sleepGuidance
 	}
 	return s
 }
@@ -281,6 +319,19 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				InputSchema: json.RawMessage(`{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"]}`),
 			})
 		}
+	}
+	// Self-timer (the `sleep` tool): suspend this drive and be re-engaged after a
+	// chosen delay. Advertised only when a Wake hook is wired (serve), so the loop is
+	// byte-identical when off.
+	if n.Wake != nil {
+		toolDefs = append(toolDefs, model.Tool{
+			Name: "sleep",
+			Description: "Suspend yourself for after_seconds (60..86400) and be re-engaged when it elapses to " +
+				"re-check progress. Use ONLY when waiting on external async work (CI, a deploy, a slow gate) with " +
+				"nothing useful to do meanwhile — NOT for a local command (run blocks and returns its result). Your " +
+				"uncommitted edits are discarded on sleep: commit first or capture state in note. note = what to check on waking.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"after_seconds":{"type":"integer"},"note":{"type":"string"}},"required":["after_seconds","note"]}`),
+		})
 	}
 
 	user := "Goal:\n" + t.Goal
@@ -611,6 +662,37 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
 					Content: guard.Wrap("live code intelligence", liveQuery(ctx, in.Symbol))})
 
+			case "sleep":
+				// Self-timer: durably arm a wake then END the drive cleanly (release the
+				// worktree/sandbox; burn nothing while asleep). The wiring site re-engages
+				// the conversation when the timer elapses. A nil Wake means the tool was not
+				// advertised — treat a stray call as unknown. On a Wake (arm) error, surface
+				// it and stay awake.
+				if n.Wake == nil {
+					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
+					continue
+				}
+				var in struct {
+					AfterSeconds int    `json:"after_seconds"`
+					Note         string `json:"note"`
+				}
+				_ = json.Unmarshal(b.Input, &in)
+				dur := clampSleep(in.AfterSeconds)
+				if err := n.Wake(ctx, dur, in.Note); err != nil {
+					results = append(results, errorResult(b.ID, "sleep: "+err.Error()))
+					continue
+				}
+				n.emit(emit.Event{Kind: emit.KindTool, Step: i,
+					Text: "sleeping " + dur.String() + " — will re-check: " + clip(in.Note, 80)})
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "self_sleep",
+					Detail: map[string]any{"after_s": int(dur.Seconds())}})
+				// Return the ErrSuspended sentinel (NOT a nil-error completion): the
+				// orchestrator skips verify + leaves the task non-runnable, and the session
+				// unwinds with no verdict and no notification — the wake re-engages later.
+				// The frozen Result shape is untouched (I1): suspension is the sentinel +
+				// the Wake side-effect, not a new field.
+				return Result{Backend: n.Name(), Summary: "suspended for " + dur.String() + ": " + in.Note}, ErrSuspended
+
 			case "ask_supervisor", "share_finding", "request_review":
 				// Bus tools (multi-agent design §3). ask_supervisor/request_review
 				// block this step on a bus Ask; share_finding is an async Send —
@@ -744,6 +826,20 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 func errorResult(id, msg string) model.Block {
 	return model.Block{Type: "tool_result", ToolUseID: id, Content: msg, IsError: true}
+}
+
+// clampSleep bounds a self-timer to [1 minute, 24 hours]: a floor so a model cannot
+// busy-suspend in a tight wake loop, a ceiling so a stray huge value cannot strand a
+// conversation for weeks. Mirrors the spirit of cron's poll-interval floor.
+func clampSleep(seconds int) time.Duration {
+	const minS, maxS = 60, 24 * 60 * 60
+	if seconds < minS {
+		seconds = minS
+	}
+	if seconds > maxS {
+		seconds = maxS
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // enrichBusField appends extra to a named string field of a bus-tool input object

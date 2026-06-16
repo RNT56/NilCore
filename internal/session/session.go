@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"nilcore/internal/backend"
 	"nilcore/internal/budget"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
@@ -346,6 +347,21 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 	defer s.drives.Done()
 
 	res, err := drv.Drive(ctx, in)
+
+	// A self-SUSPEND (the agent set a wake timer) is neither a completion nor a fault:
+	// return to Idle and persist the bounded state (so the wake resumes from it later),
+	// but DON'T fold an outcome and DON'T fire Notify — the agent is napping, not done,
+	// and the re-engage happens on wake, not now.
+	if errors.Is(err, backend.ErrSuspended) {
+		s.mu.Lock()
+		s.Phase = Idle
+		s.clearDriveCancelLocked()
+		folded := s.State
+		s.mu.Unlock()
+		s.persist(ctx, folded)
+		s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_suspended", Backend: in.Route.String()})
+		return
+	}
 
 	s.mu.Lock()
 	if err == nil {

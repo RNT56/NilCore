@@ -7,6 +7,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -188,6 +189,18 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 
 	res, err := be.Run(ctx, t)
 	if err != nil {
+		// A self-suspend (the `sleep` tool) is neither a completion nor a fault: do NOT
+		// re-verify (the worktree is deliberately incomplete — verifying it wastes a
+		// sandbox pass), and mark the task SUSPENDED (not left "running") so the restart
+		// resumer skips it — the wake owns resume, so re-driving here would double it.
+		// Propagate the sentinel so the session unwinds with no verdict/notification.
+		if errors.Is(err, backend.ErrSuspended) {
+			if o.Checkpoint != nil {
+				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal)
+			}
+			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended"})
+			return Outcome{Backend: be.Name(), Summary: res.Summary}, backend.ErrSuspended
+		}
 		return Outcome{Backend: be.Name()}, fmt.Errorf("backend: %w", err)
 	}
 

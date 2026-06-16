@@ -56,6 +56,7 @@ import (
 	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
 	"nilcore/internal/verify"
+	"nilcore/internal/wake"
 	"nilcore/internal/worktree"
 )
 
@@ -653,6 +654,14 @@ func serveMain(args []string) {
 		fmt.Fprintf(os.Stderr, "nilcore serve: web access on — search: %s, %d allowed host(s)\n", searchBackend, len(webAllow))
 	}
 
+	// The self-timer registry behind the `sleep` tool — durable over the checkpointer's
+	// store, so wakes survive a restart (re-fired by the waker on next boot). Off
+	// without a checkpointer (nil ⇒ no `sleep` tool, no waker).
+	var wakeReg *wake.Registry
+	if ckpt != nil {
+		wakeReg = wake.New(ckpt, log)
+	}
+
 	d := serveDeps{
 		flags:           c,
 		provider:        prov,
@@ -663,6 +672,7 @@ func serveMain(args []string) {
 		gate:            gate,
 		mem:             mem,
 		checkpoint:      ckpt,
+		wakeReg:         wakeReg,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
 		searchBackend:   searchBackend,
@@ -686,7 +696,7 @@ func serveMain(args []string) {
 		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"))
 	}
 
-	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot}
+	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot, Wake: wakeReg}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	serveErr := srv.Serve(ctx)
 
@@ -868,6 +878,7 @@ type serveDeps struct {
 	gate       *driveGate        // shared serve drive-concurrency cap
 	mem        *memory.Memory    // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
 	checkpoint *agent.Checkpoint // durable task/conversation persistence (nil ⇒ in-memory only, no resume)
+	wakeReg    *wake.Registry    // durable self-timer registry behind the `sleep` tool (nil ⇒ sleep off)
 
 	// Web access, resolved once from config (nilcore init) and applied to every
 	// thread's drives — parity with the chat front door. egress empty ⇒ default-deny.
@@ -962,7 +973,7 @@ func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.
 		// and sizes native-vs-supervise with the same heuristic.
 		sess.Sizer = chatShouldSupervise
 		sess.Drivers = session.Drivers{
-			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID)), metered, threadID),
+			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID, sender)), metered, threadID),
 			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver)), metered),
 			Project:   session.NewProjectDriver(gateProject(d.gate, serveProjectRun(d, ledger, approver)), metered),
 			Chat:      session.NewChatDriver(metered),
@@ -978,8 +989,18 @@ func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.
 // back over chat. The loop runs with the conversation-metered provider so spend
 // keys by the threadID, never the per-drive task id (§6). It mirrors chatNativeRun
 // but with the channel approver in place of the console one.
-func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approver, threadID string) session.RunNativeFunc {
+func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approver, threadID, sender string) session.RunNativeFunc {
 	adv := resolveAdvisor(*d.flags.backendName, d.boot, d.flags)
+	// The per-thread self-timer arm: the `sleep` tool calls this to durably register a
+	// wake for THIS conversation (threadID owned by sender). nil when no registry is
+	// wired (no checkpointer) ⇒ no `sleep` tool advertised.
+	var wakeArm func(context.Context, time.Duration, string) error
+	if d.wakeReg != nil {
+		wakeArm = func(c context.Context, after time.Duration, note string) error {
+			_, err := d.wakeReg.Arm(c, threadID, sender, after, note)
+			return err
+		}
+	}
 	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir)
@@ -994,7 +1015,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
-			n := serveNativeBackend(d, metered, adv, box, v, in)
+			n := serveNativeBackend(d, metered, adv, box, v, in, wakeArm)
 			return agent.Env{Backend: n, Verifier: v}
 		}
 		orch := &agent.Orchestrator{
@@ -1019,7 +1040,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 // conversational seams attached: the session Inbox (steer/queue), Seed (prior
 // History — continue, not restart), and Emitter (live reasoning over Channel.Update).
 // It mirrors chatNativeBackend but is fed by the serve deps.
-func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, in session.NativeRun) *backend.Native {
+func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, in session.NativeRun, wakeArm func(context.Context, time.Duration, string) error) *backend.Native {
 	// Mode capability parity with the chat front door: a read-only Discuss/Plan drive
 	// over a channel gets the write-free registry + shell off (the same structural
 	// no-write guarantee), Execute/Auto get the full set. Without this, a /plan pinned
@@ -1070,6 +1091,9 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
+	// Self-timer (serve-only): the `sleep` tool arms a durable wake for this thread.
+	// nil ⇒ no `sleep` tool advertised (byte-identical) — e.g. no checkpointer wired.
+	n.Wake = wakeArm
 	return n
 }
 

@@ -42,6 +42,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/policy"
 	"nilcore/internal/session"
+	"nilcore/internal/wake"
 )
 
 // SessionFactory builds a fully-wired conversational Session for one thread. The
@@ -75,8 +76,14 @@ type Server struct {
 	// ⇒ /add <path> is reported unavailable over a channel. URLs do not use it.
 	ResolveRoot func(path string) (string, error)
 
+	// Wake, if set, is the durable self-timer registry behind the `sleep` tool: a
+	// background waker polls it and re-engages a thread when its timer elapses (a fresh
+	// drive resumes from persisted state). nil ⇒ the waker never starts — byte-identical.
+	Wake *wake.Registry
+
 	mu      sync.Mutex         // guards threads
 	threads map[string]*thread // threadID → conversation + its surface sink
+	wakerWG sync.WaitGroup     // tracks the background waker goroutine (joined at shutdown)
 }
 
 // thread is one channel conversation: the wired Session and the per-thread surface
@@ -102,6 +109,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("server: NewSession factory is required")
 	}
 	s.Log.Append(eventlog.Event{Kind: "serve_start"})
+
+	// Self-timer waker: poll the durable wake registry and re-engage a thread when its
+	// timer elapses. Started before the receive loop so a wake armed by a prior process
+	// (survivor in the store) re-fires on this boot; joined at shutdown (no leak). nil
+	// registry ⇒ never started (byte-identical).
+	if s.Wake != nil {
+		s.wakerWG.Add(1)
+		go s.runWaker(ctx)
+	}
 
 	for {
 		req, err := s.Channel.Receive(ctx)
@@ -314,6 +330,7 @@ func (s *Server) threadFor(ctx context.Context, threadID, sender string) (th *th
 // the sender goroutine (which exits on the cancelled ctx). With nothing running both
 // return at once. No goroutine outlives Serve.
 func (s *Server) drainShutdown() {
+	s.wakerWG.Wait() // the waker exits on the cancelled ctx; join it before tearing threads down
 	s.mu.Lock()
 	live := make([]*thread, 0, len(s.threads))
 	for _, th := range s.threads {
@@ -323,6 +340,66 @@ func (s *Server) drainShutdown() {
 	for _, th := range live {
 		th.sess.Wait()
 		th.emit.wait()
+	}
+}
+
+// wakePollInterval is how often the waker checks the durable registry for a due
+// timer. A wake fires within one interval of its time — ample for self-timers
+// measured in minutes/hours, and cheap (one store read per tick).
+const wakePollInterval = 30 * time.Second
+
+// runWaker polls the wake registry on wakePollInterval and re-engages threads whose
+// timer has elapsed, until ctx is cancelled. Background goroutine; joined by
+// drainShutdown so it never outlives Serve.
+func (s *Server) runWaker(ctx context.Context) {
+	defer s.wakerWG.Done()
+	t := time.NewTicker(wakePollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.fireDueWakes(ctx, time.Now())
+		}
+	}
+}
+
+// fireDueWakes re-engages every thread whose armed wake is due as of now. For each:
+// find-or-create the thread's Session (Restoring its persisted state), DISARM before
+// re-engaging (at-most-once on the happy path — a lost nudge is far safer than an
+// infinite re-fire), then inject a synthetic, harness-authored re-check Turn (I7: it
+// is principal-trusted text, not laundered tool output; I3: the woken drive still
+// gates any irreversible action). ctx is the serve base ctx (durable — no principal
+// is attached when a timer fires). Split from runWaker so tests drive it with a
+// controlled clock (mirrors cron.Tick).
+func (s *Server) fireDueWakes(ctx context.Context, now time.Time) {
+	wakes, err := s.Wake.Pending(ctx)
+	if err != nil {
+		s.Log.Append(eventlog.Event{Kind: "wake_error", Detail: map[string]any{"error": err.Error()}})
+		return
+	}
+	for _, w := range wakes {
+		if w.WakeAt.After(now) {
+			continue // not due yet
+		}
+		th, _, ok := s.threadFor(ctx, w.ThreadID, w.Sender)
+		if !ok {
+			// The thread is pinned to a different principal — we can't re-engage it.
+			// Disarm so it doesn't re-poll forever (an unbounded stuck row), and log it.
+			_ = s.Wake.Disarm(ctx, w.ThreadID)
+			s.Log.Append(eventlog.Event{Kind: "wake_unroutable", Detail: map[string]any{"thread": w.ThreadID}})
+			continue
+		}
+		// Disarm BEFORE re-engaging (at-most-once: a fired wake must never re-fire). If
+		// the disarm itself fails, do NOT engage — engaging on a still-armed wake would
+		// re-fire it every tick (a re-drive loop); leave it for the next poll instead.
+		if err := s.Wake.Disarm(ctx, w.ThreadID); err != nil {
+			s.Log.Append(eventlog.Event{Kind: "wake_error", Detail: map[string]any{"thread": w.ThreadID, "op": "disarm", "error": err.Error()}})
+			continue
+		}
+		s.Log.Append(eventlog.Event{Kind: "wake_fired", Detail: map[string]any{"thread": w.ThreadID}})
+		_ = th.sess.Turn(ctx, "Your scheduled timer elapsed — "+w.Note+". Re-check progress and continue.")
 	}
 }
 
