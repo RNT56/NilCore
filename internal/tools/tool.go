@@ -24,6 +24,24 @@ type Tool interface {
 	Run(ctx context.Context, workdir string, input json.RawMessage) (string, error)
 }
 
+// Image is an optional image a tool produces alongside its text result (e.g. a
+// browser screenshot), to be handed to a vision-capable model as a follow-up user
+// turn (D1-T02). Base64 is the raw base64-encoded image bytes; MediaType is e.g.
+// "image/png".
+type Image struct {
+	MediaType string
+	Base64    string
+}
+
+// ImageRunner is an OPTIONAL Tool capability. RunWithImage returns the same text
+// result Run does, plus an optional captured image. The loop, after dispatching,
+// hands a non-nil image to the model as a user image block (D1-T02). A Tool that
+// does not implement ImageRunner delivers text only — byte-identical. The seam is
+// stateless: the image is returned from the call, never stored on the tool.
+type ImageRunner interface {
+	RunWithImage(ctx context.Context, workdir string, input json.RawMessage) (string, *Image, error)
+}
+
 // Registry holds the registered tools in a stable order.
 type Registry struct {
 	tools map[string]Tool
@@ -92,4 +110,20 @@ func (r *Registry) Dispatch(ctx context.Context, name, workdir string, input jso
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
 	return t.Run(ctx, workdir, input)
+}
+
+// DispatchRich runs the named tool and, when the tool implements ImageRunner,
+// returns its optional captured image alongside the text. For every other tool the
+// image is nil and the behavior is exactly Dispatch — so the loop can always call
+// DispatchRich and append an image only when one is produced (D1-T02).
+func (r *Registry) DispatchRich(ctx context.Context, name, workdir string, input json.RawMessage) (string, *Image, error) {
+	t, ok := r.tools[name]
+	if !ok {
+		return "", nil, fmt.Errorf("unknown tool %q", name)
+	}
+	if ir, ok := t.(ImageRunner); ok {
+		return ir.RunWithImage(ctx, workdir, input)
+	}
+	out, err := t.Run(ctx, workdir, input)
+	return out, nil, err
 }

@@ -14,6 +14,7 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/policy"
 	"nilcore/internal/trigger"
+	"nilcore/internal/worktree"
 )
 
 // watchMain implements `nilcore watch` — the self-start loop (P3-T07). It polls a
@@ -29,6 +30,7 @@ func watchMain(args []string) {
 	signalsDir := fs.String("signals", "./signals", "directory polled for signal files")
 	interval := fs.Duration("interval", 5*time.Second, "poll interval")
 	enabled := fs.Bool("enabled", true, "master on/off for self-start")
+	openPR := fs.Bool("open-pr", false, "after a verified self-start, offer a gated draft PR (needs NILCORE_FORGE_TOKEN + an origin remote)")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -40,16 +42,28 @@ func watchMain(args []string) {
 	defer log.Close()
 
 	orch := buildRunOrchestrator(c, b, log, absDir)
+	if *openPR {
+		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
+	}
 	gate := policy.NewConsoleApprover(os.Stdin, os.Stdout)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,
 		Start: func(ctx context.Context, goal string) error {
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("trig-%d", time.Now().Unix()), Goal: goal})
+			// UnixNano (not Unix-second) so two ticks in the same second never collide
+			// on the kept task/<id> branch under --open-pr.
+			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("trig-%d", time.Now().UnixNano()), Goal: goal})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("self-started: verified=%v — %s\n", out.Verified, out.Summary)
+			if *openPR && out.Verified && out.Branch != "" {
+				openGatedPR(ctx, absDir, out.Branch, goal, gate, b.cred, log)
+				// Reclaim the now-redundant LOCAL branch: an approved PR references the
+				// pushed REMOTE branch, a denial pushed nothing — either way the local
+				// task/<id> ref serves no purpose. Without this it leaks unboundedly.
+				worktree.DeleteBranch(ctx, absDir, out.Branch)
+			}
 			return nil
 		},
 		Log: log,

@@ -19,23 +19,15 @@ import (
 // are guard.Wrap-fenced as UNTRUSTED data (I7) before returning. The tool performs
 // no in-tree write, so it is safe in read-only modes (its name is not write/edit/git).
 //
-// ───────────────────────────── NOT DONE (scaffold) ─────────────────────────────
-// Two pieces are intentionally NOT finished here and are tracked as follow-ups:
-//
-//  1. The browser binary + driver. Run shells DriverCmd (default "nilcore-browser")
-//     and expects it to print a JSON observation to stdout. That driver and a
-//     headless browser (e.g. Chromium) must be baked into the sandbox image
-//     (P0-T03); until then the command exits non-zero and the tool fails closed —
-//     it never fabricates a passing observation.
-//  2. Returning the screenshot to the model as an image block. The screenshot the
-//     driver captures (screenshot_b64) is parsed but NOT yet handed to the model:
-//     the loop's tool-dispatch currently turns a tool result into a single text
-//     tool_result block, so an image cannot ride back through it. model.ImageBlock
-//     (P9-T01) is the format that representation will use once the dispatch path is
-//     extended; for now the tool returns the textual observations only.
-//
-// Everything else — sandboxing, URL validation, nil-Box refusal, JSON parsing,
-// fencing, fail-closed behavior — is implemented and tested.
+// The screenshot the driver captures (screenshot_b64) is handed to the model as an
+// image block via the ImageRunner seam (D1-T02): RunWithImage returns the textual
+// observation AND the screenshot, and the loop appends a model.ImageBlock user turn
+// so a vision-capable model can reason over what actually rendered. The headless
+// browser binary + the nilcore-browser driver are baked into the sandbox image
+// (D1-T01, cmd/tools/nilcore-browser + images/sandbox); the actual browser run is
+// exercised by CI (no Chromium in unit-test environments). If the driver/browser is
+// absent the command exits non-zero and the tool fails closed — it never fabricates
+// a passing observation.
 type BrowserViewTool struct {
 	Box sandbox.Sandbox
 	// DriverCmd is the in-sandbox headless-browser driver program. Empty uses
@@ -64,25 +56,36 @@ type browserObservation struct {
 	Title         string   `json:"title"`
 	Text          string   `json:"text"`
 	Console       []string `json:"console"`
-	ScreenshotB64 string   `json:"screenshot_b64"` // parsed; image-block delivery is a follow-up (see NOT DONE)
+	ScreenshotB64 string   `json:"screenshot_b64"` // delivered to the model as an image block (D1-T02)
 }
 
-func (b BrowserViewTool) Run(ctx context.Context, _ string, input json.RawMessage) (string, error) {
+// Run satisfies the Tool interface; it delegates to RunWithImage and drops the
+// image, so a non-vision caller still gets the full textual observation.
+func (b BrowserViewTool) Run(ctx context.Context, workdir string, input json.RawMessage) (string, error) {
+	out, _, err := b.RunWithImage(ctx, workdir, input)
+	return out, err
+}
+
+// RunWithImage drives the headless browser and returns the fenced textual
+// observation plus, when the driver captured one, the screenshot as an *Image for
+// the loop to hand to a vision-capable model (D1-T02 / ImageRunner). The image is
+// returned only on a successful observation — a failed/closed run yields no image.
+func (b BrowserViewTool) RunWithImage(ctx context.Context, _ string, input json.RawMessage) (string, *Image, error) {
 	if b.Box == nil {
 		// Refuse rather than reach for a host-side browser, which would bypass the
 		// sandbox boundary and the egress policy (I4).
-		return "", fmt.Errorf("browser_view: no sandbox available (refusing a host-side browser)")
+		return "", nil, fmt.Errorf("browser_view: no sandbox available (refusing a host-side browser)")
 	}
 
 	var in struct {
 		URL string `json:"url"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
-		return "", fmt.Errorf("bad input: %w", err)
+		return "", nil, fmt.Errorf("bad input: %w", err)
 	}
 	safeURL, err := validateFetchURL(in.URL) // same scheme/host/quoting guard as web_fetch
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	driver := strings.TrimSpace(b.DriverCmd)
@@ -95,7 +98,7 @@ func (b BrowserViewTool) Run(ctx context.Context, _ string, input json.RawMessag
 
 	res, err := b.Box.Exec(ctx, cmd)
 	if err != nil {
-		return "", fmt.Errorf("browser_view: sandbox: %w", err)
+		return "", nil, fmt.Errorf("browser_view: sandbox: %w", err)
 	}
 	if res.ExitCode != 0 {
 		// Fail closed: an unreachable host, a missing driver/browser binary, or a
@@ -104,14 +107,20 @@ func (b BrowserViewTool) Run(ctx context.Context, _ string, input json.RawMessag
 		if detail == "" {
 			detail = fmt.Sprintf("%s exited %d", driver, res.ExitCode)
 		}
-		return guard.Wrap("browser_view error for "+safeURL, detail), nil
+		return guard.Wrap("browser_view error for "+safeURL, detail), nil, nil
 	}
 
 	var obs browserObservation
 	if err := json.Unmarshal([]byte(res.Stdout), &obs); err != nil {
-		return guard.Wrap("browser_view raw output for "+safeURL, tailText(res.Stdout, maxBrowserText)), nil
+		return guard.Wrap("browser_view raw output for "+safeURL, tailText(res.Stdout, maxBrowserText)), nil, nil
 	}
-	return guard.Wrap("browser view of "+safeURL, renderObservation(obs)), nil
+	var img *Image
+	if obs.ScreenshotB64 != "" {
+		// The screenshot is the driver's PNG capture, base64-encoded. It is data the
+		// model reasons over (I7) — the verifier, not the screenshot, decides "done".
+		img = &Image{MediaType: "image/png", Base64: obs.ScreenshotB64}
+	}
+	return guard.Wrap("browser view of "+safeURL, renderObservation(obs)), img, nil
 }
 
 func renderObservation(obs browserObservation) string {
@@ -123,10 +132,9 @@ func renderObservation(obs browserObservation) string {
 		fmt.Fprintf(&b, "console:\n- %s\n", strings.Join(obs.Console, "\n- "))
 	}
 	if obs.ScreenshotB64 != "" {
-		// A screenshot was captured; delivering it to the model as an image block is
-		// a follow-up (see the NOT DONE note). We acknowledge it without inlining the
-		// (large) base64 payload into the text result.
-		b.WriteString("screenshot: captured (image-block delivery pending)\n")
+		// The screenshot rides back to the model as a separate image block (D1-T02);
+		// we note it in the text without inlining the (large) base64 payload here.
+		b.WriteString("screenshot: captured (delivered as an image)\n")
 	}
 	if t := strings.TrimSpace(obs.Text); t != "" {
 		b.WriteString("text:\n")

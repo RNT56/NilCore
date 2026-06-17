@@ -14,6 +14,7 @@ import (
 	"nilcore/internal/cron"
 	"nilcore/internal/policy"
 	"nilcore/internal/trigger"
+	"nilcore/internal/worktree"
 )
 
 // scheduleMain implements `nilcore schedule` — the time-driven counterpart to
@@ -34,6 +35,7 @@ func scheduleMain(args []string) {
 	goal := fs.String("goal", "", "the goal to self-start on each tick (required)")
 	name := fs.String("name", "scheduled", "job name (for the audit log)")
 	enabled := fs.Bool("enabled", true, "master on/off for self-start")
+	openPR := fs.Bool("open-pr", false, "after a verified scheduled run, offer a gated draft PR (needs NILCORE_FORGE_TOKEN + an origin remote)")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 	if *goal == "" {
@@ -50,16 +52,25 @@ func scheduleMain(args []string) {
 	defer log.Close()
 
 	orch := buildRunOrchestrator(c, b, log, absDir)
+	if *openPR {
+		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
+	}
 	gate := policy.NewConsoleApprover(os.Stdin, os.Stdout)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,
 		Start: func(ctx context.Context, goal string) error {
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("cron-%d", time.Now().Unix()), Goal: goal})
+			// UnixNano so two ticks in the same second never collide on the kept branch.
+			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("cron-%d", time.Now().UnixNano()), Goal: goal})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("scheduled run: verified=%v — %s\n", out.Verified, out.Summary)
+			if *openPR && out.Verified && out.Branch != "" {
+				openGatedPR(ctx, absDir, out.Branch, goal, gate, b.cred, log)
+				// Reclaim the now-redundant local task/<id> branch (see watch.go).
+				worktree.DeleteBranch(ctx, absDir, out.Branch)
+			}
 			return nil
 		},
 		Log: log,

@@ -2,6 +2,8 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -10,9 +12,12 @@ import (
 	"sort"
 	"strings"
 
+	"nilcore/internal/codeintel/ast"
 	"nilcore/internal/codeintel/graph"
 	"nilcore/internal/codeintel/lsp"
 	"nilcore/internal/codeintel/retrieve"
+	"nilcore/internal/codeintel/semantic"
+	"nilcore/internal/embed"
 )
 
 // CodeintelTool is a READ-ONLY code-intelligence adapter over internal/codeintel
@@ -80,7 +85,7 @@ func (CodeintelTool) Run(ctx context.Context, workdir string, input json.RawMess
 	}
 	defer g.Close()
 
-	files, err := goFilesUnder(workdir)
+	files, err := sourceFilesUnder(workdir)
 	if err != nil {
 		return "", fmt.Errorf("codeintel: scan worktree: %w", err)
 	}
@@ -105,6 +110,19 @@ func (CodeintelTool) Run(ctx context.Context, workdir string, input json.RawMess
 
 	r := &retrieve.Retriever{Graph: g} // Semantic nil → lexical entry-point fallback
 
+	// Optional semantic lens (D2-T03), opt-in via NILCORE_EMBED_KEY: a persistent,
+	// content-hash-cached embedding index over the worktree files, so retrieval ranks
+	// by meaning, not just lexical overlap. Absent the key, Semantic stays nil and
+	// retrieval uses the graph/lexical lenses (byte-identical). The index is persistent
+	// + cached (D2-T01), so only changed files re-embed across runs; the embedding key
+	// rides a per-request header (I3) and the host-side index never reaches the model.
+	if key := os.Getenv("NILCORE_EMBED_KEY"); key != "" {
+		if sem := openSemantic(ctx, workdir, files, key); sem != nil {
+			r.Semantic = sem
+			defer sem.Close()
+		}
+	}
+
 	// Optional precise lens: an operator-configured language server (e.g. gopls)
 	// adds compiler-grade symbol matches. Opt-in via NILCORE_LSP_COMMAND (server +
 	// args, space-separated); the binary is operator-trusted, never model-emitted.
@@ -123,12 +141,17 @@ func (CodeintelTool) Run(ctx context.Context, workdir string, input json.RawMess
 	return renderBundle(workdir, in.Query, indexed, bundle), nil
 }
 
-// goFilesUnder returns the Go source files under root in deterministic order,
-// skipping .git (and any vendored/hidden VCS dir) so the index is reproducible.
-// It mirrors SearchTool's walk discipline: only files under the worktree are ever
-// touched, and an unreadable subtree is reported as a walk error, not silently
-// half-indexed.
-func goFilesUnder(root string) ([]string, error) {
+// sourceFilesUnder returns the source files under root in deterministic order, for
+// every language the AST layer supports (ast.SupportedExtensions — Go and Python
+// today, D3-T02), skipping .git (and any vendored/hidden VCS dir) so the index is
+// reproducible. It mirrors SearchTool's walk discipline: only files under the
+// worktree are ever touched, and an unreadable subtree is reported as a walk error,
+// not silently half-indexed.
+func sourceFilesUnder(root string) ([]string, error) {
+	supported := map[string]bool{}
+	for _, e := range ast.SupportedExtensions() {
+		supported[strings.ToLower(e)] = true
+	}
 	var out []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -140,7 +163,7 @@ func goFilesUnder(root string) ([]string, error) {
 			}
 			return nil
 		}
-		if strings.HasSuffix(d.Name(), ".go") {
+		if supported[strings.ToLower(filepath.Ext(d.Name()))] {
 			out = append(out, path)
 		}
 		return nil
@@ -150,6 +173,49 @@ func goFilesUnder(root string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// maxEmbedBytes caps the size of a single file fed to the semantic embedder, so a
+// huge generated file cannot blow the embedding request.
+const maxEmbedBytes = 100 * 1024
+
+// openSemantic opens a persistent, content-hash-cached semantic index for the
+// worktree (D2-T03) and indexes the given files. It is called only when
+// NILCORE_EMBED_KEY is set. The index lives under the user cache dir keyed by the
+// worktree path, so across runs only changed files re-embed (the D2-T01 cache).
+// ANY failure (no cache dir, open error) returns nil so retrieval degrades to the
+// graph/lexical lenses — semantic search is never required. Per-file Add errors
+// are tolerated (best-effort indexing, like the graph build above).
+func openSemantic(ctx context.Context, workdir string, files []string, key string) *semantic.Index {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(workdir))
+	dbPath := filepath.Join(cache, "nilcore", "semantic", hex.EncodeToString(sum[:8])+".db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return nil
+	}
+	ix, err := semantic.Open(dbPath, embed.NewOpenAI(key, os.Getenv("NILCORE_EMBED_MODEL")))
+	if err != nil {
+		return nil
+	}
+	for _, path := range files {
+		if ctx.Err() != nil {
+			break
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil || len(b) == 0 || len(b) > maxEmbedBytes {
+			continue
+		}
+		rel, relErr := filepath.Rel(workdir, path)
+		if relErr != nil {
+			rel = path
+		}
+		// Add is content-hash cached (D2-T01): an unchanged file does not re-embed.
+		_ = ix.Add(ctx, rel, string(b))
+	}
+	return ix
 }
 
 // renderBundle turns a retrieve.Bundle into a compact, human/model-readable

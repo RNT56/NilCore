@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"nilcore/internal/codeintel/ast"
 	"nilcore/internal/codeintel/graph"
 	"nilcore/internal/memory"
 )
@@ -30,11 +31,17 @@ func (ix *Index) Update(ctx context.Context, path string) error {
 	return ix.Graph.BuildFile(ctx, path)
 }
 
-// IndexDir seeds the graph from every Go file under dir (the initial state a fresh
-// run needs before Update keeps it current incrementally). Best-effort: a file that
-// does not parse is skipped, .git is pruned, and the walk is the only full pass —
-// thereafter Update touches one file at a time (P3-T16's "no full re-index").
+// IndexDir seeds the graph from every supported-language source file under dir
+// (the initial state a fresh run needs before Update keeps it current
+// incrementally). Supported extensions come from ast.SupportedExtensions (Go and
+// Python today, D3-T02). Best-effort: a file that does not parse is skipped, .git
+// is pruned, and the walk is the only full pass — thereafter Update touches one
+// file at a time (P3-T16's "no full re-index").
 func (ix *Index) IndexDir(ctx context.Context, dir string) error {
+	supported := map[string]bool{}
+	for _, e := range ast.SupportedExtensions() {
+		supported[strings.ToLower(e)] = true
+	}
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -45,7 +52,7 @@ func (ix *Index) IndexDir(ctx context.Context, dir string) error {
 			}
 			return nil
 		}
-		if strings.HasSuffix(d.Name(), ".go") {
+		if supported[strings.ToLower(filepath.Ext(d.Name()))] {
 			_ = ix.Graph.BuildFile(ctx, path) // best-effort: a non-parsing file is skipped
 		}
 		return nil
