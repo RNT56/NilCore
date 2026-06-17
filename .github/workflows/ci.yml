@@ -71,3 +71,56 @@ jobs:
         env:
           NILCORE_SANDBOX_MUST_RUN: "1"
         run: go test -v -run 'TestNamespace|TestPick|TestNew|TestAvailable' ./internal/sandbox/
+
+  # The real verifier for behavioral browser verification (D1): the headless-browser
+  # run needs a real Chromium, which the hermetic `make verify` job has not — so the
+  # LIVE navigate + screenshot path is exercised HERE (mirroring sandbox-linux above,
+  # which is also environment-dependent and CI-only). It uses the Google Chrome
+  # preinstalled on the runner (falling back to apt chromium), drives the pure-Go
+  # nilcore-browser driver against a fixture page, and asserts the JSON observation
+  # (title + a real screenshot + extracted text) AND the fail-closed behavior when no
+  # browser is present — so a missing browser can never produce a false green.
+  browser-e2e:
+    name: browser behavioral verification (D1 live run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Locate a headless browser
+        run: |
+          BROWSER="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$BROWSER" ]; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends chromium-browser
+            BROWSER="$(command -v chromium-browser || command -v chromium)"
+          fi
+          [ -n "$BROWSER" ] || { echo "no headless browser available on the runner"; exit 1; }
+          echo "NILCORE_CHROMIUM=$BROWSER" >> "$GITHUB_ENV"
+          echo "using: $BROWSER"; "$BROWSER" --version || true
+      - name: Build the nilcore-browser driver
+        run: CGO_ENABLED=0 go build -o /tmp/nilcore-browser ./cmd/tools/nilcore-browser
+      - name: Live run — navigate a fixture, screenshot, assert the JSON observation
+        run: |
+          mkdir -p /tmp/fixture
+          printf '%s\n' '<!doctype html><html><head><title>NilCore E2E Fixture</title></head><body><h1>hello from the fixture</h1><p>behavioral verification works</p></body></html>' > /tmp/fixture/index.html
+          python3 -m http.server 8099 --directory /tmp/fixture >/tmp/httpd.log 2>&1 &
+          SRV=$!
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8099/ >/dev/null 2>&1 && break; sleep 0.3; done
+          set +e
+          /tmp/nilcore-browser --url http://127.0.0.1:8099/ --format json > /tmp/obs.json 2>/tmp/obs.err
+          rc=$?
+          kill "$SRV" 2>/dev/null || true
+          set -e
+          echo "driver exit: $rc"; echo "--- stderr ---"; cat /tmp/obs.err; echo "--- first 400 bytes ---"; head -c 400 /tmp/obs.json; echo
+          [ "$rc" -eq 0 ] || { echo "driver must exit 0 on a reachable page"; cat /tmp/httpd.log; exit 1; }
+          jq -e '(.title | test("NilCore"))'       /tmp/obs.json
+          jq -e '(.screenshot_b64 | length) > 100' /tmp/obs.json
+          jq -e '(.text | length) > 0'             /tmp/obs.json
+      - name: Fails closed when no browser is present (must exit non-zero)
+        run: |
+          if NILCORE_CHROMIUM=/nonexistent/not-a-browser /tmp/nilcore-browser --url http://127.0.0.1:8099/ --format json; then
+            echo "driver exited 0 with no browser — it must fail closed"; exit 1
+          fi
+          echo "fail-closed confirmed"
