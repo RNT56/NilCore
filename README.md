@@ -5,13 +5,13 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~23,500 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~30,800 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. It can now **see the running app** through a sandboxed browser, search code semantically, read Go *and* Python, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~23.5k%20LOC-1f6feb)](#the-receipts)
+[![Agent size](https://img.shields.io/badge/agent-~30.8k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
@@ -34,16 +34,20 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | The pain you've felt | How NilCore solves it |
 |---|---|
 | **"It said it was done. It wasn't."** | The **verifier is the only authority on done.** After *any* backend runs, your project's own build/test/lint re‑runs and that verdict ships the work — a self‑report never does. |
+| **"Tests pass, but does the app actually *work*?"** | NilCore can **see the running app.** A sandboxed headless browser (`browser_view` + a pure‑Go `nilcore-browser` driver baked into the image) navigates your app and hands the model a **screenshot as a multimodal image** — and, opt‑in via `NILCORE_BROWSER_VERIFY`, a composite verifier folds that behavioral check *into* the verdict, so the verifier stays the sole authority on done. *(The live browser run is CI‑only — no Chromium in hermetic unit tests — and the driver fails **closed** without a browser.)* |
 | **"It ran a destructive command / touched my host."** | **Every command the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs), destructive ones denylisted *before* execution. The model can't run an arbitrary program on your machine; its file edits are confined to a throwaway worktree. |
 | **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
-| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. |
+| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **Go *and* Python** (a pure‑Go parser seam, no tree‑sitter), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
 | **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
 | **"I have to babysit it / can't course‑correct mid‑run."** | **Just talk to it.** `nilcore chat` is one conversation — it infers whether your message is a quick fix, a feature, or a whole project and pulls the strings itself. While it works its reasoning **streams live, token by token**, and you can **queue** a follow‑up (folds in at the next step), **steer** — `!…` **interrupts mid‑thought but keeps** what it's reasoned so far, folds your feedback in, and resumes or changes course — or `/cancel` to abort the run outright while staying in the conversation. |
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
+| **"I want it to *react* — not just sit there waiting for me."** | **Event‑driven & scheduled autonomy.** `nilcore serve --webhook` turns an HMAC‑verified SCM/CI webhook into a trigger; `nilcore schedule` self‑starts on a cron/interval. Both route through the *same* reversible‑auto‑start / human‑gate machinery — headless means irreversible work deny‑defaults. |
+| **"Opening the PR is the part I don't trust it with."** | **Gated PR.** `nilcore watch --open-pr` / `schedule --open-pr` open a **draft** PR (via `internal/forge`) **only after the human gate** — the push runs inside the approved prepare step, the token comes from the SecretStore and is scrubbed from logs, and **the agent never merges.** The verified branch is preserved; default disposable cleanup is byte‑identical. |
+| **"I can't give it project‑specific marching orders."** | **Operator steering.** Drop a `NILCORE.md` / `AGENTS.md` and it loads as **trusted** instructions — the one deliberate, scoped exception to "untrusted input is data," bounded *below* the safety core: it can shape behavior but can't widen capability or bypass the gate or verifier. Wired into chat and run/build. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~23,500 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
+| **"The framework is too big to trust."** | The entire agent is **~30,800 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. *Still exactly two:* the new browser driver, Python parser, embedder, and forge are **all pure stdlib** — no module was added. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
 
 ---
 
@@ -93,8 +97,11 @@ Just talk — it infers quick‑fix vs feature vs whole‑project and acts. Watc
 </td>
 <td width="50%" valign="top">
 
-▸ **Code intelligence**
-AST · call graph · PageRank repo‑map · LSP · semantic search · Impact Set + SBFL · live worktree‑aware updates.
+▸ **Code intelligence** (Go + Python)
+AST · call graph · PageRank repo‑map · LSP · pure‑Go **HNSW** semantic search · Impact Set + SBFL · live worktree‑aware updates.
+
+▸ **It can see the running app**
+A sandboxed headless browser (`browser_view`) hands the model a screenshot as a multimodal image; opt‑in, a composite verifier folds the behavioral check into the verdict. *(Live run is CI‑only; fails closed without a browser.)*
 
 ▸ **Multi‑agent supervisor** (`nilcore build`)
 A supervisor spawns role‑specialized subagents (research · understand · plan · implement · review) that **communicate back and forth**, integrates their parallel worktrees into one **verifier‑green** tree, and re‑plans to convergence. Greenfield‑capable; the supervisor codes, too.
@@ -102,8 +109,11 @@ A supervisor spawns role‑specialized subagents (research · understand · plan
 ▸ **Tamper‑evident audit**
 Append‑only, hash‑chained, secret‑redacted event log. Replay any run.
 
-▸ **Runs unattended**
-Provider retry/failover, cost ceilings, durable resume on restart, resource GC, health checks.
+▸ **Runs unattended — and reacts**
+Provider retry/failover, cost ceilings, durable resume on restart, resource GC, health checks. Plus event/scheduled triggers — `serve --webhook` (HMAC‑verified SCM/CI) and `schedule` (cron/interval) — and a gated **draft PR** (`--open-pr`) that opens only after the human gate. The agent never merges.
+
+▸ **Operator steering**
+A `NILCORE.md` / `AGENTS.md` steering file loads as trusted project instructions — scoped *below* the safety core, so it can shape behavior but never widen capability or bypass the gate/verifier.
 
 </td>
 </tr>
@@ -148,11 +158,23 @@ nilcore -dir ./repo -goal "..." -backend claude-code
 #   queue + steer + auto-routing; gates become inline Yes/No replies.
 nilcore serve -channel telegram          # needs a channel + allowlist (from `nilcore init`)
 
+# React to events instead of waiting: turn an HMAC-verified SCM/CI webhook into a
+#   trigger, or self-start on a cron/interval. Both route through the same
+#   reversible-auto-start / human-gate machinery (headless => irreversible work deny-defaults).
+nilcore serve --webhook :8080            # needs NILCORE_WEBHOOK_SECRET (HMAC); NILCORE_WEBHOOK_LABEL optional
+nilcore schedule --every 1h --goal "..." # or a cron expr; add --open-pr to open a GATED draft PR
+
+# Let it see the running app: an opt-in composite verifier folds a sandboxed
+#   headless-browser behavioral check into the verdict (CI-only live run; fails closed).
+NILCORE_BROWSER_VERIFY=1 nilcore -dir ./svc -goal "..."
+
 # Prefer env vars / CI? Skip the wizard and export keys directly:
 #   export ANTHROPIC_API_KEY=sk-...   (or NILCORE_* for scripted: nilcore init -non-interactive)
+#   NILCORE_EMBED_KEY enables pure-Go HNSW semantic search; a NILCORE.md / AGENTS.md
+#   steering file (trusted, scoped below the safety core) gives the agent project marching orders.
 ```
 
-**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore inspect [health]` replays the append-only event log into a summary (events by kind, tasks, chain verified) or probes its health as a liveness gate; `nilcore watch` self-starts tasks from dropped signal files — reversible work auto-runs, anything irreversible routes to the human gate; `nilcore propose-edit -goal … -paths …` is the gated self-edit flow (the agent may change its own prompts/skills/tools, never the core or contracts — scope-checked, verified, human-gated); `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
+**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore inspect [health]` replays the append-only event log into a summary (events by kind, tasks, chain verified) or probes its health as a liveness gate; `nilcore watch` self-starts tasks from dropped signal files — reversible work auto-runs, anything irreversible routes to the human gate (add `--open-pr` to open a **gated draft PR** once approved); `nilcore schedule` self-starts on a cron/interval (same `--open-pr` gate); `nilcore registry list|install <manifest.json>` manages versioned local skills + MCP server specs (remote fetch stays gated as external infra); `nilcore propose-edit -goal … -paths …` is the gated self-edit flow (the agent may change its own prompts/skills/tools, never the core or contracts — scope-checked, verified, human-gated); `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
 
 **Capability plug-ins.** Drop a `SKILL.md` (frontmatter + instructions) under `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) and it surfaces to the loop as a `skill_<name>` tool — unused skills cost ~zero context. Configure MCP servers in `mcp.json` (`{name, command}`) and `nilcore` generates typed wrappers under `mcp/servers/` that the executor discovers on demand and invokes via `nilcore mcp-call`. Point `NILCORE_LSP_COMMAND` at a language server (e.g. `gopls`) for compiler-grade "precise" retrieval, and `NILCORE_LIVE_INDEX=1` for a worktree-aware, incrementally-updated `live` code-intelligence tool. All of these are opt-in; the default binary stays dependency-light and the loop byte-identical when they are absent.
 
@@ -198,17 +220,22 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 ```mermaid
 flowchart TD
-    CLI[cmd/nilcore<br/>init · run · serve · doctor] --> AGENT[agent<br/>orchestrator + adaptive routing]
+    CLI[cmd/nilcore<br/>init · run · serve · schedule · doctor] --> AGENT[agent<br/>orchestrator + adaptive routing]
+    CLI --> STEER[steering<br/>trusted NILCORE.md / AGENTS.md]
+    STEER --> AGENT
     AGENT --> BK[backend<br/>native · codex · claude-code]
     AGENT --> WT[worktree<br/>disposable per task]
-    BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter]
-    BK --> SANDBOX[sandbox<br/>hardened container]
-    BK --> VERIFY[verify<br/>source of truth]
+    BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter · multimodal]
+    BK --> SANDBOX[sandbox<br/>hardened container + nilcore-browser]
+    BK --> VERIFY[verify<br/>source of truth + browser behavioral check]
     AGENT --> POLICY[policy<br/>gate · egress · tool-call]
     AGENT --> LOG[eventlog<br/>hash-chained + store]
-    AGENT --> CI[codeintel<br/>ast to graph to repomap to retrieve]
+    AGENT --> CI[codeintel<br/>ast Go+Python to graph to repomap to HNSW retrieve]
     AGENT --> MEM[memory<br/>cross-project SQLite]
     CLI --> CHAN[channel<br/>telegram · slack]
+    CLI --> TRIG[scmhook · cron<br/>webhook / scheduled triggers]
+    TRIG --> AGENT
+    AGENT --> FORGE[forge<br/>gated draft PR]
 ```
 
 Dependencies point inward; leaf packages never import the orchestrator. The full design and rationale live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md).
@@ -221,12 +248,12 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 | | |
 |--:|:--|
-| **~23,500** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent · conversational front door) |
-| ~45,500 | lines including its tests (108 test files) |
-| **55** | small, single‑responsibility packages |
-| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui` |
+| **~30,800** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent · conversational front door) |
+| ~58,500 | lines including its tests (147 test files) |
+| **64** | small, single‑responsibility packages |
+| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver, Python parser, embedder, and forge are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
-| **Phases 0–7** | shipped — incl. the conversational front door, live token streaming, and the runs‑unattended tier (resilience · durable resume · maint · adaptive routing) |
+| **Phases 0–10** | shipped + the four formerly‑deferred items D1–D4 — incl. behavioral browser verification, semantic (HNSW) + multi‑language (Go + Python) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
 
 </div>
 
@@ -235,12 +262,13 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           chat · tui · init · run · build · serve · doctor · config · secret · version
+cmd/nilcore/           chat · tui · init · run · build · serve · schedule · watch · registry · doctor · config · secret · version
+cmd/tools/nilcore-browser   pure-Go headless-browser driver baked into the sandbox image
 internal/
-  model, provider      canonical message format + Anthropic/OpenAI/OpenRouter
+  model, provider      canonical message format (+ multimodal image block) + Anthropic/OpenAI/OpenRouter
   backend              CodingBackend contract + native / codex / claude-code
   sandbox              hardened container executor
-  verify               the source of truth for "done" (+ auto-detection)
+  verify               the source of truth for "done" (+ auto-detection · opt-in browser behavioral check)
   eventlog             append-only, hash-chained, redacted audit trail
   policy               reversibility gate · egress allowlist · tool-call denylist
   agent                orchestrator · routing · spawn (DAG) · durability · bus (inter-agent)
@@ -248,14 +276,19 @@ internal/
   session, inbox       conversational front door · queue/steer user-message seam
   emit, loopctl        live reasoning sink · steer-vs-shutdown cancel discriminator
   roster, integrate    role-specialized subagents · parallel-worktree merge + verify-each
+  steering             trusted NILCORE.md / AGENTS.md operator instructions (scoped below the safety core)
+  scmhook, cron        HMAC-verified webhook triggers · cron/interval self-start
+  forge                gated draft-PR opener (token from SecretStore; never merges)
   meter                token/dollar metering → the budget ceiling is a hard wall
   worktree             disposable git worktree per task
   channel              Channel contract · telegram · slack · authorized control
-  tools, mcp           structured tools + MCP-as-code
-  codeintel/*          ast · graph · repomap · lsp · semantic · retrieve · impact · live
+  tools, mcp           structured tools (+ browser_view) + MCP-as-code
+  embed                opt-in OpenAI-compatible embedder (NILCORE_EMBED_KEY)
+  codeintel/*          ast (Go + Python) · graph · repomap · lsp · semantic (HNSW) · retrieve · impact · live
   store, memory        SQLite backbone + cross-project memory
   secrets              keychain / encrypted vault / env / external
   skills, selfimprove  Agent Skills + plugins + gated self-edit
+  registry             versioned local skills + MCP server specs (install / list)
   budget, scheduler, maint, inspect   runtime resilience & ops
   onboard, paths       `nilcore init` wizard + versioned config + per-OS dirs
 eval/                  measure-first eval harness

@@ -33,12 +33,12 @@ The proven answer (and the 2026 frontier consensus): **fuse complementary lenses
 ripgrep + exact symbol lookup. The cheapest, most precise lens: known identifiers, error strings, literal scans.
 
 ### L2 — Structural (the backbone)
-- **tree-sitter** parses every language with a grammar into ASTs — broad, fast, incremental, no server required. Extracts symbols (functions, types, methods, modules) and references — the "tag map."
+- A **language-parser seam** turns source into ASTs and extracts symbols (functions, types, methods, modules) and references — the "tag map." Two backends ship today, both **pure-Go and CGO-free** (deliberately *not* tree-sitter, so the default binary stays zero-dep — see invariant I6): a Go backend (`internal/codeintel/ast/go.go`) and a Python backend (`internal/codeintel/ast/python.go`), both producing identical graph output. `ast.SupportedExtensions` drives the index walks (the `live/` and `codeintel/` builders), and the graph's `BuildFile` handles both languages off the same seam — a new language slots in behind it without touching the graph.
 - A **code graph** stored in SQLite: nodes = symbols/files; edges = `calls`, `implements`, `imports`, `references`, `inherits`, `defines`, `type-of`. Queried with **recursive CTEs** for transitive reachability (call paths, dependency closure, blast radius). No graph DB — SQLite is enough and stays zero-dep-aligned.
-- **LSP clients** (gopls, rust-analyzer, typescript-language-server, pyright, …) layer on **precise** types, definitions, references, and diagnostics where a server exists; tree-sitter is the always-on fallback. Aligned with **SCIP** so the graph speaks a standard.
+- **LSP clients** (gopls, rust-analyzer, typescript-language-server, pyright, …) layer on **precise** types, definitions, references, and diagnostics where a server exists; the pure-Go parser seam is the always-on fallback. Aligned with **SCIP** so the graph speaks a standard.
 
 ### L3 — Semantic (concept reach)
-Embeddings over **whole symbols** (function/type + its doc), not arbitrary chunks, via the Provider abstraction's embeddings endpoint; stored in SQLite (`sqlite-vec`). Used as an **entry point**: a semantic hit is **expanded along the graph** (pull callers/callees/types/tests) so retrieval is structure-aware, not pure similarity. Hybrid with L1 for recall.
+Embeddings over **whole symbols** (function/type + its doc), not arbitrary chunks. Vectors are served from a **content-hash-cached, pure-Go HNSW** index (`internal/codeintel/semantic/hnsw.go`) — approximate-nearest-neighbour graph search that replaced the old linear cosine scan, so query cost no longer grows with the symbol count; the content hash means only changed symbols are re-embedded. This lens is **opt-in**: set `NILCORE_EMBED_KEY` to point at an OpenAI-compatible embedder (`internal/embed`, with the model selectable via `NILCORE_EMBED_MODEL`) and the semantic layer activates. With it **off, NilCore falls back to the lexical lens** and the default binary is byte-identical — no new module rides in (the HNSW and the embedder client are stdlib-only; I6 holds, `CGO_ENABLED=0`). Used as an **entry point**: a semantic hit is **expanded along the graph** (pull callers/callees/types/tests) so retrieval is structure-aware, not pure similarity. Hybrid with L1 for recall.
 
 ### L4 — Repo Map (orientation)
 A compact, **PageRank-ranked**, token-budgeted skeleton: the most architecturally central files and symbols with their signatures. The agent reads the map to orient *before* reading any file — the structural skeleton before the details. Importance = centrality in the reference graph, so the map shows the load-bearing parts.
@@ -93,7 +93,7 @@ The agent navigates and edits by **symbol** ("edit `Auth.Validate`"), resolved v
 
 ## Tech stack (all local, zero egress)
 
-tree-sitter (multi-language AST, incremental) · LSP clients (precise facts, optional) · SQLite for the graph (recursive CTEs) and vectors (`sqlite-vec`) · code-aware embeddings via the Provider abstraction · ripgrep (lexical) · file-watching (incremental updates) · SCIP alignment for the semantic layer.
+Pure-Go multi-language parser seam (Go + Python today, CGO-free, not tree-sitter; `ast.SupportedExtensions` drives the walks) · LSP clients (precise facts, optional) · SQLite for the graph (recursive CTEs) · a content-hash-cached pure-Go HNSW vector index for the semantic lens (`internal/codeintel/semantic/hnsw.go`) · code-aware embeddings via an OpenAI-compatible embedder (`internal/embed`, opt-in via `NILCORE_EMBED_KEY` / `NILCORE_EMBED_MODEL`) · ripgrep (lexical, and the fallback when embeddings are off) · file-watching (incremental updates) · SCIP alignment for the semantic layer.
 
 ## Task cluster
 
@@ -101,11 +101,11 @@ Built as sibling sub-packages under `internal/codeintel/` so the tasks paralleli
 
 | Task | Sub-package | What |
 |---|---|---|
-| P3-T09 | `ast/` | tree-sitter parsing + symbol/reference extraction (foundation) |
+| P3-T09 | `ast/` | pure-Go language-parser seam + symbol/reference extraction (foundation); Go + Python backends (`go.go`, `python.go`), `SupportedExtensions` |
 | P3-T10 | `graph/` | code graph in SQLite + structural queries (recursive CTEs) |
 | P3-T11 | `repomap/` | PageRank-ranked, token-budgeted repo map |
 | P3-T12 | `lsp/` | LSP client for precise facts, graceful fallback (SCIP-aligned) |
-| P3-T13 | `semantic/` | symbol embeddings + structure-aware hybrid retrieval |
+| P3-T13 | `semantic/` | symbol embeddings + structure-aware hybrid retrieval; content-hash-cached pure-Go HNSW index (`hnsw.go`), opt-in via `NILCORE_EMBED_KEY` (else lexical) |
 | P3-T14 | `retrieve/` | the fusion pipeline + Context Bundle assembly |
 | P3-T15 | `impact/` | Impact Set (blast radius) + test-impact mapping + SBFL |
 | P3-T16 | `live/` | incremental/worktree-aware updates + memory fusion |

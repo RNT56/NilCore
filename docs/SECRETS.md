@@ -16,6 +16,9 @@ Secrets are held by the **host process** (NilCore), never by the model. The mode
 | `CODEX_API_KEY` | Codex backend (injected per invocation) |
 | `TELEGRAM_BOT_TOKEN` / `SLACK_*` | the chat channel |
 | per-server MCP credentials | MCP code-execution environment |
+| `NILCORE_EMBED_KEY` | semantic code search embedder (opt-in; off ⇒ lexical fallback) |
+| `NILCORE_FORGE_TOKEN` | gated draft-PR open (`watch`/`schedule --open-pr`); the agent never merges |
+| `NILCORE_WEBHOOK_SECRET` | `serve --webhook` HMAC verification of SCM/CI signatures |
 
 ## 3. SecretStore backends
 
@@ -55,6 +58,7 @@ Credentials reach subprocesses through the **environment, at spawn time, for tha
 - Provider calls from the native loop: NilCore sets the auth header itself (Bearer for OpenAI/OpenRouter, `x-api-key` for Anthropic). The key is in host memory and the request, nowhere else.
 - Delegated CLIs: `CODEX_API_KEY` is set inline for the single `codex exec` run; Claude Code uses `claude login` or `ANTHROPIC_API_KEY` injected into its env.
 - Sandbox & MCP: the container and the MCP code-execution environment receive only the env they need for the task; nothing is written to the image, the worktree, or disk.
+- Opt-in capability credentials (`NILCORE_EMBED_KEY`, `NILCORE_FORGE_TOKEN`, `NILCORE_WEBHOOK_SECRET`): resolved through the same SecretStore, held transiently in host memory, and injected per request/run — the embedder key on the embeddings request header, the forge token into the approved prepare step (push only, never a merge), the webhook secret used host-side to verify inbound HMAC signatures. None is written to disk in plaintext, logged, or given to the model (I3). The SecretStore model itself is unchanged.
 
 ## 6. Redaction
 

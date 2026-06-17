@@ -505,3 +505,14 @@ context-usage ring (◔◑◕●, degrading to `context NN%` off a TTY). `meter.
 `meter.Provider.OnUsage` feed `Session.ContextUsage`; near 80% of the window the prior
 conversation is auto-summarized into a compact seed (`session_compact`), and `/clear`
 resets History on demand (keeping the pinned mode and attached roots).
+
+### Project steering file (`NILCORE.md` / `AGENTS.md`)
+
+A repo may carry an authoritative steering file (`NILCORE.md`, falling back to
+`AGENTS.md`) that the operator owns. `internal/steering` loads it and feeds it to the
+agent as **trusted** project instructions — the deliberate, scoped I7 exception. It is
+NOT untrusted tool/file content: the operator authored it, so it is admitted as
+controlling guidance, wired into the same chat front door (and `run`/`build`). But it
+sits **below** the safety core: steering can shape *how* the agent works, never *widen
+capability* — it cannot bypass the verifier (I2), the human gate, the sandbox, or any
+invariant. Absent the file, the default is byte-identical.
