@@ -86,6 +86,18 @@ type Supervisor struct {
 	Verify    func(ctx context.Context) (verify.Report, error)
 	Gate      func(a policy.GateAction) bool
 
+	// SaveState, if set, durably records the integration snapshot each time the tip
+	// advances (every doIntegrate that merges), so a crashed multi-agent run resumes
+	// from the last VERIFIED tip — replaying merged nodes and re-releasing only the
+	// not-yet-merged ones — instead of re-planning a fresh cohort (which would orphan
+	// the prior run's branches and redo merged work). The snapshot is a LEAF type
+	// (Snapshot/SnapNode), so super never imports the orchestrator or the store: the
+	// wiring site translates it to agent.RunState and writes it via
+	// Checkpoint.SaveRunState. nil ⇒ no snapshot is taken, byte-identical to a run
+	// without durable resume. Called SINGLE-OWNER on the main goroutine (inside
+	// doIntegrate), like publishRunContext — never from the reader goroutine.
+	SaveState func(ctx context.Context, snap Snapshot) error
+
 	// ReadTools is the read/search registry the supervisor uses to inspect the
 	// integration tree before it writes code. Read-only by construction (no write
 	// tools); the loop refuses any registry that shadows an orchestration verb.
@@ -318,9 +330,10 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 	defer reader.stop()
 
 	st := &runState{
-		handles:  map[string]*Handle{},
-		findings: nil,
-		goal:     goal,
+		handles:    map[string]*Handle{},
+		findings:   nil,
+		goal:       goal,
+		nodeStates: map[string]string{},
 	}
 	// Publish the initial grounding (goal only) so a very early ask_supervisor — before
 	// any plan/spawn — is still answered with the goal in context.
@@ -552,6 +565,55 @@ type runState struct {
 	goal       string // the run's goal, kept so every publish can rebuild RunContext
 	planDigest string // compact digest of the latest plan tree (set by doPlan)
 	tree       string // bounded file list of the current integrated tree (set by RefreshRead)
+
+	// Durable-resume bookkeeping (C-resume): the per-node integration disposition,
+	// ACCUMULATED across every doIntegrate (the latest `branch` alone cannot tell a
+	// resume which nodes already merged in prior waves), plus the verified tip SHA the
+	// integrator last converged on. Both feed snapshot(); both are unused (and a nil
+	// map) when SaveState is not wired — byte-identical to a run without resume.
+	nodeStates map[string]string // node id -> "pending" | "merged" | "failed"
+	tipSHA     string            // SHA of the latest verified integration tip (from doIntegrate)
+}
+
+// Snapshot is the supervisor's durable run state, expressed in the supervisor's OWN
+// leaf terms so internal/super never imports the orchestrator (internal/agent) or the
+// store. The wiring site translates it to agent.RunState (TipSHA + Nodes) and persists
+// it via Checkpoint.SaveRunState. State strings match agent.NodeState values
+// ("pending" | "merged" | "failed" | "skipped") so the translation is 1:1.
+type Snapshot struct {
+	TipSHA string
+	Nodes  []SnapNode
+}
+
+// SnapNode is one DAG node's durable disposition: its id, the ids it depends on (so
+// resume can re-release a node only once all its deps are merged), and its integration
+// state.
+type SnapNode struct {
+	ID        string
+	DependsOn []string
+	State     string
+}
+
+// snapshot renders the durable run state from runState. It walks every spawned handle
+// (so nodes merged in PRIOR waves are included, not just this wave's), reads each
+// node's accumulated state (default "pending" — spawned but not yet merged), and pairs
+// it with the latest verified tip SHA. Deterministic (sorted by id) so the serialized
+// snapshot is stable and tests are exact. Called single-owner on the main goroutine.
+func (s *Supervisor) snapshot(st *runState) Snapshot {
+	nodes := make([]SnapNode, 0, len(st.handles))
+	for id, h := range st.handles {
+		state := st.nodeStates[id]
+		if state == "" {
+			state = "pending"
+		}
+		nodes = append(nodes, SnapNode{
+			ID:        id,
+			DependsOn: append([]string(nil), h.Spec.DependsOn...),
+			State:     state,
+		})
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return Snapshot{TipSHA: st.tipSHA, Nodes: nodes}
 }
 
 // depthCap returns the effective spawn-depth ceiling (default 1: only the
