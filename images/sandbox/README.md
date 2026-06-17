@@ -9,16 +9,21 @@ allowlist arrives in Phase 2, P2-T02).
 
 - Pinned base `golang:1.23.4-bookworm` → Go toolchain + `git`.
 - `make` (so `make verify` works as the in-container check).
+- A pinned headless **Chromium** (Debian `chromium` package) + the
+  operator-trusted **`nilcore-browser`** driver on `$PATH` — see below.
 - A non-root user `nilcore` (uid 1000) — least privilege.
 
 ## Build & tag
 
+The `nilcore-browser` driver is compiled from `cmd/tools/nilcore-browser` inside
+the image, so the **build context must be the repo root** (not `images/sandbox`):
+
 ```sh
 # Podman (preferred — rootless)
-podman build -t nilcore/sandbox:latest images/sandbox
+podman build -f images/sandbox/Dockerfile -t nilcore/sandbox:latest .
 
 # Docker
-docker build -t nilcore/sandbox:latest images/sandbox
+docker build -f images/sandbox/Dockerfile -t nilcore/sandbox:latest .
 ```
 
 Point the agent at it with `-image nilcore/sandbox:latest` (and `-runtime
@@ -27,8 +32,38 @@ podman|docker`).
 ## Verify
 
 ```sh
-podman run --rm nilcore/sandbox:latest sh -c 'git --version && go version && make --version'
+podman run --rm nilcore/sandbox:latest \
+    sh -c 'git --version && go version && make --version && chromium --version && command -v nilcore-browser'
 ```
+
+## Headless browser (`nilcore-browser`)
+
+The `browser_view` tool (`internal/tools/browser.go`) navigates a URL inside the
+sandbox by shelling out to the driver:
+
+```
+nilcore-browser --url '<url>' --format json
+```
+
+The driver prints a single JSON object — `{title, text, console, screenshot_b64}`
+— to stdout and exits **non-zero** on any failure, so the tool **fails closed**
+(it never fabricates a passing observation). Implementation notes:
+
+- It drives Chromium through its own built-in batch flags
+  (`--headless=new --dump-dom --screenshot=… --virtual-time-budget=…`), **not** a
+  hand-rolled CDP/websocket client — so it stays pure-stdlib with zero new module
+  dependencies (invariant I6) and builds with `CGO_ENABLED=0`.
+- It is build-tagged `browserdriver`, so it never links into the default
+  `go build ./...`; the image compiles it explicitly.
+- The browser binary is configurable via `NILCORE_CHROMIUM` (default `chromium`).
+  A missing binary is a hard, non-zero failure (fail-closed).
+- The rendered DOM and console output are **untrusted** data; `browser_view`
+  `guard.Wrap`s them (invariant I7) before they reach the model.
+
+The driver and browser are **operator-trusted** (baked into the image), never
+model-emitted. The browser run itself is exercised by a CI `browser-e2e` job
+against a fixture static server (mirroring the `sandbox-linux` job); the Go unit
+tests in `cmd/tools/nilcore-browser` are hermetic and cover the pure logic.
 
 ## Writing to `/work` (UID mapping)
 
