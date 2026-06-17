@@ -104,7 +104,7 @@ These tasks use a **distinct `U<tier>-T<NN>` namespace** so they never collide w
 
 ## 4. Tier 1 — Behavioral verification & event-driven autonomy
 
-> **Promoted (2026-06-16).** Tier 1 is now in the canonical work queue as **Phase 9** in `docs/TASKS.md`: `U1-T01..07` → `P9-T01..07` (same order, same specs). Track status there (a `task/<ID>` branch + a CHANGELOG entry = Done). This section remains the authoritative deep rationale + file:line sourcing behind each Phase-9 task. Tiers 2–3 below remain proposals until similarly promoted (each promotion is its own serialized contract task against `docs/TASKS.md`).
+> **SHIPPED (Phase 9, merged to `main`).** Tier 1 shipped as **Phase 9** in `docs/TASKS.md`: `U1-T01..07` → `P9-T01..07` (same order, same specs), all merged to `main` and `make verify`-green. This section remains the authoritative deep rationale + file:line sourcing behind each Phase-9 task. Tier 2 below is likewise **SHIPPED** as Phase 10; Tier 3 remains gated (each Tier-3 item stays its own serialized decision against the `docs/ROADMAP-EXTERNAL-INFRA.md` gate).
 
 **Goal of the tier.** Close the single sharpest gap (NilCore's verifier stops at build/test/lint and can't exercise a *running* app) and the second (work doesn't enter where developers live — issues, CI, schedules) — both by **extending the existing verifier and trigger machinery, not bypassing it**. This tier is the highest-leverage because it makes "the verifier is the sole authority on done" true for rendered/behavioral outcomes too, and it turns the already-built `trigger` + reversibility-gate into an event- and time-driven front door.
 
@@ -212,7 +212,7 @@ These tasks use a **distinct `U<tier>-T<NN>` namespace** so they never collide w
 
 ## 5. Tier 2 — Context depth, trusted steering, distribution
 
-> **Promoted (2026-06-16).** Tier 2 is now in the canonical queue as **Phase 10** in `docs/TASKS.md`: `U2-T01..07` → `P10-T01..07` (same order, same specs). Track status there. This section remains the authoritative deep rationale + file:line sourcing.
+> **SHIPPED (Phase 10, merged to `main`).** Tier 2 shipped as **Phase 10** in `docs/TASKS.md`: `U2-T01..07` → `P10-T01..07` (same order, same specs), all merged to `main` and `make verify`-green. This section remains the authoritative deep rationale + file:line sourcing.
 
 **Goal of the tier.** Three philosophy-consistent upgrades: (a) give the operator an **authoritative steering file** (the `AGENTS.md`/`CLAUDE.md` convention every leader has) as a new *trusted* input class — without weakening `I7`; (b) **activate and scale** the semantic index that is built-but-unwired today, staying CGO-free; (c) turn the existing skills/MCP primitives into a **versioned, verified-install registry** so capability becomes a shareable artifact. None of these touch the frozen contract; all are nil/flag-gated.
 
