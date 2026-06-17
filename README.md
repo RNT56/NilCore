@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⬡ NilCore
+<img src="assets/nilcore_go_header.png" alt="NilCore — the tiny, trustworthy coding agent" width="100%">
 
 ### The tiny, trustworthy coding agent.
 
