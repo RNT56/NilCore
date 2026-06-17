@@ -1,5 +1,7 @@
 # Implementation Plans — the deferred / design-heavy items
 
+> **SHIPPED (merged to `main`).** All four deferred items — **D1, D2, D3, D4** — are now implemented, merged to `main`, and `make verify`-green. The end-to-end task specs below are retained as the historical record / design rationale; each item carries a one-line shipped note under its heading. The one honest caveat that survives: D1's live browser run is **CI-only** (no Chromium in the hermetic unit tests), and the driver fails **closed** when no browser is present.
+
 This document fully plans the Tier-1/Tier-2 items that were **deliberately not rushed** during the Phase 9/10 implementation, because doing each one *right* is a real piece of engineering (a sandbox-image build, a vector-search algorithm, a multi-language parser), not glue. Each is specced end-to-end here — goal, design + UX decision, task breakdown in the `docs/TASKS.md` format, best practices, and an invariant ledger — so the next agent can pick one up cold.
 
 > **Read order placement.** Below the canon (`CLAUDE.md` → `docs/PREREQUISITES.md` → `docs/ARCHITECTURE.md` → `docs/PERSONA.md` → `docs/TASKS.md` → `CHANGELOG.md`) and alongside `docs/UPGRADE-PATH.md`. Everything here presumes the seven invariants and the frozen `backend.CodingBackend` contract; it never restates the law.
@@ -15,6 +17,8 @@ This document fully plans the Tier-1/Tier-2 items that were **deliberately not r
 ---
 
 ## D1 — Behavioral verification: the browser binary + screenshot→model delivery
+
+> **SHIPPED.** The sandbox image carries a headless browser and the pure-Go `nilcore-browser` driver (`cmd/tools/nilcore-browser`); `browser_view` hands the model a screenshot as a `model.ImageBlock`, and the composite verifier (opt-in via `NILCORE_BROWSER_VERIFY`) folds a browser behavioral check into the verdict so the verifier stays the sole authority on "done" (I2). **Caveat:** the live browser run is CI-only (no Chromium in the hermetic unit tests); the driver fails closed without a browser.
 
 **Source:** `internal/tools/browser.go` (the tool, with its `NOT DONE` block), `internal/verify/browser.go` (the verifier-side check), `internal/backend/native.go` (the tool-dispatch), `internal/model/model.go` (`ImageBlock`, shipped P9-T01), `images/sandbox/` (P0-T03), `internal/sandbox/sandbox.go` (container egress).
 
@@ -48,6 +52,8 @@ This document fully plans the Tier-1/Tier-2 items that were **deliberately not r
 ---
 
 ## D2 — Semantic retrieval, activated end-to-end (Embedder wiring + cache + pure-Go HNSW)
+
+> **SHIPPED.** A content-hash-cached, pure-Go HNSW vector index (`internal/codeintel/semantic/hnsw.go`) replaces the old linear cosine scan and is activated opt-in via `NILCORE_EMBED_KEY` (an OpenAI-compatible embedder, `internal/embed`). Off ⇒ lexical fallback, byte-identical. No new module — pure stdlib, `CGO_ENABLED=0` held (I6).
 
 **Source:** `internal/embed` (the Embedder, shipped P10-T03), `internal/codeintel/semantic/semantic.go` (the JSON-in-SQLite store + linear cosine scan + nil-Embedder lexical fallback), `internal/codeintel/retrieve/retrieve.go` (the `Retriever{Graph, Semantic, LSP}` + fusion order + provenance vocab), `internal/tools/codeintel.go:106` (`Retriever{Graph: g}` — `Semantic` nil today), `internal/codeintel/live/live.go` (the live index lifecycle), `go.mod` (CGO_ENABLED=0).
 
@@ -87,6 +93,8 @@ This document fully plans the Tier-1/Tier-2 items that were **deliberately not r
 
 ## D3 — Multi-language code intelligence (CGO-free)
 
+> **SHIPPED.** A language-parser seam plus a pure-Go Python backend (`internal/codeintel/ast/{go.go,python.go}`) — Go output identical, CGO-free, not tree-sitter. The live + codeintel index walks now cover Go and Python (`ast.SupportedExtensions`). No new module; `CGO_ENABLED=0` held (I6).
+
 **Source:** `internal/codeintel/ast/ast.go` (Go-first `go/parser`, with the explicit scope note that "a tree-sitter backend … slots in behind it later without changing callers (kept out now to preserve the zero-cgo build)"), `internal/codeintel/live/live.go:37-53` + `internal/tools/codeintel.go:131-153` (the two `.go`-suffix gates), `internal/codeintel/graph/graph.go:93-137` (`BuildFile` REPLACE-on-rebuild), `go.mod`.
 
 **End-to-end goal.** Code intelligence (symbols → graph → repo-map → retrieval) covers more than Go, so a non-Go repo gets structural context.
@@ -117,6 +125,8 @@ Pick (1) to prove the seam, then evaluate (2) for breadth — this is the explic
 ---
 
 ## D4 — Trigger → gated auto-PR (closing the SCM loop)
+
+> **SHIPPED.** `nilcore watch --open-pr` / `schedule --open-pr` open a draft PR via `internal/forge` only after the human gate (the push runs inside the approved prepare step; token from the SecretStore; the agent never merges; credentials scrubbed from logs). The nil-gated orchestrator `KeepBranch` preserves the verified branch; default disposable cleanup is byte-identical (I2/I3).
 
 **Source:** `internal/forge` (gated draft-PR, shipped P9-T05), `internal/trigger` + `cmd/nilcore/{watch.go,schedule.go,webhook.go}` (the self-start paths), `internal/policy/gateaction.go` (`OpenPR`), `internal/tools/githard.go` (hardened host-side git), `internal/secrets` (the token store).
 
