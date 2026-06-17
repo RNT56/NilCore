@@ -717,12 +717,24 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		// shippable (I2). Re-verify the worktree, commit on green, and return the branch
 		// for the integrator. A red worktree is a Result (State=failed), never an error.
 		rep, verr := env.Verifier.Check(ctx)
-		if verr != nil {
-			return spawn.Result{ID: spec.ID, Summary: res.Summary, State: spawn.StateFailed,
-				Err: fmt.Errorf("spawn: verify: %w", verr)}
-		}
-		if !rep.Passed {
-			return spawn.Result{ID: spec.ID, Summary: res.Summary, Passed: false, State: spawn.StateFailed}
+		if verr != nil || !rep.Passed {
+			// Preserve the unverified attempt so the supervisor can CONTINUE it
+			// (continue_from) — cutting a retry from this branch to build on the partial
+			// work — instead of re-deriving from scratch. The worker commits only on green
+			// (below), so without this its WIP is discarded with the released worktree.
+			// Passed stays FALSE, so the attempt is NEVER integrated or used as a verified
+			// dependency base (I2); the branch is a continuation seed only, reclaimed by
+			// the run-end task/ sweep. A no-change / failed commit yields no branch,
+			// degrading to the prior discard-on-failure behavior.
+			prose := res.Summary
+			br := preserveFailedAttempt(ctx, wt)        // commit the WIP first…
+			report := workReport(ctx, wt, false, prose) // …so the diff-stat reflects it
+			out := spawn.Result{ID: spec.ID, Branch: br, Summary: report,
+				Passed: false, State: spawn.StateFailed}
+			if verr != nil {
+				out.Err = fmt.Errorf("spawn: verify: %w", verr)
+			}
+			return out
 		}
 		gitMu.Lock()
 		sha, _, cerr := wt.Commit(ctx, "feat("+spec.ID+"): "+truncate(spec.Goal, 60))
@@ -754,6 +766,27 @@ const maxReportDiffBytes = 4096
 // The model's self-description is useful intent but must stay bounded — the
 // authoritative "what changed" is the diff-stat, computed host-side.
 const maxReportProseBytes = 2048
+
+// preserveFailedAttempt commits a failed/incomplete worker's work-in-progress to its
+// task/<id> branch so the supervisor can CONTINUE it (the spawn_subagent continue_from
+// option) — cutting a retry from this branch to build on the partial work — rather
+// than re-deriving from scratch. The worker's normal path commits only on green, so
+// its WIP would otherwise be discarded when the worktree is released. It returns the
+// branch carrying the committed attempt, or "" when there was nothing to commit (or
+// the commit failed), which degrades cleanly to the prior discard-on-failure behavior.
+// The caller keeps Passed=false, so this branch is NEVER integrated or used as a
+// verified dependency base (mergeOrder / resolveBaseRef gate on Passed — I2); it is a
+// continuation seed only, reclaimed by the run-end task/ sweep. Shares gitMu with
+// concurrent workers' worktree ops (committing advances the shared task/<id> ref).
+func preserveFailedAttempt(ctx context.Context, wt *worktree.Worktree) string {
+	gitMu.Lock()
+	_, changed, err := wt.Commit(ctx, "wip: unverified attempt (continuable on retry)")
+	gitMu.Unlock()
+	if err != nil || !changed {
+		return ""
+	}
+	return wt.Branch()
+}
 
 // workReport distills a finished subagent's branch into a concise, BOUNDED report
 // of what it actually did: the verifier verdict (the only done-authority, I2), the
