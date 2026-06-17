@@ -56,6 +56,52 @@ The agent auto-falls back to `ddg` if `brave` is chosen but no key resolves, so 
 
 `/add <path>` context roots are honored host-side by the read/search tools on every backend; the container backend additionally bind-mounts them read-only so the execute-mode shell can read them too (the namespace backend's shell cannot — it sees only the worktree).
 
+## Event-driven & scheduled autonomy — running without a keyboard
+
+The unattended posture (Phases 8–10) adds two ways for the agent to *start itself*, both routed through the **existing** reversible-auto-start / human-gate machinery — they introduce no new authority. When there is no human at the console (headless), **irreversible work deny-defaults and does not start** — by design.
+
+### `nilcore serve --webhook <addr>`
+Stands up an SCM/CI webhook intake alongside the `serve` channel loop. A signed forge webhook (GitHub-style HMAC-SHA256 over the raw body) becomes a `trigger.Signal` and routes through the same reversible-auto-start gate as a chat command.
+
+- Needs **`NILCORE_WEBHOOK_SECRET`** — the HMAC secret shared with the forge's webhook config. If it is empty the intake is **disabled (fail-closed)**: `--webhook` was set but no secret resolved, so nothing listens. The signature check is constant-time; an empty secret or a missing/garbled header is rejected.
+- **`NILCORE_WEBHOOK_LABEL`** (optional) narrows which events act — only matching labels become signals.
+- Listens at `http://<addr>/webhook` (e.g. `127.0.0.1:8099`, behind a TLS-terminating reverse proxy). Headless ⇒ the gate denies irreversible work; self-started tasks otherwise run as normal verified tasks.
+
+### `nilcore schedule`
+The time-driven counterpart to `nilcore watch` — on a fixed cadence it emits a goal as a self-started run.
+
+- `-goal` (required) is the work to attempt; `-name` tags the run in the audit log.
+- `-every <duration>` (default `1h`) sets an interval; `-at <spec>` sets a wall-clock schedule (local time): `@hourly`, `@daily`, or `HH:MM` (24h). `-at` overrides `-every`; an invalid `-at` is rejected up front.
+- Same headless posture: reversible scheduled work runs as a normal verified task; irreversible work deny-defaults and does not start.
+
+### `--open-pr` (gated draft PR — D4)
+`nilcore watch --open-pr` and `nilcore schedule --open-pr` offer a **draft** PR after a verified self-start, opened via `internal/forge` **only after the human gate clears** — the push runs inside the approved prepare step. Needs **`NILCORE_FORGE_TOKEN`** (from the SecretStore) and an `origin` remote. The agent **never merges**; forge credentials are scrubbed from logs. When enabled, the orchestrator's nil-gated `KeepBranch` preserves the verified branch instead of the default disposable cleanup — off ⇒ cleanup is byte-identical.
+
+## Versioned skills/MCP registry — `nilcore registry`
+
+A versioned, manifest-driven install layer over local skills (P10-T06), turning a hand-placed capability into a tracked, updatable artifact.
+
+- `nilcore registry list` — list installed skills and their versions.
+- `nilcore registry install <manifest.json>` — install the manifest's skill entries from **local** sources. Skill entries carry version metadata; MCP server specs carry version metadata too, but only `KindSkill` installs today. **Remote fetch stays GATED as EXT-07** (see `docs/ROADMAP-EXTERNAL-INFRA.md`) — the registry resolves local manifests only.
+
+## Operator env vars for the opt-in surfaces
+
+These newer surfaces are **all additive and opt-in** — when their env vars are unset the default binary behaves exactly as before (byte-identical). Every secret-bearing var resolves via the environment / SecretStore, is **never logged**, and is **never placed in a prompt or given to the model** (I3).
+
+| Env var | Enables | Notes |
+|---|---|---|
+| `NILCORE_WEBHOOK_SECRET` | `serve --webhook` HMAC verification | empty ⇒ webhook intake fail-closed (disabled) |
+| `NILCORE_WEBHOOK_LABEL` | label filter for webhook events | optional; only matching events become signals |
+| `NILCORE_FORGE_TOKEN` | `--open-pr` draft-PR push | from SecretStore; scrubbed from logs; agent never merges |
+| `NILCORE_EMBED_KEY` | semantic code search (D2) | OpenAI-compatible embedder (`internal/embed`); off ⇒ lexical fallback, byte-identical |
+| `NILCORE_EMBED_MODEL` | embedder model id | optional override for the embedder |
+| `NILCORE_BROWSER` | the `browser_view` tool / behavioral navigation (D1) | the `nilcore-browser` driver baked into the sandbox image |
+| `NILCORE_BROWSER_VERIFY` | composite browser verifier | folds a browser behavioral check INTO the verdict (I2 holds) |
+| `NILCORE_CHROMIUM` | Chromium-binary override for the driver | defaults to `chromium` on `$PATH`; missing browser ⇒ fail-closed |
+
+### Behavioral verification — operational requirements (D1)
+The `browser_view` tool drives a running app and hands the model a **screenshot** as a multimodal image block; with `NILCORE_BROWSER_VERIFY` set, a composite verifier folds a browser behavioral check **into** the verdict, so the verifier stays the **sole authority** on "done" (I2). Operationally this needs the **container backend plus a Chromium-bearing sandbox image** — the driver runs in the same sandbox box as the build, inheriting I4 confinement. The driver **fails closed without a browser** (a misconfigured verifier is red, never a false green). The **live browser run is CI-only** — hermetic unit tests carry no Chromium — so this path is exercised in CI, not in the local fast suite.
+
 ## A note on context assembly (deliberately *not* a task)
 
 Window construction (system prompt + persona + repo-map + Context Bundle + memory + history, within budget) is **intentionally distributed** — each source contributes through its own seam (`ContextSummary` P3-T06, Context Bundle P3-T14, memory retrieval P4-T04). This is a design choice, not a gap; consolidating it behind a single assembler is a future refactor if the seams prove hard to reason about, not a missing capability.
@@ -63,6 +109,8 @@ Window construction (system prompt + persona + repo-map + Context Bundle + memor
 ## Tech
 
 All store-backed state (budget ledger, task state, spend history) lives in the **Phase-4 SQLite store** — no new datastore. Supervision via **systemd** (restart, SIGTERM); resilience, scheduling, GC, and config are plain stdlib Go. Nothing here adds a runtime dependency.
+
+The later opt-in surfaces hold the line too: webhook intake (`internal/scmhook`), the cron scheduler (`internal/cron`), the draft-PR client (`internal/forge`), the skills registry (`internal/registry`), trusted steering (`internal/steering`), the OpenAI-compatible embedder (`internal/embed`), and the `nilcore-browser` driver (`cmd/tools/nilcore-browser`) are **all pure stdlib** — no module was added. The default binary still links exactly **two** core dependencies (pure-Go SQLite `modernc.org/sqlite` + `golang.org/x/sys`); the Charm TUI stack links only under `make tui`. I6 holds, and `CGO_ENABLED=0` across the release matrix.
 
 ## Task cluster
 
