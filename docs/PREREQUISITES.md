@@ -40,6 +40,9 @@ In production both CLIs run **inside the sandbox container** (defense in depth �
 | `CODEX_API_KEY` | Codex backend | per-invocation injection |
 | `TELEGRAM_BOT_TOKEN` | Telegram channel (Phase 1) | from @BotFather |
 | `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` | Slack channel (Phase 1, alt) | socket-mode app |
+| `NILCORE_EMBED_KEY` | semantic code search (opt-in, Phase 10) | OpenAI-compatible embeddings key; off ⇒ lexical fallback (byte-identical) |
+| `NILCORE_FORGE_TOKEN` | gated draft-PR open (`watch`/`schedule --open-pr`) | the agent never merges; push runs in the approved prepare step |
+| `NILCORE_WEBHOOK_SECRET` | `serve --webhook` (HMAC verification) | shared secret for SCM/CI webhook signatures |
 | Tailscale auth key | tsnet remote access (optional, later) | if exposing over a tailnet |
 
 **Secrets never reach the model.** `nilcore init` (below) stores them in the **SecretStore** — the OS keychain (macOS Keychain / Linux Secret Service) or an encrypted-file vault on a headless host — and they are injected per run into request headers or child-process env, never into a prompt, log, or config file. The full design (backends, headless-VPS master key, redaction) is in **`docs/SECRETS.md`**. A gitignored `.env` is supported only for CI/advanced use.
@@ -114,3 +117,11 @@ A PR cannot merge unless CI is green. Merge to `main` additionally requires the 
 - `tsnet` (optional remote-access path) embeds Tailscale in the binary; no exposed ports, identity over the tailnet.
 - **Install:** one cross-compiled binary (`darwin`/`linux` × `amd64`/`arm64`) — a Homebrew tap on macOS, a curl-pipe-sh installer plus a sample systemd unit on a Linux VPS (task P1-T13).
 - **Secret backend by host:** macOS → Keychain; Linux desktop → Secret Service; headless VPS → encrypted-file vault with a `0600` key-file (or systemd-creds / passphrase). Auto-detected; see `docs/SECRETS.md`.
+
+## 8. Opt-in capability prerequisites (Phase 9–10)
+
+These capabilities are **off by default** — the default binary is byte-identical when they are unset. Each carries its own prerequisite; nothing here adds a Go module dependency (still exactly two in the default binary).
+
+- **Behavioral verification** (`browser_view` tool + composite verifier, opt-in via `NILCORE_BROWSER_VERIFY`) needs the **container backend** and a **Chromium-bearing sandbox image** — the pure-Go `nilcore-browser` driver is baked into the image; point `NILCORE_CHROMIUM` at the browser binary if it is non-standard. The live browser run is **CI-only** (no Chromium in hermetic unit tests), and the driver **fails closed** without a browser, so the verifier stays the sole authority on "done". `browser_view` hands the model a screenshot as a multimodal image block.
+- **Semantic code search** (pure-Go HNSW vector index) is enabled by an **embeddings API key** in `NILCORE_EMBED_KEY` (any OpenAI-compatible embedder; model overridable via `NILCORE_EMBED_MODEL`). Unset ⇒ the lexical fallback runs and behavior is byte-identical.
+- **Event-driven / scheduled autonomy** (`serve --webhook`, `nilcore schedule`) routes through the existing reversible-auto-start / human-gate machinery; headless runs deny-default irreversible work. Webhook signatures are HMAC-verified with `NILCORE_WEBHOOK_SECRET` (optionally scoped by `NILCORE_WEBHOOK_LABEL`); gated draft PRs (`--open-pr`) use `NILCORE_FORGE_TOKEN`.
