@@ -84,6 +84,7 @@ type Server struct {
 	mu      sync.Mutex         // guards threads
 	threads map[string]*thread // threadID → conversation + its surface sink
 	wakerWG sync.WaitGroup     // tracks the background waker goroutine (joined at shutdown)
+	hbWG    sync.WaitGroup     // tracks the background heartbeat goroutine (joined at shutdown)
 }
 
 // thread is one channel conversation: the wired Session and the per-thread surface
@@ -117,6 +118,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.Wake != nil {
 		s.wakerWG.Add(1)
 		go s.runWaker(ctx)
+	}
+
+	// Liveness pulse: a metadata-only heartbeat so a long unattended run can be told
+	// apart "process alive, idle" from "process dead" by a log-tailing monitor. Pure
+	// observability — it never touches a drive. Skipped without a log (nothing to emit
+	// to); joined at shutdown.
+	if s.Log != nil {
+		s.hbWG.Add(1)
+		go s.runHeartbeat(ctx, serveHeartbeatInterval)
 	}
 
 	for {
@@ -331,6 +341,7 @@ func (s *Server) threadFor(ctx context.Context, threadID, sender string) (th *th
 // return at once. No goroutine outlives Serve.
 func (s *Server) drainShutdown() {
 	s.wakerWG.Wait() // the waker exits on the cancelled ctx; join it before tearing threads down
+	s.hbWG.Wait()    // the heartbeat likewise exits on the cancelled ctx; join it too
 	s.mu.Lock()
 	live := make([]*thread, 0, len(s.threads))
 	for _, th := range s.threads {
@@ -341,6 +352,54 @@ func (s *Server) drainShutdown() {
 		th.sess.Wait()
 		th.emit.wait()
 	}
+}
+
+// serveHeartbeatInterval is the cadence of the serve liveness pulse. One metadata-only
+// event per minute is negligible against the 64 MiB log-rotation threshold, and a
+// minute is fine resolution for "is the unattended process still alive" — an operator
+// or external monitor greps `serve_heartbeat` and watches it advance.
+const serveHeartbeatInterval = time.Minute
+
+// runHeartbeat emits a `serve_heartbeat` event every `every` until ctx is cancelled,
+// recording uptime and how many threads exist / have a drive in flight. It is liveness
+// and observability ONLY: it proves the process + its scheduler are alive and gives a
+// coarse progress pulse — it never touches a drive and changes no behavior. (It does
+// not detect a wedged drive goroutine — for that the per-call timeout + bounded loop
+// are the guards; this distinguishes process-dead from process-alive.) Background
+// goroutine; joined by drainShutdown so it never outlives Serve. `every` is a parameter
+// so tests can drive it sub-second; production passes serveHeartbeatInterval.
+func (s *Server) runHeartbeat(ctx context.Context, every time.Duration) {
+	defer s.hbWG.Done()
+	start := time.Now()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			threads, working := s.liveCounts()
+			s.Log.Append(eventlog.Event{Kind: "serve_heartbeat", Detail: map[string]any{
+				"uptime_seconds": int(time.Since(start).Seconds()),
+				"threads":        threads,
+				"working":        working,
+			}})
+		}
+	}
+}
+
+// liveCounts snapshots, under the threads lock, how many threads exist and how many
+// have a drive in flight (Phase != Idle). A point-in-time read; never blocks a drive.
+func (s *Server) liveCounts() (threads, working int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	threads = len(s.threads)
+	for _, th := range s.threads {
+		if th.sess.PhaseNow() != session.Idle {
+			working++
+		}
+	}
+	return threads, working
 }
 
 // wakePollInterval is how often the waker checks the durable registry for a due
