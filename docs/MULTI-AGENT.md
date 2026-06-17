@@ -1,12 +1,17 @@
 # NilCore Multi-Agent Supervisor — Design & Implementation Plan
 
-> **Status: design / plan (not yet implemented).** Produced by a grounded multi-agent
-> design pass (5 domain architects → adversary review → synthesis), validated against
-> the current codebase and the seven invariants in `CLAUDE.md`. Nothing here changes the
-> frozen `backend.CodingBackend` contract — the supervisor and subagents are built
-> *around* it. This document is implement-from-able: every component names the package,
-> types, and acceptance criteria. The phased task DAG (§12) is sized for NilCore's own
-> one-task-one-branch parallel-agent protocol.
+> **Status: SHIPPED (Phase 8 — full multi-agent concurrency).** The agentic supervisor is
+> implemented, wired, and verify-green — `internal/{meter,roster,super,integrate,project}`
+> and `internal/agent/bus` all exist with tests, exposed via `nilcore build`. A later
+> workstream added durable **crash-resume**: a supervised/project `serve` drive interrupted
+> by SIGTERM (or `-max-lifetime`, or a crash) resumes from its last VERIFIED integration tip
+> — pinned by a durable `resume/<taskID>` git branch and **re-verified** on restart (I2
+> never trusts a stored SHA blind) — instead of re-planning a fresh cohort. Nothing here
+> changed the frozen `backend.CodingBackend` contract (I1): the supervisor and subagents are
+> built *around* it. The sections that follow are the original grounded design pass (5 domain
+> architects → adversary review → synthesis), validated against the codebase and the seven
+> invariants in `CLAUDE.md`; they remain the accurate account of the shipped system. See
+> `CHANGELOG.md` for the per-task account.
 
 ## 0. Overview
 
