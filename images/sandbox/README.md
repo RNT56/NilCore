@@ -53,8 +53,9 @@ The driver prints a single JSON object — `{title, text, console, screenshot_b6
   (`--headless=new --dump-dom --screenshot=… --virtual-time-budget=…`), **not** a
   hand-rolled CDP/websocket client — so it stays pure-stdlib with zero new module
   dependencies (invariant I6) and builds with `CGO_ENABLED=0`.
-- It is build-tagged `browserdriver`, so it never links into the default
-  `go build ./...`; the image compiles it explicitly.
+- It is a standalone tool (`cmd/tools/nilcore-browser`); it is not linked into the
+  default `nilcore` binary, but it builds under the normal toolchain and its
+  pure-logic unit tests run in `make verify`. The image compiles it explicitly.
 - The browser binary is configurable via `NILCORE_CHROMIUM` (default `chromium`).
   A missing binary is a hard, non-zero failure (fail-closed).
 - The rendered DOM and console output are **untrusted** data; `browser_view`

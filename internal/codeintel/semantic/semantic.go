@@ -133,15 +133,21 @@ func (ix *Index) Add(ctx context.Context, id, text string) error {
 			vec = string(encoded)
 		}
 	}
+	// Hold mu across BOTH the row write and the dirty-set so they are atomic with
+	// respect to a concurrent Search (which takes mu before consulting the graph):
+	// a Search either runs entirely before this block — consistent with the old doc
+	// set — or sees dirty==true after it and rebuilds with the new row. Without the
+	// shared lock a Search could observe the committed row while dirty was still
+	// false and omit it. (The only shipped caller indexes single-threaded, but this
+	// keeps Index correct for any concurrent Add+Search.)
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
 	if _, err := ix.db.ExecContext(ctx,
 		`INSERT OR REPLACE INTO docs (id, text, vec, hash) VALUES (?, ?, ?, ?)`,
 		id, text, vec, hash); err != nil {
 		return fmt.Errorf("add %q: %w", id, err)
 	}
-	// The doc set changed; the vector graph (if any) is now stale.
-	ix.mu.Lock()
-	ix.dirty = true
-	ix.mu.Unlock()
+	ix.dirty = true // the doc set changed; the vector graph (if any) is now stale
 	return nil
 }
 
@@ -165,10 +171,13 @@ func (ix *Index) cachedVector(ctx context.Context, id, newHash string) (string, 
 	return "", false, nil
 }
 
-// Search returns the top-k most relevant documents for query, score descending,
-// with a deterministic tie-break by id. With an Embedder it ranks by cosine
-// similarity of the query embedding against stored vectors; without one it ranks
-// by case-insensitive term overlap of the query against each document's text.
+// Search returns the top-k most relevant documents for query, score descending;
+// the returned hits are ordered deterministically (score, then id). With an
+// Embedder it ranks by cosine similarity via the HNSW graph — an APPROXIMATE
+// index, so under many exactly-equidistant vectors the returned k may be any
+// stable subset of the tied group, not necessarily the id-smallest; widen
+// efSearch if exact tie selection ever matters. Without an Embedder it ranks by
+// case-insensitive term overlap of the query against each document's text (exact).
 func (ix *Index) Search(ctx context.Context, query string, k int) ([]Hit, error) {
 	if k <= 0 {
 		return nil, nil

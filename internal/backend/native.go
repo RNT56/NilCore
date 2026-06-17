@@ -576,6 +576,12 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		// The API requires a tool_result for every tool_use block, so we build
 		// one per block — including "finish" — before deciding what to do next.
 		var results []model.Block
+		// pendingImages holds tool-produced images (e.g. a browser screenshot, D1-T02).
+		// They are appended to the user turn AFTER every tool_result, because the
+		// Anthropic API requires all tool_result blocks to lead the user turn — an
+		// image interleaved between two tool_results (when a turn calls several tools)
+		// is rejected. Collected here, flushed once below.
+		var pendingImages []model.Block
 		finished := false
 		var summary string
 
@@ -744,7 +750,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					// carry arbitrary model-supplied bodies) and never the tool's output
 					// (fenced to the model as data, adv #8). Gated on a nil Emitter.
 					n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: "running tool: " + b.Name})
-					out, err := n.Tools.Dispatch(ctx, b.Name, t.Dir, b.Input)
+					out, img, err := n.Tools.DispatchRich(ctx, b.Name, t.Dir, b.Input)
 					if err != nil {
 						results = append(results, errorResult(b.ID, b.Name+": "+err.Error()))
 						continue
@@ -752,6 +758,15 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "tool_exec",
 						Detail: map[string]any{"tool": b.Name}})
 					results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: guard.Wrap(b.Name+" output", out)})
+					// A tool may also capture an image (e.g. a browser screenshot, D1-T02).
+					// It rides back in the same user turn so a vision-capable model can
+					// reason over what actually rendered, but is deferred to pendingImages
+					// so it lands AFTER every tool_result (Anthropic ordering). It is data
+					// the model reads (I7) — the verifier, not the image, decides "done".
+					// Non-image tools return img == nil ⇒ byte-identical.
+					if img != nil {
+						pendingImages = append(pendingImages, model.ImageBlock(img.MediaType, img.Base64))
+					}
 					// Incremental re-index (P3-T16): a successful write/edit updates just
 					// that file in the live graph, so the next `live` query reflects the
 					// edit. nil-safe and best-effort — the index is an accelerator, never
@@ -818,6 +833,8 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			}}})
 			continue
 		}
+		// Flush any tool-produced images AFTER all tool_results (D1-T02 ordering).
+		results = append(results, pendingImages...)
 		msgs = append(msgs, model.Message{Role: "user", Content: results})
 	}
 

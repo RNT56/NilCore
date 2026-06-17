@@ -152,10 +152,13 @@ func pythonScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
 			})
 			stack = append(stack, pyBlock{idx: len(syms) - 1, headIndent: indent})
 			// A def header can itself contain default-value calls, e.g.
-			// `def f(x=g()):`. Scan the part after the parameter list opener so we
-			// don't miss them, but skip the header's own name.
+			// `def f(x=g()):`. Scan ONLY the part after the parameter-list opener so
+			// the function's own name is never recorded as a self-call, while
+			// default-value calls are still captured.
 			if wantRefs {
-				refs = append(refs, scanPyCalls(code, path, lineNo)...)
+				if op := strings.IndexByte(code, '('); op >= 0 {
+					refs = append(refs, scanPyCalls(code[op+1:], path, lineNo)...)
+				}
 			}
 			continue
 		}

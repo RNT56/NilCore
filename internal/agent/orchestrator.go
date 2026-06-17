@@ -89,6 +89,14 @@ type Orchestrator struct {
 
 	// Checkpoint, if set, persists task state for crash/restart durability (P6-T03).
 	Checkpoint *Checkpoint
+
+	// KeepBranch, when true, PRESERVES the verified worktree branch instead of the
+	// default disposable cleanup: on a verified single-task success the working tree
+	// is committed and the branch is Released (kept), and its name is reported in
+	// Outcome.Branch — which is what lets an opt-in trigger→PR flow (D4) push the
+	// verified work. false (the default) ⇒ byte-identical: the worktree and its
+	// branch are cleaned up exactly as before, so no run leaves a branch behind.
+	KeepBranch bool
 }
 
 // Gate decides whether an action may proceed right now and records the decision.
@@ -111,6 +119,7 @@ type Outcome struct {
 	Summary  string
 	Verified bool   // did the project's checks pass after the backend ran?
 	Detail   string // verifier output (tail) when it did not pass
+	Branch   string // verified branch name, set only when KeepBranch preserved it (D4); else ""
 }
 
 // Execute runs one task. When the supervision seam is wired and ShouldSupervise
@@ -171,7 +180,19 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	if err != nil {
 		return Outcome{}, fmt.Errorf("create worktree: %w", err)
 	}
+	// keepBranch is flipped on only for a verified success under KeepBranch (D4):
+	// then the worktree is Released (its branch kept for a PR push) rather than
+	// Cleanup'd. Every other exit — error, suspend, verify-fail, or the default
+	// disposable mode — deletes the worktree and its branch, byte-identical to before.
+	keepBranch := false
 	defer func() {
+		if keepBranch {
+			if rerr := wt.Release(); rerr != nil {
+				o.Log.Append(eventlog.Event{Task: t.ID, Kind: "worktree_release",
+					Detail: map[string]any{"error": rerr.Error()}})
+			}
+			return
+		}
 		if cerr := wt.Cleanup(); cerr != nil {
 			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "worktree_cleanup",
 				Detail: map[string]any{"error": cerr.Error()}})
@@ -227,6 +248,22 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		Summary:  res.Summary,
 		Verified: rep.Passed,
 		Detail:   rep.Output,
+	}
+	// D4: preserve the verified branch for an opt-in trigger→PR push. Commit any
+	// uncommitted verified working-tree state (best-effort — the loop may have
+	// committed already), keep the branch, and report its name. Gated on KeepBranch
+	// so the default path is byte-identical (no commit, branch cleaned up).
+	if o.KeepBranch && rep.Passed {
+		// Commit any uncommitted verified state (the loop may already have committed,
+		// in which case this is a clean no-op). A genuine commit FAILURE is logged so
+		// a later empty/dangling PR is auditable; we still preserve the branch — the
+		// loop's own commits may carry the work, and the PR flow re-checks the diff.
+		if _, _, cerr := wt.Commit(ctx, "nilcore: "+t.Goal); cerr != nil {
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "keep_branch_commit",
+				Detail: map[string]any{"error": cerr.Error()}})
+		}
+		keepBranch = true
+		out.Branch = wt.Branch()
 	}
 	if o.Checkpoint != nil {
 		_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, out.Verified) // durable: terminal status

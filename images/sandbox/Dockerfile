@@ -23,16 +23,17 @@
 #   podman run --rm nilcore/sandbox:latest sh -c 'git --version && go version && make --version && chromium --version && command -v nilcore-browser'
 
 # ── Stage 1: build the nilcore-browser driver ──────────────────────────────────
-# The driver is behind the `browserdriver` build tag so it never links into the
-# default `go build ./...`; we compile it explicitly here. CGO is disabled so the
-# binary is static and matches the project-wide CGO_ENABLED=0 release posture (I6).
+# The driver is a standalone tool in cmd/tools/nilcore-browser; it is pure stdlib
+# and is NOT linked into the default nilcore binary, but it builds under the normal
+# toolchain (no build tag). CGO is disabled so the binary is static and matches the
+# project-wide CGO_ENABLED=0 release posture (I6).
 FROM golang:1.23.4-bookworm AS driver-build
 WORKDIR /src
-# Copy the module manifests first for layer caching, then the source the driver
-# needs. cmd/tools/nilcore-browser is pure stdlib, so the full tree is not
-# required, but copying it keeps the build robust to incidental imports.
+# Copy the source the driver needs. cmd/tools/nilcore-browser is pure stdlib, so the
+# full tree is not required, but copying it keeps the build robust to incidental
+# imports.
 COPY . .
-RUN CGO_ENABLED=0 go build -tags browserdriver \
+RUN CGO_ENABLED=0 go build \
         -o /out/nilcore-browser ./cmd/tools/nilcore-browser
 
 # ── Stage 2: the runtime sandbox image ─────────────────────────────────────────

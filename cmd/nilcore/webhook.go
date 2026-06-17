@@ -39,7 +39,7 @@ func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boo
 		Start: func(ctx context.Context, goal string) error {
 			mu.Lock()
 			defer mu.Unlock()
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("hook-%d", time.Now().Unix()), Goal: goal})
+			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("hook-%d", time.Now().UnixNano()), Goal: goal})
 			if err != nil {
 				return err
 			}

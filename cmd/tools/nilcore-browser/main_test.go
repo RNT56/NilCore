@@ -3,9 +3,6 @@
 // scraping, and the JSON encoder — plus the fail-closed behavior when Chromium is
 // absent. The real browser run is exercised only by the CI browser-e2e job
 // (mirroring the sandbox-linux pattern), since no Chromium is available here.
-//
-//go:build browserdriver
-
 package main
 
 import (
