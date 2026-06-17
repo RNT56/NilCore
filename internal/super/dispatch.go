@@ -528,9 +528,43 @@ func (s *Supervisor) doIntegrate(ctx context.Context, round int, st *runState, b
 		// the supervisor's reads and the grounded answer reflect the merged tree.
 		s.refreshAndPublish(ctx, st)
 	}
+	s.recordIntegration(ctx, st, results)
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_integrate",
 		Detail: map[string]any{"items": len(order), "branch": branch}})
 	return ok(b.ID, s.renderIntegration(branch, results))
+}
+
+// recordIntegration folds one doIntegrate's per-node outcomes into the durable
+// bookkeeping and, if SaveState is wired, persists a fresh snapshot. A node that
+// merged AND re-verified green is "merged" (replayed-not-redone on resume); any other
+// outcome (conflict, red, rollback) is "failed" (re-released on resume once its deps
+// are merged). The tip SHA is the LAST result's SHA — MergeResult.SHA is the merge
+// commit when merged+verified and the unchanged prior tip (PreSHA) after a rollback,
+// so the final element is always the current verified tip, with no git call. The save
+// is best-effort: a durability-write failure is logged but never fails a healthy run
+// (resume degrades to a fresh run, the pre-resume behavior). nil SaveState ⇒ no-op.
+func (s *Supervisor) recordIntegration(ctx context.Context, st *runState, results []integrate.MergeResult) {
+	if len(results) == 0 {
+		return
+	}
+	if st.nodeStates == nil {
+		st.nodeStates = map[string]string{}
+	}
+	for _, r := range results {
+		if r.Merged && r.Verified {
+			st.nodeStates[r.ID] = "merged"
+		} else {
+			st.nodeStates[r.ID] = "failed"
+		}
+	}
+	st.tipSHA = results[len(results)-1].SHA
+	if s.SaveState == nil {
+		return
+	}
+	if err := s.SaveState(ctx, s.snapshot(st)); err != nil {
+		s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_savestate_error",
+			Detail: map[string]any{"error": err.Error()}})
+	}
 }
 
 // doCode lets the supervisor write code itself: one bounded CodeFunc pass over the
