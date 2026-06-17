@@ -87,7 +87,9 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
 
-> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** is the multi-agent concurrency workstream, tracked in its own design doc. **Phase 9** is the behavioral-verification & event-driven-autonomy tier, promoted from `docs/UPGRADE-PATH.md` Tier 1. **Phase 10** (context depth, trusted steering & distribution) is promoted from Tier 2. The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
+> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** (full multi-agent concurrency) is **shipped** — dynamic-wave async dispatch, tracked in its own design doc (`docs/CONCURRENCY.md`). **Phase 9** (behavioral verification & event-driven autonomy, promoted from `docs/UPGRADE-PATH.md` Tier 1) is **shipped**. **Phase 10** (context depth, trusted steering & distribution, promoted from Tier 2) is **shipped**. The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
+
+> **Deferred items D1–D4 shipped:** the four formerly-deferred items in `docs/IMPLEMENTATION-PLANS.md` are now implemented + merged — **D1** behavioral verification (sandboxed headless browser, the `browser_view` tool + the pure-Go `nilcore-browser` driver, composite verifier opt-in via `NILCORE_BROWSER_VERIFY`), **D2** semantic code search (content-hash-cached pure-Go HNSW, opt-in via `NILCORE_EMBED_KEY`), **D3** multi-language code intelligence (a language-parser seam + a pure-Go, CGO-free Python backend — not tree-sitter), and **D4** the gated draft PR (`watch --open-pr` / `schedule --open-pr` via `internal/forge`, only after the human gate). All four are additive, opt-in, and pure stdlib — no new module was added (HNSW, the Python parser, the embedder, the browser driver, and forge are all stdlib), so the core dependency count in the default binary stays at exactly **two** (pure-Go SQLite + `golang.org/x/sys`); the Charm TUI stack (3 modules) still links **only** under `make tui`. I6 holds; `CGO_ENABLED=0` across the release matrix. Invariants I1–I7 all hold unchanged.
 
 ---
 
@@ -591,6 +593,8 @@ model is **dynamic-wave async dispatch**; `-concurrency 1` is byte-identical.
 
 Close the two sharpest competitive gaps without breaking an invariant: make the verifier able to exercise a *running* app (a browser/behavioral check feeds the verdict — `verify` stays the sole authority on "done", I2), and let work enter where developers live (SCM/CI events, schedules) through the existing `trigger` + reversibility gate. Promoted from `docs/UPGRADE-PATH.md` Tier 1 (`U1-T01..07` → `P9-T01..07`, same order); that file holds the deep rationale and the file:line sourcing for every task. Every task is additive and nil/flag-gated — the default binary is byte-identical when the feature is off. (Phase 8 is the multi-agent concurrency workstream, tracked separately.)
 
+> **Status (shipped):** Phase 9 is complete and merged. The multimodal image block (P9-T01), the sandboxed `browser_view` tool + the pure-Go `nilcore-browser` driver (P9-T02), the composite browser-folding verifier (P9-T03), the HMAC-verified SCM/CI webhook intake (P9-T04), the gated draft-PR forge action (P9-T05), and the cron/interval trigger source (P9-T06) are all wired into the binary via `nilcore serve --webhook` and `nilcore schedule` (P9-T07). New packages: `internal/{scmhook, cron, forge}`, `cmd/tools/nilcore-browser`. Every path is additive + opt-in (`NILCORE_BROWSER`, `NILCORE_BROWSER_VERIFY`, `NILCORE_CHROMIUM`, `NILCORE_FORGE_TOKEN`, `NILCORE_WEBHOOK_SECRET`, `NILCORE_WEBHOOK_LABEL` — all via env/`SecretStore`, never logged, never given to the model, I3); the default binary is byte-identical with these features off. I1–I7 hold unchanged.
+
 ### P9-T01 — Multimodal content blocks (model + providers)  · contract, runs solo
 - **Goal:** give the canonical message format an **additive** image content block so the agent can reason over a screenshot — the precondition for behavioral verification — without changing `backend.CodingBackend` or `Provider.Complete`.
 - **Depends on:** —  **Owns:** `internal/model/`, `internal/provider/`, `docs/ARCHITECTURE.md`
@@ -601,6 +605,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - `docs/ARCHITECTURE.md` message-format / I1 text updated in the **same** PR.
 - **Verify:** `make verify`; per-adapter round-trip tests (an image block → the Anthropic and OpenAI wire shapes); a test asserting a text-only `[]Block` is byte-identical to before.
 - **Notes:** touches the vendor-neutral format every adapter implements ⇒ **serialized contract task, runs solo** (no parallel task may read `internal/model` as a stable interface meanwhile); stdlib only (I6). Deep rationale + sourcing: `docs/UPGRADE-PATH.md` §4 (U1-T01).
+- **Status (shipped):** `model.Block` gained an additive `image` shape carrying a nested `Source{Type, MediaType, Data}`; the Anthropic and OpenAI adapters both carry it (images ride inside the existing `[]Block`). `Provider.Complete` and the `backend.CodingBackend` contract are **unchanged** (I1) — a text/tool_use/tool_result block still marshals byte-identically.
 
 ### P9-T02 — Sandboxed headless-browser tool
 - **Goal:** an agent-facing tool that drives a headless browser **inside the sandbox** to navigate a running app and return a screenshot (a P9-T01 image block) + fenced DOM/console, so the loop can see what it built.
@@ -611,6 +616,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Container-only and egress-gated (usable only on `*sandbox.Container` with the target host allowlisted); fails closed on the namespace backend (empty `CLONE_NEWNET`).
 - **Verify:** `make verify`; a unit test driving a local static-file server started in the sandbox (navigate → screenshot + DOM); a test that `Box==nil` and the namespace backend both refuse.
 - **Notes:** needs the browser binary in `images/sandbox/` (still fully self-hosted, not external infra). Distinct from the verifier-side check (P9-T03). I4/I7. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T02).
+- **Status (shipped):** the `browser_view` tool drives a pure-Go `nilcore-browser` driver (`cmd/tools/nilcore-browser`, no new module) baked into the sandbox image via `Box.Exec`, navigates a running app, and hands the model a screenshot as a P9-T01 multimodal image block plus `guard.Wrap`'d DOM/console (I7); it refuses host-side and on the namespace backend (fails closed without a browser). Selected via `NILCORE_BROWSER` / `NILCORE_CHROMIUM`. **Honest caveat:** the live browser run is **CI-only** — there is no Chromium in the hermetic unit tests, and the driver fails **closed** without a browser.
 
 ### P9-T03 — Behavioral verifier (composite + browser check)
 - **Goal:** make a behavioral browser check a first-class input to the verifier's verdict, so a feature that builds+tests green but renders broken ships **red** — keeping `verify` the sole authority (I2).
@@ -621,6 +627,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Opt-in: default is the unchanged `CommandVerifier`; `verify.Pass` stays used **only** for read-only Discuss/Plan drives and never substitutes on an Execute drive.
 - **Verify:** `make verify`; table test — command-pass+browser-fail ⇒ red; both pass ⇒ green; behavioral-off ⇒ byte-identical to `CommandVerifier`.
 - **Notes:** I2 inviolable — the browser result is evidence the verifier consumes; there is no screenshot-bypasses-verify path. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T03).
+- **Status (shipped):** the composite verifier folds a browser behavioral check **into** the verdict (opt-in via `NILCORE_BROWSER_VERIFY`), so a feature that builds+tests green but renders broken ships **red** — the verifier stays the **sole** authority on "done" (I2). Off ⇒ byte-identical to `CommandVerifier`. Live browser checks are CI-only (same caveat as P9-T02).
 
 ### P9-T04 — SCM/CI webhook intake → `trigger.Signal`
 - **Goal:** let a labeled issue or a failing CI run become a `trigger.Signal` routed through the **existing** reversible-auto-start / irreversible-gate machinery.
@@ -631,6 +638,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Stdlib only — no `go-github`/`go-gitlab` (I6); binds loopback by default (operator terminates TLS at a reverse proxy).
 - **Verify:** `make verify`; tests — a signed `issues.labeled` / `workflow_run.failure` payload yields the expected Signal; a bad signature is 401 + logged + no Signal.
 - **Notes:** adds a **new Signal source**, not a new mechanism — `trigger.Handle` already classifies reversible vs irreversible and logs `trigger_gated`/`trigger_start`. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T04).
+- **Status (shipped):** `internal/scmhook` (pure stdlib `net/http`, no new module) verifies the webhook HMAC against a `SecretStore` secret (`NILCORE_WEBHOOK_SECRET` / `NILCORE_WEBHOOK_LABEL`, I3), maps SCM/CI events to a `trigger.Signal`, and routes through the **existing** reversible-auto-start / human-gate machinery; surfaced text is `guard.Wrap`'d (I7) and unsigned requests are rejected + logged metadata-only (I5). Wired via `nilcore serve --webhook <addr>`; headless ⇒ irreversible work deny-defaults.
 
 ### P9-T05 — Gated PR/push action (`GateAction` + forge)
 - **Goal:** let a converged, verified change become a **draft PR** — only through the human gate, never autonomously.
@@ -641,6 +649,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Prefer the structured action over free-text `policy.Classify`; add the SCM API host to egress where the host harness needs it.
 - **Verify:** `make verify`; tests — approve ⇒ forge invoked with the expected push/PR shape (mocked transport); deny ⇒ no call; nil approver ⇒ deny; the token never appears in logs.
 - **Notes:** push/merge are already `Irreversible` in `policy.Classify`; this is **harness code performing a gated irreversible action** (like the integrator's gated promotion, which itself never lands). The git **tool** stays `status|diff|add|commit|log` only. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T05).
+- **Status (shipped):** this is the deferred **D4** item, merged. `internal/forge` opens a **draft** PR **only after** the human gate (the push runs inside the approved prepare step; token from `SecretStore` via `NILCORE_FORGE_TOKEN`, I3 — never logged, never given to the model, credentials scrubbed from logs); the agent **never** merges. Reached via `nilcore watch --open-pr` / `schedule --open-pr`; an opt-in nil-gated orchestrator `KeepBranch` preserves the verified branch, and the default disposable cleanup is byte-identical.
 
 ### P9-T06 — Cron / scheduled trigger source
 - **Goal:** time-driven autonomy — a maintenance goal that fires on a schedule — built on the existing trigger + gate, pure stdlib.
@@ -650,6 +659,7 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Reversible scheduled work auto-starts; irreversible scheduled work **deny-defaults and blocks** under an unattended approver (the documented headless posture); a fire logs a metadata-only event (I5); pure stdlib (I6).
 - **Verify:** `make verify`; tests with an injected clock — a due spec fires the Goal; reversible auto-starts; irreversible under a nil/deny approver does not start and is logged.
 - **Notes:** distinct from `internal/scheduler` (a time-agnostic bounded-concurrency pool) and `internal/loopctl` (a cancel-cause discriminator, not a scheduler). Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T06).
+- **Status (shipped):** `internal/cron` (pure stdlib `time`, no new module) emits a `trigger.Signal` on cron/interval schedules and routes through the **existing** trigger + gate; reversible scheduled work auto-starts, irreversible work deny-defaults and blocks under the unattended approver, and each fire logs a metadata-only event (I5). Wired via `nilcore schedule` (cron/interval self-start).
 
 ### P9-T07 — Tier-1 CLI wiring
 - **Goal:** wire the Phase-9 feature packages into the binary — the single `cmd/nilcore` integration step.
@@ -661,12 +671,15 @@ Close the two sharpest competitive gaps without breaking an invariant: make the 
   - Every new path nil/flag-gated; the default binary is byte-identical with Phase-9 features off.
 - **Verify:** `make verify`; CLI smoke tests (fake channel + fake orchestrator) — webhook intake dispatches; `schedule` self-starts a reversible task; browser-verify off ⇒ identical verdict path.
 - **Notes:** `cmd/nilcore/` is a shared wiring surface — this task serializes against any other open `cmd/nilcore`-owning task. Rationale: `docs/UPGRADE-PATH.md` §4 (U1-T07).
+- **Status (shipped):** the Phase-9 packages are wired into the binary — the `browser_view` tool registered into the loop tool sets (container-and-egress-gated), the composite `BrowserVerifier` constructed at the per-worktree verifier sites when behavioral verification is enabled, plus the new `nilcore serve --webhook <addr>` and `nilcore schedule` entry points and the `watch/schedule --open-pr` gated forge path. Every path is nil/flag-gated; the default binary is byte-identical with Phase-9 features off.
 
 ---
 
 ## Phase 10 — Context depth, trusted steering & distribution
 
 Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBackend` contract, all nil/flag-gated: give the operator an **authoritative steering file** (the AGENTS.md/CLAUDE.md convention) as a new *trusted* input class without weakening I7; **activate and scale** the semantic index that is built-but-unwired today, staying CGO-free (I6); and turn the existing skills/MCP primitives into a **versioned, verified-install registry**. Promoted from `docs/UPGRADE-PATH.md` Tier 2 (`U2-T01..07` → `P10-T01..07`, same order); that file holds the deep rationale and file:line sourcing.
+
+> **Status (shipped):** Phase 10 is complete and merged. The authoritative steering-file loader + trusted injection seam (P10-T01) and its principal-only front-door plumbing (P10-T02), the provider-backed Embedder (P10-T03), the pure-Go HNSW semantic index (P10-T04), the multi-language AST + broadened live index (P10-T05), and the versioned skills/MCP registry (P10-T06) are all wired into the binary (P10-T07). New packages: `internal/{steering, embed, registry}`; `internal/codeintel/semantic` gained `hnsw.go` and `internal/codeintel/ast` gained `go.go` + `python.go`. New command `nilcore registry list|install <manifest.json>`. Steering (`NILCORE.md` / `AGENTS.md`) is the deliberate, scoped I7 exception, bounded **below** the safety core — it cannot widen capability or bypass the gate/verifier. The semantic path activates opt-in via `NILCORE_EMBED_KEY` / `NILCORE_EMBED_MODEL`; off ⇒ lexical fallback, byte-identical. **No new module** was added (HNSW, the Python parser, and the embedder are pure stdlib); I6 holds, `CGO_ENABLED=0` across the release matrix. Remote registry fetch stays **gated** as `EXT-07`. I1–I7 hold unchanged.
 
 ### P10-T01 — Authoritative steering-file loader + trusted injection seam
 - **Goal:** let an operator commit a project steering file whose contents are treated as **authoritative instructions** — the deliberate, scoped exception to I7 — distinct from fenced background memory.
@@ -678,6 +691,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - This task **does not modify `internal/backend/backend.go`** (the frozen contract) even though it owns the `internal/backend/` directory — it adds only a nil-gated optional field on `Native` (the `MemoryContext`/`LiveSession` precedent).
 - **Verify:** `make verify`; tests — steering text is prepended un-wrapped and authoritative; nil seam ⇒ byte-identical; a steering file containing `/execute` or a tool grant does **not** flip mode or add a tool.
 - **Notes:** a **new trusted-input class** (operator-authored ⇒ authoritative); there is no steering loader today. It sits *below* the invariants — "behavior never overrides the safety core" (`docs/PERSONA.md`). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T01).
+- **Status (shipped):** `internal/steering` loads an operator project steering file (`NILCORE.md` / `AGENTS.md`) as **trusted** instructions through a nil-gated `SteeringContext` seam on `backend.Native` — the deliberate, scoped I7 exception, bounded **below** the safety core (it cannot widen capability or bypass the gate/verifier). `backend.go` (the frozen contract) is untouched. Nil ⇒ byte-identical.
 
 ### P10-T02 — Steering front-door plumbing (principal-only, persisted)
 - **Goal:** load the steering file **once at launch from principal/operator origin** and thread it through the drive like `Mode` and read-roots — never from untrusted text.
@@ -687,6 +701,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - A guard test mirroring `TestTurnTextDoesNotFlipMode`: steering is set/loaded **only** via the principal front door (post-`channel.Authorized.Permit`), never from `Turn` text, an inbox follow-up, or tool/web output.
 - **Verify:** `make verify`; tests — operator file at repo root loads as authoritative; absent ⇒ byte-identical; the principal-only guard test passes.
 - **Notes:** the I7-enforcement half of the steering feature; the loader (P10-T01) is inert until wired here and at the cmd layer (P10-T07). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T02).
+- **Status (shipped):** the steering file is loaded **once at launch from principal/operator origin** and threaded through the drive (and the persistence snapshot) like `Mode` and read-roots — never from `Turn` text, an inbox follow-up, or tool/web output (I7). Wired into chat + run/build. A missing file ⇒ byte-identical.
 
 ### P10-T03 — Provider-backed Embedder
 - **Goal:** supply a real `semantic.Embedder` so the dormant vector path can be turned on — closing dead code (no Embedder implementation exists today; `semantic.Open` has zero non-test callers).
@@ -696,6 +711,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - Stdlib HTTP only (I6); egress to the model API host (container backend + allowlist); a resolve/credential failure degrades cleanly (caller falls back to the nil-Embedder lexical mode).
 - **Verify:** `make verify`; a mocked-transport test asserts the embeddings request/response shape + `[]float32` decode; a no-key path returns a clean error.
 - **Notes:** the Embedder is an argument to `semantic.Open(path, e)` — there is no `Retriever.Embedder` field (the Retriever is `{Graph, Semantic, LSP}`). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T03).
+- **Status (shipped):** this is part of the deferred **D2** item, merged. `internal/embed` implements `semantic.Embedder` over an OpenAI-compatible embeddings endpoint through the existing provider/cred seam (key via `SecretStore`: `NILCORE_EMBED_KEY` / `NILCORE_EMBED_MODEL`, I3); stdlib HTTP only (I6). A resolve/credential failure degrades cleanly to the nil-Embedder lexical mode.
 
 ### P10-T04 — Pure-Go ANN/HNSW semantic index
 - **Goal:** replace the brute-force linear cosine scan with a pure-Go approximate-nearest-neighbour index so retrieval scales — **without** breaking `CGO_ENABLED=0`.
@@ -706,6 +722,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - If a pure-Go ANN module is added it is a `go.mod` change → this task carries **contract (go.mod)**, runs as the dedicated go.mod task, and its CHANGELOG entry includes the I6 dependency justification. Prefer a hand-rolled pure-Go HNSW in-package to keep the dependency count at three.
 - **Verify:** `make verify`; a recall/latency test (ANN vs the old linear scan on a fixture corpus); a `CGO_ENABLED=0 GOOS=linux/darwin` cross-compile check.
 - **Notes:** today's store is JSON-encoded vectors in one SQLite TEXT column "so the build stays cgo-free"; the replacement inherits that. The semantic lens slots into the fixed `Retrieve` fusion order + closed provenance vocabulary. Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T04).
+- **Status (shipped):** part of the deferred **D2** item, merged. `internal/codeintel/semantic/hnsw.go` replaces the brute-force linear cosine scan with a **content-hash-cached, pure-Go HNSW** vector index — **no new module** (hand-rolled in-package, so the dependency count stays at three; FAISS/hnswlib/`sqlite-vec` rejected as cgo). The Embedder seam, the nil-Embedder lexical fallback, and `Add`'s upsert semantics are preserved; `CGO_ENABLED=0` cross-compiles hold (I6).
 
 ### P10-T05 — Multi-language AST + broaden live index
 - **Goal:** lift code intelligence beyond Go — the live index seeds `.go` files only today — so non-Go repos get structural context.
@@ -716,6 +733,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - **Preserve** `graph.BuildFile`'s REPLACE-on-rebuild-per-file atomicity so the incremental live index never leaks stale nodes/edges.
 - **Verify:** `make verify`; a second-language fixture repo indexes into the graph; the live re-index of an edited non-Go file replaces only that file's contribution; `CGO_ENABLED=0` still builds.
 - **Notes:** the live session is opt-in via `NILCORE_LIVE_INDEX`, task-scoped, in-memory; this broadens *what* it parses, not the lifecycle. Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T05).
+- **Status (shipped):** the deferred **D3** item, merged. A language-parser seam plus a **pure-Go Python backend** (`internal/codeintel/ast/python.go` alongside `go.go`; CGO-free, **not** tree-sitter — Go output identical) now backs the parser; the live + codeintel index walks cover Go and Python via `ast.SupportedExtensions`. `graph.BuildFile`'s REPLACE-on-rebuild-per-file atomicity is preserved; `CGO_ENABLED=0` still builds (I6).
 
 ### P10-T06 — Versioned skills/MCP-server registry
 - **Goal:** turn the operator-only, local skills + MCP primitives into a **versioned, shareable, verified-install** registry — distribution without an editor surface — preserving every trust property.
@@ -727,6 +745,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - Stdlib only; no remote/network fetch in this task (I6).
 - **Verify:** `make verify`; tests — a local manifest installs a versioned skill that surfaces as a tool; a duplicate/older version is handled; an out-of-scope self-edit is rejected.
 - **Notes:** there is no registry/packaging/versioning/install today (`skills.Registry` is an in-memory holder). Self-improvement stays "prompts/skills/tools only, never the core, gated" (`docs/ARCHITECTURE.md`). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T06).
+- **Status (shipped):** `internal/registry` plus version metadata on `skills.Skill` and `mcp.ServerSpec` back `nilcore registry list|install <manifest.json>` over **local** skills (stdlib only, no network). Trust is preserved: MCP servers stay operator-configured, wrappers stay schema-generated, the per-tool gate + the untrusted-output fence (I7) are unchanged, and an installed skill is still a `skill_<name>` tool that only returns instructions. **Remote fetch stays gated as `EXT-07`** (external-infra).
 
 ### P10-T07 — Tier-2 CLI wiring
 - **Goal:** activate Tier-2 features in the binary — register the default Embedder + Semantic into the Retriever, discover the steering file at launch, enable the multi-language live index, expose the registry install command.
@@ -737,6 +756,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
   - Every path nil/flag-gated; default binary byte-identical when features are off/unconfigured.
 - **Verify:** `make verify`; tests — with a key, retrieval uses the semantic lens (provenance `semantic`); without, lexical fallback; steering discovered at repo root; registry install round-trip.
 - **Notes:** `cmd/nilcore/` and `internal/tools/` are shared surfaces — serialize against P9-T07 (cmd) and P9-T02 (tools). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T07).
+- **Status (shipped):** the Tier-2 features are activated in the binary — the default Embedder + Semantic lens set on the Retriever (on by default when `NILCORE_EMBED_KEY` resolves, lexical otherwise), the steering file discovered + threaded at launch, the multi-language live index enabled, and `nilcore registry install/list` exposed. Every path is nil/flag-gated; the default binary is byte-identical when features are off/unconfigured.
 
 ---
 
