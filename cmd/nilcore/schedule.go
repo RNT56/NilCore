@@ -29,7 +29,8 @@ import (
 // dependencies and open nothing") auto-starts and is verified the usual way.
 func scheduleMain(args []string) {
 	fs := flag.NewFlagSet("schedule", flag.ExitOnError)
-	every := fs.Duration("every", time.Hour, "interval between runs")
+	every := fs.Duration("every", time.Hour, "interval between runs (used when -at is empty)")
+	at := fs.String("at", "", "wall-clock schedule (local): @hourly | @daily | HH:MM (24h); overrides -every")
 	goal := fs.String("goal", "", "the goal to self-start on each tick (required)")
 	name := fs.String("name", "scheduled", "job name (for the audit log)")
 	enabled := fs.Bool("enabled", true, "master on/off for self-start")
@@ -37,6 +38,9 @@ func scheduleMain(args []string) {
 	_ = fs.Parse(args)
 	if *goal == "" {
 		fatal(fmt.Errorf("schedule: -goal is required"))
+	}
+	if *at != "" && !cron.ValidAt(*at) {
+		fatal(fmt.Errorf("schedule: invalid -at %q (want @hourly, @daily, or HH:MM)", *at))
 	}
 
 	b := loadBoot(*c.config)
@@ -61,15 +65,23 @@ func scheduleMain(args []string) {
 		Log: log,
 	}
 
+	job := cron.Job{Name: *name, Goal: *goal, Source: "cron"}
+	when := fmt.Sprintf("every %s", *every)
+	if *at != "" {
+		job.At = *at // wall-clock spec overrides the interval
+		when = "at " + *at
+	} else {
+		job.Every = *every
+	}
 	sched := &cron.Scheduler{
-		Jobs: []cron.Job{{Name: *name, Every: *every, Goal: *goal, Source: "cron"}},
+		Jobs: []cron.Job{job},
 		Fire: trig.Handle,
 		Log:  log,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	fmt.Fprintf(os.Stderr, "nilcore schedule: %q every %s (enabled=%v, Ctrl-C to stop)\n", *goal, *every, *enabled)
+	fmt.Fprintf(os.Stderr, "nilcore schedule: %q %s (enabled=%v, Ctrl-C to stop)\n", *goal, when, *enabled)
 
 	if err := sched.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		fatal(err)
