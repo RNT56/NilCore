@@ -98,6 +98,17 @@ type Supervisor struct {
 	// doIntegrate), like publishRunContext — never from the reader goroutine.
 	SaveState func(ctx context.Context, snap Snapshot) error
 
+	// Resume, if set, seeds the run from a prior durable snapshot instead of starting
+	// fresh: the integration base is the preserved tip (wired at the build site via
+	// the integrator's BaseRef + the worker/code base ref), the already-merged nodes
+	// are recorded so the next snapshot stays complete (they are NOT re-spawned or
+	// re-merged — they carry no live branch), and the model is told what is already on
+	// its starting tip so it plans only the remainder. It is a LEAF type (ResumeState),
+	// so super never imports the orchestrator; the wiring site translates the durable
+	// agent.RunState into it. Consumed once on the first Run (cleared after), so a
+	// project loop's later slices run fresh. nil ⇒ a fresh run, byte-identical.
+	Resume *ResumeState
+
 	// ReadTools is the read/search registry the supervisor uses to inspect the
 	// integration tree before it writes code. Read-only by construction (no write
 	// tools); the loop refuses any registry that shadows an orchestration verb.
@@ -335,8 +346,19 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 		goal:       goal,
 		nodeStates: map[string]string{},
 	}
-	// Publish the initial grounding (goal only) so a very early ask_supervisor — before
-	// any plan/spawn — is still answered with the goal in context.
+	// Durable resume: if a prior snapshot was wired in (the integration base is already
+	// pinned at its tip by the build site), seed the run state from it and capture the
+	// trusted framing that tells the model what is already merged. Consumed once, so a
+	// project loop's later slices start fresh. nil ⇒ a fresh run, byte-identical.
+	resumeMsg := ""
+	if s.Resume != nil {
+		resumeMsg = s.seedResume(st, s.Resume)
+		s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_resume",
+			Detail: map[string]any{"tip": shortSHA(s.Resume.TipSHA), "nodes": len(s.Resume.Nodes)}})
+		s.Resume = nil
+	}
+	// Publish the initial grounding (goal only, or the resumed tip) so a very early
+	// ask_supervisor — before any plan/spawn — is still answered with context.
 	s.publishRunContext(s.buildRunContext(st))
 
 	toolset := append(toolDefs(), s.readToolDefs()...)
@@ -347,6 +369,11 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 
 	msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text",
 		Text: "Goal:\n" + goal}}}}
+	// The resume framing is harness-authored control text (not subagent/tool output),
+	// so it is a trusted user block like the goal — never guard.Wrap'd (I7).
+	if resumeMsg != "" {
+		msgs = append(msgs, model.Message{Role: "user", Content: []model.Block{{Type: "text", Text: resumeMsg}}})
+	}
 
 	for i := 0; i < rounds; i++ {
 		// A broken audit trail halts the run: an unverifiable history is worse than
@@ -573,6 +600,15 @@ type runState struct {
 	// map) when SaveState is not wired — byte-identical to a run without resume.
 	nodeStates map[string]string // node id -> "pending" | "merged" | "failed"
 	tipSHA     string            // SHA of the latest verified integration tip (from doIntegrate)
+
+	// resumeNodes carries the prior run's node dispositions when this run was seeded
+	// from a durable snapshot (seedResume). They are NOT live handles — they have no
+	// branch and are never re-merged — so they stay out of st.handles (mergeOrder and
+	// the fanout rail only see real, live cohort members). snapshot() unions them with
+	// the live handles so a resumed run's checkpoint keeps reporting the already-merged
+	// nodes; a current handle for the same id supersedes the prior record. nil on a
+	// fresh run.
+	resumeNodes []SnapNode
 }
 
 // Snapshot is the supervisor's durable run state, expressed in the supervisor's OWN
@@ -594,13 +630,96 @@ type SnapNode struct {
 	State     string
 }
 
+// ResumeState seeds a run from a prior durable snapshot. It is the supervisor's OWN
+// leaf shape (the wiring site translates the durable agent.RunState into it), so
+// super never imports the orchestrator. TipSHA is the preserved verified integration
+// tip; TipBranch is the durable ref pinning it (surfaced as the Outcome branch when a
+// resumed run converges with no further integration); Nodes is the prior per-node
+// disposition. State strings match the Snapshot/agent.NodeState values.
+type ResumeState struct {
+	TipSHA    string
+	TipBranch string
+	Nodes     []ResumeNode
+}
+
+// ResumeNode is one prior node's durable disposition fed into a resumed run: its id,
+// the ids it depended on, and its integration state ("merged" | "failed" | "pending").
+type ResumeNode struct {
+	ID        string
+	DependsOn []string
+	State     string
+}
+
+// seedResume primes a fresh runState from a durable snapshot (consumed once at Run
+// start). It records the preserved tip (so the next checkpoint chains from it), seeds
+// the per-node states, and stashes the prior nodes as resumeNodes (kept OUT of
+// st.handles — they have no live branch and must never be re-merged or counted against
+// the fanout rail). It returns a TRUSTED, harness-authored resume framing for the
+// model (un-Wrap'd like the goal, I7 — it is our own control text, never tool output)
+// naming what is already done so the model plans only the remainder. The actual
+// "build on the preserved tip" is wired at the build site (integrator BaseRef + the
+// worker/code base ref); the I2 re-verify of the tip happens before this run starts.
+func (s *Supervisor) seedResume(st *runState, rs *ResumeState) string {
+	st.tipSHA = rs.TipSHA
+	st.branch = rs.TipBranch
+	if st.nodeStates == nil {
+		st.nodeStates = map[string]string{}
+	}
+	st.resumeNodes = make([]SnapNode, 0, len(rs.Nodes))
+	var merged, remaining []string
+	for _, n := range rs.Nodes {
+		st.resumeNodes = append(st.resumeNodes, SnapNode{ID: n.ID, DependsOn: append([]string(nil), n.DependsOn...), State: n.State})
+		st.nodeStates[n.ID] = n.State
+		if n.State == string(snapStateMerged) {
+			merged = append(merged, n.ID)
+		} else {
+			remaining = append(remaining, n.ID)
+		}
+	}
+	st.spawned = len(merged) // already-completed work, for Outcome accounting (fanout uses live handles)
+	sort.Strings(merged)
+	sort.Strings(remaining)
+
+	var b strings.Builder
+	b.WriteString("RESUMING an interrupted run. A prior run's verified integration tip is your STARTING POINT")
+	if rs.TipSHA != "" {
+		b.WriteString(" (commit ")
+		b.WriteString(shortSHA(rs.TipSHA))
+		b.WriteString(")")
+	}
+	b.WriteString(" — the work below is ALREADY MERGED onto it. Do NOT re-plan or re-spawn it; build only the REMAINING work on top.\n")
+	if len(merged) > 0 {
+		b.WriteString("Already merged (done): " + strings.Join(merged, ", ") + "\n")
+	}
+	if len(remaining) > 0 {
+		b.WriteString("Was in flight, not yet merged (re-do as needed): " + strings.Join(remaining, ", ") + "\n")
+	}
+	return b.String()
+}
+
+// shortSHA renders a stable short prefix of a commit SHA for logs/prompts; a SHA
+// shorter than the prefix is returned whole (never panics on a test sentinel).
+func shortSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
+}
+
+// snapStateMerged is the node-state string for a merged node, shared by snapshot()
+// and seedResume so the durable vocabulary has one source of truth in this package.
+const snapStateMerged = "merged"
+
 // snapshot renders the durable run state from runState. It walks every spawned handle
 // (so nodes merged in PRIOR waves are included, not just this wave's), reads each
 // node's accumulated state (default "pending" — spawned but not yet merged), and pairs
-// it with the latest verified tip SHA. Deterministic (sorted by id) so the serialized
+// it with the latest verified tip SHA. On a resumed run it also folds in resumeNodes
+// (the prior run's dispositions) for any id without a live handle, so the checkpoint
+// stays complete across resume. Deterministic (sorted by id) so the serialized
 // snapshot is stable and tests are exact. Called single-owner on the main goroutine.
 func (s *Supervisor) snapshot(st *runState) Snapshot {
-	nodes := make([]SnapNode, 0, len(st.handles))
+	nodes := make([]SnapNode, 0, len(st.handles)+len(st.resumeNodes))
+	seen := make(map[string]bool, len(st.handles))
 	for id, h := range st.handles {
 		state := st.nodeStates[id]
 		if state == "" {
@@ -611,6 +730,20 @@ func (s *Supervisor) snapshot(st *runState) Snapshot {
 			DependsOn: append([]string(nil), h.Spec.DependsOn...),
 			State:     state,
 		})
+		seen[id] = true
+	}
+	// A resumed run carries prior nodes that have no live handle this run; keep them in
+	// the snapshot so a SECOND restart still sees what already merged. A live handle for
+	// the same id supersedes the prior record (already emitted above).
+	for _, rn := range st.resumeNodes {
+		if seen[rn.ID] {
+			continue
+		}
+		state := st.nodeStates[rn.ID]
+		if state == "" {
+			state = rn.State
+		}
+		nodes = append(nodes, SnapNode{ID: rn.ID, DependsOn: append([]string(nil), rn.DependsOn...), State: state})
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 	return Snapshot{TipSHA: st.tipSHA, Nodes: nodes}

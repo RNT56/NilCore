@@ -40,6 +40,7 @@ import (
 	"unicode/utf8"
 
 	"nilcore/internal/advisor"
+	"nilcore/internal/agent"
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/backend"
 	"nilcore/internal/budget"
@@ -243,6 +244,28 @@ type buildDeps struct {
 	// a hermetic test injects its own so it can pre-exhaust the wall and assert the
 	// loop aborts. It is wiring-only and never reaches the model.
 	ledger *budget.Ledger
+
+	// Durable multi-agent resume (PR-2). All four are optional and inert by default —
+	// a build/chat run leaves them zero and the stack is byte-identical to before.
+	//
+	// checkpoint + taskID, when both set, wire the supervisor's SaveState seam: every
+	// time the integration tip advances, the snapshot is translated to agent.RunState,
+	// the tip is pinned with a durable resume/<taskID> ref (so it survives the run-end
+	// branch sweep), and the row is persisted under SuperviseStatus. nil checkpoint ⇒
+	// no durable snapshot (SaveState stays nil).
+	checkpoint *agent.Checkpoint
+	taskID     string
+
+	// baseRef is the committish the integration base is cut from. Empty ⇒ "HEAD" (the
+	// default). A resumed run pins it to the preserved tip SHA so the integrator, the
+	// supervisor's own coding pass, and re-released workers all build ON the merged
+	// work rather than orphaning it back to base HEAD.
+	baseRef string
+
+	// resume, when set, seeds the supervisor from a prior snapshot (already-merged
+	// nodes are not re-spawned; the model plans only the remainder). Paired with
+	// baseRef = the preserved tip. nil ⇒ a fresh run.
+	resume *super.ResumeState
 }
 
 // buildAssembly is the assembled multi-agent run: the project loop, the repo the
@@ -253,6 +276,10 @@ type buildAssembly struct {
 	loop   *project.Loop
 	repo   string
 	ledger *budget.Ledger
+	// sup is the supervisor the loop drives, exposed so a hermetic test can assert the
+	// durable-resume wiring (the SaveState seam, the Resume seed) without driving the
+	// full model loop. Production callers only use loop/cleanup.
+	sup *super.Supervisor
 	// cleanup tears down run-scoped resources the stack created (the supervisor's live
 	// read worktree). Always non-nil — a no-op when nothing needs cleanup. Every caller
 	// defers it after loop.Run so a long-lived serve session never leaks read worktrees.
@@ -329,8 +356,11 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 
 	intr := &integrate.Integrator{
 		BaseRepo: repo,
-		NewEnv:   func(dir string) integrate.Env { return integrate.Env{Verifier: newEnv(dir).Verifier} },
-		Log:      d.log,
+		// Empty on a fresh run (⇒ HEAD); a resumed run pins it to the preserved tip so
+		// re-integration folds the remaining branches onto the already-merged work.
+		BaseRef: d.baseRef,
+		NewEnv:  func(dir string) integrate.Env { return integrate.Env{Verifier: newEnv(dir).Verifier} },
+		Log:     d.log,
 	}
 
 	// Live repo-read: a long-lived READ worktree the supervisor's read/search tools
@@ -390,7 +420,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Spawn:     buildSpawnFunc(d, repo, exec, rost, msgBus, newEnv),
 		Code:      buildCodeFunc(d, repo, exec, newEnv),
 		Integrate: buildIntegrateFunc(intr),
-		Verify:    buildVerifyFunc(repo, newEnv),
+		Verify:    buildVerifyFunc(repo, newEnv, d.baseRef),
 		// Answer closes the half-wired back-and-forth (CV-T02): a subagent's blocking
 		// ask_supervisor/request_review gets a REAL strong-model answer instead of the
 		// canned fallback. It reuses the SAME metered strong provider as Model, so the
@@ -405,6 +435,37 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		MaxAgents:   d.maxAgent,
 		Concurrency: d.concurrency, // <2 ⇒ serial dispatch (byte-identical); >1 ⇒ in-wave concurrency
 		Budget:      ledger,
+		// Durable resume: seed from a prior snapshot when one was wired in (nil ⇒ fresh).
+		Resume: d.resume,
+	}
+	// Wire the durable-snapshot seam: with a checkpoint + a stable task id, every tip
+	// advance translates the supervisor's leaf Snapshot to agent.RunState, pins the tip
+	// with a resume/<taskID> ref the run-end sweep never touches (so the merged work
+	// survives a graceful restart), and persists it under SuperviseStatus. The
+	// translation + store write live HERE (the wiring site), keeping internal/super a
+	// leaf that imports neither the orchestrator nor the store (CLAUDE.md §4, I1). nil
+	// checkpoint ⇒ SaveState stays nil ⇒ byte-identical to a non-durable run.
+	if d.checkpoint != nil && d.taskID != "" {
+		cp, taskID, goal := d.checkpoint, d.taskID, d.goal
+		ref := resumeRef(taskID)
+		sup.SaveState = func(ctx context.Context, snap super.Snapshot) error {
+			if snap.TipSHA != "" {
+				// Share gitMu with concurrent worker worktree-adds / ref ops: pinning the
+				// tip is a shared-repo ref mutation, so it must not interleave with one
+				// (gitMu is not held here — recordIntegration runs after the integrate
+				// worktree op released it — so this never deadlocks). Best-effort: a pin
+				// failure is logged and the snapshot still records; the next integrate
+				// re-pins.
+				gitMu.Lock()
+				perr := worktree.PinBranch(ctx, repo, ref, snap.TipSHA)
+				gitMu.Unlock()
+				if perr != nil {
+					d.log.Append(eventlog.Event{Kind: "resume_pin_error",
+						Detail: map[string]any{"task": taskID, "error": perr.Error()}})
+				}
+			}
+			return cp.SaveRunState(ctx, taskID, goal, translateSnapshot(snap))
+		}
 	}
 
 	loop := &project.Loop{
@@ -423,7 +484,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Deadline:      time.Time{}, // wall-clock is enforced by the ctx deadline in buildMain
 	}
 
-	return buildAssembly{loop: loop, repo: repo, ledger: ledger, cleanup: cleanup}, nil
+	return buildAssembly{loop: loop, repo: repo, ledger: ledger, sup: sup, cleanup: cleanup}, nil
 }
 
 // meterProvider wraps prov in a meter.Provider charging the shared ledger under the
@@ -600,7 +661,10 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 				Detail: map[string]any{"deps": len(spec.BaseRefs), "conflict": conflict, "fault": merr != nil}})
 		}
 		if base == "" {
-			base = "HEAD"
+			// No live dep branch (a 0-dep node, or a resumed run whose dep branches were
+			// already swept): cut from the run's base ref — the preserved tip on resume
+			// (so a re-released dependent has its merged deps present), else base HEAD.
+			base = firstNonEmpty(d.baseRef, "HEAD")
 		}
 		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(spec.ID), base)
 		gitMu.Unlock()
@@ -762,7 +826,9 @@ func buildCodeFunc(d buildDeps, repo string, exec model.Provider, newEnv func(di
 	return func(ctx context.Context, goal string) spawn.Result {
 		id := "super-code-" + shortID()
 		branch := "task/" + id
-		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(id), "HEAD")
+		// Base ref: the preserved tip on a resumed run (so the supervisor's own coding
+		// pass builds on the merged work), else base HEAD (the default).
+		wt, err := worktree.CreateFrom(ctx, repo, branch, leafName(id), firstNonEmpty(d.baseRef, "HEAD"))
 		if err != nil {
 			return spawn.Result{ID: id, State: spawn.StateFailed, Err: fmt.Errorf("code: worktree: %w", err)}
 		}
@@ -824,9 +890,11 @@ func buildIntegrateFunc(intr *integrate.Integrator) super.IntegrateFunc {
 // (I2). The integrator is the authority on each MERGED tree (it verifies after
 // every merge), so the supervisor's own finish-verify is a secondary gate; both
 // re-run the same project verifier, so neither ships an unverified tree.
-func buildVerifyFunc(repo string, newEnv func(dir string) buildEnv) func(ctx context.Context) (verify.Report, error) {
+func buildVerifyFunc(repo string, newEnv func(dir string) buildEnv, baseRef string) func(ctx context.Context) (verify.Report, error) {
 	return func(ctx context.Context) (verify.Report, error) {
-		wt, err := worktree.CreateFrom(ctx, repo, "verify/"+shortID(), "verify-"+shortID(), "HEAD")
+		// Off the run's base ref: the preserved integration tip on a resumed run (so the
+		// finish-verify checks the merged result, not an empty base), else base HEAD.
+		wt, err := worktree.CreateFrom(ctx, repo, "verify/"+shortID(), "verify-"+shortID(), firstNonEmpty(baseRef, "HEAD"))
 		if err != nil {
 			return verify.Report{}, fmt.Errorf("verify: worktree: %w", err)
 		}

@@ -415,6 +415,35 @@ func DeleteBranches(ctx context.Context, baseRepo, prefix string) {
 	}
 }
 
+// PinBranch force-creates (or moves) `branch` to point at `sha` in baseRepo. It is
+// the durable-resume anchor: the run-end branch sweep (DeleteBranches) only reclaims
+// the throwaway task/ rebase/ integrate/ read/ prefixes, so a branch under a
+// different prefix (e.g. resume/<taskID>) keeps the verified integration tip
+// reachable across a graceful restart — even after its integrate/ branch is swept
+// and its worktree torn down. `git branch -f` is idempotent (creates the ref or
+// moves it), so a re-pin on every integration checkpoint just advances the ref.
+// Hardened git (I4): a repo-authored hook/config can never execute on the host.
+func PinBranch(ctx context.Context, baseRepo, branch, sha string) error {
+	if branch == "" || sha == "" {
+		return fmt.Errorf("worktree: pin branch requires a branch and a sha")
+	}
+	if out, err := git(ctx, baseRepo, "branch", "-f", branch, sha); err != nil {
+		return fmt.Errorf("pin branch %s @ %s: %w (%s)", branch, sha, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// DeleteBranch removes a single branch by exact name in baseRepo (best-effort: a
+// branch already gone is fine). It is the teardown for a durable resume pin once the
+// run it anchored has converged — the one-ref counterpart to DeleteBranches' prefix
+// sweep, which never touches the resume/ prefix.
+func DeleteBranch(ctx context.Context, baseRepo, branch string) {
+	if branch == "" {
+		return
+	}
+	_, _ = git(ctx, baseRepo, "branch", "-D", branch)
+}
+
 // Prunable returns the paths of worktrees registered to baseRepo whose checkout
 // directory no longer exists — left behind by a crashed prior process. These are
 // the ONLY worktrees safe to reclaim blindly: a live worktree's directory is

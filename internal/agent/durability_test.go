@@ -321,6 +321,74 @@ func TestSIGTERMMidRunReplayFromTip(t *testing.T) {
 	}
 }
 
+// TestSuperviseStatusIsolatesFromNativeResume is the regression guard for PR-2: a
+// multi-agent run's snapshot is recorded under the DISTINCT SuperviseStatus, so the
+// single-native resume path (InFlight → running/interrupted) never re-drives it as one
+// native drive (which would orphan the integration tip and redo merged work). Only the
+// dedicated InFlightSupervise pass sees it; the SIGTERM Interrupt sweep leaves it alone;
+// and Complete flips it terminal so it is not resumed again.
+func TestSuperviseStatusIsolatesFromNativeResume(t *testing.T) {
+	ctx := context.Background()
+	cp, s := newCheckpoint(t)
+
+	// A live native task AND a multi-agent run are both in flight.
+	if err := cp.Begin(ctx, backend.Task{ID: "native-1", Goal: "fix"}); err != nil {
+		t.Fatal(err)
+	}
+	snap := agent.RunState{TipSHA: "tipsha", Nodes: []agent.Node{{ID: "t1", State: agent.NodeMerged}}}
+	if err := cp.SaveRunState(ctx, "supervise:thread-9", "build it", snap); err != nil {
+		t.Fatal(err)
+	}
+
+	// The supervise row is "supervise", not "running".
+	if got, _ := s.GetTask(ctx, "supervise:thread-9"); got.Status != agent.SuperviseStatus {
+		t.Fatalf("supervise row status = %q, want %q", got.Status, agent.SuperviseStatus)
+	}
+
+	// The native resume pass sees ONLY the native task — never the supervise row.
+	inflight, err := cp.InFlight(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inflight) != 1 || inflight[0].ID != "native-1" {
+		t.Fatalf("InFlight = %+v, want only [native-1] (supervise row must NOT appear)", inflight)
+	}
+
+	// The dedicated supervise pass sees ONLY the supervise row, with its snapshot intact.
+	sup, err := cp.InFlightSupervise(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sup) != 1 || sup[0].ID != "supervise:thread-9" {
+		t.Fatalf("InFlightSupervise = %+v, want only [supervise:thread-9]", sup)
+	}
+
+	// SIGTERM checkpoint marks running→interrupted; the supervise row is untouched.
+	if err := cp.Interrupt(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetTask(ctx, "supervise:thread-9"); got.Status != agent.SuperviseStatus {
+		t.Errorf("Interrupt clobbered the supervise row: status = %q, want %q", got.Status, agent.SuperviseStatus)
+	}
+	// And it survives a fresh Checkpoint (durable across restart) with its tip intact.
+	loaded, err := agent.NewCheckpoint(s).LoadRunState(ctx, "supervise:thread-9")
+	if err != nil || loaded.TipSHA != "tipsha" {
+		t.Fatalf("supervise snapshot not durable: %+v err=%v", loaded, err)
+	}
+
+	// Complete flips it terminal so it is not resumed again.
+	if err := cp.Complete(ctx, "supervise:thread-9", "build it", true); err != nil {
+		t.Fatal(err)
+	}
+	sup2, _ := cp.InFlightSupervise(ctx)
+	if len(sup2) != 0 {
+		t.Errorf("a completed supervise run must not be in flight, got %+v", sup2)
+	}
+	if got, _ := s.GetTask(ctx, "supervise:thread-9"); got.Status != "done" {
+		t.Errorf("after Complete, supervise status = %q, want done", got.Status)
+	}
+}
+
 // --- small git helpers for the durability test (kept local; no shared test util) ---
 
 func gitInit(t *testing.T, repo string) {

@@ -184,16 +184,38 @@ func UnmarshalRunState(detail string) (RunState, error) {
 	return rs, nil
 }
 
-// SaveRunState durably records the integration snapshot for a task, preserving the
-// task's goal and "running" status. It is one UpsertTask write — the same
-// crash-atomic single-statement discipline as Begin/Complete — so a SIGTERM during
-// integration leaves either the previous snapshot or this one, never a torn record.
+// SuperviseStatus is the store status under which a multi-agent (supervise/project)
+// run's integration snapshot is recorded — DISTINCT from the single-task statuses
+// ("running"/"interrupted") so the native resume path (InFlight/Resume) never
+// re-drives a multi-agent run as a single native drive (which would orphan its
+// integration tip and redo merged work). A non-"done" supervise row is in-flight and
+// is resumed by the dedicated multi-agent resume pass (InFlightSupervise); Complete
+// flips it to "done". It mirrors the distinct-status convention of ConversationStatus
+// and WakeStatus, so the resume paths and the wake poller never cross.
+const SuperviseStatus = "supervise"
+
+// SaveRunState durably records the integration snapshot for a multi-agent run under
+// the SuperviseStatus (NOT "running" — see SuperviseStatus), preserving the task's
+// goal. It is one UpsertTask write — the same crash-atomic single-statement
+// discipline as Begin/Complete — so a SIGTERM during integration leaves either the
+// previous snapshot or this one, never a torn record. Because the row is "supervise"
+// (not "running"), the SIGTERM Interrupt sweep leaves it untouched and the native
+// InFlight pass never sees it; only InFlightSupervise resumes it.
 func (c *Checkpoint) SaveRunState(ctx context.Context, taskID, goal string, rs RunState) error {
 	detail, err := rs.Marshal()
 	if err != nil {
 		return err
 	}
-	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: "running", Detail: detail})
+	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: SuperviseStatus, Detail: detail})
+}
+
+// InFlightSupervise returns the multi-agent runs a prior process left in flight: the
+// non-terminal "supervise" rows. The dedicated multi-agent resume pass reads each
+// back with LoadRunState, rebuilds from the preserved tip, and re-releases only the
+// un-merged nodes. It is the multi-agent counterpart to InFlight (which stays scoped
+// to single native tasks), so the two resume passes never contend for the same row.
+func (c *Checkpoint) InFlightSupervise(ctx context.Context) ([]store.Task, error) {
+	return c.store.TasksByStatus(ctx, SuperviseStatus)
 }
 
 // LoadRunState reads back a task's integration snapshot. A task with no snapshot

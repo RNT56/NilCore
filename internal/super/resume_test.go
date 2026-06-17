@@ -2,6 +2,7 @@ package super
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"nilcore/internal/integrate"
@@ -92,6 +93,91 @@ func TestSnapshotDefaultsUnintegratedToPending(t *testing.T) {
 	}
 	if state["a"] != "merged" || state["b"] != "pending" {
 		t.Errorf("states = %v, want a=merged b=pending", state)
+	}
+}
+
+// seedResume must: seed the preserved tip + per-node states, keep the prior nodes in
+// the snapshot (continuity across a SECOND restart) WITHOUT putting them in st.handles
+// (so mergeOrder never tries to re-merge their swept branches), and produce a trusted
+// resume framing that names what is already merged.
+func TestSeedResumeContinuityAndNoPhantomMerge(t *testing.T) {
+	s := &Supervisor{}
+	st := &runState{handles: map[string]*Handle{}, nodeStates: map[string]string{}}
+
+	rs := &ResumeState{
+		TipSHA:    "tipsha123456789",
+		TipBranch: "resume/supervise-thread-1",
+		Nodes: []ResumeNode{
+			{ID: "t1", State: "merged"},
+			{ID: "t2", DependsOn: []string{"t1"}, State: "merged"},
+			{ID: "t3", DependsOn: []string{"t1"}, State: "failed"},
+		},
+	}
+	msg := s.seedResume(st, rs)
+
+	// State is seeded: tip, branch, per-node dispositions.
+	if st.tipSHA != rs.TipSHA || st.branch != rs.TipBranch {
+		t.Errorf("tip/branch not seeded: tip=%q branch=%q", st.tipSHA, st.branch)
+	}
+	if st.nodeStates["t1"] != "merged" || st.nodeStates["t3"] != "failed" {
+		t.Errorf("node states not seeded: %v", st.nodeStates)
+	}
+	// Prior nodes are NOT live handles — so mergeOrder (which needs Passed+Branch) emits
+	// nothing, i.e. no swept branch is ever re-merged on resume.
+	if len(st.handles) != 0 {
+		t.Errorf("seedResume must not create live handles, got %d", len(st.handles))
+	}
+	if order := s.mergeOrder(st); len(order) != 0 {
+		t.Errorf("mergeOrder over a freshly-resumed state must be empty (no phantom re-merge), got %+v", order)
+	}
+
+	// Snapshot continuity: a checkpoint taken right after resume still reports the prior
+	// merged nodes (so a SECOND crash does not lose them), with the preserved tip.
+	snap := s.snapshot(st)
+	if snap.TipSHA != rs.TipSHA {
+		t.Errorf("snapshot tip = %q, want %q", snap.TipSHA, rs.TipSHA)
+	}
+	got := map[string]string{}
+	for _, n := range snap.Nodes {
+		got[n.ID] = n.State
+	}
+	if got["t1"] != "merged" || got["t2"] != "merged" || got["t3"] != "failed" {
+		t.Errorf("snapshot lost prior dispositions: %v", got)
+	}
+
+	// The model framing names the already-merged work as the starting point.
+	if !strings.Contains(msg, "RESUMING") || !strings.Contains(msg, "t1") || !strings.Contains(msg, "t2") {
+		t.Errorf("resume framing should name the merged nodes; got %q", msg)
+	}
+
+	// A live handle for a resumed id supersedes the prior record (no duplicate node).
+	st.handles["t3"] = &Handle{Spec: SubagentSpec{ID: "t3", DependsOn: []string{"t1"}}}
+	st.nodeStates["t3"] = "merged" // t3 re-ran and merged this time
+	snap2 := s.snapshot(st)
+	count, state := 0, ""
+	for _, n := range snap2.Nodes {
+		if n.ID == "t3" {
+			count++
+			state = n.State
+		}
+	}
+	if count != 1 || state != "merged" {
+		t.Errorf("a live handle must supersede the prior resume record for t3: count=%d state=%q", count, state)
+	}
+}
+
+// A run that was never seeded (Resume nil) has no resumeNodes, so snapshot() is exactly
+// the handle-only walk — the resume path is inert on a fresh run.
+func TestSnapshotWithoutResumeIsHandleOnly(t *testing.T) {
+	s := &Supervisor{}
+	st := &runState{
+		handles:    map[string]*Handle{"a": nodeHandle("a")},
+		nodeStates: map[string]string{"a": "merged"},
+		tipSHA:     "tip",
+	}
+	snap := s.snapshot(st)
+	if len(snap.Nodes) != 1 || snap.Nodes[0].ID != "a" {
+		t.Errorf("fresh-run snapshot should be handle-only: %+v", snap.Nodes)
 	}
 }
 
