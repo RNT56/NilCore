@@ -92,6 +92,13 @@ type MergeResult struct {
 type Integrator struct {
 	// BaseRepo is the git repo the throwaway integration worktree is cut from.
 	BaseRepo string
+	// BaseRef is the committish the throwaway integration worktree starts from.
+	// Empty ⇒ "HEAD" (the default — byte-identical to before). A durable-resume
+	// run sets it to the preserved integration-tip SHA so a re-integration after a
+	// restart folds the remaining branches ON TOP of the already-merged work,
+	// instead of rebuilding from base HEAD (which would orphan the verified tip).
+	// It must resolve in BaseRepo; an unresolvable ref is a clean setup error.
+	BaseRef string
 	// NewEnv builds the per-tree environment (the verifier) for a directory —
 	// the same factory shape the orchestrator uses, adapted to the local Env.
 	NewEnv func(dir string) Env
@@ -119,11 +126,17 @@ func (it *Integrator) Integrate(ctx context.Context, order []MergeItem) (*worktr
 		return nil, nil, fmt.Errorf("integrate: BaseRepo is required")
 	}
 
-	// One throwaway worktree off the base tip. The caller owns Cleanup so it can
-	// inspect / promote the green tip first; on a setup failure we clean up.
+	// One throwaway worktree off the integration base. The caller owns Cleanup so it
+	// can inspect / promote the green tip first; on a setup failure we clean up.
+	// BaseRef defaults to HEAD; a durable-resume run pins it to the preserved tip so
+	// the remaining branches fold on top of the already-merged work (no work lost).
+	start := it.BaseRef
+	if start == "" {
+		start = "HEAD"
+	}
 	branch := "integrate/" + uniqueSuffix()
 	leaf := strings.ReplaceAll(branch, "/", "-")
-	wt, err := worktree.CreateFrom(ctx, it.BaseRepo, branch, leaf, "HEAD")
+	wt, err := worktree.CreateFrom(ctx, it.BaseRepo, branch, leaf, start)
 	if err != nil {
 		return nil, nil, fmt.Errorf("integrate: create integration worktree: %w", err)
 	}

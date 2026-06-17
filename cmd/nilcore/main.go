@@ -834,16 +834,23 @@ func ownerThreadFromTaskID(id string) string {
 	return id[:i]
 }
 
-// resumeInflight re-drives every NATIVE task a prior process left running or
-// interrupted, before serve accepts new traffic. Each runs through a freshly
-// reconstructed single-task orchestrator (the identical verified path as a live
-// serve drive, minus the conversational seams) in a disposable worktree. On an
-// irreversible gate the approver informs the owner's thread then denies (a real Ask
-// can't run safely here — the receive loop is not up yet); with no transport it is a
-// silent deny. Checkpoint.Resume records terminal status per task, so a task is
-// resumed at most once per boot. (Supervise/project resume uses the separate
-// multi-agent RunState machinery and is a documented follow-on.)
+// resumeInflight re-drives every task a prior process left in flight, before serve
+// accepts new traffic. It runs TWO passes over the durable store, partitioned by
+// status so neither re-drives the other's rows:
+//
+//   - Native tasks (running/interrupted): each runs through a freshly reconstructed
+//     single-task orchestrator (the identical verified path as a live serve drive,
+//     minus the conversational seams) in a disposable worktree, via Checkpoint.Resume.
+//   - Multi-agent runs (SuperviseStatus): each is replayed by resumeSupervise — the
+//     preserved integration tip is re-verified (I2) and the supervisor stack is rebuilt
+//     rooted at it + seeded with the prior dispositions, so the run continues from the
+//     merged work instead of redoing it.
+//
+// On an irreversible gate the approver informs the owner's thread then denies (a real
+// Ask can't run safely here — the receive loop is not up yet); with no transport it is
+// a silent deny. Each task is resumed at most once per boot (terminal status recorded).
 func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) {
+	resumeSupervise(ctx, d, notifyCh)
 	c := d.flags
 	adv := resolveAdvisor(*c.backendName, d.boot, c)
 	run := func(ctx context.Context, t backend.Task) (bool, error) {
@@ -986,8 +993,8 @@ func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.
 		sess.Sizer = chatShouldSupervise
 		sess.Drivers = session.Drivers{
 			Native:    session.NewNativeDriver(gateNative(d.gate, serveNativeRun(d, metered, approver, threadID, sender)), metered, threadID),
-			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver)), metered),
-			Project:   session.NewProjectDriver(gateProject(d.gate, serveProjectRun(d, ledger, approver)), metered),
+			Supervise: session.NewSuperviseDriver(gateSupervise(d.gate, serveSuperviseRun(d, ledger, approver, threadID)), metered),
+			Project:   session.NewProjectDriver(gateProject(d.gate, serveProjectRun(d, ledger, approver, threadID)), metered),
 			Chat:      session.NewChatDriver(metered),
 		}
 		return sess
@@ -1115,9 +1122,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 // path, the planner's own Inbox/Out wiring is a documented follow-on; the supervised/
 // project drive itself runs bounded, verifier-gated, and charged against the per-
 // conversation wall, and its outcome folds back exactly like a native drive.
-func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver) session.RunSuperviseFunc {
+func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunSuperviseFunc {
+	taskID := superviseTaskID(threadID)
 	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter) (session.DriveOutcome, error) {
-		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal))
+		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -1126,13 +1134,18 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		// Mark the durable supervise row terminal when the drive ran to its OWN
+		// conclusion; a SIGTERM-interrupted drive (ctx cancelled) is left "supervise" so
+		// the next boot's resumeSupervise replays it from the last checkpointed tip.
+		finalizeSupervise(ctx, d, taskID, goal, o.Done)
 		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
 	}
 }
 
-func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver) session.RunProjectFunc {
+func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunProjectFunc {
+	taskID := superviseTaskID(threadID)
 	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter) (session.DriveOutcome, error) {
-		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal))
+		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -1141,6 +1154,7 @@ func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approve
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		finalizeSupervise(ctx, d, taskID, goal, o.Done)
 		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
 	}
 }
@@ -1149,7 +1163,7 @@ func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approve
 // shared conversation ledger (so the supervised/project drive charges the SAME
 // per-conversation ceiling, §6) and the channel approver (the gate routes back over
 // chat). It mirrors chatBuildDeps' interactive rail sizing.
-func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver, goal string) buildDeps {
+func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver, goal, taskID string) buildDeps {
 	adv := resolveAdvisor("native", d.boot, d.flags)
 	strong := adv.prov
 	if strong == nil {
@@ -1172,6 +1186,11 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 		log:      d.log,
 		approver: approver,
 		ledger:   ledger, // pin the per-conversation wall (§6)
+		// Durable resume: with a checkpointer + a stable task id, buildStack wires the
+		// supervisor's SaveState (snapshot → pin resume/<taskID> → SuperviseStatus row).
+		// taskID empty (no checkpointer) ⇒ no durable snapshot, byte-identical.
+		checkpoint: d.checkpoint,
+		taskID:     taskID,
 	}
 }
 
