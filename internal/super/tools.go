@@ -47,6 +47,19 @@ type SubagentSpec struct {
 	// byte-identical to before. The throwaway tip is NEVER an integration — the serial
 	// Integrator stays the sole verified merge path (I2).
 	BaseRefs []string `json:"-"`
+	// ContinueFrom, unlike BaseRef/BaseRefs, IS model-set: the id of a PRIOR subagent
+	// in this run whose failed/incomplete attempt this worker should BUILD ON instead
+	// of starting from base. The harness cuts the new worktree from that attempt's
+	// preserved branch, so the worker sees the partial work and finishes/fixes it —
+	// recovering the recompute the supervisor would otherwise pay by re-deriving from
+	// scratch. It is the supervisor's explicit "salvage this attempt" decision, used
+	// when an attempt was on the right track but incomplete or had a fixable error (and
+	// OMITTED, to start fresh, when the prior approach was wrong). It takes precedence
+	// over depends_on for the base cut (the prior attempt was itself cut from those
+	// deps, so their work is already present on its branch). The referenced id must be a
+	// completed prior subagent; empty ⇒ start fresh (the default). Verification still
+	// governs (I2): the continued worker's output is re-verified like any other.
+	ContinueFrom string `json:"continue_from,omitempty"`
 }
 
 // Handle is the supervisor's record of one spawned subagent: its spec plus its
@@ -89,12 +102,17 @@ func toolDefs() []model.Tool {
 			Description: "Spawn one role-specialized subagent in its own sandboxed worktree. " +
 				"role is one of researcher|understander|planner|implementer|reviewer. " +
 				"id becomes the branch task/<id> and the bus address. depends_on lists ids whose merged work this builds on. " +
-				"Refused (with a reason) above the depth, fanout, or agent ceilings.",
+				"Refused (with a reason) above the depth, fanout, or agent ceilings. " +
+				"continue_from (optional): the id of a PRIOR failed/incomplete subagent to RETRY by building on its " +
+				"partial work — the new worker starts from that attempt's branch (use a fresh id; reference the old one here). " +
+				"Use it when an attempt was on the right track but incomplete or had a fixable error; OMIT it (start fresh) " +
+				"when the prior approach was wrong. The retry is re-verified like any other — continuing never ships unverified work.",
 			InputSchema: json.RawMessage(`{"type":"object","properties":{` +
 				`"id":{"type":"string"},` +
 				`"role":{"type":"string","enum":["researcher","understander","planner","implementer","reviewer"]},` +
 				`"goal":{"type":"string"},` +
-				`"depends_on":{"type":"array","items":{"type":"string"}}` +
+				`"depends_on":{"type":"array","items":{"type":"string"}},` +
+				`"continue_from":{"type":"string"}` +
 				`},"required":["id","role","goal"]}`),
 		},
 		{

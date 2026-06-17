@@ -147,14 +147,23 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 	// BaseRef carries the single-dep case; BaseRefs carries the multi-dep set the
 	// SpawnFunc octopus-merges into a throwaway re-base tip (Phase 2). branches is
 	// nil here — serial resolution reads st.handles only.
-	spec.BaseRef = s.depTip(st, spec)
-	spec.BaseRefs = s.resolveBaseRefs(st, nil, spec)
+	// continue_from takes precedence over dependency-based base resolution: a retry is
+	// cut from the prior attempt's branch (which already contains its deps' work), not
+	// re-resolved against the deps. Otherwise resolve the single-/multi-dep base.
+	if spec.ContinueFrom != "" {
+		spec.BaseRef = s.continueBase(st, spec)
+	} else {
+		spec.BaseRef = s.depTip(st, spec)
+		spec.BaseRefs = s.resolveBaseRefs(st, nil, spec)
+	}
 	res := s.Spawn(ctx, spec)
 	res.ID = spec.ID
 	h.Result = res
 	h.Done = true
-	if res.Branch != "" {
-		// Remember the latest verified branch as a convergence hint for finish.
+	if res.Passed && res.Branch != "" {
+		// Remember the latest VERIFIED branch as a convergence hint for finish. Gated on
+		// Passed: a failed attempt now also carries a branch (its preserved WIP, for
+		// continue_from), but it must never become the integration tip (I2).
 		st.branch = res.Branch
 	}
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_report",
@@ -178,6 +187,15 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 func (s *Supervisor) checkSpawnRails(st *runState, spec SubagentSpec) (reason string, denial bool) {
 	if _, exists := st.handles[spec.ID]; exists {
 		return "spawn_subagent: id " + spec.ID + " already spawned", false
+	}
+	// continue_from must name a COMPLETED prior subagent in this run (you continue a
+	// failed/incomplete attempt by building on its preserved branch). A dangling or
+	// still-running reference is a plain input error, not a rail denial. Reading
+	// st.handles is side-effect-free, so this stays a pure gate like the others.
+	if spec.ContinueFrom != "" {
+		if h, ok := st.handles[spec.ContinueFrom]; !ok || !h.Done {
+			return "spawn_subagent: continue_from id " + spec.ContinueFrom + " is not a completed prior subagent", false
+		}
 	}
 	// Role must be a real, resolvable role — never a silent fallback to a more
 	// privileged one (the roster decides capability, not the supervisor's prose).
@@ -327,6 +345,10 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 			// (a sibling that passed earlier in this batch); st.handles is stable for
 			// the wave (cross-round deps) — identical discipline to Phase 1.
 			switch {
+			case spec.ContinueFrom != "":
+				// Retry built on a prior attempt's branch (a previous round, stable in
+				// st.handles — no lock needed). Takes precedence over dep-base resolution.
+				spec.BaseRef = s.continueBase(st, spec)
 			case len(spec.DependsOn) == 1:
 				mu.Lock()
 				spec.BaseRef = s.resolveBaseRef(st, branches, spec)
@@ -355,7 +377,9 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 		res.ID = a.spec.ID
 		a.handle.Result = res
 		a.handle.Done = true
-		if res.Branch != "" {
+		if res.Passed && res.Branch != "" {
+			// VERIFIED-only (I2): a failed attempt now also carries a branch (its preserved
+			// WIP, for continue_from) but must never become the integration tip.
 			st.branch = res.Branch
 		}
 		s.Log.Append(eventlog.Event{Task: a.spec.ID, Kind: "subagent_report",
@@ -366,6 +390,26 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 	// after the pool drained) so a later ask_supervisor sees the full cohort outcome.
 	s.refreshAndPublish(ctx, st)
 	return results
+}
+
+// continueBase returns the branch a continue_from retry is cut from: the referenced
+// prior attempt's branch, preserved even when that attempt FAILED (the wiring site's
+// preserveFailedAttempt commits a failed worker's WIP to its branch precisely so it
+// can be continued). It takes precedence over dependency-based base resolution because
+// the prior attempt was itself cut from those dependencies, so their work is already
+// on its branch — re-resolving deps would be redundant. Returns "" when the prior
+// attempt has no branch (it changed nothing), degrading cleanly to base HEAD.
+// Existence is validated in checkSpawnRails; this is defensive. Reads st.handles,
+// which is stable for a wave's duration (the prior attempt is a previous round), so it
+// needs no lock in the concurrent path.
+func (s *Supervisor) continueBase(st *runState, spec SubagentSpec) string {
+	h, ok := st.handles[spec.ContinueFrom]
+	if !ok || !h.Done || h.Result.Branch == "" {
+		return ""
+	}
+	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_continue",
+		Detail: map[string]any{"continue_from": spec.ContinueFrom, "base": h.Result.Branch}})
+	return h.Result.Branch
 }
 
 // resolveBaseRef is the concurrent analog of depTip: the git ref a dependent worker
@@ -589,7 +633,10 @@ func (s *Supervisor) doCode(ctx context.Context, round int, st *runState, b mode
 	s.emit(emit.Event{Kind: emit.KindTool, Step: round,
 		Text: "writing code for: " + clip(in.Goal, 80)})
 	res := s.Code(ctx, in.Goal)
-	if res.Branch != "" {
+	if res.Passed && res.Branch != "" {
+		// VERIFIED-only (I2): st.branch is the convergence tip, so it only ever advances
+		// to a passed branch — uniform with the spawn paths, which now also tag a failed
+		// attempt's preserved branch.
 		st.branch = res.Branch
 		// Re-point the read tree + re-publish so the supervisor's reads and the grounded
 		// answer reflect its own coded branch too — every st.branch mutation publishes.
