@@ -170,6 +170,18 @@ nilcore schedule --every 1h --goal "..." # or a cron expr; add --open-pr to open
 #   headless-browser behavioral check into the verdict (CI-only live run; fails closed).
 NILCORE_BROWSER_VERIFY=1 nilcore -dir ./svc -goal "..."
 
+# Fan out a VERIFIED swarm: N shards in a bounded in-process pool, each producing a
+#   TYPED artifact judged by a verify-pack. Only verifier-green shards ship; failed
+#   shards requeue until clean (or the budget/pass limit). 300 agents are fine because
+#   every unit is checkable — no majority vote, no "the model says it looks right".
+nilcore swarm -goal "research 100 EV companies" -preset research \
+  -agents 300 -concurrency 40 -artifact report+matrix -verify-pack finance \
+  -passes until-clean -budget 500
+#   Presets: research | code | audit | benchmark | ui. The live scoreboard shows
+#   checked/passed/failed/retry-pass/remaining + cost/time/token + the source–claim
+#   trace; replay it anytime with `nilcore report -format matrix -dir ./repo`.
+#   In-process / single-host / bounded; default-off (the binary is byte-identical unused).
+
 # Prefer env vars / CI? Skip the wizard and export keys directly:
 #   export ANTHROPIC_API_KEY=sk-...   (or NILCORE_* for scripted: nilcore init -non-interactive)
 #   NILCORE_EMBED_KEY enables pure-Go HNSW semantic search; a NILCORE.md / AGENTS.md

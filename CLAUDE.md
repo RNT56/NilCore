@@ -159,7 +159,8 @@ docs/
   ARCHITECTURE.md      ← decided architecture + invariants + frozen contract
   PERSONA.md           ← the running agent's voice, autonomy, and behavior
   TASKS.md             ← the work queue: master DAG + in-depth task specs
-cmd/nilcore/           ← entrypoint
+  SWARM.md             ← Phase 12: verified swarm mode (`nilcore swarm`) design + task DAG
+cmd/nilcore/           ← entrypoint (run · build · serve · chat · swarm · report · …)
 internal/
   model/               ← Anthropic Messages API client (stdlib only)
   backend/             ← CodingBackend contract + native / codex / claude-code
