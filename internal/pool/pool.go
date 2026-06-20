@@ -467,7 +467,7 @@ func buildStack(
 	if err != nil {
 		return nil, fmt.Errorf("build resilient: %w", err)
 	}
-	var inner model.Provider = res
+	inner := res
 	if cap > 0 {
 		// One shared strongcap per distinct spec identity: every tier/shard
 		// pointing at this stack shares the same semaphore, so the cap is

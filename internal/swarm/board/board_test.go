@@ -310,7 +310,9 @@ func TestEmitSnapshotNoCoalesce(t *testing.T) {
 	b, _ := newTestBoard() // minInterval 0
 	b.SetTotal(1)
 	b.Record(ShardOutcome{ID: "x", Pass: 1, Passed: true})
-	if !b.EmitSnapshot(log) || !b.EmitSnapshot(log) {
+	wrote1 := b.EmitSnapshot(log)
+	wrote2 := b.EmitSnapshot(log)
+	if !wrote1 || !wrote2 {
 		t.Fatal("EmitSnapshot suppressed a write with coalescing disabled")
 	}
 	_ = log.Close()
@@ -399,8 +401,9 @@ func TestLiveVsReplayAgree(t *testing.T) {
 		t.Errorf("FinalCleanPass: live %v != replay %v", live.FinalCleanPass, sw.FinalCleanPass)
 	}
 	// Sanity on the values themselves: pass 2, one shard checked+passed, a retry, clean.
-	if !(live.Pass == 2 && live.Checked == 1 && live.Passed == 1 && live.Failed == 0 &&
-		live.RetryPass == 1 && live.Remaining == 0 && live.FinalCleanPass) {
+	okTally := live.Pass == 2 && live.Checked == 1 && live.Passed == 1 && live.Failed == 0 &&
+		live.RetryPass == 1 && live.Remaining == 0 && live.FinalCleanPass
+	if !okTally {
 		t.Errorf("unexpected final live tally: %+v", live)
 	}
 }
@@ -480,11 +483,7 @@ func readLines(t *testing.T, path string) []string {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	var out []string
-	for _, l := range splitNonEmpty(string(data)) {
-		out = append(out, l)
-	}
-	return out
+	return splitNonEmpty(string(data))
 }
 
 func splitNonEmpty(s string) []string {

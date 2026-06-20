@@ -92,6 +92,8 @@ func main() {
 		serveMain(args[1:])
 	case "build":
 		buildMain(args[1:])
+	case "swarm":
+		swarmMain(args[1:])
 	case "init":
 		initMain(args[1:])
 	case "doctor":
@@ -135,6 +137,7 @@ Usage:
   nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
   nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
   nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
+  nilcore swarm -goal "<objective>" -preset research   fan out a verified agent swarm (typed artifacts, requeue-until-clean)
   nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
   nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
   nilcore propose-edit -goal "..." -paths ...  gated self-edit of the agent's own prompts/skills/tools
@@ -142,6 +145,7 @@ Usage:
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
   nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
+  nilcore report [-format text|matrix]  render the verification report from the event log (the I2 trust gate)
   nilcore mcp-call <server> <tool> ...  invoke a configured MCP tool (the runtime bridge for generated wrappers)
   nilcore version                       print the build version
 
