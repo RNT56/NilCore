@@ -67,6 +67,15 @@ type languageParser interface {
 var parsers = map[string]languageParser{
 	".go": goParser{},
 	".py": pythonParser{},
+	// JavaScript/TypeScript share one brace-delimited heuristic backend; the .ts/.tsx
+	// extensions ride the same scanner since TS is a JS superset for our purposes.
+	".js":  jsParser{},
+	".jsx": jsParser{},
+	".ts":  jsParser{},
+	".tsx": jsParser{},
+	".mjs": jsParser{},
+	".cjs": jsParser{},
+	".rs":  rustParser{},
 }
 
 // SupportedExtensions returns the file extensions (dot included, e.g. ".go", ".py")
