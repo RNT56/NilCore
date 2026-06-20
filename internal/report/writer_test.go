@@ -53,12 +53,12 @@ func testWriteRoundTrip(t *testing.T) {
 // is rejected without writing a file.
 func testWriteExtAllowlist(t *testing.T) {
 	root := resolveDir(t)
-	for _, ext := range []string{"html", "md", "txt"} {
+	for _, ext := range []string{"html", "md", "txt", "json"} { // SW-T06 added json
 		if err := WriteReport(root, "ok-"+ext, ext, []byte("x")); err != nil {
 			t.Fatalf("ext %q must be allowed: %v", ext, err)
 		}
 	}
-	for _, bad := range []string{"", "json", "exe", "sh", "HTML", "html.txt"} {
+	for _, bad := range []string{"", "exe", "sh", "HTML", "html.txt"} {
 		if err := WriteReport(root, "bad", bad, []byte("x")); err == nil {
 			t.Fatalf("ext %q must be rejected", bad)
 		}

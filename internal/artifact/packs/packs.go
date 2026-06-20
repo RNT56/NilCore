@@ -27,6 +27,9 @@ import (
 	"strings"
 
 	"nilcore/internal/artifact/evverify"
+	"nilcore/internal/artifact/packs/audit"
+	"nilcore/internal/artifact/packs/benchmark"
+	"nilcore/internal/artifact/packs/code"
 	"nilcore/internal/artifact/packs/finance"
 	"nilcore/internal/artifact/packs/software"
 	"nilcore/internal/artifact/packs/ui"
@@ -40,6 +43,14 @@ const (
 	NameSoftware = "software"
 	NameFinance  = "finance"
 	NameUI       = "ui"
+	// NameAudit / NameBenchmark / NameCode are the Phase-12 (swarm) packs. All three
+	// run ENTIRELY in-box against the local worktree (audit reproduces a file:line with
+	// sed/grep, benchmark re-runs an allowlisted script, code re-runs the autodetected
+	// build/test) — none reaches a fixed external host, so each carries a nil host-set
+	// and HostsFor returns nil for them (no egress allowlist to cross-check, P11-T35).
+	NameAudit     = "audit"
+	NameBenchmark = "benchmark"
+	NameCode      = "code"
 )
 
 // pack bundles a name's registration entrypoint with its documented egress host-set.
@@ -83,6 +94,24 @@ var registry = map[string]pack{
 	NameUI: {
 		registerAll: ui.RegisterAll,
 		hosts:       ui.Hosts(), // intentionally empty: the flow targets a per-claim site
+	},
+	// The three swarm packs are in-box/local by construction: their checks are pure
+	// functions of files already on disk (audit), a re-run of an allowlisted script in
+	// the worktree (benchmark), or a re-run of the autodetected build/test (code). None
+	// reaches a fixed external host, so each documents a nil host-set. We still source
+	// each from the pack's own Hosts() so the single-source-of-truth discipline (and the
+	// P11-T35 cross-check input) is identical to the shipped packs.
+	NameAudit: {
+		registerAll: audit.RegisterAll,
+		hosts:       audit.Hosts(), // nil: file:line reproduction is local-only
+	},
+	NameBenchmark: {
+		registerAll: benchmark.RegisterAll,
+		hosts:       benchmark.Hosts(), // nil: re-runs an in-box script, reaches no host
+	},
+	NameCode: {
+		registerAll: code.RegisterAll,
+		hosts:       code.Hosts(), // nil: re-runs the in-box build/test, reaches no host
 	},
 }
 

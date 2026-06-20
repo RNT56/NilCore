@@ -47,6 +47,26 @@ const (
 	// write/edit tools — so it is NOT a read-only role; the supervisor merges only
 	// the verifier-set claim statuses, never the worker's prose self-report (I2/I7).
 	RoleTypedResearch Role = "typed-research"
+
+	// RoleAuditor produces a verified audit/security Report (Phase 12, SW-T15). Like
+	// RoleTypedResearch it is WRITE-capable — it must emit a spine Artifact JSON whose
+	// Claims each reproduce a finding (a file:line the audit pack re-checks in-box, or
+	// a fact a web check resolves) — so its Profile sets ReadOnly:false. It is NOT a
+	// member of the default five-role roster; it is a swarm preset role, built by
+	// AuditorProfile and selected by internal/swarm/preset. The hardcoded Role.ReadOnly()
+	// helper still reports true for it (it only excepts RoleImplementer/RoleTypedResearch),
+	// which is exactly the documented gotcha SW-T15 closes by trusting the Profile's
+	// ReadOnly field — not the role-name helper — for the write/read wiring decision.
+	RoleAuditor Role = "auditor"
+
+	// RoleUI produces a verified UI Report (Phase 12, SW-T15) — a browser/visual flow
+	// whose Claims are checked by the ui pack and (CI-only) the browser verifier. Like
+	// RoleAuditor it is WRITE-capable (it writes the spine Artifact JSON) so its Profile
+	// sets ReadOnly:false. It too is a swarm preset role (built by UIProfile, selected by
+	// internal/swarm/preset), absent from the default five, and it shares the same
+	// Role.ReadOnly()==true gotcha: capability is taken from Profile.ReadOnly, never the
+	// hardcoded helper.
+	RoleUI Role = "ui"
 )
 
 // ArtifactRelPath is the fixed, out-of-band worktree location the typed-research

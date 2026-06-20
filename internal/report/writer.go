@@ -37,6 +37,7 @@ var allowedExts = map[string]struct{}{
 	"html": {},
 	"md":   {},
 	"txt":  {},
+	"json": {}, // SW-T06: the redacted-projection JSON deliverable (render.MarshalRedacted)
 }
 
 // validRun rejects any run identifier that is not a single, safe path component,

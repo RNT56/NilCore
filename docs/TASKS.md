@@ -123,10 +123,28 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 | P11-T34 | 11 | Staging doc: verification report | — | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
 | P11-T35 | 11 | Cross-check: pack hosts ⊆ egress profiles | P11-T07, P11-T08, P11-T09, P11-T10, P11-T11, P11-T25 | `cmd/nilcore/egress_packs_test.go` | shipped |
 | P11-T36 | 11 | Promotion into the canonical DAG | P11-T06, P11-T13, P11-T18, P11-T29, P11-T24, P11-T34 | `docs/TASKS.md`, `docs/ARCHITECTURE.md`, `CHANGELOG.md` | **contract** |
+| SW-T01 | 12 | artifact schema/shape validation leaf + SchemaVerifier | — | `internal/artifact/schema` | shipped |
+| SW-T02 | 12 | `audit` verify-pack (file:line evidence reproduces in-box) | — | `internal/artifact/packs/audit` | shipped |
+| SW-T03 | 12 | `benchmark` verify-pack (verifier re-measures K in-box) | — | `internal/artifact/packs/benchmark` | shipped |
+| SW-T04 | 12 | `code` verify-pack (build/test via `verify.Detect`) | — | `internal/artifact/packs/code` | shipped |
+| SW-T05 | 12 | `packs.Build` assembler + `DefaultSchemas` (fail-closed) | SW-T01..T04 | `internal/artifact/packs/{packs,build}.go` | shipped |
+| SW-T06 | 12 | report source/claim-trace + matrix projection (additive) | SW-T01 | `internal/report` | shipped |
+| SW-T07 | 12 | provider pool (tiered/capped/failover/metered) | — | `internal/pool` | shipped |
+| SW-T08 | 12 | `onboard.Config.Pool` field + Validate (config schema) | SW-T07 | `internal/onboard/onboard.go` | shipped |
+| SW-T09 | 12 | swarm `Shard` + invariant guards (ShipGate/ClassifyCeiling/ProjectTrusted) | SW-T05 | `internal/swarm` | shipped |
+| SW-T10 | 12 | swarm durable Queue (swarm-* status namespace, resume) | SW-T09 | `internal/swarm` | shipped |
+| SW-T11 | 12 | swarm Sharder (List/Plan/Failure) | SW-T10 | `internal/swarm` | shipped |
+| SW-T12 | 12 | swarm Runner (scheduler/DAG bounded pool) | SW-T11 | `internal/swarm` | shipped |
+| SW-T13 | 12 | swarm multi-pass Controller (until-clean over requeue) | SW-T12 | `internal/swarm` | shipped |
+| SW-T14 | 12 | swarm scoreboard board sub-leaf (+ tui) | SW-T06 | `internal/swarm/board` | shipped |
+| SW-T15 | 12 | swarm presets + RoleAuditor/RoleUI | SW-T05, SW-T09, SW-T07 | `internal/swarm/preset`, `internal/roster` | shipped |
+| SW-T16 | 12 | extend `nilcore report` (swarm report/matrix/json) | SW-T06 | `cmd/nilcore/report.go` | shipped |
+| SW-T17 | 12 | `nilcore swarm` subcommand + `buildSwarm` | SW-T13..T16, SW-T08 | `cmd/nilcore/{swarm.go,main.go}` | shipped |
+| SW-T18 | 12 | Promotion into the canonical DAG | SW-T17 | `docs/{TASKS,ARCHITECTURE}.md`, `CLAUDE.md`, `CHANGELOG.md`, `README.md` | **contract** |
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
 
-> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** (full multi-agent concurrency) is **shipped** — dynamic-wave async dispatch, tracked in its own design doc (`docs/CONCURRENCY.md`). **Phase 9** (behavioral verification & event-driven autonomy, promoted from `docs/UPGRADE-PATH.md` Tier 1) is **shipped**. **Phase 10** (context depth, trusted steering & distribution, promoted from Tier 2) is **shipped**. The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
+> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** (full multi-agent concurrency) is **shipped** — dynamic-wave async dispatch, tracked in its own design doc (`docs/CONCURRENCY.md`). **Phase 9** (behavioral verification & event-driven autonomy, promoted from `docs/UPGRADE-PATH.md` Tier 1) is **shipped**. **Phase 10** (context depth, trusted steering & distribution, promoted from Tier 2) is **shipped**. **Phase 11** (verifier-backed artifact factory) is **shipped** (`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`). **Phase 12** (verified swarm mode — the bounded in-process `nilcore swarm` surface over the Phase-11 spine) is **shipped**, tracked in its own design doc (`docs/SWARM.md`). The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
 
 > **Deferred items D1–D4 shipped:** the four formerly-deferred items in `docs/IMPLEMENTATION-PLANS.md` are now implemented + merged — **D1** behavioral verification (sandboxed headless browser, the `browser_view` tool + the pure-Go `nilcore-browser` driver, composite verifier opt-in via `NILCORE_BROWSER_VERIFY`), **D2** semantic code search (content-hash-cached pure-Go HNSW, opt-in via `NILCORE_EMBED_KEY`), **D3** multi-language code intelligence (a language-parser seam + pure-Go, CGO-free Python, TS/JS, and Rust backends — not tree-sitter; the seam was broadened to four backends / nine extensions by R2), and **D4** the gated draft PR (`watch --open-pr` / `schedule --open-pr` via `internal/forge`, only after the human gate). All four are additive, opt-in, and pure stdlib — no new module was added (HNSW, the multi-language parser backends, the embedder, the browser driver incl. its pure-Go CDP client, and forge are all stdlib), so the core dependency count in the default binary stays at exactly **two** (pure-Go SQLite + `golang.org/x/sys`); the Charm TUI stack (3 modules) still links **only** under `make tui`. I6 holds; `CGO_ENABLED=0` across the release matrix. Invariants I1–I7 all hold unchanged.
 
@@ -804,6 +822,40 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
 Make **code one artifact type among many**: reports, comparison matrices, audits, benchmarks, migration plans, release notes, and research dossiers become first-class outputs, each carrying **machine-verifiable acceptance criteria**. Every claim/number/cell rides with provenance `{value, source_url, retrieved_at, extraction_method, verifier, status}`, and an artifact is **GREEN only because every claim passed a runnable check** — a status **produced by a verifier** (I2), never self-claimed. The full per-task specs, the spine data model (the Go type shapes), the wave plan, and the I1–I7 proof live in **`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`** (the staging doc, house pattern); this section is the canonical promotion (`P11-T36`). Every task is **additive, opt-in, flag/env-gated, stdlib-only** (`go.mod` untouched, `CGO_ENABLED=0`) — **the default binary is byte-identical when the features are off.**
 
 > **Status (shipped):** Phase 11 is complete and merged. The upgrade routes **around** the frozen `backend.CodingBackend` contract (I1): a typed `artifact.Artifact{Claims[]}` (each `Claim` carrying an `Evidence{value, source_url, retrieved_at, extraction_method, verifier, status}`) rides **out-of-band** as a worktree JSON file at `.nilcore/artifacts/<id>.json`, never on `backend.Result`. Artifact-GREEN is produced by `evverify.ArtifactVerifier` — a `verify.Verifier` folded into `verify.Composite` **after** the build verifier, so any red claim turns the whole verdict red and a worker's self-written `Status=pass` is overwritten by a real `CheckFunc` run in the sandbox box (I2/I4; unregistered id ⇒ `Unverifiable`, never `Pass`; staleness can only DEMOTE, never PASS on a model timestamp). Reusable **domain verifier packs** (`web`/`software`/`finance`/`ui`) register namespaced verifier-ids into the spine `Registry`, reaching live data only via `box.Exec`/`ExecWithEnv` under the egress allowlist with the body parsed host-side as trusted Go — curl-in-box + `encoding/json`, **no go-github / SEC / finance / markdown SDK** (I6); keyed packs inject `$NAME` from the `SecretStore`, and the persisted `SourceURL` stays key-free (I3). **Typed worker results** land on an additive `spawn.Result.Artifact` field (prose stays `guard.Wrap`-fenced in `super.renderReport`; the trusted surface carries only id/field/status — I7). **Granular requeue** (`internal/requeue`) re-dispatches exactly the failed claims through the existing `spawn.DAGScheduler` + `continue_from`, bounded by a per-unit ledger, flipping green only on a fresh verifier re-run. **Research egress profiles** (`internal/egressprofile`: `finance`/`docs`/`web-research` + a project-local `.nilcore/egress.json`) keep default-deny absolute — a profile widens the *tree* while `roster.EgressFor` still intersects each role narrow-only (R9). A read-only **`nilcore report`** verification UI replays the append-only log into a text/HTML/markdown report (passed/failed checks, the per-claim `{value,source_url,verifier,status}` table, retry history, final clean pass) and refuses GREEN over a broken hash-chain (I5). New leaf packages: `internal/{worktreefs, browserwire, artifact, artifact/evverify, artifact/packs/{web,software,finance,ui}, requeue, egressprofile, report, report/render}`; modified: `internal/{spawn, roster, super, onboard, tools}` + `cmd/nilcore`. Env gates: `NILCORE_EVIDENCE_VERIFY`, `NILCORE_VERIFY_PACKS`, `NILCORE_REQUEUE`, `NILCORE_EGRESS_PROFILE` / `-egress-profile`, `NILCORE_EVIDENCE_MAX_AGE`. The six per-pillar staging-doc stubs (`P11-T06/T13/T18/T24/T29/T34`) were **consolidated** into the single `docs/ROADMAP-EVIDENCE-ARTIFACTS.md`. `make verify` green; `go.mod`/`go.sum` unchanged; I1–I7 hold.
+
+---
+
+## Phase 12 — Verified swarm mode
+
+A first-class high-throughput surface — `nilcore swarm --goal … --agents N --concurrency K
+--preset P --verify-pack … --passes until-clean --budget D` — that fans N units of work into a
+**bounded in-process pool on one host**, where every unit produces a **typed, checkable artifact**
+judged by a **verifier per unit**, requeues **only failed shards** until clean (or a budget / pass
+limit), folds verifier-green work through the **serial Integrator** (which never lands to base), and
+renders a **verification scoreboard**. Built **on top of** the Phase-11 artifact spine — it
+**reuses/extends** `internal/{artifact, artifact/evverify, artifact/packs/*, requeue, report}`, never
+rebuilds them. Full design + per-task specs: **`docs/SWARM.md`** (`SW-T01..T18`). It is the
+single-host projection of a fleet; multi-host shard dispatch / cross-host task-state / a remote
+control plane crosses into `EXT-01` and stays out of scope.
+
+> **Status (shipped):** Phase 12 is complete and merged. New leaf packages: `internal/pool`
+> (tiered/capped/failover/metered provider pool over `meter`/`strongcap`/`model.Resilient`),
+> `internal/artifact/schema` (structural validation + `SchemaVerifier`), `internal/artifact/packs/
+> {audit,benchmark,code}` (the three new verify-packs + `packs.Build` assembler, fail-closed on an
+> unknown pack), `internal/swarm` (Shard + durable Queue + Sharder + Runner + multi-pass Controller),
+> `internal/swarm/board` (the live verifier-driven scoreboard, `//go:build tui` Charm dashboard linking
+> zero Charm by default), `internal/swarm/preset` (the five named bundles). Additive: `internal/report`
+> (source/claim-trace + `RenderMatrix` + redacted json), `internal/roster` (`RoleAuditor`/`RoleUI`),
+> `internal/onboard` (`Config.Pool`). New command `nilcore swarm`; `nilcore report` gains
+> `--format json|matrix` + `--dir`. The default binary is **byte-identical** when `swarm` is unused
+> (one new dispatch arm; no existing package imports a swarm/pool leaf). The seven invariants hold by
+> **reuse, not new mechanism**: I2 the `evverify.ArtifactVerifier` is the sole ship gate (per-shard +
+> Integrator re-verify; `ShipGate` refuses `verify.Pass`/nil; unknown pack ⇒ fail-closed); I1 the
+> artifact is a worktree file read by the verifier (`backend.CodingBackend` untouched); I3 keys via the
+> SecretStore, never to a decorator/log/render; I4 each shard in its own sandbox box; I6 stdlib only
+> (`go.mod` unchanged, `CGO_ENABLED=0`); I7 model-authored fields stay data. `make verify` green;
+> `golangci-lint` 0 issues. The Integrator never lands to base (promote-to-base is one gated
+> `policy.GateAction{PromoteToBase}`, nil approver default-denies).
 
 ---
 
