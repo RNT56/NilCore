@@ -84,6 +84,45 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 | P10-T05 | 10 | Multi-language AST + broaden live index | — | `internal/codeintel/ast/`, `internal/codeintel/live/` | go.mod if dep |
 | P10-T06 | 10 | Versioned skills/MCP-server registry | — | `internal/skills/`, `internal/mcp/`, `internal/registry/` | |
 | P10-T07 | 10 | Tier-2 CLI wiring | P10-T02, P10-T03, P10-T04, P10-T05, P10-T06 | `cmd/nilcore/`, `internal/tools/` | shares `cmd/nilcore`, `internal/tools` |
+| P11-T00 | 11 | Extract worktree-confinement leaf | — | `internal/worktreefs` | shipped |
+| P11-T01 | 11 | artifact leaf: data model, JSON, status lifecycle | P11-T00 | `internal/artifact` | shipped |
+| P11-T02 | 11 | artifact worktree persistence | P11-T01 | `internal/artifact` | shipped |
+| P11-T03 | 11 | evverify: Registry + CheckFunc dispatch seam | P11-T01 | `internal/artifact/evverify` | shipped |
+| P11-T04 | 11 | evverify.ArtifactVerifier (I2 keystone) | P11-T02, P11-T03 | `internal/artifact/evverify` | shipped |
+| P11-T05 | 11 | Wire evidence verification (`NILCORE_EVIDENCE_VERIFY`) | P11-T04 | `cmd/nilcore/verifier.go` | shipped |
+| P11-T06 | 11 | Staging doc: spine | — | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T07 | 11 | web-research pack | P11-T03 | `internal/artifact/packs/web` | shipped |
+| P11-T08 | 11 | software-research pack | P11-T03 | `internal/artifact/packs/software` | shipped |
+| P11-T09 | 11 | finance/market pack (keyed+keyless) | P11-T03 | `internal/artifact/packs/finance` | shipped |
+| P11-T10 | 11 | ui-browser pack | P11-T03, P11-T11a | `internal/artifact/packs/ui` | shipped |
+| P11-T11 | 11 | pack aggregator + selector | P11-T07, P11-T08, P11-T09, P11-T10 | `internal/artifact/packs/packs.go` | shipped |
+| P11-T11a | 11 | Extract browserwire leaf | — | `internal/browserwire` | shipped |
+| P11-T12 | 11 | Wire pack selection (`NILCORE_VERIFY_PACKS`) | P11-T11, P11-T05 | `cmd/nilcore/verifier.go` | shipped |
+| P11-T13 | 11 | Staging doc: domain verifier packs | P11-T06 | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T14 | 11 | spawn.Result typed-artifact field | — | `internal/spawn` | shipped |
+| P11-T15 | 11 | Typed-research Role/Profile | — | `internal/roster` | shipped |
+| P11-T16 | 11 | buildSpawnFunc reads verified artifact; compose into env.Verifier | P11-T14, P11-T15, P11-T02, P11-T04, P11-T05 | `cmd/nilcore/build.go` | shipped |
+| P11-T17 | 11 | renderReport: typed claims trusted, prose fenced | P11-T14 | `internal/super` | shipped |
+| P11-T17a | 11 | Enrich subagent_report Detail with continue_from/base | P11-T17 | `internal/super` | shipped |
+| P11-T18 | 11 | Staging doc: typed worker results | P11-T13 | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T19 | 11 | requeue leaf: Unit, Worklist, Scan | P11-T02 | `internal/requeue` | shipped |
+| P11-T20 | 11 | requeue.Ledger | P11-T19 | `internal/requeue` | shipped |
+| P11-T21 | 11 | requeue.Plan + Resolve | P11-T19, P11-T20 | `internal/requeue` | shipped |
+| P11-T22 | 11 | super: nil-gated RequeueHook | P11-T17a | `internal/super` | shipped |
+| P11-T23 | 11 | Wire granular requeue (`NILCORE_REQUEUE`) | P11-T21, P11-T22, P11-T05, P11-T16 | `cmd/nilcore/requeue_wiring.go` | shipped |
+| P11-T24 | 11 | Staging doc: granular requeue | — | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T25 | 11 | egressprofile leaf: named presets + Resolve | — | `internal/egressprofile` | shipped |
+| P11-T26 | 11 | egressprofile project-local allowlist file | P11-T25 | `internal/egressprofile` | shipped |
+| P11-T27 | 11 | onboard.WebConfig persistence + validation | P11-T25 | `internal/onboard` | shipped |
+| P11-T28 | 11 | Wire `-egress-profile` through both front doors | P11-T26, P11-T27, P11-T05, P11-T12, P11-T16, P11-T23, P11-T33 | `cmd/nilcore` (egress wiring) | shipped |
+| P11-T29 | 11 | Staging doc: research egress profiles | P11-T18 | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T30 | 11 | report leaf: ReportModel + log-replay projection | P11-T01, P11-T02 | `internal/report` | shipped |
+| P11-T31 | 11 | report worktree writer | P11-T30 | `internal/report` | shipped |
+| P11-T32 | 11 | report/render: text + HTML + markdown | P11-T30 | `internal/report/render` | shipped |
+| P11-T33 | 11 | Wire `nilcore report` subcommand | P11-T31, P11-T32 | `cmd/nilcore/report.go`, `cmd/nilcore/main.go` (dispatch) | shipped |
+| P11-T34 | 11 | Staging doc: verification report | — | `docs/ROADMAP-EVIDENCE-ARTIFACTS.md` | consolidated |
+| P11-T35 | 11 | Cross-check: pack hosts ⊆ egress profiles | P11-T07, P11-T08, P11-T09, P11-T10, P11-T11, P11-T25 | `cmd/nilcore/egress_packs_test.go` | shipped |
+| P11-T36 | 11 | Promotion into the canonical DAG | P11-T06, P11-T13, P11-T18, P11-T29, P11-T24, P11-T34 | `docs/TASKS.md`, `docs/ARCHITECTURE.md`, `CHANGELOG.md` | **contract** |
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
 
@@ -757,6 +796,14 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
 - **Verify:** `make verify`; tests — with a key, retrieval uses the semantic lens (provenance `semantic`); without, lexical fallback; steering discovered at repo root; registry install round-trip.
 - **Notes:** `cmd/nilcore/` and `internal/tools/` are shared surfaces — serialize against P9-T07 (cmd) and P9-T02 (tools). Rationale: `docs/UPGRADE-PATH.md` §5 (U2-T07).
 - **Status (shipped):** the Tier-2 features are activated in the binary — the default Embedder + Semantic lens set on the Retriever (on by default when `NILCORE_EMBED_KEY` resolves, lexical otherwise), the steering file discovered + threaded at launch, the multi-language live index enabled, and `nilcore registry install/list` exposed. Every path is nil/flag-gated; the default binary is byte-identical when features are off/unconfigured.
+
+---
+
+## Phase 11 — NilCore as a verifier-backed artifact factory
+
+Make **code one artifact type among many**: reports, comparison matrices, audits, benchmarks, migration plans, release notes, and research dossiers become first-class outputs, each carrying **machine-verifiable acceptance criteria**. Every claim/number/cell rides with provenance `{value, source_url, retrieved_at, extraction_method, verifier, status}`, and an artifact is **GREEN only because every claim passed a runnable check** — a status **produced by a verifier** (I2), never self-claimed. The full per-task specs, the spine data model (the Go type shapes), the wave plan, and the I1–I7 proof live in **`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`** (the staging doc, house pattern); this section is the canonical promotion (`P11-T36`). Every task is **additive, opt-in, flag/env-gated, stdlib-only** (`go.mod` untouched, `CGO_ENABLED=0`) — **the default binary is byte-identical when the features are off.**
+
+> **Status (shipped):** Phase 11 is complete and merged. The upgrade routes **around** the frozen `backend.CodingBackend` contract (I1): a typed `artifact.Artifact{Claims[]}` (each `Claim` carrying an `Evidence{value, source_url, retrieved_at, extraction_method, verifier, status}`) rides **out-of-band** as a worktree JSON file at `.nilcore/artifacts/<id>.json`, never on `backend.Result`. Artifact-GREEN is produced by `evverify.ArtifactVerifier` — a `verify.Verifier` folded into `verify.Composite` **after** the build verifier, so any red claim turns the whole verdict red and a worker's self-written `Status=pass` is overwritten by a real `CheckFunc` run in the sandbox box (I2/I4; unregistered id ⇒ `Unverifiable`, never `Pass`; staleness can only DEMOTE, never PASS on a model timestamp). Reusable **domain verifier packs** (`web`/`software`/`finance`/`ui`) register namespaced verifier-ids into the spine `Registry`, reaching live data only via `box.Exec`/`ExecWithEnv` under the egress allowlist with the body parsed host-side as trusted Go — curl-in-box + `encoding/json`, **no go-github / SEC / finance / markdown SDK** (I6); keyed packs inject `$NAME` from the `SecretStore`, and the persisted `SourceURL` stays key-free (I3). **Typed worker results** land on an additive `spawn.Result.Artifact` field (prose stays `guard.Wrap`-fenced in `super.renderReport`; the trusted surface carries only id/field/status — I7). **Granular requeue** (`internal/requeue`) re-dispatches exactly the failed claims through the existing `spawn.DAGScheduler` + `continue_from`, bounded by a per-unit ledger, flipping green only on a fresh verifier re-run. **Research egress profiles** (`internal/egressprofile`: `finance`/`docs`/`web-research` + a project-local `.nilcore/egress.json`) keep default-deny absolute — a profile widens the *tree* while `roster.EgressFor` still intersects each role narrow-only (R9). A read-only **`nilcore report`** verification UI replays the append-only log into a text/HTML/markdown report (passed/failed checks, the per-claim `{value,source_url,verifier,status}` table, retry history, final clean pass) and refuses GREEN over a broken hash-chain (I5). New leaf packages: `internal/{worktreefs, browserwire, artifact, artifact/evverify, artifact/packs/{web,software,finance,ui}, requeue, egressprofile, report, report/render}`; modified: `internal/{spawn, roster, super, onboard, tools}` + `cmd/nilcore`. Env gates: `NILCORE_EVIDENCE_VERIFY`, `NILCORE_VERIFY_PACKS`, `NILCORE_REQUEUE`, `NILCORE_EGRESS_PROFILE` / `-egress-profile`, `NILCORE_EVIDENCE_MAX_AGE`. The six per-pillar staging-doc stubs (`P11-T06/T13/T18/T24/T29/T34`) were **consolidated** into the single `docs/ROADMAP-EVIDENCE-ARTIFACTS.md`. `make verify` green; `go.mod`/`go.sum` unchanged; I1–I7 hold.
 
 ---
 
