@@ -21,6 +21,8 @@ This design adds an **agentic supervisor** that, from one high-level goal (inclu
 
 The work is **six new small stdlib-only packages** plus additive seams on existing packages and one new CLI subcommand. No existing contract changes.
 
+> **See also — verified swarm mode (Phase 12, `docs/SWARM.md`).** `nilcore swarm` is the bounded, high-throughput *product surface* built on this same machinery: it fans **N units of work into an in-process pool on one host** (`scheduler` / `spawn.DAGScheduler`), where every unit produces a **typed artifact** judged by a **verify-pack** and only verifier-green shards ship — failed shards **requeue until clean**. It reuses the Phase-11 artifact spine (`internal/{artifact,evverify,requeue,report}`) and adds `internal/{pool,swarm,swarm/board,swarm/preset}` over the same invariant envelope below. This document remains the canonical design for the supervisor itself; the swarm is its scaled, artifact-verified sibling.
+
 ### New packages (all stdlib-only, I6)
 | Package | Responsibility |
 |---|---|
