@@ -63,6 +63,7 @@ type step struct {
 	URL      string `json:"url,omitempty"`
 	Selector string `json:"selector,omitempty"`
 	Text     string `json:"text,omitempty"`
+	Key      string `json:"key,omitempty"`
 	MS       int    `json:"ms,omitempty"`
 }
 
@@ -72,6 +73,7 @@ const (
 	actNavigate = "navigate"
 	actClick    = "click"
 	actType     = "type"
+	actKey      = "key"
 	actWait     = "wait"
 )
 
@@ -112,6 +114,10 @@ func parseSteps(actionsJSON string) ([]step, error) {
 		case actType:
 			if strings.TrimSpace(s.Selector) == "" {
 				return nil, fmt.Errorf("step %d (type) requires a selector", i)
+			}
+		case actKey:
+			if strings.TrimSpace(s.Key) == "" {
+				return nil, fmt.Errorf("step %d (key) requires a key (a DOM key name like \"Enter\")", i)
 			}
 		case actWait:
 			if s.MS < 0 || s.MS > maxWaitMS {
@@ -284,6 +290,10 @@ func applyStep(ctx context.Context, d stepDriver, s step) error {
 		return d.ClickSelector(ctx, s.Selector)
 	case actType:
 		return d.TypeIntoSelector(ctx, s.Selector, s.Text)
+	case actKey:
+		// A discrete key press at the current focus — e.g. "Enter" to submit a form
+		// after a `type` step. No selector: it goes to whatever the page has focused.
+		return d.TypeKey(ctx, s.Key)
 	case actWait:
 		// A bounded sleep honoring cancellation; lets a just-triggered render or
 		// navigation settle before the next step or the final capture.
@@ -305,6 +315,7 @@ type stepDriver interface {
 	Navigate(ctx context.Context, url string) error
 	ClickSelector(ctx context.Context, selector string) error
 	TypeIntoSelector(ctx context.Context, selector, text string) error
+	TypeKey(ctx context.Context, key string) error
 }
 
 // captureObservation reads the final title, text excerpt, and screenshot via CDP

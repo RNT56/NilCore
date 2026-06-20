@@ -200,3 +200,62 @@ func TestApplyConfigDefaultsRespectsExplicitFlags(t *testing.T) {
 		t.Errorf("explicit flag: runtime=%q image=%q", *c.runtime, *c.image)
 	}
 }
+
+// TestResolveDelegatedEnvOverrides covers the R1 precedence rule: NILCORE_<CLI>_MODEL
+// / _EFFORT override the config file, an empty env var does NOT clobber a configured
+// value, ExtraArgs/Env pass through untouched, the input config is not mutated (it is
+// taken by value), and the prefix isolates one CLI's env from the other's.
+func TestResolveDelegatedEnvOverrides(t *testing.T) {
+	base := onboard.DelegatedConfig{
+		Model:     "cfg-model",
+		Effort:    "cfg-effort",
+		ExtraArgs: []string{"-c", "k=v"},
+		Env:       map[string]string{"CODEX_HOME": "/work/.codex"},
+	}
+
+	t.Run("env unset keeps config", func(t *testing.T) {
+		got := resolveDelegated("NILCORE_CODEX", base)
+		if got.Model != "cfg-model" || got.Effort != "cfg-effort" {
+			t.Errorf("unset env should preserve config: model=%q effort=%q", got.Model, got.Effort)
+		}
+	})
+
+	t.Run("model and effort env override", func(t *testing.T) {
+		t.Setenv("NILCORE_CODEX_MODEL", "env-model")
+		t.Setenv("NILCORE_CODEX_EFFORT", "env-effort")
+		got := resolveDelegated("NILCORE_CODEX", base)
+		if got.Model != "env-model" || got.Effort != "env-effort" {
+			t.Errorf("env should win: model=%q effort=%q", got.Model, got.Effort)
+		}
+	})
+
+	t.Run("empty env var does not clobber config", func(t *testing.T) {
+		t.Setenv("NILCORE_CODEX_MODEL", "")
+		got := resolveDelegated("NILCORE_CODEX", base)
+		if got.Model != "cfg-model" {
+			t.Errorf("empty env should keep config model, got %q", got.Model)
+		}
+	})
+
+	t.Run("extra args and env pass through; input not mutated", func(t *testing.T) {
+		t.Setenv("NILCORE_CODEX_MODEL", "env-model")
+		got := resolveDelegated("NILCORE_CODEX", base)
+		if len(got.ExtraArgs) != 2 || got.ExtraArgs[0] != "-c" {
+			t.Errorf("ExtraArgs should pass through, got %v", got.ExtraArgs)
+		}
+		if got.Env["CODEX_HOME"] != "/work/.codex" {
+			t.Errorf("Env should pass through, got %v", got.Env)
+		}
+		if base.Model != "cfg-model" {
+			t.Errorf("input config mutated (should be by value): base.Model=%q", base.Model)
+		}
+	})
+
+	t.Run("prefix isolates CLIs", func(t *testing.T) {
+		t.Setenv("NILCORE_CLAUDE_MODEL", "claude-only")
+		got := resolveDelegated("NILCORE_CODEX", base)
+		if got.Model != "cfg-model" {
+			t.Errorf("CLAUDE env leaked into CODEX resolution: got %q", got.Model)
+		}
+	})
+}

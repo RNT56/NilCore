@@ -4,16 +4,20 @@
 //
 //	nilcore-browser --url '<url>' --format json
 //
-// and json-Unmarshals our stdout into {title, text, console, screenshot_b64}.
-// We therefore print EXACTLY that object and exit non-zero on any failure so the
-// tool fails closed (it never fabricates a passing observation).
+// and json-Unmarshals our stdout into {title, text, console, screenshot_b64} — or,
+// for a flow, `nilcore-browser --actions '<json>' [--url '<url>'] --format json`.
+// We print EXACTLY that object and exit non-zero on any failure so the tool fails
+// closed (it never fabricates a passing observation).
 //
-// WHY shell Chromium's own flags instead of a CDP/websocket client: I6 keeps the
-// core at zero external dependencies. A hand-rolled DevTools client would be a
-// large, fragile surface; instead we drive a real headless Chromium through its
-// built-in batch flags (--headless=new --dump-dom --screenshot ...), which Chrome
-// supports precisely for scripted, one-shot capture. The driver is pure stdlib
-// and builds with CGO_ENABLED=0.
+// TWO PATHS, one contract. The BATCH path (no --actions) drives a real headless
+// Chromium through its built-in one-shot flags (--headless=new --dump-dom
+// --screenshot ...), which Chrome supports precisely for scripted capture — no
+// persistent connection needed. The FLOW path (--actions: navigate/click/type/key/
+// wait) needs to *act* between renders, which the batch flags can't, so it launches
+// a long-lived headless Chrome with a debugging port and drives it over the pure-Go
+// Chrome DevTools Protocol client in `internal/cdp` (a minimal RFC6455 WebSocket +
+// CDP, stdlib only). Both honor I6 — zero external dependencies, no tree-sitter-style
+// native bindings — and build with CGO_ENABLED=0.
 //
 // It is a standalone tool (compiled into the sandbox image; see images/sandbox/),
 // NOT linked into the default nilcore binary — but it is pure stdlib, so it builds
