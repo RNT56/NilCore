@@ -45,6 +45,59 @@ type ReportModel struct {
 	Artifacts     []ArtifactView // one per artifact_verify event whose file folds back
 	Retries       []RetryAttempt // requeue/continue-from history, ordered by Seq
 	FinalPass     bool           // ChainVerified AND every relevant check passed
+
+	// ClaimTraces is the flattened source→claim→verdict projection (SW-T06): one
+	// row per folded claim across every artifact, tying a claim's verifier verdict
+	// to its key-free SourceRef. It is populated in the SAME single log pass as
+	// Artifacts (no extra file read) and is additive — existing consumers ignore it.
+	ClaimTraces []ClaimTrace
+	// SchemaDefects is the flattened schema_verify finding list (SW-T06): one row
+	// per structural Defect carried in a schema_verify event's metadata. It records
+	// shape failures the SchemaVerifier (SW-T01) found BEFORE any per-claim check
+	// ran, so a malformed artifact surfaces even when no ClaimTrace exists.
+	SchemaDefects []SchemaDefectRow
+}
+
+// ClaimTrace ties one claim's VERDICT to its key-free SOURCE in a flat row — the
+// source-claim-trace projection (SW-T06). Status/Detail/Verifier are the trusted,
+// verifier-set fields (I2); Value and Source.Locator are model-authored UNTRUSTED
+// data carried verbatim (I7) — the RENDERER (RenderMatrix) escapes/redacts them,
+// this struct only projects. Attempt threads the requeue pass so a re-verified
+// claim's trace can be read in attempt order; it is 0 when no retry touched it.
+type ClaimTrace struct {
+	ArtifactID string
+	ClaimID    string
+	Field      string
+	Value      string          // UNTRUSTED model-authored (I7) — renderer escapes
+	Source     SourceRef       // key-free provenance (I3) — renderer redacts the Locator
+	Verifier   string          // trusted: which check produced the verdict
+	Status     artifact.Status // trusted verifier verdict (I2)
+	Detail     string          // trusted verifier detail
+	Attempt    int             // requeue pass that last touched this claim (0 = none)
+}
+
+// SourceRef is the key-free provenance of a claim's evidence. Locator is the
+// SourceURL (required key-free by I3, but still redacted on render as defence in
+// depth); RetrievedAt is when it was fetched; Resolved reports whether the source
+// reached a decisive verdict (Status not unverified/unverifiable) so the matrix can
+// flag an un-anchored claim without trusting a model string.
+type SourceRef struct {
+	Locator     string
+	RetrievedAt time.Time
+	Resolved    bool
+}
+
+// SchemaDefectRow is one structural finding from a schema_verify event — the
+// metadata-only projection of a schema.Defect (SW-T01). Every field is
+// HARNESS-authored (Code from the closed enum, Field/ClaimID are trusted location
+// identifiers, Reason is the bounded harness-written explanation) — NO model field
+// rides in it (I7), so it is safe to render and marshal verbatim.
+type SchemaDefectRow struct {
+	ArtifactID string
+	ClaimID    string
+	Field      string
+	Code       string
+	Reason     string
 }
 
 // CheckResult is one verify-family event projected to a pass/fail row. Family is
@@ -152,9 +205,16 @@ func ReplayReport(logPath, worktreeRoot string) (*ReportModel, error) {
 		events = append(events, e)
 	}
 
-	// Project checks, fold artifacts, and gather retry history in one pass over
-	// the already-decoded events (the file was read exactly once above).
+	// Project checks, fold artifacts, gather retry history, AND project schema
+	// defects + claim traces in ONE pass over the already-decoded events (the file
+	// was read exactly once above). The claim traces are derived from the SAME
+	// folded artifact view, so no extra read or second walk is incurred.
 	seenArtifact := map[string]bool{}
+	// claimAttempt records the highest requeue attempt number seen for each claim id
+	// (from the GRA claim_* kinds, which carry {attempt, claim_id}). It is filled in
+	// THIS pass and used to backfill ClaimTrace.Attempt below, so a re-verified
+	// claim's trace reads in attempt order without a second walk or file read.
+	claimAttempt := map[string]int{}
 	for _, e := range events {
 		if verifyFamilies[e.Kind] {
 			m.Checks = append(m.Checks, checkFromEvent(e))
@@ -164,11 +224,26 @@ func ReplayReport(logPath, worktreeRoot string) (*ReportModel, error) {
 				seenArtifact[id] = true
 				if av, ok := foldArtifact(worktreeRoot, id); ok {
 					m.Artifacts = append(m.Artifacts, av)
+					m.ClaimTraces = append(m.ClaimTraces, tracesFromView(av)...)
 				}
 			}
 		}
+		if e.Kind == schemaVerifyKind {
+			m.SchemaDefects = append(m.SchemaDefects, schemaDefectsFromEvent(e)...)
+		}
+		if cid, att, ok := claimAttemptFromEvent(e); ok && att > claimAttempt[cid] {
+			claimAttempt[cid] = att
+		}
 		if ra, ok := retryFromEvent(e); ok {
 			m.Retries = append(m.Retries, ra)
+		}
+	}
+
+	// Backfill each claim trace's Attempt from the per-claim attempt high-water mark
+	// gathered above. A claim never requeued keeps Attempt 0.
+	for i := range m.ClaimTraces {
+		if att, ok := claimAttempt[m.ClaimTraces[i].ClaimID]; ok {
+			m.ClaimTraces[i].Attempt = att
 		}
 	}
 
@@ -328,6 +403,106 @@ func foldArtifact(worktreeRoot, id string) (ArtifactView, bool) {
 		Green:  a.Green(), // mirror the authoritative pure projection exactly
 		Claims: rows,
 	}, true
+}
+
+// schemaVerifyKind is the event Kind the SchemaVerifier (SW-T01) emits when the
+// structural shape check runs. It MUST equal schema.EventKind on the wire; this
+// package decodes the Detail rather than importing the struct so `report` stays a
+// leaf whose only artifact-subtree dependency is the artifact package itself.
+const schemaVerifyKind = "schema_verify"
+
+// tracesFromView flattens one folded artifact view into per-claim ClaimTrace rows.
+// It reuses the SAME ClaimRow data already projected by foldArtifact, so no second
+// artifact read or walk happens. Value/Locator are carried verbatim (UNTRUSTED, I7)
+// — the renderer escapes/redacts; this only projects. Resolved is derived from the
+// trusted Status (a claim with a decisive verdict resolved its source), never from
+// any model-authored string.
+func tracesFromView(av ArtifactView) []ClaimTrace {
+	out := make([]ClaimTrace, 0, len(av.Claims))
+	for i := range av.Claims {
+		c := av.Claims[i]
+		out = append(out, ClaimTrace{
+			ArtifactID: av.ID,
+			ClaimID:    c.ClaimID,
+			Field:      c.Field,
+			Value:      c.Value,
+			Source: SourceRef{
+				Locator:     c.SourceURL,
+				RetrievedAt: c.RetrievedAt,
+				Resolved:    statusResolved(c.Status),
+			},
+			Verifier: c.Verifier,
+			Status:   c.Status,
+			Detail:   c.Detail,
+		})
+	}
+	return out
+}
+
+// statusResolved reports whether a claim's verifier verdict is decisive — i.e. the
+// source was actually reached and judged. StatusPass/StatusFail/StatusStale are
+// decisive (the source resolved, even if it failed a freshness/equality check);
+// StatusUnverified (never checked) and StatusUnverifiable (no decisive verdict) are
+// NOT resolved. This is a pure function of the trusted Status (I2), never a model
+// string.
+func statusResolved(s artifact.Status) bool {
+	switch s {
+	case artifact.StatusPass, artifact.StatusFail, artifact.StatusStale:
+		return true
+	default:
+		return false
+	}
+}
+
+// schemaDefectsFromEvent decodes the metadata-only schema_verify event Detail into
+// SchemaDefectRow rows. The on-wire shape is defined defensively here (the cmd-layer
+// sink that serializes schema.SchemaVerifyEvent is owned elsewhere): the artifact id
+// at Detail["id"], and a "defects" list whose entries carry {code, field, claim_id,
+// reason}. Every decoded field is harness-authored (Code from the closed enum, a
+// location identifier, a bounded harness Reason) — no model field rides in it (I7).
+// A passing schema check (no defects) yields zero rows. An absent/malformed defects
+// list yields zero rows rather than an error: a log without the SW-T01 enrichment
+// degrades gracefully to an empty SchemaDefects slice.
+func schemaDefectsFromEvent(e logEvent) []SchemaDefectRow {
+	id := stringDetail(e.Detail, "id")
+	raw, ok := e.Detail["defects"].([]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	out := make([]SchemaDefectRow, 0, len(raw))
+	for _, item := range raw {
+		d, ok := item.(map[string]any)
+		if !ok {
+			continue // a non-object entry is dropped, not fatal (defensive decode)
+		}
+		out = append(out, SchemaDefectRow{
+			ArtifactID: id,
+			ClaimID:    stringDetail(d, "claim_id"),
+			Field:      stringDetail(d, "field"),
+			Code:       stringDetail(d, "code"),
+			Reason:     stringDetail(d, "reason"),
+		})
+	}
+	return out
+}
+
+// claimAttemptFromEvent extracts a (claim_id, attempt) pair from a GRA claim_* event
+// so ReplayReport can stamp each ClaimTrace with the requeue pass that last touched
+// it. Only the claim_* kinds carry attempt + claim_id; any other event returns
+// ok=false. An absent/wrong-typed attempt reads as ok=false (the trace keeps
+// Attempt 0), never an optimistic default.
+func claimAttemptFromEvent(e logEvent) (string, int, bool) {
+	switch e.Kind {
+	case "claim_requeue", "claim_resolved", "requeue_exhausted":
+		cid := stringDetail(e.Detail, "claim_id")
+		att, ok := intDetail(e.Detail, "attempt")
+		if cid == "" || !ok {
+			return "", 0, false
+		}
+		return cid, att, true
+	default:
+		return "", 0, false
+	}
 }
 
 // allChecksPassed reports whether every projected check passed. An empty check set

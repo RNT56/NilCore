@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"nilcore/internal/pool"
 	"nilcore/internal/secrets"
 )
 
@@ -280,6 +281,90 @@ func TestValidate(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", b.name)
 		}
+	}
+}
+
+// TestPoolRoundTrip proves a Config carrying a swarm Pool block survives
+// Save→Load through the strict (DisallowUnknownFields) decoder unchanged: the
+// additive `pool` key is recognized, and its tier specs + caps come back intact.
+func TestPoolRoundTrip(t *testing.T) {
+	cfg := Config{
+		Version:   CurrentConfigVersion,
+		Providers: []ProviderConfig{{Name: "anthropic", KeyRef: "anthropic_api_key"}},
+		Executor:  "anthropic:claude-sonnet-4-6",
+		Runtime:   "podman",
+		Channel:   ChannelConfig{Type: "none"},
+		Pool: &pool.PoolConfig{
+			Planner:  pool.TierSpec{Spec: "anthropic:claude-opus-4-8", Cap: 4},
+			Verifier: pool.TierSpec{Spec: "anthropic:claude-opus-4-8"},
+			Worker:   pool.TierSpec{Spec: "anthropic:claude-haiku-4-5", Cap: 40},
+			Caps:     map[string]int{"openai:gpt-5.5": 8},
+			Jitter:   "750ms",
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid pool config rejected: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Pool == nil {
+		t.Fatal("pool block lost on round-trip")
+	}
+	if got.Pool.Worker.Spec != "anthropic:claude-haiku-4-5" || got.Pool.Worker.Cap != 40 {
+		t.Errorf("worker tier = %+v, want haiku cap 40", got.Pool.Worker)
+	}
+	if got.Pool.Caps["openai:gpt-5.5"] != 8 || got.Pool.Jitter != "750ms" {
+		t.Errorf("pool extras lost: caps=%v jitter=%q", got.Pool.Caps, got.Pool.Jitter)
+	}
+}
+
+// TestPoolAbsentParses pins the v1-compatibility promise: a config written before
+// P12 (no `pool` key at all) still loads under DisallowUnknownFields, and its Pool
+// is nil so no pool clause runs.
+func TestPoolAbsentParses(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "old.json")
+	body := `{"version":1,"runtime":"podman","providers":[{"name":"anthropic","key_ref":"k"}],"channel":{"type":"none"}}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("old config without pool must parse: %v", err)
+	}
+	if cfg.Pool != nil {
+		t.Errorf("absent pool should decode to nil, got %+v", cfg.Pool)
+	}
+}
+
+// TestValidatePool proves the Validate pool clause is fail-closed: an unknown
+// vendor in a tier spec and a negative cap are both loud errors, while a valid
+// pool passes. The vendor set is exactly onboard's validProviders.
+func TestValidatePool(t *testing.T) {
+	base := Config{Version: CurrentConfigVersion, Runtime: "podman", Backend: "native",
+		Providers: []ProviderConfig{{Name: "anthropic", KeyRef: "k"}}, Channel: ChannelConfig{Type: "none"}}
+
+	ok := base
+	ok.Pool = &pool.PoolConfig{Worker: pool.TierSpec{Spec: "anthropic:claude-haiku-4-5", Cap: 40}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid pool rejected: %v", err)
+	}
+
+	unknownVendor := base
+	unknownVendor.Pool = &pool.PoolConfig{Worker: pool.TierSpec{Spec: "groq:mixtral"}}
+	if err := unknownVendor.Validate(); err == nil {
+		t.Error("unknown pool vendor must be rejected")
+	}
+
+	negativeCap := base
+	negativeCap.Pool = &pool.PoolConfig{Worker: pool.TierSpec{Spec: "anthropic:claude-haiku-4-5", Cap: -1}}
+	if err := negativeCap.Validate(); err == nil {
+		t.Error("negative pool cap must be rejected")
 	}
 }
 

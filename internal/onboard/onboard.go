@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"nilcore/internal/egressprofile"
+	"nilcore/internal/pool"
 )
 
 // DefaultImage is the sandbox container image suggested by `nilcore init` and the
@@ -62,6 +63,7 @@ type Config struct {
 	Delegated []string         `json:"delegated"`         // detected CLIs (informational): codex, claude
 	Codex     DelegatedConfig  `json:"codex,omitempty"`   // optional config for the Codex delegated CLI (R1)
 	Claude    DelegatedConfig  `json:"claude,omitempty"`  // optional config for the Claude Code delegated CLI (R1)
+	Pool      *pool.PoolConfig `json:"pool,omitempty"`    // optional swarm provider-pool tiers/caps (P12); nil ⇒ today's single-worker wiring, so an existing config is byte-identical
 }
 
 // DelegatedConfig configures a delegated coding CLI (Codex / Claude Code). All
@@ -145,7 +147,30 @@ func (c Config) Validate() error {
 			return fmt.Errorf("provider %q has no key_ref", p.Name)
 		}
 	}
+	// The optional swarm pool (P12) is validated against the SAME closed vendor
+	// set onboard uses everywhere else, so a tier spec naming an unknown vendor or
+	// a negative cap fails loudly here rather than at swarm-build time. The pool is
+	// a leaf and does not import onboard's vocabulary (avoiding a cycle); onboard,
+	// which owns the canonical list, passes it down. nil Pool ⇒ no clause runs, so
+	// every pre-P12 config is unchanged.
+	if c.Pool != nil {
+		if err := c.Pool.Validate(validProviderNames()); err != nil {
+			return fmt.Errorf("pool config: %w", err)
+		}
+	}
 	return nil
+}
+
+// validProviderNames renders the validProviders set as a slice for pool.Validate,
+// which takes the caller-owned vendor list by value (it must not import onboard's
+// map). Keys are sorted so the "want one of …" portion of a pool error is stable.
+func validProviderNames() []string {
+	names := make([]string, 0, len(validProviders))
+	for name := range validProviders {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Save writes the config as JSON (0600) to path, creating parent dirs. It stamps
