@@ -5,7 +5,7 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~30,800 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. It can now **see the running app** through a sandboxed browser, search code semantically, read Go *and* Python, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~30,800 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. It can now **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read Go, Python, TypeScript/JavaScript *and* Rust, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
@@ -34,11 +34,11 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | The pain you've felt | How NilCore solves it |
 |---|---|
 | **"It said it was done. It wasn't."** | The **verifier is the only authority on done.** After *any* backend runs, your project's own build/test/lint re‑runs and that verdict ships the work — a self‑report never does. |
-| **"Tests pass, but does the app actually *work*?"** | NilCore can **see the running app.** A sandboxed headless browser (`browser_view` + a pure‑Go `nilcore-browser` driver baked into the image) navigates your app and hands the model a **screenshot as a multimodal image** — and, opt‑in via `NILCORE_BROWSER_VERIFY`, a composite verifier folds that behavioral check *into* the verdict, so the verifier stays the sole authority on done. *(The live browser run is CI‑only — no Chromium in hermetic unit tests — and the driver fails **closed** without a browser.)* |
+| **"Tests pass, but does the app actually *work*?"** | NilCore can **see the running app.** A sandboxed headless browser (`browser_view` + a pure‑Go `nilcore-browser` driver baked into the image) navigates your app — and, given an `actions` script, first **drives a flow** (click / type / wait, e.g. log in or submit a form) over a pure‑Go CDP client — then hands the model a **screenshot as a multimodal image**; opt‑in via `NILCORE_BROWSER_VERIFY`, a composite verifier folds that behavioral check *into* the verdict, so the verifier stays the sole authority on done. *(The live browser run is CI‑only — no Chromium in hermetic unit tests — and the driver fails **closed** without a browser.)* |
 | **"It ran a destructive command / touched my host."** | **Every command the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs), destructive ones denylisted *before* execution. The model can't run an arbitrary program on your machine; its file edits are confined to a throwaway worktree. |
 | **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
-| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **Go *and* Python** (a pure‑Go parser seam, no tree‑sitter), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
+| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **Go, Python, TypeScript/JavaScript *and* Rust** (a pure‑Go parser seam — heuristic line scanners, no tree‑sitter; the `NILCORE_LSP_COMMAND` seam stays the precise lens), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
 | **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
 | **"I have to babysit it / can't course‑correct mid‑run."** | **Just talk to it.** `nilcore chat` is one conversation — it infers whether your message is a quick fix, a feature, or a whole project and pulls the strings itself. While it works its reasoning **streams live, token by token**, and you can **queue** a follow‑up (folds in at the next step), **steer** — `!…` **interrupts mid‑thought but keeps** what it's reasoned so far, folds your feedback in, and resumes or changes course — or `/cancel` to abort the run outright while staying in the conversation. |
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
@@ -47,7 +47,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"I can't give it project‑specific marching orders."** | **Operator steering.** Drop a `NILCORE.md` / `AGENTS.md` and it loads as **trusted** instructions — the one deliberate, scoped exception to "untrusted input is data," bounded *below* the safety core: it can shape behavior but can't widen capability or bypass the gate or verifier. Wired into chat and run/build. |
 | **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~30,800 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. *Still exactly two:* the new browser driver, Python parser, embedder, and forge are **all pure stdlib** — no module was added. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
+| **"The framework is too big to trust."** | The entire agent is **~30,800 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — over a ~8k single‑task core, a multi‑agent layer, and the conversational front door. *Still exactly two:* the browser driver (incl. its pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, and forge are **all pure stdlib** — no module was added. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
 
 ---
 
@@ -97,11 +97,11 @@ Just talk — it infers quick‑fix vs feature vs whole‑project and acts. Watc
 </td>
 <td width="50%" valign="top">
 
-▸ **Code intelligence** (Go + Python)
+▸ **Code intelligence** (Go · Python · TS/JS · Rust)
 AST · call graph · PageRank repo‑map · LSP · pure‑Go **HNSW** semantic search · Impact Set + SBFL · live worktree‑aware updates.
 
 ▸ **It can see the running app**
-A sandboxed headless browser (`browser_view`) hands the model a screenshot as a multimodal image; opt‑in, a composite verifier folds the behavioral check into the verdict. *(Live run is CI‑only; fails closed without a browser.)*
+A sandboxed headless browser (`browser_view`) can **drive a flow first** (click / type / wait — log in, submit a form) over a pure‑Go CDP client, then hands the model a screenshot as a multimodal image; opt‑in, a composite verifier folds the behavioral check into the verdict. *(Live run is CI‑only; fails closed without a browser.)*
 
 ▸ **Multi‑agent supervisor** (`nilcore build`)
 A supervisor spawns role‑specialized subagents (research · understand · plan · implement · review) that **communicate back and forth**, integrates their parallel worktrees into one **verifier‑green** tree, and re‑plans to convergence. Greenfield‑capable; the supervisor codes, too.
@@ -151,7 +151,9 @@ nilcore -dir ./repo \
 #   verifier-green tree, and re-plans to convergence. Greenfield (-new) or -dir.
 nilcore build -goal "Go HTTP service: /health 200 + /orders POST persists to SQLite" -new ./svc
 
-# Delegate a single task to Claude Code or Codex — verified the same way
+# Delegate a single task to Claude Code or Codex — verified the same way.
+#   Model / effort / extra args / env are configurable (via `nilcore init`, or
+#   NILCORE_CLAUDE_MODEL/_EFFORT · NILCORE_CODEX_MODEL/_EFFORT); unset => CLI default.
 nilcore -dir ./repo -goal "..." -backend claude-code
 
 # Drive it from your phone: serve gives Telegram/Slack the same conversation —
@@ -230,7 +232,7 @@ flowchart TD
     BK --> VERIFY[verify<br/>source of truth + browser behavioral check]
     AGENT --> POLICY[policy<br/>gate · egress · tool-call]
     AGENT --> LOG[eventlog<br/>hash-chained + store]
-    AGENT --> CI[codeintel<br/>ast Go+Python to graph to repomap to HNSW retrieve]
+    AGENT --> CI[codeintel<br/>ast Go+Python+TS/JS+Rust to graph to repomap to HNSW retrieve]
     AGENT --> MEM[memory<br/>cross-project SQLite]
     CLI --> CHAN[channel<br/>telegram · slack]
     CLI --> TRIG[scmhook · cron<br/>webhook / scheduled triggers]
@@ -251,9 +253,9 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 | **~30,800** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent · conversational front door) |
 | ~58,500 | lines including its tests (147 test files) |
 | **64** | small, single‑responsibility packages |
-| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver, Python parser, embedder, and forge are all pure stdlib — no module added |
+| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, and forge are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
-| **Phases 0–10** | shipped + the four formerly‑deferred items D1–D4 — incl. behavioral browser verification, semantic (HNSW) + multi‑language (Go + Python) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
+| **Phases 0–10** | shipped + the four formerly‑deferred items D1–D4 (later broadened by R1–R3) — incl. behavioral browser verification that can now **drive** a flow before observing, semantic (HNSW) + multi‑language (Go · Python · TS/JS · Rust) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
 
 </div>
 
@@ -284,7 +286,7 @@ internal/
   channel              Channel contract · telegram · slack · authorized control
   tools, mcp           structured tools (+ browser_view) + MCP-as-code
   embed                opt-in OpenAI-compatible embedder (NILCORE_EMBED_KEY)
-  codeintel/*          ast (Go + Python) · graph · repomap · lsp · semantic (HNSW) · retrieve · impact · live
+  codeintel/*          ast (Go · Python · TS/JS · Rust) · graph · repomap · lsp · semantic (HNSW) · retrieve · impact · live
   store, memory        SQLite backbone + cross-project memory
   secrets              keychain / encrypted vault / env / external
   skills, selfimprove  Agent Skills + plugins + gated self-edit

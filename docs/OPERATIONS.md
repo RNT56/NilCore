@@ -98,9 +98,23 @@ These newer surfaces are **all additive and opt-in** — when their env vars are
 | `NILCORE_BROWSER` | the `browser_view` tool / behavioral navigation (D1) | the `nilcore-browser` driver baked into the sandbox image |
 | `NILCORE_BROWSER_VERIFY` | composite browser verifier | folds a browser behavioral check INTO the verdict (I2 holds) |
 | `NILCORE_CHROMIUM` | Chromium-binary override for the driver | defaults to `chromium` on `$PATH`; missing browser ⇒ fail-closed |
+| `NILCORE_CODEX_MODEL` | override the Codex delegated-CLI model (R1) | beats `config.json` `codex.model`; unset ⇒ config/default |
+| `NILCORE_CODEX_EFFORT` | override the Codex reasoning effort (R1) | passed as `-c model_reasoning_effort=<e>` |
+| `NILCORE_CLAUDE_MODEL` | override the Claude Code delegated-CLI model (R1) | beats `config.json` `claude.model`; unset ⇒ config/default |
+| `NILCORE_CLAUDE_EFFORT` | override the Claude Code reasoning effort (R1) | injected as `CLAUDE_CODE_EFFORT_LEVEL` (env, not a flag) |
 
-### Behavioral verification — operational requirements (D1)
-The `browser_view` tool drives a running app and hands the model a **screenshot** as a multimodal image block; with `NILCORE_BROWSER_VERIFY` set, a composite verifier folds a browser behavioral check **into** the verdict, so the verifier stays the **sole authority** on "done" (I2). Operationally this needs the **container backend plus a Chromium-bearing sandbox image** — the driver runs in the same sandbox box as the build, inheriting I4 confinement. The driver **fails closed without a browser** (a misconfigured verifier is red, never a false green). The **live browser run is CI-only** — hermetic unit tests carry no Chromium — so this path is exercised in CI, not in the local fast suite.
+### Delegated coding CLIs — configuring Codex / Claude Code (R1)
+When NilCore delegates a task to **Codex** or **Claude Code** (`-backend codex` / `-backend claude-code`) instead of the native loop, both CLIs are **configurable**, not hardcoded key-only. Every knob is optional and **zero knobs ⇒ byte-identical** to the bare command:
+
+- **Model** → Codex `--model`, Claude `--model`.
+- **Effort** → Codex `-c model_reasoning_effort=<e>`; Claude `CLAUDE_CODE_EFFORT_LEVEL=<e>` (the env, since the flag name drifts across CLI versions).
+- **Extra args** → raw extra CLI tokens appended before the goal (e.g. `-c key=value`).
+- **Env** → extra per-run environment merged with the API key — notably `CODEX_HOME` / `CLAUDE_CONFIG_DIR` to surface a host config dir despite the sandbox's `HOME=/tmp`.
+
+Set them in `config.json` under `codex` / `claude` (written by `nilcore init`), e.g. `"codex": {"model": "o3", "effort": "high", "extra_args": ["-c", "foo=bar"], "env": {"CODEX_HOME": "/work/.codex"}}`. The env overrides above win over the config file at runtime. The API key is still injected **per run** and merged **last** (an operator `env` can't shadow it); it is never logged — the event log records only `{cli, exit}` (I3).
+
+### Behavioral verification — operational requirements (D1, flow-driving R3)
+The `browser_view` tool drives a running app and hands the model a **screenshot** as a multimodal image block; given an optional **`actions`** script it first **drives a flow** (navigate/click/type/wait — e.g. log in, submit a form — over a pure-Go CDP client, R3) and then observes, returning the same `{title, text, console, screenshot_b64}`. Model-supplied selectors/text/URLs are **data** replayed as CDP params, never shell or code (I7). With `NILCORE_BROWSER_VERIFY` set, a composite verifier folds a browser behavioral check **into** the verdict, so the verifier stays the **sole authority** on "done" (I2). Operationally this needs the **container backend plus a Chromium-bearing sandbox image** — the driver runs in the same sandbox box as the build, inheriting I4 confinement. The driver **fails closed without a browser** (a misconfigured verifier is red, never a false green). The **live browser run (batch and the `--actions` flow) is CI-only** — hermetic unit tests carry no Chromium — so this path is exercised in CI, not in the local fast suite.
 
 ## A note on context assembly (deliberately *not* a task)
 

@@ -30,6 +30,15 @@ The native backend needs only an Anthropic API key. The delegating backends need
 
 In production both CLIs run **inside the sandbox container** (defense in depth — they sandbox themselves too) with their API key injected into the container env for the single run only. Phase 0 invokes them directly in the worktree; Phase 2 moves them inside the container.
 
+### Per-CLI model / effort / config (optional, R1)
+
+The delegating backends are configurable, not key-only — every knob is optional and **zero fields ⇒ byte-identical** to the bare command. Set them in `config.json` under `codex` / `claude` (written by `nilcore init`), or override at runtime with env vars:
+
+- **Model** — `NILCORE_CODEX_MODEL` / `NILCORE_CLAUDE_MODEL` (→ `--model`).
+- **Effort** — `NILCORE_CODEX_EFFORT` (→ `-c model_reasoning_effort=<e>`) / `NILCORE_CLAUDE_EFFORT` (→ the `CLAUDE_CODE_EFFORT_LEVEL` env, since the flag name drifts across versions).
+- **`extra_args`** (config only) — raw extra CLI tokens, e.g. `["-c", "key=value"]`.
+- **`env`** (config only) — extra per-run environment merged with the API key. Use it for **`CODEX_HOME` / `CLAUDE_CONFIG_DIR`** to surface a host config dir despite the sandbox's `HOME=/tmp`. The API key is merged **last**, so an operator `env` can never shadow it, and it is never logged (I3).
+
 ## 3. Accounts & secrets
 
 | Secret | Used by | Notes |
@@ -122,6 +131,6 @@ A PR cannot merge unless CI is green. Merge to `main` additionally requires the 
 
 These capabilities are **off by default** — the default binary is byte-identical when they are unset. Each carries its own prerequisite; nothing here adds a Go module dependency (still exactly two in the default binary).
 
-- **Behavioral verification** (`browser_view` tool + composite verifier, opt-in via `NILCORE_BROWSER_VERIFY`) needs the **container backend** and a **Chromium-bearing sandbox image** — the pure-Go `nilcore-browser` driver is baked into the image; point `NILCORE_CHROMIUM` at the browser binary if it is non-standard. The live browser run is **CI-only** (no Chromium in hermetic unit tests), and the driver **fails closed** without a browser, so the verifier stays the sole authority on "done". `browser_view` hands the model a screenshot as a multimodal image block.
+- **Behavioral verification** (`browser_view` tool + composite verifier, opt-in via `NILCORE_BROWSER_VERIFY`) needs the **container backend** and a **Chromium-bearing sandbox image** — the pure-Go `nilcore-browser` driver is baked into the image; point `NILCORE_CHROMIUM` at the browser binary if it is non-standard. The live browser run is **CI-only** (no Chromium in hermetic unit tests), and the driver **fails closed** without a browser, so the verifier stays the sole authority on "done". `browser_view` hands the model a screenshot as a multimodal image block, and — given an optional `actions` script — first **drives a flow** (navigate/click/type/wait, e.g. log in or submit a form) over a pure-Go CDP client before observing (R3); the same Chromium binary serves both the batch and the `--actions` path.
 - **Semantic code search** (pure-Go HNSW vector index) is enabled by an **embeddings API key** in `NILCORE_EMBED_KEY` (any OpenAI-compatible embedder; model overridable via `NILCORE_EMBED_MODEL`). Unset ⇒ the lexical fallback runs and behavior is byte-identical.
 - **Event-driven / scheduled autonomy** (`serve --webhook`, `nilcore schedule`) routes through the existing reversible-auto-start / human-gate machinery; headless runs deny-default irreversible work. Webhook signatures are HMAC-verified with `NILCORE_WEBHOOK_SECRET` (optionally scoped by `NILCORE_WEBHOOK_LABEL`); gated draft PRs (`--open-pr`) use `NILCORE_FORGE_TOKEN`.
