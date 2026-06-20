@@ -46,11 +46,11 @@ func TestEnqueueRoundTripsState(t *testing.T) {
 		Goal:   "build the report",
 		Preset: "research",
 		Pass:   3,
-		Ledger: requeue.Ledger{MaxAttempts: 2, Attempts: map[string]int{"swarm/run1/0/c1": 1}},
+		Ledger: requeue.Ledger{MaxAttempts: 2, Attempts: map[string]int{"swarm-run1-0/c1": 1}},
 		TipSHA: "deadbeef",
 	}
 	shards := []Shard{
-		{ID: "swarm/run1/0", Goal: "g0", Kind: artifact.KindReport, Pack: "finance", State: ShardQueued},
+		{ID: "swarm-run1-0", Goal: "g0", Kind: artifact.KindReport, Pack: "finance", State: ShardQueued},
 	}
 	if err := q.Enqueue(ctx, st, shards); err != nil {
 		t.Fatalf("enqueue: %v", err)
@@ -63,7 +63,7 @@ func TestEnqueueRoundTripsState(t *testing.T) {
 	if got.Goal != st.Goal || got.Preset != st.Preset || got.Pass != st.Pass || got.TipSHA != st.TipSHA {
 		t.Errorf("state mismatch: got %+v want %+v", got, st)
 	}
-	if got.Ledger.MaxAttempts != 2 || got.Ledger.Attempts["swarm/run1/0/c1"] != 1 {
+	if got.Ledger.MaxAttempts != 2 || got.Ledger.Attempts["swarm-run1-0/c1"] != 1 {
 		t.Errorf("ledger not round-tripped: %+v", got.Ledger)
 	}
 }
@@ -77,13 +77,13 @@ func TestMarkFullDetailRMWPreservesGreen(t *testing.T) {
 	q := NewQueue(openStore(t), nil, "run1")
 
 	s := Shard{
-		ID:      "swarm/run1/0",
+		ID:      "swarm-run1-0",
 		Goal:    "g0",
 		Input:   "seed",
 		Kind:    artifact.KindReport,
 		Pack:    "finance",
 		Role:    "researcher",
-		Deps:    []string{"swarm/run1/x"},
+		Deps:    []string{"swarm-run1-x"},
 		Branch:  "task/swarm-run1-0",
 		Attempt: 1,
 		State:   ShardPassed, // green: Green=true is persisted
@@ -133,7 +133,7 @@ func TestMarkRMWAcrossStatusTransition(t *testing.T) {
 	ctx := context.Background()
 	q := NewQueue(openStore(t), nil, "run1")
 
-	base := Shard{ID: "swarm/run1/0", Goal: "g", Pack: "p", Branch: "b", State: ShardPassed}
+	base := Shard{ID: "swarm-run1-0", Goal: "g", Pack: "p", Branch: "b", State: ShardPassed}
 	if err := q.Mark(ctx, base); err != nil {
 		t.Fatalf("mark pass: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestNamespaceIsolationFromNative(t *testing.T) {
 	st := openStore(t)
 	q := NewQueue(st, nil, "run1")
 
-	if err := q.Mark(ctx, Shard{ID: "swarm/run1/0", Goal: "g", State: ShardRunning}); err != nil {
+	if err := q.Mark(ctx, Shard{ID: "swarm-run1-0", Goal: "g", State: ShardRunning}); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
 	// The native sweep filters on the bare "running" status.
@@ -199,10 +199,10 @@ func TestRunIsolationByPrefix(t *testing.T) {
 	q1 := NewQueue(st, nil, "runA")
 	q2 := NewQueue(st, nil, "runB")
 
-	if err := q1.Mark(ctx, Shard{ID: "swarm/runA/0", Goal: "a", State: ShardFailed}); err != nil {
+	if err := q1.Mark(ctx, Shard{ID: "swarm-runA-0", Goal: "a", State: ShardFailed}); err != nil {
 		t.Fatal(err)
 	}
-	if err := q2.Mark(ctx, Shard{ID: "swarm/runB/0", Goal: "b", State: ShardFailed}); err != nil {
+	if err := q2.Mark(ctx, Shard{ID: "swarm-runB-0", Goal: "b", State: ShardFailed}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -210,15 +210,15 @@ func TestRunIsolationByPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(a) != 1 || a[0].ID != "swarm/runA/0" {
-		t.Errorf("runA shards = %+v, want only swarm/runA/0", a)
+	if len(a) != 1 || a[0].ID != "swarm-runA-0" {
+		t.Errorf("runA shards = %+v, want only swarm-runA-0", a)
 	}
 	b, err := q2.ShardsByRun(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b) != 1 || b[0].ID != "swarm/runB/0" {
-		t.Errorf("runB shards = %+v, want only swarm/runB/0", b)
+	if len(b) != 1 || b[0].ID != "swarm-runB-0" {
+		t.Errorf("runB shards = %+v, want only swarm-runB-0", b)
 	}
 }
 
@@ -230,7 +230,7 @@ func TestFailedReturnsEligibleOnly(t *testing.T) {
 
 	// Two failed shards. The Ledger gives shard 0 budget (attempt 1 < max 2) and marks
 	// shard 1 exhausted (attempt 2 == max 2).
-	for _, id := range []string{"swarm/run1/0", "swarm/run1/1"} {
+	for _, id := range []string{"swarm-run1-0", "swarm-run1-1"} {
 		if err := q.Mark(ctx, Shard{ID: id, Goal: "g", State: ShardFailed}); err != nil {
 			t.Fatal(err)
 		}
@@ -238,16 +238,16 @@ func TestFailedReturnsEligibleOnly(t *testing.T) {
 	led := &requeue.Ledger{
 		MaxAttempts: 2,
 		Attempts: map[string]int{
-			"swarm/run1/0/c1": 1, // budget remains
-			"swarm/run1/1/c1": 2, // exhausted
+			"swarm-run1-0/c1": 1, // budget remains
+			"swarm-run1-1/c1": 2, // exhausted
 		},
 	}
 	got, err := q.Failed(ctx, led)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].ID != "swarm/run1/0" {
-		t.Errorf("Failed eligible = %+v, want only swarm/run1/0", got)
+	if len(got) != 1 || got[0].ID != "swarm-run1-0" {
+		t.Errorf("Failed eligible = %+v, want only swarm-run1-0", got)
 	}
 }
 
@@ -256,7 +256,7 @@ func TestFailedReturnsEligibleOnly(t *testing.T) {
 func TestFailedNilLedgerReturnsAll(t *testing.T) {
 	ctx := context.Background()
 	q := NewQueue(openStore(t), nil, "run1")
-	for _, id := range []string{"swarm/run1/0", "swarm/run1/1"} {
+	for _, id := range []string{"swarm-run1-0", "swarm-run1-1"} {
 		if err := q.Mark(ctx, Shard{ID: id, Goal: "g", State: ShardFailed}); err != nil {
 			t.Fatal(err)
 		}
@@ -287,8 +287,8 @@ func TestInFlightSwarmFindsRunRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ID != "swarm/run1" {
-		t.Errorf("InFlightSwarm = %+v, want only the run row swarm/run1", rows)
+	if len(rows) != 1 || rows[0].ID != "swarm-run1" {
+		t.Errorf("InFlightSwarm = %+v, want only the run row swarm-run1", rows)
 	}
 }
 

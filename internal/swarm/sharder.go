@@ -50,11 +50,17 @@ type Sharder interface {
 	Shards(ctx context.Context, goal, runID string) ([]Shard, error)
 }
 
-// shardID builds the canonical namespaced shard identity "swarm/<runID>/<n>" — the
+// shardID builds the canonical namespaced shard identity "swarm-<runID>-<n>" — the
 // one place the convention lives, shared by every sharder so the prefix the Queue
-// filters on is produced identically everywhere.
+// filters on is produced identically everywhere. The separator is '-' (not '/') ON
+// PURPOSE: a shard owns ONE artifact written at .nilcore/artifacts/<shard id>.json and
+// the convergence model keys artifact id == shard id, but artifact.validID rejects any
+// id containing a path separator. A '/'-delimited id would make the per-shard
+// artifact read/write/verify silently fail (the artifact would never land in the
+// collate root requeue.Scan reads), so the id must itself be a valid single-component
+// artifact id. runID is a fixed-length slug, so no run's prefix is a prefix of another.
 func shardID(runID string, n int) string {
-	return fmt.Sprintf("swarm/%s/%d", runID, n)
+	return fmt.Sprintf("swarm-%s-%d", runID, n)
 }
 
 // ListSharder fans an operator-supplied list into shards with NO model call. Lines is

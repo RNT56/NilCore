@@ -137,7 +137,7 @@ type shardDetail struct {
 // Queue is the durable shard queue for one swarm run. It owns no concurrency of its
 // own — the single SQLite writer is the serialization point — and never opens a
 // network transport. runID namespaces every row this queue touches (the run row is
-// "swarm/<runID>" and each shard ID is "swarm/<runID>/<n>"), so two runs sharing one
+// "swarm-<runID>" and each shard ID is "swarm-<runID>-<n>"), so two runs sharing one
 // store never read each other's shards.
 type Queue struct {
 	store *store.Store
@@ -152,15 +152,16 @@ func NewQueue(st *store.Store, log *eventlog.Log, runID string) *Queue {
 	return &Queue{store: st, log: log, runID: runID}
 }
 
-// runRowID is the run row's task id: "swarm/<runID>". It is distinct from every
-// shard id ("swarm/<runID>/<n>") because it has no trailing "/<n>" segment, so
-// ShardsByRun's prefix filter excludes it (the prefix is "swarm/<runID>/").
-func (q *Queue) runRowID() string { return "swarm/" + q.runID }
+// runRowID is the run row's task id: "swarm-<runID>". It is distinct from every
+// shard id ("swarm-<runID>-<n>") because it has no trailing "-<n>" segment, so
+// ShardsByRun's prefix filter excludes it (the prefix is "swarm-<runID>-").
+func (q *Queue) runRowID() string { return "swarm-" + q.runID }
 
-// shardPrefix is the ID prefix that identifies a shard of THIS run: "swarm/<runID>/".
+// shardPrefix is the ID prefix that identifies a shard of THIS run: "swarm-<runID>-".
 // ShardsByRun filters TasksByStatus output by this prefix in Go (no store change), so
-// run isolation is a pure string test on the durable id.
-func (q *Queue) shardPrefix() string { return "swarm/" + q.runID + "/" }
+// run isolation is a pure string test on the durable id. runID is a fixed-length slug,
+// so "swarm-<runID>-" is never a prefix of another run's "swarm-<otherID>-".
+func (q *Queue) shardPrefix() string { return "swarm-" + q.runID + "-" }
 
 // Enqueue persists the run row (carrying SwarmState) and one queued row per shard. It
 // is idempotent: re-enqueuing a shard already present re-writes its row from the

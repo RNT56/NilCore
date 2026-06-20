@@ -674,7 +674,14 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	// in-box ArtifactVerifier (+ a raw build/browser child for code/ui) over the
 	// artifact the worker writes at .nilcore/artifacts/<id>.json. ShipGate refuses a
 	// vacuous verify.Pass/nil (I2). A nil box fails network claims closed, never Pass.
-	relPath := filepath.Join(".nilcore", "artifacts", s.ID+".json")
+	//
+	// The path is ABSOLUTE under the per-shard worktree root (env.Box.Workdir() ==
+	// wt.Path()), mirroring the proven typed-research path (build.go): evverify reads
+	// RelPath host-side via worktreefs.OpenNoFollow, so a CWD-relative path would look
+	// under the nilcore process dir, not the worktree the worker actually wrote into —
+	// every shard would read "artifact missing" and fail closed. s.ID is a valid
+	// single-component artifact id (no '/'), so the file is one component, not nested.
+	relPath := filepath.Join(env.Box.Workdir(), ".nilcore", "artifacts", s.ID+".json")
 	plan, perr := packs.Build(c.packName, env.Box, relPath, packs.DefaultSchemas())
 	if perr != nil {
 		return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
@@ -710,6 +717,17 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 
 	// The verifier — not the worker self-report — decides whether this shard ships (I2).
 	rep, verr := gov.Check(ctx)
+
+	// Copy the VERDICT-OVERWRITTEN artifact (evverify.Check wrote the real per-claim
+	// statuses back to the worktree file) into the shared collate root REGARDLESS of
+	// pass/fail, so requeue.Scan — which reads <collateRoot>/.nilcore/artifacts/*.json —
+	// sees THIS shard's claims. A RED artifact MUST be visible for the Controller to
+	// requeue it (and to count it as remaining); copying only green artifacts would make
+	// a fully-failed run falsely converge (Scan finds nothing red ⇒ empty worklist ⇒
+	// done). Best-effort: a shard whose worker wrote no parseable artifact contributes
+	// nothing and is treated as red below (the verifier already failed it).
+	collateArtifact(c.collateRoot, wt.Path(), s.ID)
+
 	if verr != nil || !rep.Passed {
 		// Preserve the unverified attempt so a requeue can continue_from it.
 		br := preserveFailedAttempt(ctx, wt)
@@ -720,12 +738,8 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		return c.recordFail(s, res)
 	}
 
-	// Green: copy the verified artifact into the shared collate root so requeue.Scan
-	// sees a non-pass-free artifact for this shard (the convergence read, I2). On a
-	// code preset, commit the worktree and surface the branch for the Integrator.
-	if a, aerr := artifact.Read(wt.Path(), s.ID); aerr == nil && a != nil {
-		_ = artifact.Write(c.collateRoot, a)
-	}
+	// Green: the artifact is already collated above. On a code preset, commit the
+	// worktree and surface the branch for the Integrator.
 	res := spawn.Result{ID: s.ID, Passed: true, State: spawn.StatePassed}
 	if c.preset.FanIn == preset.FanInMerge {
 		gitMu.Lock()
@@ -765,6 +779,21 @@ func (c *shardContext) recordFail(s swarm.Shard, res spawn.Result) spawn.Result 
 // that moves the pass/fail tally — I2), keyed by the shard's pass (Attempt+1).
 func (c *shardContext) recordVerdict(s swarm.Shard, passed bool) {
 	c.board.Record(board.ShardOutcome{ID: s.ID, Pass: s.Attempt + 1, Passed: passed})
+}
+
+// collateArtifact copies the verdict-overwritten artifact for shard `id` from its
+// per-shard worktree into the shared collate root, so requeue.Scan (which reads
+// <collateRoot>/.nilcore/artifacts/*.json) sees this shard's claims REGARDLESS of
+// pass/fail. A RED artifact must be collated too — copying only green ones would make a
+// fully-failed run falsely converge (Scan finds nothing red ⇒ empty worklist ⇒ done).
+// Best-effort: a shard whose worker wrote no parseable artifact contributes nothing
+// (the verifier already failed it). `id` MUST be a valid single-component artifact id
+// (no '/'); a '/'-containing id makes artifact.Read/Write silently no-op — exactly the
+// false-convergence blocker — so the sharder mints '-'-delimited ids that satisfy this.
+func collateArtifact(collateRoot, wtPath, id string) {
+	if a, err := artifact.Read(wtPath, id); err == nil && a != nil {
+		_ = artifact.Write(collateRoot, a)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -929,7 +958,11 @@ func loadResumeState(ctx context.Context, st *store.Store, log *eventlog.Log) (*
 	// The last row is the most recently written run (store rows are id-ordered, and a
 	// run id embeds a monotonic suffix). Read its state through a correctly-bound queue.
 	runRow := rows[len(rows)-1]
-	runID := strings.TrimPrefix(runRow.ID, "swarm/")
+	// The run row id is "swarm-<runID>" (the Queue's runRowID); recover the runID by
+	// stripping that exact prefix so the rebound queue's runRowID() round-trips back to
+	// this same row. (Must match queue.runRowID — a '/' here would mis-bind the queue and
+	// LoadState would miss the row.)
+	runID := strings.TrimPrefix(runRow.ID, "swarm-")
 	rq := swarm.NewQueue(st, log, runID)
 	state, err := rq.LoadState(ctx)
 	if err != nil {

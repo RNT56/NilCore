@@ -283,11 +283,49 @@ func TestSwarmUIPresetNilBoxFailsClosed(t *testing.T) {
 		newEnv: func(string) buildEnv { return buildEnv{Box: nil, Verifier: verify.Pass{}} },
 	}
 	res := sc.run(context.Background(), swarm.Shard{
-		ID: "swarm/test/0", Goal: "audit the landing page", Kind: pre.Kind,
+		ID: "swarm-test-0", Goal: "audit the landing page", Kind: pre.Kind,
 		Pack: pre.VerifyPacks[0], Role: string(pre.Role), State: swarm.ShardQueued,
 	})
 	if res.Passed {
 		t.Fatal("ui shard with a nil box must fail closed (Passed:false)")
+	}
+}
+
+// TestCollateArtifactMakesRedVisibleToScan is the regression guard for the
+// false-convergence blocker: a shard's verdict-bearing artifact must be copied into the
+// shared collate root for BOTH green AND red shards, and the shard id must be a valid
+// single-component artifact id, so requeue.Scan over the collate root actually sees a red
+// claim. Before the fix the verifier path was CWD-relative and only green artifacts were
+// collated, so a fully-failed run found an empty worklist and falsely converged green.
+func TestCollateArtifactMakesRedVisibleToScan(t *testing.T) {
+	wt := t.TempDir()
+	collate := t.TempDir()
+	const id = "swarm-run-0" // the sharder's '-'-delimited shape: a valid artifact id
+	red := &artifact.Artifact{
+		SchemaVersion: artifact.SchemaVersion, ID: id, Kind: artifact.KindReport,
+		Claims: []artifact.Claim{{ID: "c1", Field: "x",
+			Evidence: artifact.Evidence{Status: artifact.StatusFail, Verifier: "v"}}},
+	}
+	if err := artifact.Write(wt, red); err != nil {
+		t.Fatalf("seed red artifact: %v", err)
+	}
+
+	// The fix: collate copies the RED artifact into the collate root (best-effort).
+	collateArtifact(collate, wt, id)
+
+	wl, err := requeue.Scan(collate, nil)
+	if err != nil {
+		t.Fatalf("requeue.Scan: %v", err)
+	}
+	if len(wl.Units) != 1 || wl.Units[0].ArtifactID != id || wl.Units[0].Status != artifact.StatusFail {
+		t.Fatalf("collated red artifact must surface one red Unit, got %+v", wl.Units)
+	}
+
+	// A '/'-containing id (the original blocker) makes artifact.Read reject the path, so
+	// collate is a no-op — proving WHY the sharder must mint '-'-delimited ids.
+	collateArtifact(collate, wt, "swarm/run/0")
+	if wl2, _ := requeue.Scan(collate, nil); len(wl2.Units) != 1 {
+		t.Fatalf("an invalid-id collate must be a no-op, got %d units", len(wl2.Units))
 	}
 }
 
@@ -308,7 +346,7 @@ func TestSwarmResumeAdoptsInterruptedRun(t *testing.T) {
 	if err := q.SaveState(ctx, prior); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
-	failedShard := swarm.Shard{ID: "swarm/" + priorRunID + "/0", Goal: "fix it",
+	failedShard := swarm.Shard{ID: "swarm-" + priorRunID + "-0", Goal: "fix it",
 		Kind: artifact.KindBenchmark, Pack: "benchmark", Role: "implementer", State: swarm.ShardFailed}
 	if err := q.Mark(ctx, failedShard); err != nil {
 		t.Fatalf("Mark: %v", err)

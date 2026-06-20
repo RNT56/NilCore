@@ -52,10 +52,19 @@ func TestListSharderNamespacedNoModel(t *testing.T) {
 	if len(shards) != 3 {
 		t.Fatalf("got %d shards, want 3 (blanks/comments dropped)", len(shards))
 	}
-	wantIDs := []string{"swarm/run1/0", "swarm/run1/1", "swarm/run1/2"}
+	wantIDs := []string{"swarm-run1-0", "swarm-run1-1", "swarm-run1-2"}
 	for i, sh := range shards {
 		if sh.ID != wantIDs[i] {
 			t.Errorf("shard[%d].ID = %q, want %q", i, sh.ID, wantIDs[i])
+		}
+		// REGRESSION (the false-convergence blocker): a shard owns ONE artifact at
+		// .nilcore/artifacts/<shard id>.json and the convergence model keys artifact id ==
+		// shard id, but the artifact store rejects a '/'-containing id. If the shard id were
+		// not a valid single-component artifact id, the per-shard artifact read/write/verify
+		// would silently fail and a failed run would falsely converge green. Assert it has no
+		// path separator and no leading dot.
+		if strings.ContainsRune(sh.ID, '/') || strings.HasPrefix(sh.ID, ".") {
+			t.Errorf("shard[%d].ID %q must be a valid single-component artifact id", i, sh.ID)
 		}
 		if sh.Kind != artifact.KindReport || sh.Pack != "finance" || sh.Role != "researcher" || sh.Tier != "strong" {
 			t.Errorf("shard[%d] routing not carried: %+v", i, sh)
@@ -98,11 +107,11 @@ func TestPlanSharderCarriesDeps(t *testing.T) {
 	if len(shards) != 2 {
 		t.Fatalf("got %d shards, want 2", len(shards))
 	}
-	if shards[0].ID != "swarm/run9/0" || shards[1].ID != "swarm/run9/1" {
+	if shards[0].ID != "swarm-run9-0" || shards[1].ID != "swarm-run9-1" {
 		t.Errorf("ids = %q,%q", shards[0].ID, shards[1].ID)
 	}
-	if len(shards[1].Deps) != 1 || shards[1].Deps[0] != "swarm/run9/0" {
-		t.Errorf("shard[1].Deps = %v, want [swarm/run9/0]", shards[1].Deps)
+	if len(shards[1].Deps) != 1 || shards[1].Deps[0] != "swarm-run9-0" {
+		t.Errorf("shard[1].Deps = %v, want [swarm-run9-0]", shards[1].Deps)
 	}
 	if shards[0].Pack != "code" || shards[0].Kind != artifact.KindSpec {
 		t.Errorf("routing not applied: %+v", shards[0])
