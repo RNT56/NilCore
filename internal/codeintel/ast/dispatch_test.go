@@ -51,10 +51,52 @@ func TestUpperCaseExtensionDispatches(t *testing.T) {
 	}
 }
 
+// The JS/TS family and Rust extensions must all dispatch to their backend (not be
+// treated as unsupported). We assert a representative source under each suffix yields
+// its expected top-level symbol.
+func TestNewExtensionsDispatch(t *testing.T) {
+	cases := []struct {
+		file string
+		src  string
+		want string
+	}{
+		{"a.ts", "export function f() {\n  return 1;\n}\n", "f"},
+		{"a.tsx", "function Widget() {\n  return null;\n}\n", "Widget"},
+		{"a.js", "const g = () => {\n  return 2;\n};\n", "g"},
+		{"a.jsx", "function App() {\n  return null;\n}\n", "App"},
+		{"a.mjs", "export function m() {\n  return 3;\n}\n", "m"},
+		{"a.cjs", "function c() {\n  return 4;\n}\n", "c"},
+		{"a.rs", "fn r() -> i32 {\n    0\n}\n", "r"},
+	}
+	for _, tc := range cases {
+		p := filepath.Join(t.TempDir(), tc.file)
+		if err := os.WriteFile(p, []byte(tc.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		syms, err := Symbols(p)
+		if err != nil {
+			t.Errorf("%s: Symbols error: %v", tc.file, err)
+			continue
+		}
+		var found bool
+		for _, s := range syms {
+			if s.Name == tc.want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: did not dispatch to a backend (want symbol %q, got %+v)", tc.file, tc.want, syms)
+		}
+	}
+}
+
 func TestSupportedExtensions(t *testing.T) {
 	got := SupportedExtensions()
 	sort.Strings(got)
-	want := []string{".go", ".py"}
+	// The full set now spans every registered backend: Go, Python, the JS/TS family,
+	// and Rust. Kept exhaustive so a forgotten registration (or an accidental drop)
+	// fails loudly.
+	want := []string{".cjs", ".go", ".js", ".jsx", ".mjs", ".py", ".rs", ".ts", ".tsx"}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedExtensions() = %v, want %v", got, want)
 	}
