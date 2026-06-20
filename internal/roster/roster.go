@@ -40,7 +40,22 @@ const (
 	RoleImplementer Role = "implementer"
 	// RoleReviewer cross-model reviews a diff. Read-only; deny-all egress.
 	RoleReviewer Role = "reviewer"
+	// RoleTypedResearch does evidence-verified research: it investigates with web
+	// access AND writes a spine Artifact JSON (claims + provenance) to the worktree
+	// for the ArtifactVerifier to assert over (Phase 11, P11-T15). Unlike
+	// RoleResearcher it is WRITE-capable — it must emit the artifact file via the
+	// write/edit tools — so it is NOT a read-only role; the supervisor merges only
+	// the verifier-set claim statuses, never the worker's prose self-report (I2/I7).
+	RoleTypedResearch Role = "typed-research"
 )
+
+// ArtifactRelPath is the fixed, out-of-band worktree location the typed-research
+// role writes its spine Artifact to. It MUST equal the artifact spine's fixed
+// RelPath (`internal/artifact` persists to `.nilcore/artifacts/<id>.json`); the
+// `<id>.json` suffix is appended by the worker per artifact. This constant is the
+// documented shared anchor named in the role's System prompt so the worker and the
+// verifier agree on one path without roster importing the artifact leaf.
+const ArtifactRelPath = ".nilcore/artifacts/<id>.json"
 
 // Profile is the per-role configuration NewWorker turns into a sandboxed worker.
 // Every field is a capability lever; none is a suggestion the model may ignore.
@@ -116,9 +131,10 @@ func (r *Roster) Roles() []Role {
 }
 
 // ReadOnly reports whether role is a structural read-only role (no write tools).
-// Of the five, only the implementer writes; the rest are read-only.
+// The two write-capable roles are the implementer (writes code) and typed-research
+// (writes a spine Artifact JSON, P11-T15); every other role is read-only.
 func (role Role) ReadOnly() bool {
-	return role != RoleImplementer
+	return role != RoleImplementer && role != RoleTypedResearch
 }
 
 // readToolset returns the read-only structured tool set: read + search ONLY. The

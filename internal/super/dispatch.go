@@ -167,7 +167,7 @@ func (s *Supervisor) doSpawn(ctx context.Context, round int, st *runState, b mod
 		st.branch = res.Branch
 	}
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_report",
-		Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
+		Detail: subagentReportDetail(st, spec, res)})
 	// Re-point the read tree at the just-verified branch and re-publish so a concurrent
 	// sibling's ask_supervisor sees this subagent's folded state + the live tree.
 	s.refreshAndPublish(ctx, st)
@@ -383,7 +383,7 @@ func (s *Supervisor) runSpawnWave(ctx context.Context, round int, st *runState, 
 			st.branch = res.Branch
 		}
 		s.Log.Append(eventlog.Event{Task: a.spec.ID, Kind: "subagent_report",
-			Detail: map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}})
+			Detail: subagentReportDetail(st, a.spec, res)})
 		results[a.idx] = ok(a.toolID, s.renderReport(res))
 	}
 	// Re-point the read tree + re-publish once after the whole wave folds (single-owner,
@@ -410,6 +410,30 @@ func (s *Supervisor) continueBase(st *runState, spec SubagentSpec) string {
 	s.Log.Append(eventlog.Event{Task: spec.ID, Kind: "subagent_continue",
 		Detail: map[string]any{"continue_from": spec.ContinueFrom, "base": h.Result.Branch}})
 	return h.Result.Branch
+}
+
+// subagentReportDetail builds the subagent_report Detail. By default it is the
+// frozen {passed,branch,has_err} shape so non-retry logs stay byte-identical
+// (Pillar 6 reads these). When spec.ContinueFrom != "" — i.e. this run is an
+// actual retry — it additively carries continue_from (the prior attempt's id)
+// and base (that attempt's preserved branch, the cut point), giving the report
+// projection a SECONDARY retry-history signal (the GRA claim_* kinds are
+// primary). The extra keys appear ONLY on a retry, so a non-retry Detail is
+// unchanged. base mirrors continueBase's value: st.handles[ContinueFrom]'s
+// branch ("" if the prior attempt changed nothing / is absent), so both the
+// concurrent and serial report sites agree without recomputing BaseRef (which
+// the concurrent path resolves on a closure-local spec copy, not a.spec).
+func subagentReportDetail(st *runState, spec SubagentSpec, res spawn.Result) map[string]any {
+	d := map[string]any{"passed": res.Passed, "branch": res.Branch, "has_err": res.Err != nil}
+	if spec.ContinueFrom != "" {
+		var base string
+		if h, ok := st.handles[spec.ContinueFrom]; ok {
+			base = h.Result.Branch
+		}
+		d["continue_from"] = spec.ContinueFrom
+		d["base"] = base
+	}
+	return d
 }
 
 // resolveBaseRef is the concurrent analog of depTip: the git ref a dependent worker
@@ -718,6 +742,14 @@ func (s *Supervisor) mergeOrder(st *runState) []integrate.MergeItem {
 // (id/passed/branch) plus the UNTRUSTED prose summary fenced as data (I7). The
 // supervisor reads the booleans to decide; the prose can never become an
 // instruction. An error is reported as a typed field, not raw.
+//
+// When a typed-research Result carries a verified evidence artifact (Pillar 3),
+// its harness-set claim statuses render as additional TRUSTED control lines
+// (`artifact …`, `claim …`) emitted BEFORE the fenced prose. These lines surface
+// only the verifier-produced identity+status (ID/Field/Status, Green) — never a
+// model-authored Value or SourceURL, which by construction ArtifactSummary does
+// not carry — so the trusted/untrusted split holds: the verifier's verdict is
+// control, the worker's narrative stays data behind guard.Wrap.
 func (s *Supervisor) renderReport(r spawn.Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "subagent %s: passed=%t", r.ID, r.Passed)
@@ -728,6 +760,13 @@ func (s *Supervisor) renderReport(r spawn.Result) string {
 		fmt.Fprintf(&b, " error=%q", r.Err.Error())
 	}
 	b.WriteByte('\n')
+	if r.Artifact != nil {
+		a := r.Artifact
+		fmt.Fprintf(&b, "artifact %s kind=%s green=%t\n", a.ID, a.Kind, a.Green)
+		for _, c := range a.Claims {
+			fmt.Fprintf(&b, "claim %s field=%s status=%s\n", c.ID, c.Field, c.Status)
+		}
+	}
 	if strings.TrimSpace(r.Summary) != "" {
 		b.WriteString(guard.Wrap("subagent "+r.ID+" summary", r.Summary))
 	}

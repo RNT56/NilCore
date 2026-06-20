@@ -98,6 +98,32 @@ type Supervisor struct {
 	// doIntegrate), like publishRunContext — never from the reader goroutine.
 	SaveState func(ctx context.Context, snap Snapshot) error
 
+	// RequeueHook, if set, is the granular-requeue seam (P11-T22 / Pillar 4): it is
+	// consulted ONLY at convergence-red — i.e. after the model finishes and the
+	// project's checks (s.Verify) come back NOT passed — to decide whether a focused
+	// re-dispatch round is worth running instead of either spinning to MaxRounds or
+	// converging red. The wiring site (cmd, NILCORE_REQUEUE) supplies a func that
+	// scans the per-claim verifier statuses, plans the minimal focused subtasks, and
+	// bounds retries with a ledger; super itself stays a LEAF — it never imports
+	// internal/requeue, internal/artifact, or the store, and learns the outcome only
+	// through this nil-able func (mirroring SaveState/RefreshRead).
+	//
+	// Contract:
+	//   - remaining  — the still-failing requeue UNIT ids that have retry budget left.
+	//     These are HARNESS-AUTHORED trusted control data (the verifier set the claim
+	//     statuses; the hook derived the ids), so they may be folded into the planner's
+	//     next turn as a trusted control block. Any PROSE handed to the model still
+	//     passes guard.Wrap (I7) — only these bare ids are trusted.
+	//   - exhausted — every still-failing unit has hit its MaxAttempts ceiling, so no
+	//     focused round can help: the loop CONVERGES RED immediately (no extra round, no
+	//     spinning to MaxRounds). This is the bounded-retry termination rail.
+	//
+	// Consulted EXACTLY ONCE per convergence-red and NEVER on green. nil ⇒ the loop is
+	// byte-identical to the pre-requeue path: a red finish just keeps looping as today.
+	// Called SINGLE-OWNER on the main goroutine (inside Run, at the finish/verify point),
+	// like SaveState — never from the reader goroutine.
+	RequeueHook func(ctx context.Context) (remaining []string, exhausted bool)
+
 	// Resume, if set, seeds the run from a prior durable snapshot instead of starting
 	// fresh: the integration base is the preserved tip (wired at the build site via
 	// the integrator's BaseRef + the worker/code base ref), the already-merged nodes
@@ -551,6 +577,32 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 				out.Summary = summary
 				return out, nil
 			}
+			// CONVERGENCE-RED. With granular requeue wired (RequeueHook != nil), consult
+			// it EXACTLY ONCE here — never on the green path above — to decide whether a
+			// focused re-dispatch round is still worth running (Pillar 4). The hook
+			// scanned the per-claim verifier statuses (set by the ArtifactVerifier in
+			// s.Verify) and bounded retries with a ledger; super learns only its verdict.
+			// Exhausted ⇒ every still-failing unit hit its ceiling: CONVERGE RED now (the
+			// bounded-retry termination rail — no extra round, no spinning to MaxRounds).
+			// Otherwise the remaining unit ids are HARNESS-trusted control data we fold
+			// into the next turn so the planner targets exactly the broken cells; the loop
+			// then runs one more focused round as usual. nil hook ⇒ this whole block is
+			// skipped and the path below is byte-identical to the pre-requeue loop.
+			var requeueFocus string
+			if s.RequeueHook != nil {
+				remaining, exhausted := s.RequeueHook(ctx)
+				if exhausted {
+					s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_verify",
+						Detail: map[string]any{"passed": false, "requeue_exhausted": true}})
+					return s.outcome(st, false, "requeue_exhausted", i+1), nil
+				}
+				if len(remaining) > 0 {
+					// Trusted control ids (not model output): a bare, un-Wrap'd list naming
+					// exactly the still-failing requeue units the next round should fix.
+					requeueFocus = "Focused requeue — re-derive ONLY these still-failing units, " +
+						"leaving every passing claim untouched: " + strings.Join(remaining, ", ")
+				}
+			}
 			// Not actually done: hand back the tool_results plus the fenced verifier
 			// output and keep going (same recovery shape as native.go's finish path).
 			// Any principal QUEUE / findings this round were already folded at the
@@ -560,6 +612,12 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 				Text: "The project checks did not pass — finish does not decide done-ness. " +
 					"Fix the gaps (spawn, code, or re-integrate) and finish again.\n\n" +
 					guard.Wrap("verifier output", rep.Output)})
+			// The focused requeue directive is harness-authored TRUSTED control text (the
+			// hook's unit ids), so it rides as its own un-Wrap'd block AFTER the fenced
+			// verifier DATA — never concatenated into it (the trust line, I7).
+			if requeueFocus != "" {
+				fail = append(fail, model.Block{Type: "text", Text: requeueFocus})
+			}
 			msgs = append(msgs, model.Message{Role: "user", Content: fail})
 			continue
 		}
