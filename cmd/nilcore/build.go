@@ -33,7 +33,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +43,6 @@ import (
 	"nilcore/internal/agent"
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/artifact"
-	"nilcore/internal/artifact/evverify"
 	"nilcore/internal/backend"
 	"nilcore/internal/budget"
 	"nilcore/internal/eventlog"
@@ -702,9 +700,9 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		// path that this worktree's worker never reaches). gov is the verifier that both
 		// the worker's own loop AND the post-run governing Check below run against, so a
 		// red claim turns spawn.Result.Passed false. Off / non-typed-research ⇒ gov is
-		// env.Verifier unchanged and the path is byte-identical. artifactPath is the
-		// absolute artifact JSON path the post-run projection reads (empty ⇒ no projection).
-		gov, artifactPath := typedResearchVerifier(spec, env, d.log)
+		// env.Verifier unchanged and the result is byte-identical. hasEvidence is true only
+		// when the typed-research evidence verifier was composed, gating the post-run projection.
+		gov, hasEvidence := typedResearchVerifier(spec, env, d.log)
 		// Egress (P11-T28, the single audited toggle): the role's allowlist is
 		// intersected with the build tree. By default d.egress is empty ⇒ every role's
 		// intersected egress is empty and the sandbox stays --network none. When the
@@ -790,11 +788,11 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		// verdict-bearing artifact back from the worktree it owns and project ONLY the
 		// trusted (harness-set) fields onto spawn.Result.Artifact, then append a
 		// typed_result event. Fail-closed: a missing / parse-broken / empty-claims
-		// artifact leaves Artifact nil and the prose summary unchanged. artifactPath is
-		// empty unless evidence verification was composed for this typed-research worker,
+		// artifact leaves Artifact nil and the prose summary unchanged. hasEvidence is
+		// false unless evidence verification was composed for this typed-research worker,
 		// so the off / non-typed path is byte-identical (no read, no projection, no event).
-		if artifactPath != "" {
-			if as := readVerifiedArtifact(wt.Path(), spec.ID); as != nil {
+		if hasEvidence {
+			if as := readVerifiedArtifact(wt.Path()); as != nil {
 				out.Artifact = as
 				d.log.Append(eventlog.Event{Task: spec.ID, Kind: "typed_result", Detail: map[string]any{
 					"id": as.ID, "kind": as.Kind, "green": as.Green, "claims": len(as.Claims),
@@ -805,73 +803,68 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 	}
 }
 
-// typedResearchVerifier composes the per-subagent governing verifier for one spawn.
-// For the typed-research role with NILCORE_EVIDENCE_VERIFY on it returns a
-// verify.Composite{build-checks, evidence} — the build verifier FIRST so an evidence
-// check can never mask a red build (I2), with the ArtifactVerifier resolving each
-// claim through the SAME registry + staleness + eventlog sink the app-level path uses
-// (the helpers live in verifier.go, this package). It also returns the ABSOLUTE
-// artifact path so the post-run projection reads the verdict-overwritten file from the
-// worktree the SpawnFunc owns. For any other role, or with the flag off, it returns
-// env.Verifier unchanged and an empty path — the byte-identical default. A bad pack
-// list (evidenceRegistry error) fails closed: the evidence slot is the always-RED
-// sentinel, so a misconfigured run never greens a typed claim it could not check.
-func typedResearchVerifier(spec super.SubagentSpec, env buildEnv, log *eventlog.Log) (verify.Verifier, string) {
+// lazyEvidenceVerifier composes the build verifier with the evidence verifiers
+// discovered from the worktree AT CHECK TIME. The typed-research worker writes its
+// artifact DURING its run, so the artifact file exists only when Check runs, not when
+// the governing verifier is constructed — and the worker chooses the artifact's id
+// (the prompt says "replace <id> with the artifact id"), so the harness must DISCOVER
+// whatever the worker wrote rather than assume a spec.ID filename. It delegates to the
+// same id-agnostic evidenceVerifiers glob the app-level path uses, which re-reads the
+// NILCORE_EVIDENCE_VERIFY gate, fails closed on a bad pack list, and runs an
+// ArtifactVerifier per artifact found. The build verifier is ALWAYS first so an
+// evidence check can never mask a red build (I2).
+type lazyEvidenceVerifier struct {
+	build verify.Verifier
+	box   sandbox.Sandbox
+	log   *eventlog.Log
+}
+
+func (l lazyEvidenceVerifier) Check(ctx context.Context) (verify.Report, error) {
+	named := append([]verify.NamedVerifier{{Name: "checks", V: l.build}}, evidenceVerifiers(l.box, l.log)...)
+	return verify.Composite{Named: named}.Check(ctx)
+}
+
+// typedResearchVerifier returns the per-subagent governing verifier for one spawn and
+// whether evidence verification was composed (so the caller knows to project the typed
+// artifact afterwards). For the typed-research role with NILCORE_EVIDENCE_VERIFY on and
+// a box, it returns a lazyEvidenceVerifier that, at Check time, ANDs the build verifier
+// with an ArtifactVerifier per artifact the worker actually wrote — the satisfiable
+// form of the I2 guarantee for the typed path (the app-level behavioralVerifier is a
+// separate path this worktree's worker never reaches). For any other role, the flag
+// off, or no box, it returns env.Verifier unchanged — the byte-identical default.
+func typedResearchVerifier(spec super.SubagentSpec, env buildEnv, log *eventlog.Log) (verify.Verifier, bool) {
 	if spec.Role != roster.RoleTypedResearch {
-		return env.Verifier, ""
+		return env.Verifier, false
 	}
 	if strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_VERIFY")) == "" {
-		return env.Verifier, ""
+		return env.Verifier, false
 	}
 	if env.Box == nil {
 		// No box to verify through: nothing to assert over. Leave the verifier untouched
-		// (the build verifier still governs) and project nothing — a network claim could
-		// only resolve Unverifiable here anyway.
-		return env.Verifier, ""
+		// (the build verifier still governs) and project nothing.
+		return env.Verifier, false
 	}
-	// The artifact rides at the fixed out-of-band path the spine agrees on; spec.ID is
-	// the artifact id (the typed-research prompt instructs the worker to write
-	// .nilcore/artifacts/<id>.json with id == its task id). The path is absolute (under
-	// the worktree root) so worktreefs.OpenNoFollow inside evverify resolves it; a
-	// symlink planted at the target is still refused there.
-	relPath := filepath.Join(env.Box.Workdir(), ".nilcore", "artifacts", spec.ID+".json")
-
-	reg, err := evidenceRegistry()
-	if err != nil {
-		// Fail-closed (mirrors verifier.go): a bad pack list must redden, never silently
-		// degrade to the generic-only registry and green a domain claim as a no-op.
-		gov := verify.Composite{Named: []verify.NamedVerifier{
-			{Name: "checks", V: env.Verifier},
-			{Name: "evidence:packs", V: failClosed{reason: err.Error()}},
-		}}
-		return gov, ""
-	}
-	av := &evverify.ArtifactVerifier{
-		Box:       env.Box,
-		Reg:       reg,
-		RelPath:   relPath,
-		MaxAge:    evidenceMaxAge(),
-		EventSink: evidenceEventSink(log),
-	}
-	gov := verify.Composite{Named: []verify.NamedVerifier{
-		{Name: "checks", V: env.Verifier},
-		{Name: "evidence:" + spec.ID, V: av},
-	}}
-	return gov, relPath
+	return lazyEvidenceVerifier{build: env.Verifier, box: env.Box, log: log}, true
 }
 
-// readVerifiedArtifact reads the verdict-overwritten artifact for id from the worker's
-// worktree root and projects ONLY the TRUSTED, harness-set fields onto a flat
+// readVerifiedArtifact discovers the artifact the worker wrote (it chose the id, so we
+// glob id-agnostically — the same artifactFiles glob the verifiers use) from the
+// worker's worktree root and projects ONLY the TRUSTED, harness-set fields onto a flat
 // spawn.ArtifactSummary: id, kind, the pure Green() projection, and one ClaimStatus
 // (id/field/verifier-set status) per claim. The model-authored Value/SourceURL/
 // Statement are DELIBERATELY NOT copied — they stay fenced as prose in the worker's
 // Summary (I7); spawn.ClaimStatus has no field for them by construction (P11-T14).
-// It is fail-closed: a missing / parse-broken / empty-claims artifact returns nil, so
-// the caller leaves spawn.Result.Artifact nil and the prose report unchanged. The read
+// It is fail-closed: no / parse-broken / empty-claims artifact returns nil, so the
+// caller leaves spawn.Result.Artifact nil and the prose report unchanged. The read
 // goes through artifact.Read (worktreefs O_NOFOLLOW), so a symlink at the target is
-// refused rather than followed (I4).
-func readVerifiedArtifact(root, id string) *spawn.ArtifactSummary {
-	a, err := artifact.Read(root, id)
+// refused rather than followed (I4). A typed-research worker writes one artifact; if it
+// wrote several, the first by stable sort order is projected.
+func readVerifiedArtifact(root string) *spawn.ArtifactSummary {
+	paths := artifactFiles(root)
+	if len(paths) == 0 {
+		return nil // fail-closed: no artifact to project
+	}
+	a, err := artifact.Read(root, artifactID(paths[0]))
 	if err != nil || a == nil || len(a.Claims) == 0 {
 		return nil // fail-closed: nothing trustworthy to project
 	}

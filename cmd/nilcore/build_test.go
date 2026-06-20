@@ -552,12 +552,12 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		t.Setenv("NILCORE_EVIDENCE_VERIFY", "")
 		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0}
 		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
-		gov, path := typedResearchVerifier(typedSpec("rep"), env, nil)
+		gov, hasEv := typedResearchVerifier(typedSpec("rep"), env, nil)
 		if gov != env.Verifier {
 			t.Errorf("flag off must leave the verifier unchanged, got %T", gov)
 		}
-		if path != "" {
-			t.Errorf("flag off must yield no artifact path, got %q", path)
+		if hasEv {
+			t.Error("flag off must compose no evidence verifier")
 		}
 	})
 
@@ -566,12 +566,12 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0}
 		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
 		spec := super.SubagentSpec{ID: "imp", Role: roster.RoleImplementer, Goal: "code"}
-		gov, path := typedResearchVerifier(spec, env, nil)
+		gov, hasEv := typedResearchVerifier(spec, env, nil)
 		if gov != env.Verifier {
 			t.Errorf("non-typed role must leave the verifier unchanged, got %T", gov)
 		}
-		if path != "" {
-			t.Errorf("non-typed role must yield no artifact path, got %q", path)
+		if hasEv {
+			t.Error("non-typed role must compose no evidence verifier")
 		}
 	})
 
@@ -585,20 +585,13 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		writeURLArtifact(t, box.dir, "rep", "https://example.com")
 		env := buildEnv{Box: box, Verifier: verify.New(box, "true")} // "true" ⇒ build greens
 
-		gov, path := typedResearchVerifier(typedSpec("rep"), env, nil)
-		comp, ok := gov.(verify.Composite)
-		if !ok {
-			t.Fatalf("flag on + typed role must compose a Composite, got %T", gov)
+		gov, hasEv := typedResearchVerifier(typedSpec("rep"), env, nil)
+		if !hasEv {
+			t.Fatal("flag on + typed role must compose evidence verification")
 		}
-		if len(comp.Named) != 2 || comp.Named[0].Name != "checks" {
-			t.Fatalf("composed verifier must be {checks, evidence}, got %+v", comp.Named)
-		}
-		if !strings.HasPrefix(comp.Named[1].Name, "evidence") {
-			t.Errorf("evidence verifier must follow the build verifier, got %q", comp.Named[1].Name)
-		}
-		if !strings.HasSuffix(path, filepath.Join(".nilcore", "artifacts", "rep.json")) {
-			t.Errorf("artifact path = %q, want the fixed out-of-band path for id rep", path)
-		}
+		// gov globs the worktree at Check time and ANDs the build verifier (FIRST, so it
+		// can never be masked) with an ArtifactVerifier per artifact found — the single
+		// claim resolves Unverifiable (exit 22), so the composed verdict must be red.
 		rep, err := gov.Check(context.Background())
 		if err != nil {
 			t.Fatalf("Check: %v", err)
@@ -613,7 +606,11 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		t.Setenv("NILCORE_VERIFY_PACKS", "")
 		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0} // exit 0 ⇒ url_resolves Pass
 		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
-		writeURLArtifact(t, box.dir, "rep", "https://example.com")
+		// The worker CHOOSES the artifact id; it need not equal the task id (spec.ID).
+		// Write it under a model-chosen id DIFFERENT from typedSpec's "rep" to prove the
+		// harness discovers the artifact id-agnostically — the seam the old code assumed
+		// (filename == spec.ID), which a real model-driven worker would not satisfy.
+		writeURLArtifact(t, box.dir, "entity-acme", "https://example.com")
 
 		gov, _ := typedResearchVerifier(typedSpec("rep"), env, nil)
 		rep, err := gov.Check(context.Background())
@@ -623,15 +620,15 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		if !rep.Passed {
 			t.Fatalf("all-pass artifact + green build must green, got: %s", rep.Output)
 		}
-		// The verifier overwrote the on-disk status; the projection reads it back.
-		as := readVerifiedArtifact(box.dir, "rep")
+		// The verifier overwrote the on-disk status; the projection discovers + reads it.
+		as := readVerifiedArtifact(box.dir)
 		if as == nil {
 			t.Fatal("green artifact must project a non-nil ArtifactSummary")
 		}
 		if !as.Green {
 			t.Errorf("Green must be true for an all-pass artifact, got %+v", as)
 		}
-		if as.ID != "rep" || as.Kind != string(artifact.KindReport) {
+		if as.ID != "entity-acme" || as.Kind != string(artifact.KindReport) {
 			t.Errorf("projection id/kind wrong: %+v", as)
 		}
 		if len(as.Claims) != 1 {
@@ -644,7 +641,7 @@ func TestSpawnTypedArtifact(t *testing.T) {
 
 	t.Run("missing / broken / empty-claims artifact => nil (fail-closed)", func(t *testing.T) {
 		// Missing: no artifact file written.
-		if as := readVerifiedArtifact(t.TempDir(), "ghost"); as != nil {
+		if as := readVerifiedArtifact(t.TempDir()); as != nil {
 			t.Errorf("missing artifact must project nil, got %+v", as)
 		}
 		// Parse-broken: a corrupt JSON body at the fixed path.
@@ -656,7 +653,7 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "rep.json"), []byte("{not json"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if as := readVerifiedArtifact(broken, "rep"); as != nil {
+		if as := readVerifiedArtifact(broken); as != nil {
 			t.Errorf("parse-broken artifact must project nil, got %+v", as)
 		}
 		// Empty claims: a well-formed artifact asserting nothing is NOT green.
@@ -666,7 +663,7 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if as := readVerifiedArtifact(empty, "rep"); as != nil {
+		if as := readVerifiedArtifact(empty); as != nil {
 			t.Errorf("empty-claims artifact must project nil (fail-closed), got %+v", as)
 		}
 	})
@@ -683,7 +680,7 @@ func TestSpawnTypedArtifact(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		as := readVerifiedArtifact(root, "rep")
+		as := readVerifiedArtifact(root)
 		if as == nil {
 			t.Fatal("projection nil")
 		}
