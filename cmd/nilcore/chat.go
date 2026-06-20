@@ -85,9 +85,10 @@ const searchKeyEnv = "BRAVE_API_KEY"
 // -max-steps, -backend, -config, -log behave exactly as for run) and adds the
 // conversation budget ceiling.
 type chatFlags struct {
-	common      commonFlags
-	budget      *float64
-	allowEgress *string
+	common        commonFlags
+	budget        *float64
+	allowEgress   *string
+	egressProfile *string
 }
 
 // chatMain is the `nilcore chat` entry point and the bare-`nilcore` default. It
@@ -98,9 +99,10 @@ type chatFlags struct {
 func chatMain(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	cf := chatFlags{
-		common:      registerCommon(fs),
-		budget:      fs.Float64("budget", chatDefaultBudget, "global dollar ceiling for the whole conversation (a hard wall via the meter)"),
-		allowEgress: fs.String("allow-egress", "", "comma-separated host allowlist for sandboxed web access (e.g. \"example.com,*.docs.io\"); empty = no network (default-deny). Enables web_fetch; add api.search.brave.com + set BRAVE_API_KEY to enable web_search."),
+		common:        registerCommon(fs),
+		budget:        fs.Float64("budget", chatDefaultBudget, "global dollar ceiling for the whole conversation (a hard wall via the meter)"),
+		allowEgress:   fs.String("allow-egress", "", "comma-separated host allowlist for sandboxed web access (e.g. \"example.com,*.docs.io\"); empty = no network (default-deny). Enables web_fetch; add api.search.brave.com + set BRAVE_API_KEY to enable web_search."),
+		egressProfile: fs.String("egress-profile", "", "opt into a named research egress preset (finance|docs|web-research) that WIDENS the sandbox allowlist to a sanctioned host set; empty = default-deny. Composes with -allow-egress (profile = base, flag = extra). Overrides NILCORE_EGRESS_PROFILE and the persisted config."),
 	}
 	_ = fs.Parse(args)
 
@@ -150,7 +152,19 @@ func chatMain(args []string) {
 	// Effective web access from config (nilcore init) + the -allow-egress flag, with
 	// the search backend resolved and its host auto-allowlisted.
 	searchKey := b.cred(searchKeyEnv)
-	allow, searchBackend := resolveWeb(b.cfg, *cf.allowEgress, searchKey)
+	// Pillar-5 research egress profile (P11-T28): resolve the optional widen-tree
+	// from -egress-profile > NILCORE_EGRESS_PROFILE > config, fail-closed on an
+	// unknown name / unparseable file (deny-all, never fail-open). Its hosts are the
+	// BASE of resolveWeb's allowlist (added before the search host); the audited
+	// widen is recorded as a single metadata-only event. Nothing opted in ⇒ a zero
+	// profile ⇒ byte-identical.
+	prof, perr := resolveEgressProfile(b.cfg, *cf.egressProfile)
+	if perr != nil {
+		fatal(perr)
+	}
+	emitEgressProfile(log, prof, egressBackendLabel(*cf.common.sandboxPref))
+	warnNamespaceEgress(prof, *cf.common.sandboxPref)
+	allow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, *cf.allowEgress, searchKey)
 	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console)
 	defer stopProxy()
 
@@ -164,7 +178,12 @@ func chatMain(args []string) {
 		emitter:         emitter,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
-		searchBackend:   searchBackend,
+		// egressTree is the Pillar-5 widen-tree (P11-T28); empty unless a profile was
+		// opted in. It flows into the build stack so a researcher role's intersected
+		// egress can reach the sanctioned hosts (a deny-all role still stays
+		// --network none — EgressFor narrows, never widens).
+		egressTree:    prof.Tree,
+		searchBackend: searchBackend,
 		// Web-search key resolved env-first then SecretStore (I3); used only by the
 		// brave backend, never logged, never placed in a prompt.
 		searchKey: searchKey,
@@ -237,6 +256,13 @@ type chatDeps struct {
 	egress          policy.Egress
 	egressProxyAddr string
 
+	// egressTree is the Pillar-5 research-egress widen-tree (P11-T28): the resolved
+	// named-preset (+ project-file) host set, or empty when no profile is opted in.
+	// It feeds buildDeps.egress so build-stack workers (the researcher role) can
+	// intersect against the sanctioned hosts. Empty ⇒ build keeps deny-all
+	// (byte-identical).
+	egressTree policy.Egress
+
 	// searchBackend is the resolved web_search engine (off | ddg keyless | brave
 	// keyed). searchKey is the brave API key (resolved env-first then SecretStore, I3;
 	// never logged, never in a prompt; injected into the in-box request via per-run
@@ -269,19 +295,30 @@ func (d chatDeps) approverOr() policy.Approver {
 //
 //   - Config (`cfg.Web`) is the baseline; the flag ADDS hosts on top (a one-off
 //     `-allow-egress foo.com` extends, never silently replaces, the saved set).
+//   - profileHosts is the Pillar-5 research egress profile's widen-tree (P11-T28):
+//     a named preset (+ project-local file) the operator opted into. It is the BASE
+//     of the allowlist — added before config and the flag, and before the search
+//     host — so a profile alone enables web (an opted-in profile is itself opt-in).
+//     The flag remains "extra" on top (profile = base, flag = extra).
 //   - Web is enabled when the operator opted in (`cfg.Web.Enabled`) OR passed any
-//     flag host. Otherwise it stays default-deny (nil allowlist, no proxy).
+//     flag host OR opted into a profile. Otherwise it stays default-deny (nil
+//     allowlist, no proxy).
 //   - The chosen search backend's host is AUTO-ADDED to the allowlist, so search
 //     works the moment web is on without the user having to list it.
 //   - The backend resolves from config; left auto, a Brave key ⇒ brave, else the
 //     keyless ddg default. A configured brave with no resolvable key degrades to ddg.
-func resolveWeb(cfg onboard.Config, flagAllow, searchKey string) (allow []string, backend tools.SearchBackend) {
+func resolveWeb(cfg onboard.Config, profileHosts []string, flagAllow, searchKey string) (allow []string, backend tools.SearchBackend) {
 	seen := map[string]bool{}
 	add := func(h string) {
 		if h = strings.TrimSpace(h); h != "" && !seen[h] {
 			seen[h] = true
 			allow = append(allow, h)
 		}
+	}
+	// Profile hosts are the base of the widen-tree (added before config + flag), so
+	// the search host lands after them, matching the "profile = base" contract.
+	for _, h := range profileHosts {
+		add(h)
 	}
 	for _, h := range cfg.Web.Allow {
 		add(h)
@@ -290,8 +327,8 @@ func resolveWeb(cfg onboard.Config, flagAllow, searchKey string) (allow []string
 	for _, h := range flagHosts {
 		add(h)
 	}
-	if !cfg.Web.Enabled && len(flagHosts) == 0 {
-		return nil, tools.SearchOff // default-deny: no opt-in, no flag
+	if !cfg.Web.Enabled && len(flagHosts) == 0 && len(profileHosts) == 0 {
+		return nil, tools.SearchOff // default-deny: no opt-in, no flag, no profile
 	}
 
 	backend = tools.SearchBackend(cfg.Web.Search)
@@ -826,7 +863,8 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
 		strong:   strong,
 		log:      d.log,
 		approver: d.approverOr(),
-		ledger:   ledger, // pin the conversation wall (§6)
+		ledger:   ledger,       // pin the conversation wall (§6)
+		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 }
 
