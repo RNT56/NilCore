@@ -15,14 +15,12 @@
 // supports precisely for scripted, one-shot capture. The driver is pure stdlib
 // and builds with CGO_ENABLED=0.
 //
-// This binary is build-tagged `browserdriver` so it never links into the default
-// toolchain build (`go build ./...`); it is compiled deliberately into the
-// sandbox image (see images/sandbox/). The browser-run itself is exercised only
-// by a CI e2e job against a fixture server — same pattern as the sandbox-linux
-// job — because no real Chromium is available in unit-test environments. The
-// package is stdlib-only and is not linked into the default nilcore binary (it is
-// a standalone tool compiled into the sandbox image), so it builds under the
-// default `go build ./...` and its pure-logic tests run under `make verify`.
+// It is a standalone tool (compiled into the sandbox image; see images/sandbox/),
+// NOT linked into the default nilcore binary — but it is pure stdlib, so it builds
+// under the default `go build ./...` and its pure-logic tests run under
+// `make verify`. The browser run itself (batch and the --actions flow) is exercised
+// only by a CI e2e job against a fixture server — same pattern as the sandbox-linux
+// job — because no real Chromium is available in unit-test environments.
 package main
 
 import (

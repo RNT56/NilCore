@@ -92,6 +92,25 @@ func TestReadFrameRejectsMaskedServerFrame(t *testing.T) {
 	}
 }
 
+func TestReadFrameRejectsReservedBits(t *testing.T) {
+	// FIN + RSV1 + text opcode, unmasked, 2-byte payload. RSV1 is set with no
+	// negotiated extension → must be rejected (RFC6455 §5.2).
+	rsv := []byte{0x80 | 0x40 | opText, 0x02, 'h', 'i'}
+	if _, err := readFrame(bufio.NewReader(bytes.NewReader(rsv))); err == nil {
+		t.Fatal("readFrame accepted a frame with a reserved bit set; must reject")
+	}
+}
+
+func TestReadFrameRejectsOversizedControlFrame(t *testing.T) {
+	// A ping (control) frame advertising a 200-byte payload via the extended-length
+	// form. Control frames must be <=125 bytes (RFC6455 §5.5) → reject before the
+	// payload is even read.
+	ping := []byte{0x80 | opPing, 0x7E, 0x00, 0xC8} // FIN+ping, len marker 126, ext=200
+	if _, err := readFrame(bufio.NewReader(bytes.NewReader(ping))); err == nil {
+		t.Fatal("readFrame accepted a >125-byte control frame; must reject")
+	}
+}
+
 // makeServerFrame builds an unmasked server-shaped frame (FIN optional) for the
 // frame reader's tests. It mirrors the header rules without the mask bit/key.
 func makeServerFrame(opcode byte, fin bool, payload []byte) []byte {

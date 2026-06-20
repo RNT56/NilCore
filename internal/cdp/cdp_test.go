@@ -355,3 +355,66 @@ func TestClickDispatchesPressAndRelease(t *testing.T) {
 		t.Fatalf("mouse event types = %q,%q want mousePressed,mouseReleased", a, b)
 	}
 }
+
+// TestClickButtonsBitmask confirms `buttons` reflects which buttons are held during
+// each phase: 1 on press, 0 on release (CDP semantics).
+func TestClickButtonsBitmask(t *testing.T) {
+	clientWS, server := newPipePair(t)
+	c := &Conn{ws: clientWS}
+
+	reqs := make(chan peerReq, 2)
+	go func() {
+		br := bufio.NewReader(server)
+		for i := 0; i < 2; i++ {
+			req := decodeClientRequest(t, br)
+			reqs <- req
+			writeServerResult(t, server, req.ID, map[string]any{})
+		}
+	}()
+
+	if err := c.Click(context.Background(), 1, 2); err != nil {
+		t.Fatalf("Click: %v", err)
+	}
+	down, up := <-reqs, <-reqs
+	if b, _ := down.Params["buttons"].(float64); b != 1 {
+		t.Errorf("mousePressed buttons = %v, want 1", down.Params["buttons"])
+	}
+	if b, _ := up.Params["buttons"].(float64); b != 0 {
+		t.Errorf("mouseReleased buttons = %v, want 0", up.Params["buttons"])
+	}
+}
+
+// TestTypeKeyEnterCarriesVirtualKeyCode confirms a discrete Enter press carries the
+// metadata Chrome needs to fire the default action (form submit) — not a bare,
+// inert {type,key} event.
+func TestTypeKeyEnterCarriesVirtualKeyCode(t *testing.T) {
+	clientWS, server := newPipePair(t)
+	c := &Conn{ws: clientWS}
+
+	reqs := make(chan peerReq, 2)
+	go func() {
+		br := bufio.NewReader(server)
+		for i := 0; i < 2; i++ {
+			req := decodeClientRequest(t, br)
+			reqs <- req
+			writeServerResult(t, server, req.ID, map[string]any{})
+		}
+	}()
+
+	if err := c.TypeKey(context.Background(), "Enter"); err != nil {
+		t.Fatalf("TypeKey: %v", err)
+	}
+	down, up := <-reqs, <-reqs
+	if down.Method != "Input.dispatchKeyEvent" || down.Params["type"] != "keyDown" {
+		t.Fatalf("first event = %q/%v, want Input.dispatchKeyEvent/keyDown", down.Method, down.Params["type"])
+	}
+	if vk, _ := down.Params["windowsVirtualKeyCode"].(float64); vk != 13 {
+		t.Errorf("Enter keyDown windowsVirtualKeyCode = %v, want 13", down.Params["windowsVirtualKeyCode"])
+	}
+	if down.Params["code"] != "Enter" || down.Params["text"] != "\r" {
+		t.Errorf("Enter keyDown code/text = %v/%v, want Enter/CR", down.Params["code"], down.Params["text"])
+	}
+	if up.Params["type"] != "keyUp" {
+		t.Errorf("second event type = %v, want keyUp", up.Params["type"])
+	}
+}

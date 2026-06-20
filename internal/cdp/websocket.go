@@ -290,6 +290,11 @@ func readFrame(br *bufio.Reader) (frame, error) {
 		return frame{}, fmt.Errorf("reading frame header: %w", err)
 	}
 	fin := head[0]&0x80 != 0
+	if head[0]&0x70 != 0 {
+		// Reserved bits set without a negotiated extension (RFC6455 §5.2) — we
+		// negotiate none, so this is a protocol violation.
+		return frame{}, errors.New("reserved bits set without negotiated extension")
+	}
 	opcode := head[0] & 0x0F
 	masked := head[1]&0x80 != 0
 	if masked {
@@ -323,6 +328,11 @@ func readFrame(br *bufio.Reader) (frame, error) {
 	if length > maxFramePayload {
 		return frame{}, fmt.Errorf("frame payload %d exceeds limit %d", length, maxFramePayload)
 	}
+	if opcode&0x08 != 0 && (length > 125 || !fin) {
+		// Control frames (close/ping/pong) MUST be <=125 bytes and not fragmented
+		// (RFC6455 §5.5). Rejecting here also bounds the pong echo in readMessage.
+		return frame{}, errors.New("invalid control frame (fragmented or >125 bytes)")
+	}
 
 	data := make([]byte, length)
 	if _, err := io.ReadFull(br, data); err != nil {
@@ -347,6 +357,11 @@ func (ws *wsConn) writeText(payload []byte) error {
 
 // writeControl sends a control frame (ping/pong/close) with the given opcode.
 func (ws *wsConn) writeControl(opcode byte, payload []byte) error {
+	if len(payload) > 125 {
+		// RFC6455 §5.5: control-frame payloads are capped at 125 bytes. (Inbound
+		// pings are already bounded by readFrame, so the pong echo never trips this.)
+		return fmt.Errorf("control frame payload %d exceeds 125", len(payload))
+	}
 	f, err := encodeFrame(opcode, payload)
 	if err != nil {
 		return err
@@ -383,6 +398,9 @@ func (ws *wsConn) readMessage() ([]byte, error) {
 			if assembling {
 				return nil, errors.New("unexpected text frame mid-fragment")
 			}
+			if len(buf)+len(f.data) > maxFramePayload {
+				return nil, fmt.Errorf("reassembled message exceeds limit %d", maxFramePayload)
+			}
 			buf = append(buf, f.data...)
 			if f.fin {
 				return buf, nil
@@ -391,6 +409,11 @@ func (ws *wsConn) readMessage() ([]byte, error) {
 		case opContinuation:
 			if !assembling {
 				return nil, errors.New("continuation frame without a start frame")
+			}
+			// Bound the AGGREGATE message, not just each frame: a flood of small
+			// continuation frames must not grow buf without limit (OOM guard).
+			if len(buf)+len(f.data) > maxFramePayload {
+				return nil, fmt.Errorf("reassembled message exceeds limit %d", maxFramePayload)
 			}
 			buf = append(buf, f.data...)
 			if f.fin {

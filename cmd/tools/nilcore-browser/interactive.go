@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,10 +27,32 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"nilcore/internal/cdp"
 )
+
+// syncBuffer is an io.Writer safe for concurrent use: os/exec runs an internal
+// goroutine that copies the child's stderr into cmd.Stderr while the main goroutine
+// snapshots it mid-session (for an error detail, or the console at capture time). A
+// bare strings.Builder would be a data race; the mutex makes the snapshot safe.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // ───────────────────────────── action model ─────────────────────────────
 
@@ -204,7 +227,7 @@ func runInteractive(ctx context.Context, chromium, initialURL string, steps []st
 	defer os.RemoveAll(userDir)
 
 	cmd := exec.CommandContext(runCtx, chromium, interactiveChromiumArgs(port, userDir)...)
-	var stderr strings.Builder
+	var stderr syncBuffer // concurrency-safe: read mid-session while exec's copier writes
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return observation{}, fmt.Errorf("launching chromium: %w", err)

@@ -41,7 +41,10 @@ func (c *Conn) Navigate(ctx context.Context, url string) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("decoding navigate result: %w", err)
 	}
-	if res.ErrorText != "" {
+	if res.ErrorText != "" && res.ErrorText != "net::ERR_ABORTED" {
+		// ERR_ABORTED is benign: Chrome reports it when a navigation is superseded
+		// by a client-side redirect or turns into a download — not a real failure.
+		// Every other errorText (DNS, refused, cert) stays fatal (fail-closed).
 		return fmt.Errorf("navigation to %s failed: %s", url, res.ErrorText)
 	}
 	return nil
@@ -170,17 +173,22 @@ func (c *Conn) ElementCenter(ctx context.Context, selector string) (point, error
 // then a mouseReleased Input event — CDP has no single "click" command, so a
 // press+release pair is the click.
 func (c *Conn) Click(ctx context.Context, x, y float64) error {
-	for _, typ := range []string{"mousePressed", "mouseReleased"} {
+	// `buttons` is the bitmask of buttons held DURING the event: the left button is
+	// down on press (1) and released on up (0). `button` names which one changed.
+	for _, ev := range []struct {
+		typ     string
+		buttons int
+	}{{"mousePressed", 1}, {"mouseReleased", 0}} {
 		_, err := c.Send(ctx, "Input.dispatchMouseEvent", map[string]any{
-			"type":       typ,
+			"type":       ev.typ,
 			"x":          x,
 			"y":          y,
 			"button":     "left",
-			"buttons":    1,
+			"buttons":    ev.buttons,
 			"clickCount": 1,
 		})
 		if err != nil {
-			return fmt.Errorf("dispatching %s at (%.1f,%.1f): %w", typ, x, y, err)
+			return fmt.Errorf("dispatching %s at (%.1f,%.1f): %w", ev.typ, x, y, err)
 		}
 	}
 	return nil
@@ -210,16 +218,38 @@ func (c *Conn) Type(ctx context.Context, text string) error {
 	return nil
 }
 
+// keyMeta carries the extra fields Chrome needs to synthesize a REAL key press for
+// a few common keys: without windowsVirtualKeyCode/code (and text, for keys that
+// emit a character) dispatchKeyEvent fires an inert event that never triggers the
+// default action — e.g. Enter would not submit a form. Unknown keys fall back to
+// the bare {type,key} event.
+var keyMeta = map[string]struct {
+	code string
+	vk   int
+	text string
+}{
+	"Enter":     {"Enter", 13, "\r"},
+	"Tab":       {"Tab", 9, ""},
+	"Escape":    {"Escape", 27, ""},
+	"Backspace": {"Backspace", 8, ""},
+}
+
 // TypeKey dispatches a single key as a keyDown then keyUp Input event. It is
-// available for flows that need a discrete key press (e.g. Enter) rather than
-// literal text insertion. key is a DOM key name like "Enter".
+// available for flows that need a discrete key press (e.g. Enter to submit) rather
+// than literal text insertion. key is a DOM key name like "Enter".
 func (c *Conn) TypeKey(ctx context.Context, key string) error {
+	meta, known := keyMeta[key]
 	for _, typ := range []string{"keyDown", "keyUp"} {
-		_, err := c.Send(ctx, "Input.dispatchKeyEvent", map[string]any{
-			"type": typ,
-			"key":  key,
-		})
-		if err != nil {
+		params := map[string]any{"type": typ, "key": key}
+		if known {
+			params["windowsVirtualKeyCode"] = meta.vk
+			params["code"] = meta.code
+			if typ == "keyDown" && meta.text != "" {
+				// text on keyDown is what drives the keypress + default action.
+				params["text"] = meta.text
+			}
+		}
+		if _, err := c.Send(ctx, "Input.dispatchKeyEvent", params); err != nil {
 			return fmt.Errorf("dispatching key %q: %w", key, err)
 		}
 	}
