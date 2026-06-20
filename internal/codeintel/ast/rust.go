@@ -36,7 +36,10 @@ var (
 	// after `for` wins; without `for`, the only type is the receiver). Generics and
 	// where-clauses after the name are ignored.
 	rustImplForRe = regexp.MustCompile(`^\s*impl\b.*\bfor\s+([A-Za-z_][A-Za-z0-9_:]*)`)
-	rustImplRe    = regexp.MustCompile(`^\s*impl\s+(?:<[^>]*>\s*)?([A-Za-z_][A-Za-z0-9_:]*)`)
+	// `impl\b\s*` (word-bounded, space optional) so the no-space generic forms
+	// `impl<T> Type`, `impl<'a> Type`, `impl<T: Bound> Type` match as receiver blocks
+	// too — not just the spaced `impl Type` — while `implicit_fn` is not mistaken for it.
+	rustImplRe = regexp.MustCompile(`^\s*impl\b\s*(?:<[^>]*>\s*)?([A-Za-z_][A-Za-z0-9_:]*)`)
 	// Call sites: an identifier or path (a::b::c) or selector (obj.method) immediately
 	// followed by "(". We keep the trailing simple name as the callee.
 	rustCallRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)

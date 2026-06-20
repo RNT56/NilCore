@@ -157,6 +157,41 @@ func TestRustCalls(t *testing.T) {
 	}
 }
 
+// A type-generic impl written with NO space after `impl` — `impl<T> Wrapper<T>`,
+// `impl<T: Clone> Wrapper<T>`, `impl<T, U> Pair<T, U>` — is idiomatic and must still
+// open a receiver block, so its methods are methods of the type, not free functions.
+// (Regression: the regex once required `impl\s+`, missing every no-space generic.)
+//
+// Lifetime-parameterized impls (`impl<'a> Parser<'a>`) are a documented limitation,
+// not covered here: the shared line stripper treats a Rust lifetime `'a` as a char
+// literal, so the receiver is lost — an accepted heuristic-scanner approximation
+// (the LSP seam is the precise lens). Kept explicit so the boundary is intentional.
+func TestRustGenericImplReceiver(t *testing.T) {
+	for _, src := range []string{
+		"struct Wrapper<T> { v: T }\n\nimpl<T> Wrapper<T> {\n    fn get(&self) -> i32 { 0 }\n}\n",
+		"struct Wrapper<T> { v: T }\n\nimpl<T: Clone> Wrapper<T> {\n    fn get(&self) -> i32 { 0 }\n}\n",
+		"struct Pair<T, U> { a: T, b: U }\n\nimpl<T, U> Pair<T, U> {\n    fn get(&self) -> i32 { 0 }\n}\n",
+	} {
+		syms, err := Symbols(writeSrc(t, "gen.rs", src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var get Symbol
+		var found bool
+		for _, s := range syms {
+			if s.Name == "get" {
+				get, found = s, true
+			}
+		}
+		if !found {
+			t.Fatalf("get not extracted from %q", src)
+		}
+		if get.Kind != KindMethod || (get.Recv != "Wrapper" && get.Recv != "Pair") {
+			t.Errorf("generic-impl method get: kind=%q recv=%q, want a method on Wrapper/Pair\nsrc: %s", get.Kind, get.Recv, src)
+		}
+	}
+}
+
 // `impl Trait for Type` must set the receiver to the implemented-for type, not the
 // trait — the type after `for` wins.
 func TestRustImplTraitForReceiver(t *testing.T) {

@@ -108,14 +108,15 @@ func TestParseSteps(t *testing.T) {
 	}{
 		{
 			name:    "full valid flow",
-			json:    `[{"action":"navigate","url":"http://x/"},{"action":"click","selector":"#login"},{"action":"type","selector":"#user","text":"alice"},{"action":"wait","ms":500}]`,
-			wantLen: 4,
+			json:    `[{"action":"navigate","url":"http://x/"},{"action":"click","selector":"#login"},{"action":"type","selector":"#user","text":"alice"},{"action":"key","key":"Enter"},{"action":"wait","ms":500}]`,
+			wantLen: 5,
 		},
 		{name: "empty array", json: `[]`, wantErr: true},
 		{name: "not an array", json: `{"action":"navigate"}`, wantErr: true},
 		{name: "navigate missing url", json: `[{"action":"navigate"}]`, wantErr: true},
 		{name: "click missing selector", json: `[{"action":"click"}]`, wantErr: true},
 		{name: "type missing selector", json: `[{"action":"type","text":"x"}]`, wantErr: true},
+		{name: "key missing key", json: `[{"action":"key"}]`, wantErr: true},
 		{name: "wait negative ms", json: `[{"action":"wait","ms":-5}]`, wantErr: true},
 		{name: "wait too long", json: `[{"action":"wait","ms":999999}]`, wantErr: true},
 		{name: "unknown action", json: `[{"action":"teleport"}]`, wantErr: true},
@@ -234,6 +235,11 @@ func (r *recordingDriver) TypeIntoSelector(_ context.Context, sel, text string) 
 	return nil
 }
 
+func (r *recordingDriver) TypeKey(_ context.Context, key string) error {
+	r.calls = append(r.calls, "key:"+key)
+	return nil
+}
+
 func TestApplyStepDispatch(t *testing.T) {
 	d := &recordingDriver{}
 	ctx := context.Background()
@@ -241,14 +247,15 @@ func TestApplyStepDispatch(t *testing.T) {
 		{Action: actNavigate, URL: "http://x/"},
 		{Action: actClick, Selector: "#login"},
 		{Action: actType, Selector: "#user", Text: "alice"},
-		{Action: actWait, MS: 0}, // 0ms wait returns immediately, no driver call
+		{Action: actKey, Key: "Enter"}, // discrete key press (e.g. submit)
+		{Action: actWait, MS: 0},       // 0ms wait returns immediately, no driver call
 	}
 	for _, s := range steps {
 		if err := applyStep(ctx, d, s); err != nil {
 			t.Fatalf("applyStep(%+v): %v", s, err)
 		}
 	}
-	want := []string{"navigate:http://x/", "click:#login", "type:#user=alice"}
+	want := []string{"navigate:http://x/", "click:#login", "type:#user=alice", "key:Enter"}
 	if !reflect.DeepEqual(d.calls, want) {
 		t.Fatalf("dispatched calls = %v, want %v", d.calls, want)
 	}
