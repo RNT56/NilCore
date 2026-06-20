@@ -284,6 +284,12 @@ func FromEnv(getenv func(string) string, store secrets.SecretStore) (Config, err
 		}
 	}
 
+	// Research egress preset (P11, Pillar 5): persisted so the front-door wiring can
+	// widen the egress tree to a named preset on the next run. Hostname-only — no
+	// secret is read here (keyed sources resolve via the SecretStore at the wiring
+	// layer, I3). Unset ⇒ Web.Profile stays empty (Validate accepts empty).
+	cfg.Web.Profile = getenv("NILCORE_EGRESS_PROFILE")
+
 	cfg.Delegated = detectDelegated()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

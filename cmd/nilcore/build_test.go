@@ -8,17 +8,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"nilcore/internal/agent/bus"
+	"nilcore/internal/artifact"
 	"nilcore/internal/budget"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
 	"nilcore/internal/model"
 	"nilcore/internal/policy"
 	"nilcore/internal/project"
+	"nilcore/internal/roster"
 	"nilcore/internal/spawn"
 	"nilcore/internal/super"
 	"nilcore/internal/verify"
@@ -531,6 +534,174 @@ func TestWorkReportEmptyChangeAndProseClip(t *testing.T) {
 	if strings.Count(report, "a") >= len(huge) {
 		t.Errorf("prose was not clipped to the byte budget (len was %d)", strings.Count(report, "a"))
 	}
+}
+
+// TestSpawnTypedArtifact is the P11-T16 acceptance test. It exercises the two seams
+// buildSpawnFunc adds — (a) composing evverify.ArtifactVerifier into the per-subagent
+// env.Verifier for the typed-research role under NILCORE_EVIDENCE_VERIFY, and (b)
+// reading the verdict-overwritten artifact back into the trusted spawn.Result.Artifact
+// projection — without driving a container or the network. It targets the helpers the
+// spawn func calls (typedResearchVerifier / readVerifiedArtifact) with the same
+// hermetic fakeVerifierBox the P11-T05 wiring test uses (exit 0 ⇒ url_resolves Pass).
+func TestSpawnTypedArtifact(t *testing.T) {
+	typedSpec := func(id string) super.SubagentSpec {
+		return super.SubagentSpec{ID: id, Role: roster.RoleTypedResearch, Goal: "research"}
+	}
+
+	t.Run("flag off => env.Verifier unchanged, no path (byte-identical)", func(t *testing.T) {
+		t.Setenv("NILCORE_EVIDENCE_VERIFY", "")
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0}
+		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
+		gov, path := typedResearchVerifier(typedSpec("rep"), env, nil)
+		if gov != env.Verifier {
+			t.Errorf("flag off must leave the verifier unchanged, got %T", gov)
+		}
+		if path != "" {
+			t.Errorf("flag off must yield no artifact path, got %q", path)
+		}
+	})
+
+	t.Run("non-typed role => env.Verifier unchanged even with flag on", func(t *testing.T) {
+		t.Setenv("NILCORE_EVIDENCE_VERIFY", "1")
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0}
+		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
+		spec := super.SubagentSpec{ID: "imp", Role: roster.RoleImplementer, Goal: "code"}
+		gov, path := typedResearchVerifier(spec, env, nil)
+		if gov != env.Verifier {
+			t.Errorf("non-typed role must leave the verifier unchanged, got %T", gov)
+		}
+		if path != "" {
+			t.Errorf("non-typed role must yield no artifact path, got %q", path)
+		}
+	})
+
+	t.Run("flag on + typed role => ArtifactVerifier composed; one-fail artifact => Passed=false", func(t *testing.T) {
+		t.Setenv("NILCORE_EVIDENCE_VERIFY", "1")
+		t.Setenv("NILCORE_VERIFY_PACKS", "")
+		// exit 22 ⇒ web.url_resolves resolves Unverifiable (a non-pass), so the single
+		// claim is RED and the whole composed verdict must be red — the satisfiable I2
+		// guarantee the typed path needs (spawn.Result.Passed is set from this verdict).
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 22}
+		writeURLArtifact(t, box.dir, "rep", "https://example.com")
+		env := buildEnv{Box: box, Verifier: verify.New(box, "true")} // "true" ⇒ build greens
+
+		gov, path := typedResearchVerifier(typedSpec("rep"), env, nil)
+		comp, ok := gov.(verify.Composite)
+		if !ok {
+			t.Fatalf("flag on + typed role must compose a Composite, got %T", gov)
+		}
+		if len(comp.Named) != 2 || comp.Named[0].Name != "checks" {
+			t.Fatalf("composed verifier must be {checks, evidence}, got %+v", comp.Named)
+		}
+		if !strings.HasPrefix(comp.Named[1].Name, "evidence") {
+			t.Errorf("evidence verifier must follow the build verifier, got %q", comp.Named[1].Name)
+		}
+		if !strings.HasSuffix(path, filepath.Join(".nilcore", "artifacts", "rep.json")) {
+			t.Errorf("artifact path = %q, want the fixed out-of-band path for id rep", path)
+		}
+		rep, err := gov.Check(context.Background())
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if rep.Passed {
+			t.Fatalf("a one-fail artifact must redden the composed verdict (Passed=false), got Passed=true: %s", rep.Output)
+		}
+	})
+
+	t.Run("green artifact => projection non-nil, Green=true, one ClaimStatus per claim", func(t *testing.T) {
+		t.Setenv("NILCORE_EVIDENCE_VERIFY", "1")
+		t.Setenv("NILCORE_VERIFY_PACKS", "")
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0} // exit 0 ⇒ url_resolves Pass
+		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
+		writeURLArtifact(t, box.dir, "rep", "https://example.com")
+
+		gov, _ := typedResearchVerifier(typedSpec("rep"), env, nil)
+		rep, err := gov.Check(context.Background())
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if !rep.Passed {
+			t.Fatalf("all-pass artifact + green build must green, got: %s", rep.Output)
+		}
+		// The verifier overwrote the on-disk status; the projection reads it back.
+		as := readVerifiedArtifact(box.dir, "rep")
+		if as == nil {
+			t.Fatal("green artifact must project a non-nil ArtifactSummary")
+		}
+		if !as.Green {
+			t.Errorf("Green must be true for an all-pass artifact, got %+v", as)
+		}
+		if as.ID != "rep" || as.Kind != string(artifact.KindReport) {
+			t.Errorf("projection id/kind wrong: %+v", as)
+		}
+		if len(as.Claims) != 1 {
+			t.Fatalf("projection must carry one ClaimStatus per claim, got %d", len(as.Claims))
+		}
+		if as.Claims[0].Status != string(artifact.StatusPass) {
+			t.Errorf("ClaimStatus must mirror the verifier-set status, got %q", as.Claims[0].Status)
+		}
+	})
+
+	t.Run("missing / broken / empty-claims artifact => nil (fail-closed)", func(t *testing.T) {
+		// Missing: no artifact file written.
+		if as := readVerifiedArtifact(t.TempDir(), "ghost"); as != nil {
+			t.Errorf("missing artifact must project nil, got %+v", as)
+		}
+		// Parse-broken: a corrupt JSON body at the fixed path.
+		broken := t.TempDir()
+		dir := filepath.Join(broken, ".nilcore", "artifacts")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rep.json"), []byte("{not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if as := readVerifiedArtifact(broken, "rep"); as != nil {
+			t.Errorf("parse-broken artifact must project nil, got %+v", as)
+		}
+		// Empty claims: a well-formed artifact asserting nothing is NOT green.
+		empty := t.TempDir()
+		if err := artifact.Write(empty, &artifact.Artifact{
+			ID: "rep", Kind: artifact.KindReport, CreatedAt: time.Now(), Claims: nil,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if as := readVerifiedArtifact(empty, "rep"); as != nil {
+			t.Errorf("empty-claims artifact must project nil (fail-closed), got %+v", as)
+		}
+	})
+
+	t.Run("no secret in projection: only id/field/status, never value/url", func(t *testing.T) {
+		const secret = "https://example.com/?key=SUPER-SECRET"
+		root := t.TempDir()
+		if err := artifact.Write(root, &artifact.Artifact{
+			ID: "rep", Kind: artifact.KindMatrix, CreatedAt: time.Now(),
+			Claims: []artifact.Claim{{ID: "c1", Field: "f1", Evidence: artifact.Evidence{
+				Value: "SENSITIVE-VALUE", SourceURL: secret, Verifier: "web.url_resolves",
+				Status: artifact.StatusPass,
+			}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		as := readVerifiedArtifact(root, "rep")
+		if as == nil {
+			t.Fatal("projection nil")
+		}
+		// Structural guarantee (P11-T14): ClaimStatus exposes ONLY ID/Field/Status — no
+		// field can even hold a value/url. Assert the type carries no such field, and
+		// that the marshaled projection never contains the secret or the model value.
+		typ := reflect.TypeOf(spawn.ClaimStatus{})
+		for i := 0; i < typ.NumField(); i++ {
+			name := typ.Field(i).Name
+			if name == "Value" || name == "SourceURL" || name == "URL" {
+				t.Fatalf("ClaimStatus must never carry an untrusted field, has %q", name)
+			}
+		}
+		blob := mustJSON(t, as)
+		if strings.Contains(string(blob), secret) || strings.Contains(string(blob), "SENSITIVE-VALUE") {
+			t.Errorf("projection leaked an untrusted value/url:\n%s", blob)
+		}
+	})
 }
 
 // seqProvider replays a fixed response sequence (hermetic), capturing the last

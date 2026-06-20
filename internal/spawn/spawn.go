@@ -51,6 +51,14 @@ type Result struct {
 	Passed  bool
 	State   State
 	Err     error
+	// Artifact is the typed, verifier-set projection of a subworker's evidence
+	// artifact (Pillar 3). It is nil for every non-typed-research run — which is
+	// the default — and `json:",omitempty"` plus pointer keeps the serialized
+	// shape byte-identical when off (no "artifact" key at all). The supervisor's
+	// renderReport treats these fields as TRUSTED control lines because they are
+	// harness-computed (status set by the ArtifactVerifier), never model
+	// self-claimed. Carried verbatim through Spawn and a DAG wave.
+	Artifact *ArtifactSummary `json:",omitempty"`
 }
 
 // RunFunc runs one subtask in its own worktree and returns its result.

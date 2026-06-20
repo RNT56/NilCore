@@ -3,164 +3,47 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
+
+	"nilcore/internal/worktreefs"
 )
+
+// The symlink-safe path-join, O_NOFOLLOW open, and atomic temp+rename write that
+// confine every host-side file op to the worktree now live in the audited leaf
+// internal/worktreefs (shared with the artifact store and report writer — auditor
+// B1). The thin wrappers below keep this package's existing call sites and tests
+// byte-identical while delegating the security-load-bearing logic to that one copy.
 
 // safePath resolves rel against workdir and confirms it stays inside it — both
 // lexically AND after following symlinks — so a tool can never read or write
-// outside the worktree. A lexical check alone is not enough: an in-tree symlink
-// (e.g. `evil -> /etc`) would otherwise let a write escape. We therefore resolve
-// the worktree root and the deepest existing ancestor of the target through
-// EvalSymlinks and re-check containment. (Writes additionally go through an
-// atomic temp-file + O_NOFOLLOW open + rename to close the TOCTOU window on the
-// final component — see writeNoFollow.)
+// outside the worktree. Delegates to worktreefs.SafeJoin.
 func safePath(workdir, rel string) (string, error) {
-	if rel == "" {
-		return "", fmt.Errorf("empty path")
-	}
-	root, err := filepath.EvalSymlinks(workdir)
-	if err != nil {
-		return "", fmt.Errorf("resolve worktree root: %w", err)
-	}
-	root = filepath.Clean(root)
-	target := filepath.Clean(filepath.Join(root, rel))
-	return confine(root, target, rel)
+	return worktreefs.SafeJoin(workdir, rel)
 }
 
-// confine confirms target stays inside root — both lexically AND after following
-// symlinks — returning target on success. It is the shared containment check for
-// safePath (worktree-relative writes/reads) and safeAbs (absolute reads against an
-// added read root): a lexical check alone is not enough because an in-tree symlink
-// (e.g. `evil -> /etc`) would let access escape, so we resolve the deepest existing
-// ancestor of the target and re-check. ref is the original path, for the error.
-func confine(root, target, ref string) (string, error) {
-	if !within(root, target) {
-		return "", fmt.Errorf("path %q escapes its root", ref)
-	}
-	// Resolve the deepest existing ancestor (the target itself may not exist yet,
-	// e.g. a new file) and confirm it still resolves inside the root — this is what
-	// catches an in-tree symlink pointing out.
-	probe := target
-	for {
-		if _, lerr := os.Lstat(probe); lerr == nil {
-			break
-		}
-		parent := filepath.Dir(probe)
-		if parent == probe {
-			break
-		}
-		probe = parent
-	}
-	real, err := filepath.EvalSymlinks(probe)
-	if err != nil {
-		return "", fmt.Errorf("resolve path %q: %w", ref, err)
-	}
-	if !within(root, filepath.Clean(real)) {
-		return "", fmt.Errorf("path %q resolves outside its root (symlink escape)", ref)
-	}
-	return target, nil
-}
-
-// safeAbs confirms an ABSOLUTE path resolves inside root (symlink-safe), returning
-// the cleaned path. It is the read-root counterpart of safePath: where safePath
-// joins a relative path onto the worktree, safeAbs validates a model-supplied
-// absolute path against one allowed root. Used only for READS against the worktree
-// or an explicitly-added read root — never for a write (writes stay worktree-only).
+// safeAbs confirms an ABSOLUTE path resolves inside root (symlink-safe). It is the
+// read-root counterpart of safePath, used only for READS against the worktree or an
+// explicitly-added read root. Delegates to worktreefs.SafeAbs.
 func safeAbs(root, abs string) (string, error) {
-	rootResolved, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve root: %w", err)
-	}
-	return confine(filepath.Clean(rootResolved), filepath.Clean(abs), abs)
+	return worktreefs.SafeAbs(root, abs)
 }
 
-// within reports whether p is root or lives under it.
-func within(root, p string) bool {
-	return p == root || strings.HasPrefix(p, root+string(os.PathSeparator))
-}
-
-// writeNoFollow writes content to p atomically and without following a symlink
-// at the destination.
-//
-// Atomicity: we never truncate-in-place. Instead we write the full content into
-// a freshly-created temp file in the SAME directory (so os.Rename stays on one
-// filesystem and is therefore atomic on POSIX), fsync it so the bytes are durable
-// before the rename, then os.Rename it over p. A kill of the harness at any point
-// leaves either the old file untouched (rename never happened) or the complete
-// new file (rename committed) — never a half-applied, truncated file.
-//
-// Symlink safety: the temp file is opened with O_CREATE|O_EXCL|O_NOFOLLOW under a
-// random, not-yet-existing name, so a symlink swapped in at the temp path cannot
-// be followed or clobbered. os.Rename does not follow a symlink at the
-// destination — it replaces p (even if p was swapped to a symlink after
-// safePath's check) rather than writing through it — so this is at least as
-// strong as the previous O_NOFOLLOW-on-final-component TOCTOU defense, and
-// safePath already rejects a destination that resolves outside the worktree.
+// writeNoFollow writes content to p atomically and without following a symlink at
+// the destination, preserving the destination's existing permissions on overwrite
+// (default 0644 for a new file). p is an already-confined absolute target (produced
+// by safePath); we write into its directory via a confined relative name so the
+// atomic temp+rename + O_NOFOLLOW discipline lives in one place (worktreefs).
 func writeNoFollow(p string, content []byte) error {
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-
-	// Preserve the destination's existing permissions on overwrite; default 0644
-	// for a new file. Lstat (not Stat) so a symlink at p is not followed here.
-	perm := os.FileMode(0o644)
-	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
-		perm = fi.Mode().Perm()
-	}
-
-	// O_EXCL guarantees a brand-new file under a unique name; O_NOFOLLOW refuses a
-	// symlink swapped in at the temp path. os.CreateTemp can't set these flags, so
-	// retry on the (vanishingly rare) name collision ourselves.
-	var f *os.File
-	var tmp string
-	for i := 0; ; i++ {
-		tmp = filepath.Join(dir, fmt.Sprintf(".nilcore-tmp-%d-%d", os.Getpid(), randUint()))
-		var err error
-		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL|syscall.O_NOFOLLOW, perm)
-		if err == nil {
-			break
-		}
-		if errors.Is(err, fs.ErrExist) && i < 1000 {
-			continue
-		}
-		return fmt.Errorf("create temp file: %w", err)
-	}
-
-	// From here on, ensure the temp file never lingers if anything fails.
-	if _, err := f.Write(content); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return fmt.Errorf("fsync temp file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("rename temp file: %w", err)
-	}
-	return nil
+	// p is already confined by safePath; WriteConfined performs the atomic temp+rename
+	// + O_NOFOLLOW write without re-resolving p (which would fail on a not-yet-existing
+	// parent dir). perm 0 ⇒ preserve-existing-else-0644, matching the prior behavior.
+	return worktreefs.WriteConfined(p, content, 0)
 }
-
-// randUint returns a random uint64 for temp-file naming. It is only used to avoid
-// name collisions, not for any security property — O_EXCL is what actually
-// guarantees a fresh file — so the stdlib math/rand/v2 source is fine.
-func randUint() uint64 { return rand.Uint64() }
 
 // ReadTool returns the contents of a file in the worktree, or — by absolute path —
 // in an added read-only context root. ReadRoots are the extra roots (absolute,

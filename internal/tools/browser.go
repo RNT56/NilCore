@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"nilcore/internal/browserwire"
 	"nilcore/internal/guard"
 	"nilcore/internal/sandbox"
 )
@@ -72,21 +73,9 @@ func hasActions(raw json.RawMessage) bool {
 	return len(steps) > 0
 }
 
-// shellSingleQuote wraps s in single quotes for safe use in `sh -c`, escaping any
-// embedded single quote — so model-supplied actions JSON cannot break out of the
-// quoting (the driver consumes it as DATA, not shell). Mirrors backend.shellQuote.
-func shellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// browserObservation is the JSON contract the in-sandbox driver prints on stdout.
-// Unknown fields are ignored; it is parsed as data, never executed (I7).
-type browserObservation struct {
-	Title         string   `json:"title"`
-	Text          string   `json:"text"`
-	Console       []string `json:"console"`
-	ScreenshotB64 string   `json:"screenshot_b64"` // delivered to the model as an image block (D1-T02)
-}
+// The shell single-quote escaper (the I4 quoting boundary) and the driver's
+// stdout JSON contract live in the stdlib-only internal/browserwire leaf, shared
+// verbatim with the UI verifier pack so there is exactly one tested copy.
 
 // Run satisfies the Tool interface; it delegates to RunWithImage and drops the
 // image, so a non-vision caller still gets the full textual observation.
@@ -132,7 +121,7 @@ func (b BrowserViewTool) RunWithImage(ctx context.Context, _ string, input json.
 		if len(in.Actions) > maxActionsBytes {
 			return "", nil, fmt.Errorf("browser_view: actions payload too large (%d > %d bytes)", len(in.Actions), maxActionsBytes)
 		}
-		cmd = fmt.Sprintf("%s --actions %s --format json", driver, shellSingleQuote(string(in.Actions)))
+		cmd = fmt.Sprintf("%s --actions %s --format json", driver, browserwire.ShellSingleQuote(string(in.Actions)))
 		if strings.TrimSpace(in.URL) != "" {
 			safeURL, err := validateFetchURL(in.URL)
 			if err != nil {
@@ -166,7 +155,7 @@ func (b BrowserViewTool) RunWithImage(ctx context.Context, _ string, input json.
 		return guard.Wrap("browser_view error for "+target, detail), nil, nil
 	}
 
-	var obs browserObservation
+	var obs browserwire.Observation
 	if err := json.Unmarshal([]byte(res.Stdout), &obs); err != nil {
 		return guard.Wrap("browser_view raw output for "+target, tailText(res.Stdout, maxBrowserText)), nil, nil
 	}
@@ -179,7 +168,7 @@ func (b BrowserViewTool) RunWithImage(ctx context.Context, _ string, input json.
 	return guard.Wrap("browser view of "+target, renderObservation(obs)), img, nil
 }
 
-func renderObservation(obs browserObservation) string {
+func renderObservation(obs browserwire.Observation) string {
 	var b strings.Builder
 	if obs.Title != "" {
 		fmt.Fprintf(&b, "title: %s\n", obs.Title)

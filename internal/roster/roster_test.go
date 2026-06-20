@@ -324,14 +324,22 @@ func TestResolveUnknownRole(t *testing.T) {
 
 func TestDefaultRosterHasAllFiveRoles(t *testing.T) {
 	r := defaultRoster()
-	want := []Role{RoleResearcher, RoleUnderstander, RolePlanner, RoleImplementer, RoleReviewer}
-	for _, role := range want {
+	// The original five roles must still be present and unchanged (snapshot); the
+	// typed-research role (P11-T15) is an additive sixth.
+	five := []Role{RoleResearcher, RoleUnderstander, RolePlanner, RoleImplementer, RoleReviewer}
+	for _, role := range five {
 		if _, ok := r.Resolve(role); !ok {
 			t.Errorf("default roster missing role %q", role)
 		}
 	}
+	want := append(append([]Role{}, five...), RoleTypedResearch)
 	if got := len(r.Roles()); got != len(want) {
 		t.Errorf("default roster has %d roles, want %d", got, len(want))
+	}
+	for _, role := range want {
+		if _, ok := r.Resolve(role); !ok {
+			t.Errorf("default roster missing role %q", role)
+		}
 	}
 }
 
@@ -417,12 +425,15 @@ func TestWebFetchOnlyOnResearcherAndNoWriteTools(t *testing.T) {
 		p, _ := r.Resolve(role)
 		w := NewWorker(p, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
 
+		// The researcher and the typed-research role (P11-T15) carry web_fetch; no
+		// other role does.
+		wantsFetch := role == RoleResearcher || role == RoleTypedResearch
 		hasFetch := w.Tools.Has("web_fetch")
-		if role == RoleResearcher && !hasFetch {
-			t.Errorf("researcher must carry web_fetch")
+		if wantsFetch && !hasFetch {
+			t.Errorf("role %q must carry web_fetch", role)
 		}
-		if role != RoleResearcher && hasFetch {
-			t.Errorf("non-researcher role %q must NOT carry web_fetch", role)
+		if !wantsFetch && hasFetch {
+			t.Errorf("role %q must NOT carry web_fetch", role)
 		}
 		// The structural guarantee: read-only roles carry NO write/git-write tools,
 		// even after the new codeintel/web_fetch tools were wired in.
@@ -455,6 +466,63 @@ func TestWebFetchDoesNotMutateSharedRegistry(t *testing.T) {
 	// workers (in-place mutation would have leaked it onto the catalog).
 	if p.Tools.Has("web_fetch") {
 		t.Error("constructing a worker mutated the shared profile registry")
+	}
+}
+
+// --- P11-T15: the typed-research role (write-capable, evidence-verified) -----
+
+// The typed-research role is resolvable, write-capable (NOT read-only), carries the
+// write+edit tools, names the fixed artifact path + spine shape in its prompt, and
+// narrows to --network none under a deny-all tree. The original five roles stay
+// unchanged. (P11-T15 acceptance.)
+func TestTypedResearchProfile(t *testing.T) {
+	r := defaultRoster()
+
+	p, ok := r.Resolve(RoleTypedResearch)
+	if !ok {
+		t.Fatal("typed-research role is not resolvable")
+	}
+
+	// Write-capable: NOT read-only, and the role/profile ReadOnly agree.
+	if p.ReadOnly {
+		t.Error("typed-research profile must NOT be ReadOnly (it writes the artifact)")
+	}
+	if RoleTypedResearch.ReadOnly() {
+		t.Error("RoleTypedResearch.ReadOnly() must be false (write-capable)")
+	}
+
+	// hasWriteTool true: the worker's registry carries write+edit (and git).
+	w := NewWorker(p, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+	if !hasWriteTool(w.Tools) {
+		t.Error("typed-research worker must advertise write tools (hasWriteTool false)")
+	}
+	for _, wt := range []string{"write", "edit"} {
+		if !w.Tools.Has(wt) {
+			t.Errorf("typed-research worker missing write tool %q", wt)
+		}
+	}
+
+	// System prompt names the fixed artifact path and the spine Claim/Evidence shape.
+	for _, sub := range []string{".nilcore/artifacts/<id>.json", "Claim", "Evidence", "source_url", "status"} {
+		if !strings.Contains(p.System, sub) {
+			t.Errorf("typed-research System prompt missing %q", sub)
+		}
+	}
+	// The prompt path must equal the documented shared constant.
+	if !strings.Contains(p.System, ArtifactRelPath) {
+		t.Errorf("typed-research System prompt path does not match ArtifactRelPath %q", ArtifactRelPath)
+	}
+
+	// EgressFor under a deny-all tree => empty allowlist (--network none); narrow-only.
+	if eg := EgressFor(p, policy.Egress{}); !eg.Empty() {
+		t.Errorf("typed-research under deny-all tree got network %v (must be --network none)", eg.Allowed)
+	}
+
+	// The original five roles are still present and unchanged in shape.
+	for _, role := range []Role{RoleResearcher, RoleUnderstander, RolePlanner, RoleImplementer, RoleReviewer} {
+		if _, ok := r.Resolve(role); !ok {
+			t.Errorf("original role %q vanished after adding typed-research", role)
+		}
 	}
 }
 

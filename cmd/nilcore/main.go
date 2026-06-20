@@ -102,6 +102,8 @@ func main() {
 		secretMain(args[1:])
 	case "inspect":
 		inspectMain(args[1:])
+	case "report":
+		reportMain(args[1:])
 	case "mcp-call":
 		mcpCallMain(args[1:])
 	case "propose-edit":
@@ -581,6 +583,7 @@ func serveMain(args []string) {
 	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
 	maxLifetime := fs.Duration("max-lifetime", 0, "after this wall-clock duration, serve checkpoints in-flight work and exits cleanly so a supervisor (systemd) restarts it into the resume path (0 = no cap)")
 	webhookAddr := fs.String("webhook", "", "address for the SCM/CI webhook intake (e.g. 127.0.0.1:8099); needs NILCORE_WEBHOOK_SECRET")
+	egressProfile := fs.String("egress-profile", "", "opt into a named research egress preset (finance|docs|web-research) that WIDENS the sandbox allowlist to a sanctioned host set; empty = default-deny. Overrides NILCORE_EGRESS_PROFILE and the persisted config.")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
 
@@ -657,7 +660,17 @@ func serveMain(args []string) {
 	// host auto-allowlisted. The proxy is bound to the serve ctx (one proxy for the
 	// server). Default-deny when web is not configured.
 	searchKey := b.cred(searchKeyEnv)
-	webAllow, searchBackend := resolveWeb(b.cfg, "", searchKey)
+	// Pillar-5 research egress profile (P11-T28): same flag/env/config resolution as
+	// the chat front door, fail-closed on an unknown name / unparseable file. The
+	// widen-tree hosts are the BASE of the serve allowlist; the audited widen is
+	// recorded as one metadata-only event. Nothing opted in ⇒ byte-identical.
+	prof, perr := resolveEgressProfile(b.cfg, *egressProfile)
+	if perr != nil {
+		fatal(perr)
+	}
+	emitEgressProfile(log, prof, egressBackendLabel(*c.sandboxPref))
+	warnNamespaceEgress(prof, *c.sandboxPref)
+	webAllow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, "", searchKey)
 	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow)
 	defer stopProxy()
 	if egress.Empty() {
@@ -689,6 +702,7 @@ func serveMain(args []string) {
 		egressProxyAddr: proxyAddr,
 		searchBackend:   searchBackend,
 		searchKey:       searchKey,
+		egressTree:      prof.Tree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 	factory := serveSessionFactory(d, rawCh, ctx)
 
@@ -905,6 +919,12 @@ type serveDeps struct {
 	egressProxyAddr string
 	searchBackend   tools.SearchBackend
 	searchKey       string
+
+	// egressTree is the Pillar-5 research-egress widen-tree (P11-T28): the resolved
+	// named-preset (+ project-file) host set, or empty when no profile is opted in.
+	// It feeds buildDeps.egress so a supervised/project drive's researcher role can
+	// intersect against the sanctioned hosts (a deny-all role stays --network none).
+	egressTree policy.Egress
 }
 
 // webEnabled reports whether sandboxed web access is configured for serve.
@@ -1185,7 +1205,8 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 		strong:   strong,
 		log:      d.log,
 		approver: approver,
-		ledger:   ledger, // pin the per-conversation wall (§6)
+		ledger:   ledger,       // pin the per-conversation wall (§6)
+		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 		// Durable resume: with a checkpointer + a stable task id, buildStack wires the
 		// supervisor's SaveState (snapshot → pin resume/<taskID> → SuperviseStatus row).
 		// taskID empty (no checkpointer) ⇒ no durable snapshot, byte-identical.
