@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"nilcore/internal/egressprofile"
 )
 
 // DefaultImage is the sandbox container image suggested by `nilcore init` and the
@@ -81,11 +83,20 @@ type DelegatedConfig struct {
 // WebConfig records the agent's web-access setup (so it survives a restart and is
 // not a flag the operator must remember). It references secrets, never secrets.
 // Empty/zero ⇒ web access off (default-deny), the prior behavior.
+//
+// Profile/ProfileFile are the persisted form of the Pillar-5 research egress
+// presets (P11). Profile names a built-in preset from egressprofile.Names()
+// (finance|docs|web-research); ProfileFile points at a project-local
+// .nilcore/egress.json allowlist. Both are hostname-only knobs — keyed sources
+// resolve their secret via the SecretStore at the wiring layer, never here (I3).
+// Both default-zero (omitempty) so an existing config without them is unchanged.
 type WebConfig struct {
 	Enabled      bool     `json:"enabled,omitempty"`        // master switch for sandboxed web access
 	Allow        []string `json:"allow,omitempty"`          // egress host allowlist (the search host is auto-added)
 	Search       string   `json:"search,omitempty"`         // "" (auto) | off | ddg (keyless) | brave (keyed)
 	SearchKeyRef string   `json:"search_key_ref,omitempty"` // SecretStore ref for the brave key (never the key)
+	Profile      string   `json:"profile,omitempty"`        // named egress preset (egressprofile.Names()); "" ⇒ none
+	ProfileFile  string   `json:"profile_file,omitempty"`   // path to a project-local egress allowlist file; "" ⇒ none
 }
 
 // Recognized values. Kept as closed sets so Validate and the wizard share one
@@ -118,6 +129,13 @@ func (c Config) Validate() error {
 	}
 	if !validSearch[c.Web.Search] {
 		return fmt.Errorf("unknown web.search %q; valid values are off, ddg, brave", c.Web.Search)
+	}
+	// The egress profile, when present, must name a built-in preset. The valid
+	// set is sourced from egressprofile.Names() so the wizard, the loader, and
+	// the egress leaf share exactly one vocabulary. Empty ⇒ no profile (default).
+	if c.Web.Profile != "" && !validEgressProfile(c.Web.Profile) {
+		return fmt.Errorf("unknown web.profile %q; valid values are %s",
+			c.Web.Profile, strings.Join(egressprofile.Names(), ", "))
 	}
 	for _, p := range c.Providers {
 		if !validProviders[p.Name] {
@@ -193,6 +211,18 @@ func parse(b []byte) (Config, error) {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// validEgressProfile reports whether name is one of the built-in egress presets.
+// The closed set is sourced from egressprofile.Names() (not duplicated here) so a
+// new preset added there validates automatically and a non-member fails loudly.
+func validEgressProfile(name string) bool {
+	for _, n := range egressprofile.Names() {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // oneOf renders a set's keys as a stable, comma-separated list for error
