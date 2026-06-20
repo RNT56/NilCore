@@ -58,6 +58,24 @@ type Config struct {
 	Channel   ChannelConfig    `json:"channel"`           //
 	Web       WebConfig        `json:"web,omitempty"`     // sandboxed web access (egress allowlist + search)
 	Delegated []string         `json:"delegated"`         // detected CLIs (informational): codex, claude
+	Codex     DelegatedConfig  `json:"codex,omitempty"`   // optional config for the Codex delegated CLI (R1)
+	Claude    DelegatedConfig  `json:"claude,omitempty"`  // optional config for the Claude Code delegated CLI (R1)
+}
+
+// DelegatedConfig configures a delegated coding CLI (Codex / Claude Code). All
+// fields are optional; empty ⇒ the CLI's own defaults, so the delegated command is
+// byte-identical to before. Model/Effort map to the CLI's model + reasoning-effort
+// knobs; ExtraArgs are raw extra CLI tokens (e.g. "-c", "key=value"); Env is extra
+// per-run environment merged with the API key (e.g. CODEX_HOME / CLAUDE_CONFIG_DIR
+// to surface a config dir despite the sandbox's HOME=/tmp). Env values are injected
+// per run and never logged or given to the model (I3). Env-var overrides at runtime:
+// NILCORE_CODEX_MODEL / NILCORE_CODEX_EFFORT and NILCORE_CLAUDE_MODEL /
+// NILCORE_CLAUDE_EFFORT take precedence over the config file.
+type DelegatedConfig struct {
+	Model     string            `json:"model,omitempty"`
+	Effort    string            `json:"effort,omitempty"`
+	ExtraArgs []string          `json:"extra_args,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
 }
 
 // WebConfig records the agent's web-access setup (so it survives a restart and is

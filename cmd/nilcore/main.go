@@ -519,7 +519,7 @@ func runMain(args []string) {
 
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir),
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
 		Log:        log,
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
@@ -557,7 +557,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	mem, cp := setupPersistence(log)
 	return &agent.Orchestrator{
 		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir),
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
 		Log:        log,
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
@@ -857,7 +857,7 @@ func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) 
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
 			v := behavioralVerifier(box, *c.checkCmd)
-			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo)
+			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo, d.boot.cfg)
 			return agent.Env{Backend: be, Verifier: v}
 		}
 		// A resumed gate INFORMS the owner's thread then denies (escalate-on-gate); with
@@ -1342,11 +1342,11 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 }
 
 // envFactory builds the per-worktree backend+verifier factory.
-func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string) func(string) agent.Env {
+func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config) func(string) agent.Env {
 	return func(dir string) agent.Env {
 		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
 		v := behavioralVerifier(box, *c.checkCmd)
-		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project)
+		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project, cfg)
 		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
 		// the worktree checkout; load it once and prepend as trusted instructions on
 		// the native backend. nil/empty ⇒ byte-identical; only the native loop reads it.
@@ -1359,13 +1359,33 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 	}
 }
 
-func buildBackend(name string, prov model.Provider, cred func(string) string, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string) backend.CodingBackend {
+// resolveDelegated merges a delegated CLI's config-file settings (onboard.Config)
+// with runtime env overrides (R1): NILCORE_<CLI>_MODEL / _EFFORT take precedence
+// over the config file, while ExtraArgs + Env come from the config file. dc is taken
+// by value, so the override never mutates the loaded config. No secret flows through
+// here — buildBackend adds the API key separately and it is never logged (I3).
+func resolveDelegated(envPrefix string, dc onboard.DelegatedConfig) onboard.DelegatedConfig {
+	if v := os.Getenv(envPrefix + "_MODEL"); v != "" {
+		dc.Model = v
+	}
+	if v := os.Getenv(envPrefix + "_EFFORT"); v != "" {
+		dc.Effort = v
+	}
+	return dc
+}
+
+func buildBackend(name string, prov model.Provider, cred func(string) string, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string, cfg onboard.Config) backend.CodingBackend {
 	switch name {
 	case "codex":
 		// Key resolved env-first then SecretStore (I3); injected into the container per run.
-		return &backend.Codex{Box: box, Key: cred("CODEX_API_KEY"), Log: log}
+		// model/effort/extra-args/env come from config (env-overridden) — R1.
+		c := resolveDelegated("NILCORE_CODEX", cfg.Codex)
+		return &backend.Codex{Box: box, Key: cred("CODEX_API_KEY"), Log: log,
+			Model: c.Model, Effort: c.Effort, ExtraArgs: c.ExtraArgs, Env: c.Env}
 	case "claude-code":
-		return &backend.ClaudeCode{Box: box, Key: cred("ANTHROPIC_API_KEY"), Log: log}
+		c := resolveDelegated("NILCORE_CLAUDE", cfg.Claude)
+		return &backend.ClaudeCode{Box: box, Key: cred("ANTHROPIC_API_KEY"), Log: log,
+			Model: c.Model, Effort: c.Effort, ExtraArgs: c.ExtraArgs, Env: c.Env}
 	default: // native
 		n := &backend.Native{
 			Model:        prov,

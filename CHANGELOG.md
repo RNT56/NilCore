@@ -18,6 +18,8 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 _All 56 tasks in the `docs/TASKS.md` DAG are merged — see [0.1.0] below._
 
+- **R1** — Delegated-CLI configurability: `backend.Codex`/`backend.ClaudeCode` gain additive `Model`/`Effort`/`ExtraArgs`/`Env` (the frozen `CodingBackend` interface untouched, I1). Codex threads `--model` / `-c model_reasoning_effort=…` / raw extra args; Claude threads `--model` / extra args with effort via `CLAUDE_CODE_EFFORT_LEVEL`; `Env` is merged per-run for `CODEX_HOME`/`CLAUDE_CONFIG_DIR` (solves the sandbox `HOME=/tmp` config-visibility gap). Every value is `shellQuote`'d (no breakout), the API key is merged last (an operator `Env` can't shadow it), and the event log still records only `{cli, exit}` — never the model/effort/env/key (I3). Wired via `onboard.Config.{Codex,Claude}` with `NILCORE_CODEX_MODEL`/`_EFFORT` (+ `NILCORE_CLAUDE_*`) env overrides; zero fields ⇒ byte-identical. Resolves the review's "hardcoded, under-configured delegation" finding. _Owns:_ `internal/backend`, `internal/onboard`, `cmd/nilcore`, `docs/ROADMAP-REPORT-FIXES.md`. _(R1)_
+
 ### Deferred items D1–D4 implemented end-to-end (`docs/IMPLEMENTATION-PLANS.md`)
 
 The four design-heavy items the Phase-9/10 work had planned are now built, wired, adversarially reviewed (a 5-dimension multi-agent review; its findings folded in), and verified: `make verify` + `golangci-lint` (0 issues) + `CGO_ENABLED=0` linux/darwin cross-compile all green. Everything is additive and opt-in — the default binary is byte-identical.
