@@ -20,6 +20,15 @@ An `EXT-NN` item is **not** an eligible task in the sense of `CLAUDE.md` §5 wor
 
 If any of these cannot be met, the item stays on this roadmap, unbuilt.
 
+> **Execution blueprints (ready when a gate clears).** Each `EXT-NN` item now has a complete,
+> parallel-executable task DAG — mirroring the depth of `docs/SWARM.md` — in
+> **[`docs/EXT-EXECUTION-PLANS.md`](EXT-EXECUTION-PLANS.md)** (per-item plans under `docs/ext-plans/`).
+> Those plans are **not** eligible work: every one is BLOCKED behind the gate above. They exist so
+> that *if* a human records the §0 decision for an item, the work can be executed completely and
+> robustly without re-deriving the design — and so the cross-item shared substrate (the one
+> credential-proxy design, the leasing control plane, the federated `Authorizer`) is built once, not
+> eight times. The boundary stays defended; the path is merely drawn.
+
 ---
 
 ## 1. The boundary — what "external infra" means here, sourced
