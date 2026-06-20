@@ -15,14 +15,12 @@
 // supports precisely for scripted, one-shot capture. The driver is pure stdlib
 // and builds with CGO_ENABLED=0.
 //
-// This binary is build-tagged `browserdriver` so it never links into the default
-// toolchain build (`go build ./...`); it is compiled deliberately into the
-// sandbox image (see images/sandbox/). The browser-run itself is exercised only
-// by a CI e2e job against a fixture server — same pattern as the sandbox-linux
-// job — because no real Chromium is available in unit-test environments. The
-// package is stdlib-only and is not linked into the default nilcore binary (it is
-// a standalone tool compiled into the sandbox image), so it builds under the
-// default `go build ./...` and its pure-logic tests run under `make verify`.
+// It is a standalone tool (compiled into the sandbox image; see images/sandbox/),
+// NOT linked into the default nilcore binary — but it is pure stdlib, so it builds
+// under the default `go build ./...` and its pure-logic tests run under
+// `make verify`. The browser run itself (batch and the --actions flow) is exercised
+// only by a CI e2e job against a fixture server — same pattern as the sandbox-linux
+// job — because no real Chromium is available in unit-test environments.
 package main
 
 import (
@@ -53,12 +51,12 @@ func main() {
 // it, and prints the JSON observation. The browser invocation is isolated behind
 // the runBrowser function variable so tests can drive run without a real browser.
 func run(ctx context.Context, args []string, stdout *os.File) error {
-	url, format, err := parseArgs(args)
+	// The interactive flow path is opt-in via --actions; we split it out first so
+	// the batch path's flag set (and its tests) are unchanged when --actions is
+	// absent. When present, we drive Chrome over CDP through the steps in order.
+	actionsJSON, rest, err := extractActions(args)
 	if err != nil {
 		return err
-	}
-	if format != "json" {
-		return fmt.Errorf("unsupported --format %q (only json)", format)
 	}
 
 	chromium, err := resolveChromium(os.Getenv(envChromium))
@@ -66,9 +64,41 @@ func run(ctx context.Context, args []string, stdout *os.File) error {
 		return err
 	}
 
-	obs, err := runBrowser(ctx, chromium, url)
-	if err != nil {
-		return err
+	var obs observation
+	if actionsJSON != "" {
+		// Interactive path: --url is optional (a navigate step may supply the
+		// initial URL instead). format still must be json.
+		url, format, err := parseInteractiveArgs(rest)
+		if err != nil {
+			return err
+		}
+		if format != "json" {
+			return fmt.Errorf("unsupported --format %q (only json)", format)
+		}
+		steps, err := parseSteps(actionsJSON)
+		if err != nil {
+			return err
+		}
+		if err := requireDestination(url, steps); err != nil {
+			return err
+		}
+		obs, err = runInteractive(ctx, chromium, url, steps)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Batch path: behavior UNCHANGED — strict parseArgs requires --url.
+		url, format, err := parseArgs(rest)
+		if err != nil {
+			return err
+		}
+		if format != "json" {
+			return fmt.Errorf("unsupported --format %q (only json)", format)
+		}
+		obs, err = runBrowser(ctx, chromium, url)
+		if err != nil {
+			return err
+		}
 	}
 
 	out, err := encodeObservation(obs)
@@ -79,6 +109,44 @@ func run(ctx context.Context, args []string, stdout *os.File) error {
 		return fmt.Errorf("writing stdout: %w", err)
 	}
 	return nil
+}
+
+// extractActions pulls a single `--actions <json>` (or `--actions=<json>`) out of
+// args, returning the JSON and the remaining args for the existing flag parser.
+// Splitting it out keeps parseArgs — and the contract it enforces — untouched on
+// the batch path. With --actions absent the rest is args verbatim (behavior
+// UNCHANGED). The url may still come from --url; for the interactive path it is
+// applied as the first navigation when no explicit navigate step is given.
+func extractActions(args []string) (actionsJSON string, rest []string, err error) {
+	rest = make([]string, 0, len(args))
+	seen := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--actions":
+			if seen {
+				return "", nil, errors.New("--actions given more than once")
+			}
+			if i+1 >= len(args) {
+				return "", nil, errors.New("--actions requires a value")
+			}
+			actionsJSON = args[i+1]
+			seen = true
+			i++
+		case strings.HasPrefix(a, "--actions="):
+			if seen {
+				return "", nil, errors.New("--actions given more than once")
+			}
+			actionsJSON = strings.TrimPrefix(a, "--actions=")
+			seen = true
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if seen && strings.TrimSpace(actionsJSON) == "" {
+		return "", nil, errors.New("--actions value is empty")
+	}
+	return actionsJSON, rest, nil
 }
 
 // runBrowser is a variable so unit tests can substitute a fake; the production

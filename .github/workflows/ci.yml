@@ -118,6 +118,27 @@ jobs:
           jq -e '(.title | test("NilCore"))'       /tmp/obs.json
           jq -e '(.screenshot_b64 | length) > 100' /tmp/obs.json
           jq -e '(.text | length) > 0'             /tmp/obs.json
+      - name: Live flow — type + click drive a fixture, assert the post-action observation
+        run: |
+          mkdir -p /tmp/flow
+          # The fixture's button sets document.title to "flow-after:<input value>" on
+          # click, so the title proves the type+click actions actually drove the page.
+          # base64-encoded to keep the HTML (and its quotes) intact through YAML.
+          echo 'PCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PHRpdGxlPmZsb3ctYmVmb3JlPC90aXRsZT48L2hlYWQ+PGJvZHk+PGlucHV0IGlkPSJuYW1lIj48YnV0dG9uIGlkPSJnbyIgb25jbGljaz0iZG9jdW1lbnQudGl0bGU9J2Zsb3ctYWZ0ZXI6Jytkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbmFtZScpLnZhbHVlIj5HbzwvYnV0dG9uPjwvYm9keT48L2h0bWw+' | base64 -d > /tmp/flow/index.html
+          python3 -m http.server 8098 --directory /tmp/flow >/tmp/flowhttpd.log 2>&1 &
+          SRV=$!
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8098/ >/dev/null 2>&1 && break; sleep 0.3; done
+          set +e
+          /tmp/nilcore-browser --url http://127.0.0.1:8098/ \
+            --actions '[{"action":"type","selector":"#name","text":"alice"},{"action":"click","selector":"#go"},{"action":"wait","ms":300}]' \
+            --format json > /tmp/flow.json 2>/tmp/flow.err
+          rc=$?
+          kill "$SRV" 2>/dev/null || true
+          set -e
+          echo "driver exit: $rc"; echo "--- stderr ---"; cat /tmp/flow.err; echo "--- observation ---"; head -c 500 /tmp/flow.json; echo
+          [ "$rc" -eq 0 ] || { echo "interactive flow must exit 0 on a reachable fixture"; cat /tmp/flowhttpd.log; exit 1; }
+          # The title only becomes flow-after:alice if BOTH the type and the click landed.
+          jq -e '(.title | test("flow-after:alice"))' /tmp/flow.json
       - name: Fails closed when no browser is present (must exit non-zero)
         run: |
           if NILCORE_CHROMIUM=/nonexistent/not-a-browser /tmp/nilcore-browser --url http://127.0.0.1:8099/ --format json; then
