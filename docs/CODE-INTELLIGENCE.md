@@ -33,7 +33,7 @@ The proven answer (and the 2026 frontier consensus): **fuse complementary lenses
 ripgrep + exact symbol lookup. The cheapest, most precise lens: known identifiers, error strings, literal scans.
 
 ### L2 — Structural (the backbone)
-- A **language-parser seam** turns source into ASTs and extracts symbols (functions, types, methods, modules) and references — the "tag map." Two backends ship today, both **pure-Go and CGO-free** (deliberately *not* tree-sitter, so the default binary stays zero-dep — see invariant I6): a Go backend (`internal/codeintel/ast/go.go`) and a Python backend (`internal/codeintel/ast/python.go`), both producing identical graph output. `ast.SupportedExtensions` drives the index walks (the `live/` and `codeintel/` builders), and the graph's `BuildFile` handles both languages off the same seam — a new language slots in behind it without touching the graph.
+- A **language-parser seam** turns source into ASTs and extracts symbols (functions, types, methods, modules) and references — the "tag map." Four backends ship today, all **pure-Go and CGO-free** (deliberately *not* tree-sitter, so the default binary stays zero-dep — see invariant I6): a Go backend via `go/parser` (`internal/codeintel/ast/go.go`) and heuristic line-scanner backends for Python (`python.go`), TypeScript/JavaScript (`js.go`, covering `.ts/.tsx/.js/.jsx/.mjs/.cjs`), and Rust (`rust.go`, `.rs`) — nine extensions in all. The heuristic scanners are honest approximations (brace-depth spans, not a full grammar); the **LSP seam** (`NILCORE_LSP_COMMAND`, e.g. `tsserver`/`rust-analyzer`) is the precise lens that sharpens them where a server exists. `ast.SupportedExtensions` drives the index walks (the `live/` and `codeintel/` builders), and the graph's `BuildFile` handles every language off the same seam — a new language slots in behind it without touching the graph.
 - A **code graph** stored in SQLite: nodes = symbols/files; edges = `calls`, `implements`, `imports`, `references`, `inherits`, `defines`, `type-of`. Queried with **recursive CTEs** for transitive reachability (call paths, dependency closure, blast radius). No graph DB — SQLite is enough and stays zero-dep-aligned.
 - **LSP clients** (gopls, rust-analyzer, typescript-language-server, pyright, …) layer on **precise** types, definitions, references, and diagnostics where a server exists; the pure-Go parser seam is the always-on fallback. Aligned with **SCIP** so the graph speaks a standard.
 
@@ -93,7 +93,7 @@ The agent navigates and edits by **symbol** ("edit `Auth.Validate`"), resolved v
 
 ## Tech stack (all local, zero egress)
 
-Pure-Go multi-language parser seam (Go + Python today, CGO-free, not tree-sitter; `ast.SupportedExtensions` drives the walks) · LSP clients (precise facts, optional) · SQLite for the graph (recursive CTEs) · a content-hash-cached pure-Go HNSW vector index for the semantic lens (`internal/codeintel/semantic/hnsw.go`) · code-aware embeddings via an OpenAI-compatible embedder (`internal/embed`, opt-in via `NILCORE_EMBED_KEY` / `NILCORE_EMBED_MODEL`) · ripgrep (lexical, and the fallback when embeddings are off) · file-watching (incremental updates) · SCIP alignment for the semantic layer.
+Pure-Go multi-language parser seam (Go via `go/parser`, plus heuristic line-scanner backends for Python, TypeScript/JavaScript, and Rust — nine extensions: `.go .py .js .jsx .ts .tsx .mjs .cjs .rs`; CGO-free, not tree-sitter; `ast.SupportedExtensions` drives the walks) · LSP clients (the precise lens via `NILCORE_LSP_COMMAND`, optional) · SQLite for the graph (recursive CTEs) · a content-hash-cached pure-Go HNSW vector index for the semantic lens (`internal/codeintel/semantic/hnsw.go`) · code-aware embeddings via an OpenAI-compatible embedder (`internal/embed`, opt-in via `NILCORE_EMBED_KEY` / `NILCORE_EMBED_MODEL`) · ripgrep (lexical, and the fallback when embeddings are off) · file-watching (incremental updates) · SCIP alignment for the semantic layer.
 
 ## Task cluster
 
@@ -101,7 +101,7 @@ Built as sibling sub-packages under `internal/codeintel/` so the tasks paralleli
 
 | Task | Sub-package | What |
 |---|---|---|
-| P3-T09 | `ast/` | pure-Go language-parser seam + symbol/reference extraction (foundation); Go + Python backends (`go.go`, `python.go`), `SupportedExtensions` |
+| P3-T09 / D3 / R2 | `ast/` | pure-Go language-parser seam + symbol/reference extraction (foundation); Go (`go.go`, via `go/parser`) · Python (`python.go`) · TS/JS (`js.go`) · Rust (`rust.go`) backends — heuristic scanners except Go; `SupportedExtensions` (9 extensions) |
 | P3-T10 | `graph/` | code graph in SQLite + structural queries (recursive CTEs) |
 | P3-T11 | `repomap/` | PageRank-ranked, token-budgeted repo map |
 | P3-T12 | `lsp/` | LSP client for precise facts, graceful fallback (SCIP-aligned) |

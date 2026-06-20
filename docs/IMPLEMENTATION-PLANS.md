@@ -93,7 +93,7 @@ This document fully plans the Tier-1/Tier-2 items that were **deliberately not r
 
 ## D3 — Multi-language code intelligence (CGO-free)
 
-> **SHIPPED.** A language-parser seam plus a pure-Go Python backend (`internal/codeintel/ast/{go.go,python.go}`) — Go output identical, CGO-free, not tree-sitter. The live + codeintel index walks now cover Go and Python (`ast.SupportedExtensions`). No new module; `CGO_ENABLED=0` held (I6).
+> **SHIPPED (extended by R2).** A language-parser seam plus pure-Go Python, TypeScript/JavaScript, and Rust backends (`internal/codeintel/ast/{go.go,python.go,js.go,rust.go}`) — Go/Python output identical, CGO-free, not tree-sitter; the JS/TS and Rust backends are heuristic line scanners, with the LSP seam (`NILCORE_LSP_COMMAND`) the precise lens. The live + codeintel index walks now cover Go, Python, the JS/TS family, and Rust — nine extensions via `ast.SupportedExtensions`. No new module; `CGO_ENABLED=0` held (I6).
 
 **Source:** `internal/codeintel/ast/ast.go` (Go-first `go/parser`, with the explicit scope note that "a tree-sitter backend … slots in behind it later without changing callers (kept out now to preserve the zero-cgo build)"), `internal/codeintel/live/live.go:37-53` + `internal/tools/codeintel.go:131-153` (the two `.go`-suffix gates), `internal/codeintel/graph/graph.go:93-137` (`BuildFile` REPLACE-on-rebuild), `go.mod`.
 
