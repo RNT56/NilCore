@@ -20,6 +20,13 @@ type fakeVerifier struct {
 
 func (f fakeVerifier) Check(context.Context) (verify.Report, error) { return f.rep, f.err }
 
+// ptrVerifier has a POINTER receiver, so a (*ptrVerifier)(nil) is a valid typed-nil
+// verify.Verifier: non-nil at the interface level, but a Check call on it would
+// dereference the nil pointer and panic. NewShipGate must refuse it (POLISH #19).
+type ptrVerifier struct{ rep verify.Report }
+
+func (p *ptrVerifier) Check(context.Context) (verify.Report, error) { return p.rep, nil }
+
 func TestNewShipGateRefusesNil(t *testing.T) {
 	if _, err := NewShipGate(nil); !errors.Is(err, ErrNoShipVerifier) {
 		t.Fatalf("NewShipGate(nil) err = %v, want ErrNoShipVerifier", err)
@@ -29,6 +36,30 @@ func TestNewShipGateRefusesNil(t *testing.T) {
 func TestNewShipGateRefusesPass(t *testing.T) {
 	if _, err := NewShipGate(verify.Pass{}); !errors.Is(err, ErrNoShipVerifier) {
 		t.Fatalf("NewShipGate(verify.Pass{}) err = %v, want ErrNoShipVerifier", err)
+	}
+}
+
+// TestNewShipGateRefusesTypedNil is the POLISH #19 guard: a typed-nil verifier (a nil
+// pointer wrapped in a non-nil interface) passes the `v == nil` check yet would PANIC on
+// Check. The gate must refuse it at construction with ErrNoShipVerifier — never let a
+// shard ship behind a verifier that cannot run. The assertion discriminates: it also
+// confirms a NON-nil pointer of the SAME type IS accepted, so the guard rejects only the
+// nil value, not the whole type.
+func TestNewShipGateRefusesTypedNil(t *testing.T) {
+	var typedNil *ptrVerifier // nil pointer
+	// Sanity: as an interface it is NOT == nil (the typed-nil trap the old guard missed).
+	var asIface verify.Verifier = typedNil
+	if asIface == nil {
+		t.Fatal("precondition: a typed-nil should be non-nil at the interface level")
+	}
+	if _, err := NewShipGate(asIface); !errors.Is(err, ErrNoShipVerifier) {
+		t.Fatalf("NewShipGate(typed-nil) err = %v, want ErrNoShipVerifier (must not let a panicking verifier ship)", err)
+	}
+	// A non-nil pointer of the same type is a real verifier and must be ACCEPTED — the
+	// guard rejects the nil VALUE, not the type.
+	real := &ptrVerifier{rep: verify.Report{Passed: true}}
+	if _, err := NewShipGate(real); err != nil {
+		t.Fatalf("NewShipGate(non-nil *ptrVerifier) err = %v, want accepted", err)
 	}
 }
 

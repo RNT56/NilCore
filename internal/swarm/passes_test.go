@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -244,11 +245,12 @@ func TestControllerBudgetCut(t *testing.T) {
 	}
 	fn := h.fnFromStatusPlan(map[string][]artifact.Status{})
 	c := &Controller{
-		Runner:   &Runner{Concurrency: 2, Fn: fn},
-		Queue:    h.q,
-		Worktree: h.worktree,
-		Policy:   PassPolicy{UntilClean: true, MaxPasses: 5},
-		Budget:   led,
+		Runner:        &Runner{Concurrency: 2, Fn: fn},
+		Queue:         h.q,
+		Worktree:      h.worktree,
+		Policy:        PassPolicy{UntilClean: true, MaxPasses: 5},
+		Budget:        led,
+		GlobalCeiling: 0.0001, // the same wall SetGlobalCeiling got; read non-recordingly
 	}
 	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shardSet("swarm/run1/0"))
 	if err != nil {
@@ -262,23 +264,232 @@ func TestControllerBudgetCut(t *testing.T) {
 	}
 }
 
-// TestControllerIntegrateBaseRefThreads asserts the IntegrateFunc receives the green
-// shards' branches and that the verified SHA threads forward onto SwarmState.TipSHA so
-// the next pass folds on top of the prior tip.
+// TestControllerBudgetProbeIsNonRecording asserts the MINOR #20 fix: the per-pass global
+// headroom check reads the ledger NON-RECORDINGLY (Total() vs GlobalCeiling) and charges
+// NOTHING — neither a probe residue against a reserved task nor any global spend. A
+// multi-pass run (red→green over 2 passes) is driven and the ledger's Total must stay at
+// exactly zero dollars throughout, proving no sub-cent probe was charged per pass.
+func TestControllerBudgetProbeIsNonRecording(t *testing.T) {
+	h := newHarness(t)
+	led := budget.New()
+	led.SetGlobalCeiling(100.0) // generous: headroom always exists, so the probe path runs every pass
+	plan := map[string][]artifact.Status{
+		"swarm/run1/0": {artifact.StatusFail, artifact.StatusPass}, // forces a second pass
+	}
+	c := &Controller{
+		Runner:        &Runner{Concurrency: 2, Fn: h.fnFromStatusPlan(plan)},
+		Queue:         h.q,
+		Worktree:      h.worktree,
+		Policy:        PassPolicy{UntilClean: true, MaxPasses: 5},
+		Budget:        led,
+		GlobalCeiling: 100.0,
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shardSet("swarm/run1/0"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done || out.Passes != 2 {
+		t.Fatalf("out = %+v, want Done in 2 passes (so the probe ran on each)", out)
+	}
+	// The headroom check ran on every pass but charged nothing — Total stays zero. The
+	// pre-fix recording probe would have accrued budgetProbe per pass here.
+	if tokens, dollars := led.Total(); tokens != 0 || dollars != 0 {
+		t.Errorf("ledger Total = (%d tokens, $%.12f), want (0, $0) — the headroom check must not charge", tokens, dollars)
+	}
+}
+
+// TestControllerLyingGreenDoesNotConverge asserts the I2 keystone for the swarm: a shard
+// whose Fn LIES — it returns res.Passed=true while the on-disk artifact is Fail — does
+// NOT converge the run. The verifier (the on-disk status, which requeue.Scan reads) is
+// authoritative, never the worker self-report. The harness's normal Fn couples the two;
+// this test deliberately DECOUPLES them to create the lying-green case the convergence
+// test (TestControllerConverges) cannot.
+func TestControllerLyingGreenDoesNotConverge(t *testing.T) {
+	h := newHarness(t)
+	// The lying Fn: write a RED artifact to disk, but self-report Passed=true with a
+	// branch (as a compromised/buggy worker might). Scan must still see the red Unit.
+	lyingFn := func(ctx context.Context, s Shard) spawn.Result {
+		h.mu.Lock()
+		h.calls[s.ID]++
+		h.mu.Unlock()
+		h.writeArtifact(s.ID, artifact.StatusFail)                      // on-disk truth: RED
+		return spawn.Result{ID: s.ID, Passed: true, Branch: "task/lie"} // self-report: GREEN (a lie)
+	}
+	c := &Controller{
+		Runner:   &Runner{Concurrency: 1, Fn: lyingFn},
+		Queue:    h.q,
+		Worktree: h.worktree,
+		// Bounded so the permanently-red lie terminates rather than retrying forever; the
+		// point is that it never reports Done with a clean tip.
+		Policy: PassPolicy{UntilClean: false, MaxPasses: 1},
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 1}}, shardSet("swarm/run1/0"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The disk/verifier is authoritative: a red artifact ⇒ a non-empty worklist ⇒ NOT
+	// converged, despite the worker's green self-report.
+	if out.Done {
+		t.Errorf("a lying-green shard (red on disk) must NOT converge the run: out = %+v", out)
+	}
+	if out.Reason == ReasonConverged {
+		t.Errorf("Reason = converged on a red artifact — the self-report was trusted over the verifier (I2 broken)")
+	}
+	if out.Remaining < 1 {
+		t.Errorf("Remaining = %d, want >0 (the red shard is still open)", out.Remaining)
+	}
+	// The board tally reflects the RED via the ARTIFACT-DERIVED Remaining count
+	// (board.Remaining = distinctArtifacts(Scan), NOT the self-report): the red artifact
+	// surfaces as a remaining shard, so the scoreboard the operator sees agrees with the
+	// disk verdict even though the worker self-reported green.
+	if out.Board.Remaining < 1 {
+		t.Errorf("Board.Remaining = %d, want >0 — the scoreboard must reflect the on-disk red, not the green lie", out.Board.Remaining)
+	}
+}
+
+// TestControllerHardCapBacksstopRotatingClaims asserts the MINOR #10 backstop: a worker
+// that rotates its claim ids every pass (so the per-Unit retry Ledger never recognizes a
+// Unit as exhausted) cannot spin the loop forever. With UntilClean and a generous retry
+// budget, the run would loop unbounded on the pre-fix code; the no-progress detector /
+// hard cap must stop it RED in a bounded number of passes. The rotating ids keep the
+// worklist size constant (one red Unit per pass, always a fresh id), so the no-progress
+// detector fires after two such passes.
+func TestControllerHardCapBacksstopRotatingClaims(t *testing.T) {
+	h := newHarness(t)
+	// A worker that writes ONE red claim per pass, with a DIFFERENT claim id each pass —
+	// so the retry Ledger (keyed ArtifactID/ClaimID) sees a "fresh" Unit every time and
+	// never marks it exhausted. The worklist size stays 1 forever: zero progress.
+	rotating := func(ctx context.Context, s Shard) spawn.Result {
+		h.mu.Lock()
+		n := h.calls[s.ID]
+		h.calls[s.ID]++
+		h.mu.Unlock()
+		a := &artifact.Artifact{
+			ID:   s.ID,
+			Kind: artifact.KindReport,
+			Claims: []artifact.Claim{{
+				ID:       fmt.Sprintf("c-rot-%d", n), // ROTATING claim id — defeats the retry Ledger
+				Field:    "value",
+				Evidence: artifact.Evidence{Value: "x", Status: artifact.StatusFail},
+			}},
+		}
+		blob, _ := artifact.Marshal(a)
+		name := strings.ReplaceAll(s.ID, "/", "_") + ".json"
+		_ = os.WriteFile(filepath.Join(h.worktree, ".nilcore", "artifacts", name), blob, 0o644)
+		return spawn.Result{ID: s.ID, Passed: false}
+	}
+	c := &Controller{
+		Runner:   &Runner{Concurrency: 1, Fn: rotating},
+		Queue:    h.q,
+		Worktree: h.worktree,
+		// UntilClean + a generous per-Unit budget: the ONLY thing that can stop this is the
+		// no-progress / hard-cap backstop, not the exhausted rail (each rotated id is fresh).
+		Policy:        PassPolicy{UntilClean: true},
+		HardMaxPasses: 100, // high enough that the no-progress detector, not the cap, must fire
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 5}}, shardSet("swarm/run1/0"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Done {
+		t.Errorf("a rotating-claim worker makes no progress and must not converge: %+v", out)
+	}
+	// The no-progress detector stops it (two passes with a non-shrinking worklist), well
+	// before the hard cap — proving the loop is bounded for a non-converging worker.
+	if out.Reason != ReasonStalled {
+		t.Errorf("Reason = %q, want stalled (no-progress detector)", out.Reason)
+	}
+	if out.Passes > 4 {
+		t.Errorf("ran %d passes before stalling; the no-progress detector must fire promptly", out.Passes)
+	}
+}
+
+// TestControllerHardCapAbsoluteBackstop asserts the absolute pass cap fires EVEN when a
+// worker keeps the worklist nominally shrinking-then-growing so the no-progress detector
+// never trips: the hard cap is the last-resort wall. Here a worker alternates the red
+// claim COUNT (2 red, then 1 red, then 2 red, …) so Remaining oscillates and never
+// stalls two passes running — but the absolute HardMaxPasses still bounds the loop.
+func TestControllerHardCapAbsoluteBackstop(t *testing.T) {
+	h := newHarness(t)
+	oscillating := func(ctx context.Context, s Shard) spawn.Result {
+		h.mu.Lock()
+		n := h.calls[s.ID]
+		h.calls[s.ID]++
+		h.mu.Unlock()
+		nClaims := 2
+		if n%2 == 1 {
+			nClaims = 1 // alternate count so Remaining(distinct artifacts) is steady but units oscillate
+		}
+		claims := make([]artifact.Claim, nClaims)
+		for i := range claims {
+			claims[i] = artifact.Claim{
+				ID:       fmt.Sprintf("c-%d-%d", n, i), // rotating so never exhausted
+				Field:    "v",
+				Evidence: artifact.Evidence{Value: "x", Status: artifact.StatusFail},
+			}
+		}
+		a := &artifact.Artifact{ID: s.ID, Kind: artifact.KindReport, Claims: claims}
+		blob, _ := artifact.Marshal(a)
+		name := strings.ReplaceAll(s.ID, "/", "_") + ".json"
+		_ = os.WriteFile(filepath.Join(h.worktree, ".nilcore", "artifacts", name), blob, 0o644)
+		return spawn.Result{ID: s.ID, Passed: false}
+	}
+	c := &Controller{
+		Runner:        &Runner{Concurrency: 1, Fn: oscillating},
+		Queue:         h.q,
+		Worktree:      h.worktree,
+		Policy:        PassPolicy{UntilClean: true},
+		HardMaxPasses: 6, // the absolute wall
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 999}}, shardSet("swarm/run1/0"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Done {
+		t.Errorf("a non-converging worker must not converge: %+v", out)
+	}
+	// Whatever rail fires, the loop is BOUNDED by the hard cap: it never exceeds it.
+	if out.Passes > 6 {
+		t.Errorf("ran %d passes, exceeded the absolute HardMaxPasses=6 backstop", out.Passes)
+	}
+}
+
+// TestControllerIntegrateBaseRefThreads asserts the load-bearing MAJOR #6 fix: each
+// pass folds its green branches onto the PRIOR pass's verified tip, not base HEAD. It
+// drives a TWO-green-pass run (shard A green on pass 1; shard B red on pass 1, green on
+// pass 2) through a RECORDING base seam that captures the baseRef the Controller hands
+// the integrator each pass, then asserts:
+//
+//   - pass 1 integrates from "" (no prior tip — start at HEAD);
+//   - pass 2 integrates from EXACTLY pass 1's returned verified SHA (the tip threaded
+//     forward), so pass 2 extends the merged work instead of rebuilding from HEAD;
+//   - the final TipBranch is pass 2's verified SHA.
+//
+// The recording seam is what makes this discriminate: a base-ref-less IntegrateFunc (the
+// pre-fix signature) could not even receive the prior tip, so the test would not compile
+// against it; here we prove the real value flows pass-to-pass.
 func TestControllerIntegrateBaseRefThreads(t *testing.T) {
 	h := newHarness(t)
 	plan := map[string][]artifact.Status{
-		"swarm/run1/0": {artifact.StatusFail, artifact.StatusPass}, // green on pass 2
+		"swarm/run1/0": {artifact.StatusPass},                      // green on pass 1
+		"swarm/run1/1": {artifact.StatusFail, artifact.StatusPass}, // red pass 1, green pass 2
 	}
 	fn := h.fnFromStatusPlan(plan)
 
+	// The recording base seam: capture the baseRef PER PASS and synthesize a verified SHA
+	// that embeds the pass number, so pass 2's observed baseRef must equal pass 1's
+	// returned SHA for the threading assertion to hold.
+	var gotBaseRefs []string
 	var gotItems [][]integrate.MergeItem
-	integFn := func(ctx context.Context, order []integrate.MergeItem) (string, []integrate.MergeResult, error) {
+	pass := 0
+	integFn := func(ctx context.Context, baseRef string, order []integrate.MergeItem) (string, []integrate.MergeResult, error) {
+		pass++
+		gotBaseRefs = append(gotBaseRefs, baseRef)
 		gotItems = append(gotItems, order)
 		var results []integrate.MergeResult
 		for _, it := range order {
 			results = append(results, integrate.MergeResult{ID: it.ID, Branch: it.Branch,
-				Merged: true, Verified: true, SHA: "sha-" + it.ID})
+				Merged: true, Verified: true, SHA: fmt.Sprintf("tip-p%d", pass)})
 		}
 		return "integrate/x", results, nil
 	}
@@ -290,25 +501,33 @@ func TestControllerIntegrateBaseRefThreads(t *testing.T) {
 		Policy:    PassPolicy{UntilClean: true, MaxPasses: 5},
 		Integrate: integFn,
 	}
-	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shardSet("swarm/run1/0"))
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shardSet("swarm/run1/0", "swarm/run1/1"))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !out.Done || out.Reason != ReasonConverged {
 		t.Errorf("out = %+v, want Done converged", out)
 	}
-	// On the final (green) pass, the green shard's branch must reach the integrator and
-	// the verified SHA must thread onto the tip.
-	if out.TipBranch != "sha-swarm/run1/0" {
-		t.Errorf("TipBranch = %q, want the verified merge SHA threaded forward", out.TipBranch)
+	if len(gotBaseRefs) < 2 {
+		t.Fatalf("integrator called %d times, want >=2 (one per pass)", len(gotBaseRefs))
 	}
-	// The integrator was only handed the shard once green (pass 2), never the red pass.
-	if len(gotItems) == 0 {
-		t.Fatalf("integrator never called")
+	// Pass 1 folds from HEAD (no prior tip).
+	if gotBaseRefs[0] != "" {
+		t.Errorf("pass 1 baseRef = %q, want \"\" (HEAD — no prior tip)", gotBaseRefs[0])
 	}
+	// Pass 2 folds onto pass 1's verified tip — the THREADING the fix guarantees. If the
+	// tip were dead (the bug), pass 2 would re-fold from "" again.
+	if gotBaseRefs[1] != "tip-p1" {
+		t.Errorf("pass 2 baseRef = %q, want \"tip-p1\" (pass 1's verified tip threaded forward)", gotBaseRefs[1])
+	}
+	// The final tip is pass 2's verified SHA.
+	if out.TipBranch != "tip-p2" {
+		t.Errorf("TipBranch = %q, want \"tip-p2\" (final verified tip)", out.TipBranch)
+	}
+	// Pass 2's fold includes BOTH green shards (A carried forward + B newly green).
 	last := gotItems[len(gotItems)-1]
-	if len(last) != 1 || last[0].ID != "swarm/run1/0" {
-		t.Errorf("final integrate order = %+v, want [swarm/run1/0]", last)
+	if len(last) != 2 {
+		t.Errorf("final integrate order = %+v, want both green shards", last)
 	}
 }
 

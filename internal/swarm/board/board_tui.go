@@ -121,9 +121,11 @@ func (m DashboardModel) View() string {
 			tag = " (exhausted)"
 		}
 		row := style.Render(fmt.Sprintf("%s %s%s", glyph, r.ID, tag))
-		meta := fmt.Sprintf("pass %d · status=%s", r.Pass, r.Status)
+		// Redact + sanitize the displayed Status/SourceURL the same way the pure renderer
+		// does (MINOR #12) — a key shape or control byte must not survive into the TUI.
+		meta := fmt.Sprintf("pass %d · status=%s", r.Pass, safeField(r.Status))
 		if r.SourceURL != "" {
-			meta += " · src=" + r.SourceURL
+			meta += " · src=" + safeSource(r.SourceURL)
 		}
 		b.WriteString("  " + row + "  " + dashDim.Render(meta) + "\n")
 	}
