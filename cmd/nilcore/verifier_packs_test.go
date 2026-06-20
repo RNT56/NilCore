@@ -164,9 +164,20 @@ func TestVerifyPacksWiring(t *testing.T) {
 		v := behavioralVerifierWithLog(box, "true", log)
 		_ = readReport(t, v)
 
-		// The SecretStore value was seeded into the env so the pack could inject it.
-		if box.envSeen[finance.EnvFREDKey] != secret {
-			t.Fatalf("keyed pack must inject the SecretStore key via ExecWithEnv; env seen %v", box.envSeen)
+		// The SecretStore value was seeded into the env so the pack could inject it. The
+		// pack resolves the key into a fully-formed request URL and hands that URL to the
+		// box via ExecWithEnv under a dedicated var ($NILCORE_KEYED_URL) — so the key VALUE
+		// reaches the box embedded in that env entry (never under its own name, never in the
+		// command string). Assert the key arrived in the box env, whichever entry carries it.
+		keyInBoxEnv := false
+		for _, v := range box.envSeen {
+			if strings.Contains(v, secret) {
+				keyInBoxEnv = true
+				break
+			}
+		}
+		if !keyInBoxEnv {
+			t.Fatalf("keyed pack must inject the SecretStore key into the box env via ExecWithEnv; env seen %v", box.envSeen)
 		}
 		// The literal key must appear in NEITHER the command string, the artifact JSON,
 		// nor the event Detail (I3).

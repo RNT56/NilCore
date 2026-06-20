@@ -305,28 +305,71 @@ func TestPatternMatches(t *testing.T) {
 func TestFindingReproduces(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("grep count matches the claim => Pass", func(t *testing.T) {
-		box := boxReturning("3\n", 0)
-		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "3"))
+	t.Run("anchored grep count matches the claim => Pass", func(t *testing.T) {
+		// Cited line is 3; matches at 2,3,4 are all within reproWindow (±2) of it.
+		box := boxReturning("2:TODO a\n3:TODO b\n4:TODO c\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:3", "TODO", "3"))
 		if st != artifact.StatusPass {
-			t.Fatalf("count match = %q, want pass", st)
+			t.Fatalf("anchored count match = %q, want pass", st)
 		}
 	})
 
-	t.Run("grep is fixed-string, single-quoted pattern and path", func(t *testing.T) {
-		box := boxReturning("1\n", 0)
+	t.Run("grep is fixed-string line-numbered, single-quoted pattern and path", func(t *testing.T) {
+		box := boxReturning("1:needle\n", 0)
 		_, _ = checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "pkg/a.go:1", "needle", "1"))
 		cmd := box.lastCmd()
-		if !strings.Contains(cmd, "grep -n -c -F 'needle' 'pkg/a.go'") {
-			t.Fatalf("cmd %q is not a single-quoted fixed-string grep", cmd)
+		if !strings.Contains(cmd, "grep -n -F 'needle' 'pkg/a.go'") {
+			t.Fatalf("cmd %q is not a single-quoted fixed-string line-numbered grep", cmd)
+		}
+		// -c (count-only) must be gone: we need per-match line numbers to anchor.
+		if strings.Contains(cmd, "-c") {
+			t.Fatalf("cmd %q still uses -c; anchoring needs line numbers, not a bare count", cmd)
 		}
 	})
 
-	t.Run("grep count mismatch => Fail", func(t *testing.T) {
-		box := boxReturning("5\n", 0)
-		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "3"))
+	t.Run("grep count mismatch within window => Fail", func(t *testing.T) {
+		// Cited line 1, window matches at 1,2,3 => 3 in-window, but claim says 5.
+		box := boxReturning("1:x\n2:x\n3:x\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "5"))
 		if st != artifact.StatusFail {
 			t.Fatalf("count mismatch = %q, want fail", st)
+		}
+	})
+
+	// THE discriminating test for MINOR #14: the SAME pattern present in the file, at the
+	// SAME claimed count, but FAR from the cited line, must NOT pass. The old whole-file
+	// grep accepted this; the anchored check must reject it as Fail (the finding does not
+	// reproduce at the citation).
+	t.Run("match far from the cited line => Fail (anchoring guard)", func(t *testing.T) {
+		// One match in the file, but at line 200 while the finding cites line 5.
+		box := boxReturning("200:TODO over here\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:5", "TODO", "1"))
+		if st != artifact.StatusFail {
+			t.Fatalf("far-away match = %q, want fail (must not reproduce at the citation)", st)
+		}
+	})
+
+	// Same match-set, same claimed count, but moving the CITATION on/off the match flips the
+	// verdict — proving the cited line is load-bearing (not ignored as before).
+	t.Run("citation on the match passes; citation off it fails (same grep output)", func(t *testing.T) {
+		grep := "100:TODO\n"
+		onSt, _ := checkFindingReproduces(ctx, boxReturning(grep, 0), claim(IDFindingReproduces, "x.go:100", "TODO", "1"))
+		if onSt != artifact.StatusPass {
+			t.Fatalf("citation ON the match = %q, want pass", onSt)
+		}
+		offSt, _ := checkFindingReproduces(ctx, boxReturning(grep, 0), claim(IDFindingReproduces, "x.go:50", "TODO", "1"))
+		if offSt != artifact.StatusFail {
+			t.Fatalf("citation OFF the match = %q, want fail (same grep output, only the cited line moved)", offSt)
+		}
+	})
+
+	// A match just outside the window must not count; just inside must.
+	t.Run("window boundary: ±2 counts, ±3 does not", func(t *testing.T) {
+		// Cited 10: a match at 12 (in, |Δ|=2) and one at 13 (out, |Δ|=3). Claim 1 in-window.
+		box := boxReturning("12:TODO\n13:TODO\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:10", "TODO", "1"))
+		if st != artifact.StatusPass {
+			t.Fatalf("window boundary = %q, want pass (only the ±2 match counts)", st)
 		}
 	})
 
@@ -354,11 +397,21 @@ func TestFindingReproduces(t *testing.T) {
 		}
 	})
 
-	t.Run("unparseable grep count => Unverifiable", func(t *testing.T) {
-		box := boxReturning("not-a-number\n", 0)
+	t.Run("malformed grep -n output (no line-number prefix) => Unverifiable", func(t *testing.T) {
+		// A line with no ':' separator is not valid `grep -n` output; it must not be coerced
+		// into a count.
+		box := boxReturning("no-colon-here\n", 0)
 		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "1"))
 		if st != artifact.StatusUnverifiable {
-			t.Fatalf("bad count = %q, want unverifiable", st)
+			t.Fatalf("malformed -n output = %q, want unverifiable", st)
+		}
+	})
+
+	t.Run("non-integer line-number prefix => Unverifiable", func(t *testing.T) {
+		box := boxReturning("NaN:TODO\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "1"))
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("non-integer line number = %q, want unverifiable", st)
 		}
 	})
 
@@ -415,10 +468,20 @@ func TestFindingReproduces(t *testing.T) {
 	})
 
 	t.Run("exactly one box.Exec per check", func(t *testing.T) {
-		box := boxReturning("2\n", 0)
+		box := boxReturning("1:TODO\n2:TODO\n", 0)
 		_, _ = checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "2"))
 		if box.calls() != 1 {
 			t.Fatalf("made %d box.Exec calls, want exactly 1", box.calls())
+		}
+	})
+
+	t.Run("matched line text is never echoed into Detail (I7)", func(t *testing.T) {
+		secret := "TOTALLY_SECRET_TOKEN_xyz789"
+		// One match far from the citation => Fail; the matched line text must not leak.
+		box := boxReturning("200:"+secret+"\n", 0)
+		_, d := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "TODO", "1"))
+		if strings.Contains(d, secret) {
+			t.Fatalf("detail %q echoed the matched line text (I7 violation)", d)
 		}
 	})
 }

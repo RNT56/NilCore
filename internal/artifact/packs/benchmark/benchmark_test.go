@@ -251,6 +251,33 @@ func TestScriptThresholdReMeasures(t *testing.T) {
 	}
 }
 
+// TestScriptThresholdIgnoresWorkerSamples is the DISCRIMINATING I2 guard: the worker's
+// supplied samples[] and the box's own re-runs DISAGREE about the verdict, so the test
+// can only pass if the verifier ignores the worker array and trusts its own measurement.
+//
+// The worker swears samples=[1,1,1] and claims a tight fast bound (mean<=50). If the
+// verifier ever (mis)read mean(spec.Samples)=1, that would satisfy 1<=50 => Pass — a
+// laundered regression slipping through. But the box re-measures ~100 ns/op each run,
+// and 100 is NOT <= 50, so the only honest verdict is Fail. Asserting Fail here proves
+// the box's own measurement governs and the worker samples are discarded; if this case
+// ever reported Pass, the re-measure guarantee (I2) would be broken.
+func TestScriptThresholdIgnoresWorkerSamples(t *testing.T) {
+	ctx := context.Background()
+	box := &seqBox{seq: []sandbox.Result{goBench(100), goBench(100), goBench(100)}}
+	// Worker-claimed fast samples [1,1,1] under a fast bound of 50; box re-runs measure
+	// ~100 (over the bound). Worker samples => Pass; honest re-measure => Fail.
+	val := specValue(t, "ns/op", 50, opLE, 3, 0.10, []float64{1, 1, 1})
+	c := claim(IDScriptThreshold, val, runnerGoBench)
+	got, d := checkScriptThreshold(ctx, box, c)
+	if got != artifact.StatusFail {
+		t.Fatalf("status = %q, want Fail (the box re-measured ~100 > bound 50; "+
+			"a Pass here means the verifier trusted the worker's [1,1,1] samples) detail: %s", got, d)
+	}
+	if box.callCount() != 3 {
+		t.Fatalf("verifier ran %d times, want 3 re-measure runs (must not short-circuit on worker samples)", box.callCount())
+	}
+}
+
 func TestScriptThresholdNilBox(t *testing.T) {
 	c := claim(IDScriptThreshold, specValue(t, "ns/op", 200, opLE, 3, 0.1, nil), runnerGoBench)
 	got, _ := checkScriptThreshold(context.Background(), nil, c)

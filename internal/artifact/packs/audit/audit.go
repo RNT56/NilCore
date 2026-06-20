@@ -51,7 +51,8 @@ const (
 	// (whitespace-normalized) — the finding's quoted text is actually on that line.
 	IDPatternMatches = "audit.pattern_matches"
 	// IDFindingReproduces asserts a grep of the asserted pattern over the cited file
-	// yields the claimed number of matches (the finding reproduces at the claimed count).
+	// yields the claimed number of matches AT the cited line (within reproWindow lines) —
+	// the finding reproduces at the citation, not merely somewhere in the file.
 	IDFindingReproduces = "audit.finding_reproduces"
 )
 
@@ -59,9 +60,20 @@ const (
 // ever supplies the (single-quoted, validated) path/line/pattern that follows them, so
 // it can never substitute its own program (I4).
 const (
-	verbSed  = "sed -n"
-	verbGrep = "grep -n -c -F"
+	verbSed = "sed -n"
+	// grep -n -F: fixed-string, line-NUMBERED. We keep -n (and drop the old -c count-only
+	// mode) because the reproduce check must know WHICH lines match — a match somewhere in
+	// the file is not enough; it must fall at (or within reproWindow of) the CITED line.
+	verbGrep = "grep -n -F"
 )
+
+// reproWindow is the half-width (in lines) of the band around the cited line within which
+// a grep match counts as "reproducing AT the citation". A finding cites a single line, but
+// trivial edits (a wrapped argument, an inserted comment) can nudge the exact match by a
+// line or two, so we accept a tiny window rather than demanding the byte-exact line — while
+// still rejecting a match that is hundreds of lines away (which is what the old whole-file
+// grep silently accepted).
+const reproWindow = 2
 
 // RegisterAll registers exactly this pack's three verifier-ids into r. It is called
 // once at wiring time (via packs.Select) before any verification runs. An id not

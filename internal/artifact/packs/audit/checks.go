@@ -140,23 +140,28 @@ func checkPatternMatches(ctx context.Context, box sandbox.Sandbox, c artifact.Cl
 	return artifact.StatusFail, detail(fmt.Sprintf("%s:%d does not contain the asserted pattern", loc.path, loc.line))
 }
 
-// checkFindingReproduces asserts that grepping the asserted pattern over the cited file
-// yields the CLAIMED number of matches — i.e. the finding reproduces at the claimed
-// count across the whole file, not just the one cited line. Evidence.Value carries the
-// fixed-string pattern; the claimed count is an integer carried in the claim's
-// Statement (the worker states "this appears N times"); the file is the locator's path.
+// checkFindingReproduces asserts that the asserted pattern reproduces AT the cited line —
+// i.e. grepping the file yields the CLAIMED number of matches that fall at (or within
+// reproWindow lines of) the locator's cited line, not merely somewhere in the file. The
+// cited line component is the anchor: a finding pinned at line 5 that only matches at line
+// 200 does NOT reproduce, even though the pattern is present in the file. Evidence.Value
+// carries the fixed-string pattern; the claimed count is an integer in the claim's
+// Statement (the worker states "this appears N times at the citation"); the file is the
+// locator's path.
 //
-// It runs ONE `grep -n -c -F '<pattern>' '<path>'`:
+// It runs ONE `grep -n -F '<pattern>' '<path>'`:
 //   - -F: the pattern is a FIXED string, never a regex — a model-authored pattern can
 //     never become a surprising regex, and is single-quoted so it stays DATA (I4).
-//   - -c: grep prints only the match COUNT on stdout, so the raw matching lines never
-//     leave the box (I7) — we assert on the integer count alone.
-//   - exit 0 and the count equals the claim               => Pass.
-//   - exit 1 (grep: no match) and the claim is 0          => Pass; otherwise            => Fail.
-//   - exit 0/1 but the count != the claim                  => Fail.
-//   - exit >1 (grep error, e.g. file unreadable)           => Unverifiable.
-//   - a sandbox-level error / unparseable count / missing-or-bad claimed count => Unverifiable.
-//   - an empty pattern / unparseable locator / path-escape  => Unverifiable (escape makes NO box call).
+//   - -n: grep prefixes each match with its 1-based line number ("<lineno>:<text>"). We
+//     parse only the LINE NUMBERS host-side and count those within reproWindow of the
+//     cited line; the matched line TEXT is never parsed into Detail (I7).
+//   - exit 0 and the windowed count equals the claim       => Pass.
+//   - exit 1 (grep: no match anywhere) and the claim is 0  => Pass; otherwise => Fail.
+//   - exit 0 but the windowed count != the claim            => Fail (the finding does not
+//     reproduce at the citation, even if the pattern appears elsewhere in the file).
+//   - exit >1 (grep error, e.g. file unreadable)            => Unverifiable.
+//   - a sandbox-level error / unparseable -n output / missing-or-bad claimed count => Unverifiable.
+//   - an empty pattern / unparseable locator / path-escape   => Unverifiable (escape makes NO box call).
 func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) (artifact.Status, string) {
 	loc, err := validateFileLine(c.Evidence.SourceURL)
 	if err != nil {
@@ -179,7 +184,7 @@ func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact
 		// refuse rather than risk it (the locator path was already validated).
 		return artifact.StatusUnverifiable, "asserted pattern contains a quote or newline (cannot verify safely)"
 	}
-	// grep -n -c -F '<pattern>' '<path>': fixed-string, count-only. The verb is a pack
+	// grep -n -F '<pattern>' '<path>': fixed-string, line-numbered. The verb is a pack
 	// constant; the pattern and path are single-quoted DATA.
 	cmd := fmt.Sprintf("%s %s %s", verbGrep, quote(pattern), quote(loc.path))
 	res, err := box.Exec(ctx, cmd)
@@ -188,21 +193,25 @@ func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact
 	}
 	switch res.ExitCode {
 	case 0:
-		got, perr := parseCount(res.Stdout)
+		// Count only matches whose line number lands within reproWindow of the cited line —
+		// anchoring the reproduction at the citation rather than anywhere in the file. The
+		// line-number parse is over trusted Go; the matched TEXT is discarded (I7).
+		got, perr := countNear(res.Stdout, loc.line, reproWindow)
 		if perr != nil {
-			return artifact.StatusUnverifiable, detail("unparseable grep count: " + perr.Error())
+			return artifact.StatusUnverifiable, detail("unparseable grep -n output: " + perr.Error())
 		}
 		if got == wantCount {
-			return artifact.StatusPass, fmt.Sprintf("%s reproduces the finding %d time(s) as claimed", loc.path, wantCount)
+			return artifact.StatusPass, fmt.Sprintf("%s:%d reproduces the finding %d time(s) as claimed", loc.path, loc.line, wantCount)
 		}
-		return artifact.StatusFail, detail(fmt.Sprintf("%s has %d match(es), claim asserts %d", loc.path, got, wantCount))
+		return artifact.StatusFail, detail(fmt.Sprintf("%s:%d has %d match(es) within %d line(s), claim asserts %d", loc.path, loc.line, got, reproWindow, wantCount))
 	case 1:
-		// grep exit 1 == zero matches. The finding reproduces 0 times: Pass iff the claim
-		// asserted 0, else Fail (the asserted finding is not present).
+		// grep exit 1 == zero matches anywhere in the file. The finding reproduces 0 times
+		// at the citation: Pass iff the claim asserted 0, else Fail (the asserted finding is
+		// not present).
 		if wantCount == 0 {
-			return artifact.StatusPass, fmt.Sprintf("%s reproduces the finding 0 times as claimed", loc.path)
+			return artifact.StatusPass, fmt.Sprintf("%s:%d reproduces the finding 0 times as claimed", loc.path, loc.line)
 		}
-		return artifact.StatusFail, detail(fmt.Sprintf("%s has 0 matches, claim asserts %d", loc.path, wantCount))
+		return artifact.StatusFail, detail(fmt.Sprintf("%s:%d has 0 matches, claim asserts %d", loc.path, loc.line, wantCount))
 	default:
 		// grep exit >1 is a real error (file unreadable, bad invocation): not a decisive
 		// verdict about the finding ⇒ Unverifiable.
@@ -233,8 +242,34 @@ func claimedCount(c artifact.Claim) (int, error) {
 	return n, nil
 }
 
-// parseCount reads the integer `grep -c` prints on its own line. grep -c emits a single
-// count; with no file argument issues it is exactly the number on stdout.
-func parseCount(stdout string) (int, error) {
-	return strconv.Atoi(strings.TrimSpace(stdout))
+// countNear parses `grep -n` output ("<lineno>:<text>" per match) and returns how many
+// matches fall within window lines of cited (i.e. |lineno-cited| <= window) — the anchored
+// reproduction count. Only the leading line NUMBER of each non-empty line is parsed; the
+// matched text after the first ':' is DISCARDED and never surfaces (I7). A line whose
+// prefix before the first ':' is not an integer is a malformed grep emission and yields an
+// error (mapped to Unverifiable), so a garbled stream can never masquerade as a count.
+func countNear(stdout string, cited, window int) (int, error) {
+	n := 0
+	for _, ln := range strings.Split(stdout, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		idx := strings.IndexByte(ln, ':')
+		if idx < 0 {
+			return 0, fmt.Errorf("grep -n line %q has no ':' line-number separator", ln)
+		}
+		num, err := strconv.Atoi(strings.TrimSpace(ln[:idx]))
+		if err != nil {
+			return 0, fmt.Errorf("grep -n line-number %q is not an integer", ln[:idx])
+		}
+		d := num - cited
+		if d < 0 {
+			d = -d
+		}
+		if d <= window {
+			n++
+		}
+	}
+	return n, nil
 }

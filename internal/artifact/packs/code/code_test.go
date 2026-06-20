@@ -207,7 +207,7 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 		{
 			name: "go-selector-pass", extract: "go", value: "./internal/foo",
 			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusPass,
-			wantCmd: "go test './internal/foo'",
+			wantCmd: "go test -- './internal/foo'",
 		},
 		{
 			name: "go-bare-suite-pass", extract: "go", value: "",
@@ -217,12 +217,12 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 		{
 			name: "npm-selector-pass", extract: "npm", value: "unit",
 			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusPass,
-			wantCmd: "npm test 'unit'",
+			wantCmd: "npm test -- 'unit'",
 		},
 		{
 			name: "pytest-fail", extract: "pytest", value: "tests/test_x.py",
 			box: &fakeBox{exec: exit(1, "1 failed")}, want: artifact.StatusFail,
-			wantCmd: "pytest 'tests/test_x.py'",
+			wantCmd: "pytest -- 'tests/test_x.py'",
 		},
 		{
 			name: "sandbox-error-unverifiable", extract: "go", value: "",
@@ -244,6 +244,21 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 		},
 		{
 			name: "selector-with-space-unverifiable-no-box", extract: "go", value: "a b",
+			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusUnverifiable, wantNoBox: true,
+		},
+		// A leading-dash selector is the I2 laundering vector: "go test -run=^$" selects
+		// zero tests, exits 0, and would forge a green verdict. validateSelector must
+		// reject it BEFORE any box.Exec — the fake box fails the test if Exec is reached.
+		{
+			name: "selector-run-empty-unverifiable-no-box", extract: "go", value: "-run=^$",
+			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusUnverifiable, wantNoBox: true,
+		},
+		{
+			name: "selector-count-zero-unverifiable-no-box", extract: "go", value: "-count=0",
+			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusUnverifiable, wantNoBox: true,
+		},
+		{
+			name: "selector-list-flag-unverifiable-no-box", extract: "go", value: "--list",
 			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusUnverifiable, wantNoBox: true,
 		},
 	}
@@ -293,14 +308,40 @@ func TestDetailBounded(t *testing.T) {
 // --- single-quoting (I7) ------------------------------------------------------
 
 // TestTestCommandIsSingleQuoted asserts a benign selector is single-quoted into the
-// fixed shape, so it stays DATA (the command-injection boundary).
+// fixed shape behind a literal "--" separator, so it stays DATA (the command-injection
+// boundary) and can never be read as a flag.
 func TestTestCommandIsSingleQuoted(t *testing.T) {
 	cmd, err := buildTestCommand(claim(IDTestPasses, "go", "TestFoo"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cmd != "go test 'TestFoo'" {
-		t.Fatalf("cmd = %q, want the selector single-quoted into the go shape", cmd)
+	if cmd != "go test -- 'TestFoo'" {
+		t.Fatalf("cmd = %q, want the selector single-quoted behind '--' in the go shape", cmd)
+	}
+	if !strings.Contains(cmd, " -- ") {
+		t.Fatalf("cmd = %q, want a literal '--' separator before the selector", cmd)
+	}
+}
+
+// TestValidateSelectorRejectsLeadingDash is the discriminating guard for the I2
+// laundering vector: a selector that begins with '-' (e.g. "-run=^$", which selects zero
+// tests, exits 0, and forges a green verdict) MUST be rejected by validateSelector — and
+// a benign selector with the same flag-name shape but no leading dash MUST pass, so the
+// test proves it is the leading dash (not the substring) that is caught.
+func TestValidateSelectorRejectsLeadingDash(t *testing.T) {
+	reject := []string{"-run=^$", "-count=0", "--list", "-v", "  -run=Foo"}
+	for _, sel := range reject {
+		if err := validateSelector(sel); err == nil {
+			t.Fatalf("validateSelector(%q) = nil, want an error for a leading-dash selector", sel)
+		}
+	}
+	// Control side: an inner dash, or a flag-looking name without the leading dash, is
+	// fine — the rule must discriminate on POSITION, not merely contain "-".
+	accept := []string{"TestRun", "run=Foo", "./pkg/-internal", "Test-Name"}
+	for _, sel := range accept {
+		if err := validateSelector(sel); err != nil {
+			t.Fatalf("validateSelector(%q) = %v, want nil (a non-leading dash is allowed)", sel, err)
+		}
 	}
 }
 
