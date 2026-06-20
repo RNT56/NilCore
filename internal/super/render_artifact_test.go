@@ -70,7 +70,8 @@ func TestRenderReportTypedArtifactTrustedThenFenced(t *testing.T) {
 	idxClaim1 := strings.Index(got, claim1)
 	idxClaim2 := strings.Index(got, claim2)
 	idxFence := strings.Index(got, "[untrusted subagent super.t2 summary")
-	if !(idxControl < idxArt && idxArt < idxClaim1 && idxClaim1 < idxClaim2 && idxClaim2 < idxFence) {
+	ordered := idxControl < idxArt && idxArt < idxClaim1 && idxClaim1 < idxClaim2 && idxClaim2 < idxFence
+	if !ordered {
 		t.Fatalf("ordering wrong (control=%d art=%d c1=%d c2=%d fence=%d):\n%s",
 			idxControl, idxArt, idxClaim1, idxClaim2, idxFence, got)
 	}

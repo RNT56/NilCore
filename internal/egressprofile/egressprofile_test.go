@@ -200,7 +200,9 @@ func TestLoadFile(t *testing.T) {
 
 	t.Run("reads allow list preserving order and trimming", func(t *testing.T) {
 		p := filepath.Join(dir, "ok.json")
-		os.WriteFile(p, []byte(`{"schema_version":1,"allow":["  a.com ","*.b.org",""]}`), 0o644)
+		if err := os.WriteFile(p, []byte(`{"schema_version":1,"allow":["  a.com ","*.b.org",""]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		eg, err := LoadFile(p)
 		if err != nil {
 			t.Fatalf("LoadFile: %v", err)
@@ -248,7 +250,9 @@ func TestLoadFile(t *testing.T) {
 
 	t.Run("malformed JSON is a parse error, never silent zero-value", func(t *testing.T) {
 		p := filepath.Join(dir, "bad.json")
-		os.WriteFile(p, []byte("{not json"), 0o644)
+		if err := os.WriteFile(p, []byte("{not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		eg, err := LoadFile(p)
 		if err == nil {
 			t.Fatalf("LoadFile of malformed JSON returned nil error, eg=%v", eg)

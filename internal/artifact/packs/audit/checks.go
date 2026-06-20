@@ -186,8 +186,8 @@ func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact
 	if err != nil {
 		return artifact.StatusUnverifiable, detail("sandbox: " + err.Error())
 	}
-	switch {
-	case res.ExitCode == 0:
+	switch res.ExitCode {
+	case 0:
 		got, perr := parseCount(res.Stdout)
 		if perr != nil {
 			return artifact.StatusUnverifiable, detail("unparseable grep count: " + perr.Error())
@@ -196,7 +196,7 @@ func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact
 			return artifact.StatusPass, fmt.Sprintf("%s reproduces the finding %d time(s) as claimed", loc.path, wantCount)
 		}
 		return artifact.StatusFail, detail(fmt.Sprintf("%s has %d match(es), claim asserts %d", loc.path, got, wantCount))
-	case res.ExitCode == 1:
+	case 1:
 		// grep exit 1 == zero matches. The finding reproduces 0 times: Pass iff the claim
 		// asserted 0, else Fail (the asserted finding is not present).
 		if wantCount == 0 {

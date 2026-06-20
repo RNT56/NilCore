@@ -749,7 +749,10 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		gitMu.Unlock()
 	}
 	// Project the trusted (harness-set) artifact fields onto the Result for the report.
-	if as := readVerifiedArtifact(wt.Path(), s.ID); as != nil {
+	// readVerifiedArtifact is id-agnostic (P11 #48): it discovers the single artifact the
+	// worker wrote under this worktree's .nilcore/artifacts/ rather than assuming a
+	// filename — which is exactly right here (one artifact per shard worktree).
+	if as := readVerifiedArtifact(wt.Path()); as != nil {
 		res.Artifact = as
 	}
 	c.recordVerdict(s, true)
