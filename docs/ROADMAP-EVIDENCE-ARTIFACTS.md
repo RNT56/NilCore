@@ -4,6 +4,8 @@
 
 This is **Phase 11**, namespace `P11-T##`. Like `docs/UPGRADE-PATH.md` and `docs/ROADMAP-REPORT-FIXES.md`, this is a **staging doc**, not the canon: it presumes all seven invariants and the frozen `backend.CodingBackend` contract and never restates the law — it points at it (`CLAUDE.md` → `docs/ARCHITECTURE.md`). Promoting these specs into `docs/TASKS.md` is itself a **serialized contract task** (`P11-T36`, §9). Every task is **additive, opt-in, flag/env-gated, stdlib-first** (no new module; `CGO_ENABLED=0`) — **the default binary stays byte-identical when the feature is off**, and each spec carries the test that proves it.
 
+> **SHIPPED + built upon.** Phase 11 is merged (PR #47/#48). **Phase 12 — verified swarm mode** (`docs/SWARM.md`, `nilcore swarm`) is the high-throughput product surface built directly on this spine: it **reuses** `internal/{artifact, evverify, artifact/packs/*, requeue, report}` to fan hundreds of agents into a bounded in-process pool where every shard produces a typed artifact judged by a verify-pack and only verifier-green shards ship — failed shards requeue until clean. This doc remains the design of the spine itself; the swarm extends it, never rebuilds it.
+
 ---
 
 ## 1. Overview — the six pillars

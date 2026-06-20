@@ -5,13 +5,13 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~30,800 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, and **one conversational front door** you just talk to. It can now **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read Go, Python, TypeScript/JavaScript *and* Rust, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~46,500 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, **one conversational front door** you just talk to, and a **verified swarm** that fans hundreds of agents at a problem. It treats code as one **verifiable artifact** among many — reports, comparison matrices, audits, benchmarks, research dossiers — each carrying claims a verifier re‑checks in the sandbox. It can **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read Go, Python, TypeScript/JavaScript *and* Rust, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~30.8k%20LOC-1f6feb)](#the-receipts)
+[![Agent size](https://img.shields.io/badge/agent-~46.5k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
@@ -94,6 +94,9 @@ Keychain / encrypted‑file vault / env / external hook. The model never sees a 
 ▸ **One conversational front door** (`nilcore chat`)
 Just talk — it infers quick‑fix vs feature vs whole‑project and acts. Watch its reasoning **stream live**; **queue** a follow‑up, **steer** (`!…`) — it interrupts mid‑thought, keeps the partial reasoning, then resumes or changes — or `/cancel` to abort. Works in the terminal and over Telegram/Slack.
 
+▸ **Verifier‑backed artifacts, not just code**
+Code is one artifact type among many — reports, comparison matrices, audits, benchmarks, research dossiers — each a typed `Artifact` whose every `Claim` carries `Evidence{value, source_url, verifier, status}`. A worker's self‑written `pass` is **overwritten** by a real check run in the sandbox; an unregistered verifier ⇒ `unverifiable`, never green. **Granular requeue** re‑runs exactly the failed claims, not the world. `nilcore report` replays the log into the trust story and refuses green over a broken chain.
+
 </td>
 <td width="50%" valign="top">
 
@@ -111,6 +114,9 @@ Append‑only, hash‑chained, secret‑redacted event log. Replay any run.
 
 ▸ **Runs unattended — and reacts**
 Provider retry/failover, cost ceilings, durable resume on restart, resource GC, health checks. Plus event/scheduled triggers — `serve --webhook` (HMAC‑verified SCM/CI) and `schedule` (cron/interval) — and a gated **draft PR** (`--open-pr`) that opens only after the human gate. The agent never merges.
+
+▸ **Verified swarm mode** (`nilcore swarm`)
+Fan **N units of work into a bounded in‑process pool on one host** — `--agents 300 --concurrency 40` — where every unit produces a **typed artifact judged by a verify‑pack** and only verifier‑green shards ship; failed shards **requeue until clean** (or a budget/pass limit). Five presets (research · code · audit · benchmark · ui), a tiered **provider pool** (strong planner/verifier + cheap worker tier + fallback + per‑provider caps), and a live **scoreboard** (checked/passed/failed/retry‑pass/remaining + cost/time/token + source‑claim trace). *Massive fan‑out, verifier‑owned quality — it refuses to ship anything it can't verify.*
 
 ▸ **Operator steering**
 A `NILCORE.md` / `AGENTS.md` steering file loads as trusted project instructions — scoped *below* the safety core, so it can shape behavior but never widen capability or bypass the gate/verifier.
@@ -234,9 +240,13 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 ```mermaid
 flowchart TD
-    CLI[cmd/nilcore<br/>init · run · serve · schedule · doctor] --> AGENT[agent<br/>orchestrator + adaptive routing]
+    CLI[cmd/nilcore<br/>init · run · build · serve · swarm · report · schedule · doctor] --> AGENT[agent<br/>orchestrator + adaptive routing]
     CLI --> STEER[steering<br/>trusted NILCORE.md / AGENTS.md]
     STEER --> AGENT
+    CLI --> SWARM[swarm<br/>bounded in-process pool · typed artifacts · requeue-until-clean]
+    SWARM --> POOL[pool<br/>strong planner/verifier · cheap workers · fallback · caps]
+    SWARM --> ARTIFACT[artifact + evverify + packs<br/>typed claims · verifier-produced green]
+    ARTIFACT --> VERIFY
     AGENT --> BK[backend<br/>native · codex · claude-code]
     AGENT --> WT[worktree<br/>disposable per task]
     BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter · multimodal]
@@ -262,12 +272,12 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 | | |
 |--:|:--|
-| **~30,800** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent · conversational front door) |
-| ~58,500 | lines including its tests (147 test files) |
-| **64** | small, single‑responsibility packages |
-| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, and forge are all pure stdlib — no module added |
+| **~46,500** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent supervisor · conversational front door · verified swarm) |
+| ~89,300 | lines including its tests (206 test files) |
+| **84** | small, single‑responsibility packages |
+| **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, forge, the provider pool, and the swarm runner are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
-| **Phases 0–10** | shipped + the four formerly‑deferred items D1–D4 (later broadened by R1–R3) — incl. behavioral browser verification that can now **drive** a flow before observing, semantic (HNSW) + multi‑language (Go · Python · TS/JS · Rust) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
+| **Phases 0–12** | shipped — incl. the **verifier‑backed artifact factory** (code is one verifiable artifact among reports · matrices · audits · benchmarks · dossiers, each claim re‑checked in the sandbox) and **verified swarm mode** (`nilcore swarm`: hundreds of agents in a bounded in‑process pool, a typed artifact + verify‑pack per unit, requeue‑until‑clean), atop behavioral browser verification, semantic (HNSW) + multi‑language (Go · Python · TS/JS · Rust) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
 
 </div>
 
@@ -276,7 +286,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           chat · tui · init · run · build · serve · schedule · watch · registry · doctor · config · secret · version
+cmd/nilcore/           chat · tui · init · run · build · swarm · report · serve · schedule · watch · registry · doctor · config · secret · version
 cmd/tools/nilcore-browser   pure-Go headless-browser driver baked into the sandbox image
 internal/
   model, provider      canonical message format (+ multimodal image block) + Anthropic/OpenAI/OpenRouter
@@ -290,6 +300,11 @@ internal/
   session, inbox       conversational front door · queue/steer user-message seam
   emit, loopctl        live reasoning sink · steer-vs-shutdown cancel discriminator
   roster, integrate    role-specialized subagents · parallel-worktree merge + verify-each
+  artifact, evverify   typed evidence artifacts (Claim/Evidence/Status) · verifier-produced green (the artifact factory)
+  artifact/{packs,schema}  verify-packs: web·software·finance·ui·audit·benchmark·code + structural schema (curl-in-box, no SDK)
+  requeue, report      field-granular requeue (only the failed claims) · verification report + matrix replay over the log
+  pool, swarm          tiered provider pool (planner/verifier·workers·fallback·caps) · verified swarm: shard queue·runner·until-clean controller·scoreboard
+  worktreefs, browserwire   symlink-safe worktree FS confinement (O_NOFOLLOW) · shared shell-quote + browser-observation contract
   steering             trusted NILCORE.md / AGENTS.md operator instructions (scoped below the safety core)
   scmhook, cron        HMAC-verified webhook triggers · cron/interval self-start
   forge                gated draft-PR opener (token from SecretStore; never merges)
