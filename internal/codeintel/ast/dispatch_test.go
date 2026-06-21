@@ -78,6 +78,12 @@ func TestNewExtensionsDispatch(t *testing.T) {
 		{"a.hh", "class HH {\n};\n", "HH"},
 		{"a.hxx", "class HX {\n};\n", "HX"},
 		{"a.cs", "class CS {\n    void M() {\n    }\n}\n", "CS"},
+		// Tier-2 languages (Phase 13).
+		{"a.rb", "def rb\n  1\nend\n", "rb"},
+		{"a.php", "<?php\nfunction pf() {\n    return 1;\n}\n", "pf"},
+		{"a.kt", "fun kf() {\n    return\n}\n", "kf"},
+		{"a.kts", "fun ks() {\n    return\n}\n", "ks"},
+		{"a.swift", "func sf() {\n    return\n}\n", "sf"},
 	}
 	for _, tc := range cases {
 		p := filepath.Join(t.TempDir(), tc.file)
@@ -105,11 +111,13 @@ func TestSupportedExtensions(t *testing.T) {
 	got := SupportedExtensions()
 	sort.Strings(got)
 	// The full set now spans every registered backend: Go, Python, the JS/TS family,
-	// Rust, and the Tier-1 brace languages (Java, C, C++, C#). Kept exhaustive so a
-	// forgotten registration (or an accidental drop) fails loudly.
+	// Rust, the Tier-1 brace languages (Java, C, C++, C#), and the Tier-2 languages
+	// (Ruby, PHP, Kotlin, Swift). Kept exhaustive so a forgotten registration (or an
+	// accidental drop) fails loudly.
 	want := []string{
 		".c", ".cc", ".cjs", ".cpp", ".cs", ".cxx", ".go", ".h", ".hh", ".hpp",
-		".hxx", ".java", ".js", ".jsx", ".mjs", ".py", ".rs", ".ts", ".tsx",
+		".hxx", ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py",
+		".rb", ".rs", ".swift", ".ts", ".tsx",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedExtensions() = %v, want %v", got, want)

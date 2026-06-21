@@ -6,8 +6,10 @@
 // Scope note: this is a multi-language seam (D3-T01). The public API — Symbols /
 // References / Calls plus the Symbol/Reference/Span/Kind types — is the stable
 // contract; behind it sits a per-language backend keyed by file extension. Go is
-// served by the standard library (go/parser); Python, JS/TS, Rust, and the Tier-1
-// brace-delimited languages (Java, C, C++, C#) by pure-Go heuristic line scanners.
+// served by the standard library (go/parser); Python, JS/TS, Rust, the Tier-1
+// brace-delimited languages (Java, C, C++, C#), and the Tier-2 languages (Ruby — a
+// `def`/`end` scanner; PHP, Kotlin, Swift — brace-delimited) by pure-Go heuristic line
+// scanners.
 // Everything here is stdlib only — no cgo, no tree-sitter — so the zero-cgo build
 // holds. A richer per-language backend (a tree-sitter binding behind an external
 // service, say) can slot in later without changing callers.
@@ -94,6 +96,13 @@ var parsers = map[string]languageParser{
 	".hxx": cppParser{},
 	// C#.
 	".cs": csharpParser{},
+	// Tier-2 languages (Phase 13). Ruby uses a `def`/`class`/`module` + `end` scanner;
+	// PHP, Kotlin, and Swift reuse the shared brace machinery (brace.go).
+	".rb":    rubyParser{},
+	".php":   phpParser{},
+	".kt":    kotlinParser{},
+	".kts":   kotlinParser{},
+	".swift": swiftParser{},
 }
 
 // SupportedExtensions returns the file extensions (dot included, e.g. ".go", ".py")
