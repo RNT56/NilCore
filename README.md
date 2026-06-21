@@ -5,7 +5,7 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~46,500 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, **one conversational front door** you just talk to, and a **verified swarm** that fans hundreds of agents at a problem. It treats code as one **verifiable artifact** among many — reports, comparison matrices, audits, benchmarks, research dossiers — each carrying claims a verifier re‑checks in the sandbox. It can **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read Go, Python, TypeScript/JavaScript *and* Rust, and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~46,500 lines of Go** you can read end to end: a ~8k single‑task core, an opt‑in **multi‑agent supervisor** that builds whole projects, **one conversational front door** you just talk to, and a **verified swarm** that fans hundreds of agents at a problem. It treats code as one **verifiable artifact** among many — reports, comparison matrices, audits, benchmarks, research dossiers — each carrying claims a verifier re‑checks in the sandbox. It can **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read **19 languages** (Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · Kotlin · Swift · …), and start work from a webhook or a schedule. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
@@ -38,7 +38,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It ran a destructive command / touched my host."** | **Every command the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs), destructive ones denylisted *before* execution. The model can't run an arbitrary program on your machine; its file edits are confined to a throwaway worktree. |
 | **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
-| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **Go, Python, TypeScript/JavaScript *and* Rust** (a pure‑Go parser seam — heuristic line scanners, no tree‑sitter; the `NILCORE_LSP_COMMAND` seam stays the precise lens), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
+| **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **19 languages across 34 file extensions** — Go · Python · TS/JS · Rust · Java · C · C++ · C# · Ruby · PHP · Kotlin · Swift · Scala · Dart · Zig · Bash · Lua · Elixir · SQL (a pure‑Go parser seam — Go is precise via `go/parser`, the rest are broad, structural **heuristic line scanners**, no tree‑sitter; the `NILCORE_LSP_COMMAND` seam stays the precise lens where a server exists), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
 | **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
 | **"I have to babysit it / can't course‑correct mid‑run."** | **Just talk to it.** `nilcore chat` is one conversation — it infers whether your message is a quick fix, a feature, or a whole project and pulls the strings itself. While it works its reasoning **streams live, token by token**, and you can **queue** a follow‑up (folds in at the next step), **steer** — `!…` **interrupts mid‑thought but keeps** what it's reasoned so far, folds your feedback in, and resumes or changes course — or `/cancel` to abort the run outright while staying in the conversation. |
 | **"It went rogue while I was away."** | **Bounded autonomy:** reversible work runs unattended; irreversible actions (merge, push, deploy, pay) hit a **human gate** — which becomes a Yes/No tap in Telegram or Slack. |
@@ -100,7 +100,7 @@ Code is one artifact type among many — reports, comparison matrices, audits, b
 </td>
 <td width="50%" valign="top">
 
-▸ **Code intelligence** (Go · Python · TS/JS · Rust)
+▸ **Code intelligence** (**19 languages** — Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · Kotlin · Swift · …; heuristic scanners, LSP = the precise lens)
 AST · call graph · PageRank repo‑map · LSP · pure‑Go **HNSW** semantic search · Impact Set + SBFL · live worktree‑aware updates.
 
 ▸ **It can see the running app**
@@ -254,7 +254,7 @@ flowchart TD
     BK --> VERIFY[verify<br/>source of truth + browser behavioral check]
     AGENT --> POLICY[policy<br/>gate · egress · tool-call]
     AGENT --> LOG[eventlog<br/>hash-chained + store]
-    AGENT --> CI[codeintel<br/>ast Go+Python+TS/JS+Rust to graph to repomap to HNSW retrieve]
+    AGENT --> CI[codeintel<br/>ast 19 languages to graph to repomap to HNSW retrieve]
     AGENT --> MEM[memory<br/>cross-project SQLite]
     CLI --> CHAN[channel<br/>telegram · slack]
     CLI --> TRIG[scmhook · cron<br/>webhook / scheduled triggers]
@@ -277,7 +277,7 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 | **84** | small, single‑responsibility packages |
 | **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, forge, the provider pool, and the swarm runner are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
-| **Phases 0–12** | shipped — incl. the **verifier‑backed artifact factory** (code is one verifiable artifact among reports · matrices · audits · benchmarks · dossiers, each claim re‑checked in the sandbox) and **verified swarm mode** (`nilcore swarm`: hundreds of agents in a bounded in‑process pool, a typed artifact + verify‑pack per unit, requeue‑until‑clean), atop behavioral browser verification, semantic (HNSW) + multi‑language (Go · Python · TS/JS · Rust) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
+| **Phases 0–12** | shipped — incl. the **verifier‑backed artifact factory** (code is one verifiable artifact among reports · matrices · audits · benchmarks · dossiers, each claim re‑checked in the sandbox) and **verified swarm mode** (`nilcore swarm`: hundreds of agents in a bounded in‑process pool, a typed artifact + verify‑pack per unit, requeue‑until‑clean), atop behavioral browser verification, semantic (HNSW) + multi‑language (**19 languages** / 34 extensions — Go · Python · TS/JS · Rust · Java · C/C++ · C# · …) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
 
 </div>
 
@@ -313,7 +313,7 @@ internal/
   channel              Channel contract · telegram · slack · authorized control
   tools, mcp           structured tools (+ browser_view) + MCP-as-code
   embed                opt-in OpenAI-compatible embedder (NILCORE_EMBED_KEY)
-  codeintel/*          ast (Go · Python · TS/JS · Rust) · graph · repomap · lsp · semantic (HNSW) · retrieve · impact · live
+  codeintel/*          ast (19 languages / 34 exts — Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · …) · graph · repomap · lsp · semantic (HNSW) · retrieve · impact · live
   store, memory        SQLite backbone + cross-project memory
   secrets              keychain / encrypted vault / env / external
   skills, selfimprove  Agent Skills + plugins + gated self-edit
