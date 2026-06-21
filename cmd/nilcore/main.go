@@ -106,6 +106,10 @@ func main() {
 		inspectMain(args[1:])
 	case "report":
 		reportMain(args[1:])
+	case "trust":
+		trustMain(args[1:])
+	case "trace", "why":
+		traceMain(args[1:])
 	case "mcp-call":
 		mcpCallMain(args[1:])
 	case "propose-edit":
@@ -146,6 +150,8 @@ Usage:
   nilcore secret set <name>             store or rotate a single secret in the secret store
   nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
   nilcore report [-format text|matrix]  render the verification report from the event log (the I2 trust gate)
+  nilcore trust [-format text|json]     show the Trust Ledger scoreboard (verifier-judged strength routing; the verifier still decides)
+  nilcore trace <task> | nilcore why <task>   explain why the agent did what it did, from the event log (read-only)
   nilcore mcp-call <server> <tool> ...  invoke a configured MCP tool (the runtime bridge for generated wrappers)
   nilcore version                       print the build version
 
