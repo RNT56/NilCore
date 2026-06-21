@@ -84,6 +84,17 @@ func TestNewExtensionsDispatch(t *testing.T) {
 		{"a.kt", "fun kf() {\n    return\n}\n", "kf"},
 		{"a.kts", "fun ks() {\n    return\n}\n", "ks"},
 		{"a.swift", "func sf() {\n    return\n}\n", "sf"},
+		// Tier-3 languages (Phase 13).
+		{"a.scala", "object O {\n  def sf() = 1\n}\n", "O"},
+		{"a.sc", "def scf() = 1\n", "scf"},
+		{"a.dart", "class D {\n  void m() {}\n}\n", "D"},
+		{"a.zig", "fn zf() void {\n}\n", "zf"},
+		{"a.sh", "shf() {\n  echo hi\n}\n", "shf"},
+		{"a.bash", "function bf {\n  echo hi\n}\n", "bf"},
+		{"a.lua", "function lf()\n  return 1\nend\n", "lf"},
+		{"a.ex", "defmodule M do\n  def ef() do\n    1\n  end\nend\n", "M"},
+		{"a.exs", "defmodule S do\nend\n", "S"},
+		{"a.sql", "CREATE TABLE users (id int);\n", "users"},
 	}
 	for _, tc := range cases {
 		p := filepath.Join(t.TempDir(), tc.file)
@@ -111,13 +122,15 @@ func TestSupportedExtensions(t *testing.T) {
 	got := SupportedExtensions()
 	sort.Strings(got)
 	// The full set now spans every registered backend: Go, Python, the JS/TS family,
-	// Rust, the Tier-1 brace languages (Java, C, C++, C#), and the Tier-2 languages
-	// (Ruby, PHP, Kotlin, Swift). Kept exhaustive so a forgotten registration (or an
-	// accidental drop) fails loudly.
+	// Rust, the Tier-1 brace languages (Java, C, C++, C#), the Tier-2 languages (Ruby,
+	// PHP, Kotlin, Swift), and the Tier-3 languages (Scala, Dart, Zig, Bash, Lua, Elixir,
+	// SQL). Kept exhaustive so a forgotten registration (or an accidental drop) fails
+	// loudly.
 	want := []string{
-		".c", ".cc", ".cjs", ".cpp", ".cs", ".cxx", ".go", ".h", ".hh", ".hpp",
-		".hxx", ".java", ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py",
-		".rb", ".rs", ".swift", ".ts", ".tsx",
+		".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".cxx", ".dart", ".ex", ".exs",
+		".go", ".h", ".hh", ".hpp", ".hxx", ".java", ".js", ".jsx", ".kt", ".kts",
+		".lua", ".mjs", ".php", ".py", ".rb", ".rs", ".sc", ".scala", ".sh", ".sql",
+		".swift", ".ts", ".tsx", ".zig",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedExtensions() = %v, want %v", got, want)
