@@ -41,6 +41,17 @@ type Spawner interface {
 	Spawn(ctx context.Context, t backend.Task) error
 }
 
+// Selector orders/filters a set of candidate backend NAMES best-first for a task
+// (Phase 13 multi-backend strength-routing). It is the structural seam the Trust
+// Ledger plugs into — trust.Selector satisfies this shape WITHOUT importing agent,
+// exactly like trust.Router satisfies Router. I2 boundary: a Selector only orders
+// WHICH backend to run first; it NEVER decides "done" or the race winner. The
+// verifier still judges every race (route.Race) and re-runs as the final gate
+// (executeSingle), so a Selector is a bias on the first attempt, never an override.
+type Selector interface {
+	Select(ctx context.Context, t backend.Task, names []string) []string
+}
+
 // SingleRouter is the default Router: always the one configured backend.
 type SingleRouter struct{}
 
@@ -97,6 +108,79 @@ type Orchestrator struct {
 	// verified work. false (the default) ⇒ byte-identical: the worktree and its
 	// branch are cleaned up exactly as before, so no run leaves a branch behind.
 	KeepBranch bool
+
+	// Phase 13 multi-backend strength-routing (default-zero = today's single-backend
+	// path, byte-identical). These three fields together unlock a path where an
+	// operator who has configured several DISTINCT backends (native + codex +
+	// claude-code) gets the historically-strongest one tried FIRST, and on a
+	// verify-fail a race of the DISTINCT backends where the VERIFIER picks the winner
+	// (the Trust Ledger only ORDERS — I2). The multi path is taken ONLY when
+	// multiBackend() holds (len(Backends) > 1 AND NewEnvFor != nil); otherwise every
+	// existing field and code path is untouched.
+
+	// Backends is the set of configured backend NAMES, in operator-declared order.
+	// Empty or a single name ⇒ the single-backend path (NewEnv). It is never mutated
+	// by the orchestrator (orderBackends works on a copy).
+	Backends []string
+
+	// NewEnvFor builds an Env whose Backend is the NAMED one, resolved FRESH per
+	// worktree directory. This is what the multi path uses instead of NewEnv: it
+	// avoids a stale construction-time backend by re-resolving the named backend for
+	// each worktree. Required for the multi path; nil ⇒ stay on the single path.
+	NewEnvFor func(dir, backendName string) Env
+
+	// Selector, when set, orders the candidate backend names best-first (the Trust
+	// Ledger plugs in here). nil ⇒ the configured Backends order is used as-is. A
+	// Selector only orders WHICH backend to run; the verifier still decides "done"
+	// (I2).
+	Selector Selector
+}
+
+// multiBackend reports whether the Phase-13 multi-backend path is active: more than
+// one configured backend name AND a NewEnvFor to resolve each by name. With either
+// unset (the default) this is false and executeSingle/raceEscalate behave EXACTLY
+// as before (byte-identical).
+func (o *Orchestrator) multiBackend() bool {
+	return len(o.Backends) > 1 && o.NewEnvFor != nil
+}
+
+// orderBackends returns the candidate backend names best-first for this task. When
+// a Selector is wired it orders a COPY of o.Backends (the Trust Ledger biases toward
+// the historically-strongest); otherwise the configured order is kept. o.Backends is
+// never mutated. The result is de-duplicated and empty names are dropped, so a
+// fresh worktree is built once per DISTINCT backend.
+func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []string {
+	src := make([]string, len(o.Backends))
+	copy(src, o.Backends)
+	if o.Selector != nil {
+		src = o.Selector.Select(ctx, t, src)
+	}
+	seen := make(map[string]bool, len(src))
+	out := make([]string, 0, len(src))
+	for _, n := range src {
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	// A Selector is documented as ordering AND filtering, so it may legitimately return
+	// fewer — or, pathologically, zero — names. The multi-backend path needs at least one
+	// runnable backend (executeSingle indexes [0]; raceEscalate needs candidates), and
+	// o.Backends is non-empty by construction (multiBackend requires len>1). So if a
+	// Selector dropped everything, fall back to the configured set (de-duped) rather than
+	// hand the caller an empty slice — defending the hot path in ONE place.
+	if len(out) == 0 {
+		seen = make(map[string]bool, len(o.Backends))
+		for _, n := range o.Backends {
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // Gate decides whether an action may proceed right now and records the decision.
@@ -162,7 +246,10 @@ func (o *Orchestrator) executeSupervised(ctx context.Context, t backend.Task) (O
 // executeSingle runs one task: create an isolated worktree, run the backend in
 // it, then re-verify as the gate. The worktree is always cleaned up.
 func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outcome, error) {
-	if o.NewEnv == nil {
+	// The single path needs NewEnv; the multi path (multiBackend) supplies NewEnvFor
+	// instead. multiBackend() already guarantees NewEnvFor != nil, so this guard only
+	// fires when neither builder is wired — and on the single path it is byte-identical.
+	if o.NewEnv == nil && !o.multiBackend() {
 		return Outcome{}, fmt.Errorf("orchestrator: NewEnv is required")
 	}
 	router := o.Router
@@ -202,8 +289,29 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	// The task runs against the worktree, not the original repo — reversible by
 	// construction.
 	t.Dir = wt.Path()
-	env := o.NewEnv(t.Dir)
-	be := router.Route(ctx, t, env.Backend)
+	// Backend SELECTION — the ONLY thing the multi-backend path changes here. The
+	// verifier (env.Verifier, backend-independent) and everything after are identical
+	// on both paths (I2: this only orders WHICH backend runs first).
+	var env Env
+	var be backend.CodingBackend
+	if o.multiBackend() {
+		// Multi path: pick the historically-strongest configured backend first
+		// (Selector orders; nil ⇒ configured order) and resolve it FRESH for this
+		// worktree via NewEnvFor (no stale construction-time backend).
+		names := o.orderBackends(ctx, t)
+		env = o.NewEnvFor(t.Dir, names[0])
+		be = env.Backend
+		order := "configured"
+		if o.Selector != nil {
+			order = "trust"
+		}
+		o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "backend_select",
+			Detail: map[string]any{"chosen": names[0], "order": names, "by": order}})
+	} else {
+		// Single path — UNCHANGED, byte-identical to before.
+		env = o.NewEnv(t.Dir)
+		be = router.Route(ctx, t, env.Backend)
+	}
 
 	o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_run",
 		Detail: map[string]any{"worktree": wt.Path(), "branch": wt.Branch()}})
@@ -235,9 +343,13 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify",
 		Detail: map[string]any{"passed": rep.Passed}})
 
-	// Adaptive escalation: the cheap single path failed verification — race a
-	// best-of-N to recover (only when RaceN > 1; easy tasks never reach here).
-	if !rep.Passed && o.RaceN > 1 {
+	// Adaptive escalation: the cheap single path failed verification — race to
+	// recover. On the single path this is best-of-N copies of the one backend, gated
+	// on RaceN > 1 exactly as before (byte-identical). On the multi path it races the
+	// DISTINCT configured backends and the gate is multiBackend() itself (more than
+	// one backend is already guaranteed), so an operator gets the cross-backend race
+	// without also having to set RaceN. Easy tasks (passed first try) never reach here.
+	if !rep.Passed && (o.RaceN > 1 || o.multiBackend()) {
 		if rout, ok := o.raceEscalate(ctx, t); ok {
 			return rout, nil
 		}
@@ -281,8 +393,36 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 // winning worktree is disposable. Returns (_, false) when none pass, leaving the
 // caller to return the original failed Outcome.
 func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcome, bool) {
-	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate", Detail: map[string]any{"n": o.RaceN}})
 	var cands []route.Candidate
+	if o.multiBackend() {
+		// Multi path: race the DISTINCT configured backends (one fresh worktree per
+		// ordered name) so route.Race competes DIFFERENT backends and the verifier
+		// picks the winner; best-first ordering breaks verifier ties toward the
+		// historically-strongest. The per-candidate race_outcome events now carry
+		// distinct backends — the signal that closes the Trust Ledger loop.
+		names := o.orderBackends(ctx, t)
+		o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate",
+			Detail: map[string]any{"n": len(names), "backends": names}})
+		for i, name := range names {
+			rwt, err := worktree.CreateFrom(ctx, o.BaseRepo,
+				"race/"+t.ID+"-"+strconv.Itoa(i), t.ID+"-race-"+strconv.Itoa(i), "HEAD")
+			if err != nil {
+				continue
+			}
+			defer func() { _ = rwt.Cleanup() }()
+			rt := t
+			rt.Dir = rwt.Path()
+			renv := o.NewEnvFor(rt.Dir, name)
+			cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+		}
+		if len(cands) == 0 {
+			return Outcome{}, false
+		}
+		return o.runRace(ctx, t, cands)
+	}
+
+	// Single path — UNCHANGED, byte-identical: RaceN copies of the one backend.
+	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate", Detail: map[string]any{"n": o.RaceN}})
 	for i := 0; i < o.RaceN; i++ {
 		rwt, err := worktree.CreateFrom(ctx, o.BaseRepo,
 			"race/"+t.ID+"-"+strconv.Itoa(i), t.ID+"-race-"+strconv.Itoa(i), "HEAD")
@@ -298,6 +438,15 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcom
 	if len(cands) == 0 {
 		return Outcome{}, false
 	}
+	return o.runRace(ctx, t, cands)
+}
+
+// runRace is the shared tail of both raceEscalate paths: judge the candidates by
+// the verifier (route.Race — I2), and on a winner record the durable terminal
+// status and write back facts. Both the single (N-copies) and multi (distinct
+// backends) paths feed identical candidates here, so the single path stays
+// byte-identical — only the candidate SET differs between them.
+func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate) (Outcome, bool) {
 	rres, ok := route.Race(ctx, cands, o.Log)
 	if !ok {
 		return Outcome{}, false
