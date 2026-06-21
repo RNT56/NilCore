@@ -126,7 +126,7 @@ type SupervisorFirstRouter struct {
 }
 ```
 
-**One cheap executor-tier classifier call** (JSON-out, ~256 tokens), parsed with the same defensive `firstText`+brace-extraction `route.go:89-96`/`summarize.go:82-85` use, returns `{route, reason}`. The native-vs-feature-vs-project sizing is **reconciled with the existing `agent.ShouldSupervise` heuristic** so the seam already wired into `orchestrator.go:110` stays the single source of that judgment. `RouteChat` answers "what are you working on?" without any loop; `RouteContinue` (the persistence requirement) is detected here when the message references `State.Summary.Goal`.
+**One cheap executor-tier classifier call** (JSON-out, ~256 tokens), parsed with the same defensive `firstText`+brace-extraction `route.go:89-96`/`summarize.go:82-85` use, returns `{route, reason}`. The native-vs-feature-vs-project sizing is **the model classifier's call** — a parseable proposal (sized by the work, not the wording, via a capability+cost manifest: `chat` < `native` < `supervise` < `project`) is **honored as-is**. The `agent.ShouldSupervise` heuristic is now ONLY the **fallback** for unparseable / no-classifier output (see the mitigation below) — it never overrules a proposal the model could parse. `RouteChat` answers "what are you working on?" without any loop; `RouteContinue` (the persistence requirement) is detected here when the message references `State.Summary.Goal`.
 
 **Mitigations adopted (adv #9):**
 - The classifier MUST use the **metered** provider (`s.Meter(s.ID)`), never a raw provider — its spend counts against the conversation ceiling (§6).
