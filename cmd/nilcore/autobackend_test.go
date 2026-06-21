@@ -14,6 +14,15 @@ import (
 	"nilcore/internal/onboard"
 )
 
+// TestMain unsets NILCORE_MODEL so availableBackends' native probe — which now
+// resolves the SAME spec as resolveProvider("native") (modelSpec(NILCORE_MODEL,
+// cfg.Executor)) — is deterministic regardless of the host environment. Tests that
+// need a specific model set it explicitly via t.Setenv.
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("NILCORE_MODEL")
+	os.Exit(m.Run())
+}
+
 // credFor returns a fake SecretStore-backed resolver that yields "present" only for
 // the named env vars (any other lookup ⇒ "", i.e. unavailable). It never touches a
 // real store or the process environment, so availability tests are hermetic.
@@ -95,6 +104,32 @@ func TestAvailableBackendsCLIWithoutKeyExcluded(t *testing.T) {
 	got := availableBackends(nativeCfg(), credFor("ANTHROPIC_API_KEY")) // no CODEX_API_KEY
 	if want := []string{"native", "claude-code"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("availableBackends = %v, want %v", got, want)
+	}
+}
+
+// TestAvailableBackendsNativeViaDefaultModel is the regression for the
+// auto-excludes-usable-native bug: with NO config executor but the default model's
+// provider key present, native is STILL available — availableBackends mirrors
+// resolveProvider("native"), which resolves the built-in default model
+// ("claude-sonnet-4-6" ⇒ anthropic). The old check keyed only off cfg.Executor and
+// wrongly excluded native here.
+func TestAvailableBackendsNativeViaDefaultModel(t *testing.T) {
+	emptyPath(t) // codex/claude absent; NILCORE_MODEL unset by TestMain
+	got := availableBackends(onboard.Config{}, credFor("ANTHROPIC_API_KEY"))
+	if want := []string{"native"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("availableBackends = %v, want %v (default model + key ⇒ native usable)", got, want)
+	}
+}
+
+// TestAvailableBackendsNativeViaEnvModel: a NILCORE_MODEL override (no config
+// executor) plus its provider key ⇒ native available, matching resolveProvider's
+// NILCORE_MODEL-wins spec resolution.
+func TestAvailableBackendsNativeViaEnvModel(t *testing.T) {
+	emptyPath(t)
+	t.Setenv("NILCORE_MODEL", "anthropic:claude-opus-4-8")
+	got := availableBackends(onboard.Config{}, credFor("ANTHROPIC_API_KEY"))
+	if want := []string{"native"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("availableBackends = %v, want %v (NILCORE_MODEL + key ⇒ native usable)", got, want)
 	}
 }
 

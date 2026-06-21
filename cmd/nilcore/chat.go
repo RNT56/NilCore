@@ -505,8 +505,9 @@ func buildChatSession(d chatDeps) (*session.Session, error) {
 // reconciles its classifier proposal against (§3.4). It is a deliberately simple,
 // pure-function judgment over the goal text — long, multi-component goals warrant
 // the supervisor; a short localized ask stays the single native loop. The router
-// uses it both to upgrade/downgrade the classifier and as the no-model fallback on
-// unparseable output, so it must never panic and must be cheap.
+// uses it ONLY as the no-model / unparseable-output fallback (and the optional,
+// default-off ClampDownToNative backstop) — the model classifier's proposal is
+// authoritative — so it must never panic and must be cheap.
 func chatShouldSupervise(goal string) bool {
 	g := strings.ToLower(goal)
 	// A genuinely large surface (many words) or an explicit multi-component verb is

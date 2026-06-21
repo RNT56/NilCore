@@ -606,10 +606,12 @@ var canonicalBackendOrder = []string{"native", "codex", "claude-code"}
 // tool and its credential are present, so the auto selector never picks a backend
 // that would fatal at resolve time:
 //
-//   - native:      a configured executor model spec AND its provider key resolvable
-//     via cred (env-first, then SecretStore). native is the baseline,
-//     but it still needs a model+key — a host with no provider key
-//     configured genuinely has no usable native backend.
+//   - native:      the RESOLVED model spec's provider key resolvable via cred
+//     (env-first, then SecretStore). The spec is modelSpec(NILCORE_MODEL,
+//     cfg.Executor) — exactly what resolveProvider("native") uses — so it
+//     honors the NILCORE_MODEL override and the built-in default model, not
+//     just a configured executor. native is usable iff that resolves; a host
+//     with no provider key genuinely has no usable native backend.
 //   - codex:       the `codex` CLI on PATH AND CODEX_API_KEY resolvable.
 //   - claude-code: the `claude` CLI on PATH AND ANTHROPIC_API_KEY resolvable.
 //
@@ -623,7 +625,13 @@ func availableBackends(cfg onboard.Config, cred func(string) string) []string {
 	for _, name := range canonicalBackendOrder {
 		switch name {
 		case "native":
-			if cfg.Executor != "" && cred(providerEnv(vendorOf(cfg.Executor))) != "" {
+			// Mirror resolveProvider("native") EXACTLY: resolve the same spec it will
+			// (NILCORE_MODEL → cfg.Executor → built-in default) and gate on that spec's
+			// provider key. Otherwise auto would wrongly exclude native on a host that
+			// sets NILCORE_MODEL (or relies on the default model) without a config
+			// executor — a backend `nilcore run` resolves fine.
+			spec := modelSpec(os.Getenv("NILCORE_MODEL"), cfg.Executor)
+			if spec != "" && cred(providerEnv(vendorOf(spec))) != "" {
 				out = append(out, name)
 			}
 		case "codex":
@@ -641,10 +649,14 @@ func availableBackends(cfg onboard.Config, cred func(string) string) []string {
 
 // preferredBackendName resolves the preference that seeds the auto cold-start
 // order: the one-run -prefer-backend flag if set, else the durable
-// config.preferred_backend, else "native". It is validated upstream (registerCommon
-// flag validation + onboard.Validate), so it always names a concrete backend here.
+// config.preferred_backend, else "native". The -prefer-backend flag is validated
+// HERE — the single chokepoint every auto path (run / serve / the
+// buildRunOrchestrator commands) flows through — so a typo fails loudly and
+// uniformly rather than being silently dropped by orderPreferredFirst. The config
+// field is validated by onboard.Validate at load.
 func preferredBackendName(c commonFlags, cfg onboard.Config) string {
 	if p := strings.TrimSpace(*c.preferBackend); p != "" {
+		validateConcreteBackendFlag("-prefer-backend", p)
 		return p
 	}
 	if cfg.PreferredBackend != "" {
@@ -847,10 +859,16 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 	}
 
 	// Resolve the executor (cheap) and strong (advisor) tiers exactly as buildMain
-	// does, so the supervised seam runs the identical stack.
+	// does, so the supervised seam runs the identical stack. The supervised workers
+	// are native, but the seam is an ENHANCEMENT, never required: on a delegated
+	// backend (-backend codex/claude-code) with no native model+key, skip the
+	// scale-up and let the single-task run proceed rather than aborting a working
+	// run mid-flight the moment a goal happens to size complex.
 	exec, err := resolveProvider("native", b)
 	if err != nil {
-		fatal(err)
+		fmt.Fprintf(os.Stderr, "auto-supervise: no native executor available (%v); continuing as a single-task run\n", err)
+		log.Append(eventlog.Event{Kind: "auto_supervise_skipped", Detail: map[string]any{"reason": err.Error()}})
+		return noop
 	}
 	strong := resolveAdvisor("native", b, c).prov
 	if strong == nil {
