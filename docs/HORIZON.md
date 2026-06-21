@@ -1,5 +1,7 @@
 # NilCore — Horizon Scan (Phase 13+ candidates)
 
+> **Shipped since this scan (Phase 13).** The scan's top three picks are now built and merged: **A1 the Trust Ledger** (`internal/trust`, PR #55), **A7 the "why did it do that" trace explorer** (`internal/trace`, `nilcore trace`/`why`, PR #55), and — closing A1's "honest boundary" — **live multi-backend strength-routing** (`-backends native,codex,claude-code` + `trust.Selector` driving the orchestrator, PR #57). The Phase-13 languages batch also widened code intelligence from 4 to **19 languages / 34 extensions** (PR #56). Those items below are marked **✅ SHIPPED**; everything else remains open future work and is unchanged.
+
 A grounded scan for genuinely NEW upgrades that reinforce NilCore's unique edge — **verifier-owned trust, a small self-hostable harness** — and are NOT already in any roadmap (`docs/TASKS.md` Phases 0–12 / D1–D4 / R1–R3 are SHIPPED; `EXT-01..08` are planned-but-gated; `UPGRADE-PATH` Tiers 1–2 shipped as P9/P10, Tier 3 gated).
 
 Thesis anchors (`docs/PRINCIPLES.md`): (1) the feedback loop is the product; (2) the harness wins, borrow the intelligence; (3) context is scarce; (9) **earn improvement from evidence**; (10) safety enables autonomy.
@@ -22,7 +24,9 @@ Ideas were generated across six lenses, deduped, then ranked by **leverage × th
 
 ## BUCKET A — Thesis-aligned, do-now/next (ranked)
 
-### ⭐ A1. The Trust Ledger — close the evidence→routing loop (THE TOP PICK)
+### ⭐ A1. The Trust Ledger — close the evidence→routing loop (THE TOP PICK) — ✅ SHIPPED (Phase 13)
+
+> **✅ Shipped (PR #55 + PR #57).** `internal/trust` now replays the `race_outcome` events + an `eval.Report` into a per-backend / per-config **verifier-judged** scoreboard ranked by a smoothed rule-of-succession pass-rate (so a 1-of-1 "lucky" never outranks a 90-of-100 "proven"), and **refuses to score over a broken hash chain**. `nilcore trust` surfaces it. The seam shipped ready in PR #55 but dormant; **PR #57 wired it live**: `trust.Selector` now drives `agent.Orchestrator.{Backends, NewEnvFor, Selector}` so `-backends native,codex,claude-code` competes *different* backends, the historically-strongest tried first and a race of the distinct backends on a verify-fail — the routing package's own doc-comment promise, finally kept. **I2 holds**: the Selector only ORDERS; the verifier still judges every race and is the final gate. This realized A1, A6 (the cost dimension rides the same ledger), and closed the "honest boundary" below.
 
 **One-paragraph spec.** A new leaf `internal/trust` reads back the `race_outcome` events already in the append-only log (`internal/route/route.go:61`) and the eval harness's `Report` (`eval/eval.go:29`) and folds them into a small, durable, per-`(task-class, backend, model, tier)` scoreboard: pass-rate, median cost, median latency, sample count, last-seen. `route.Race` and the `RaceN` ladder consult it to **order and prune candidates** — race the historically-strongest-per-dollar backend first, drop a candidate that has lost N contests on this task-class — instead of firing an identical fixed fan every time. Crucially this is **earned, not assumed**: the ledger is built *only* from verifier verdicts (I2 is the sole truth-source), it can never auto-approve or skip verification, and a cold/low-confidence cell falls back to today's static behavior. It is the literal fulfilment of the routing package's own doc-comment promise.
 
@@ -82,7 +86,9 @@ Ideas were generated across six lenses, deduped, then ranked by **leverage × th
 
 ---
 
-### A7. "Why did it do that" — a trace explorer over the event log
+### A7. "Why did it do that" — a trace explorer over the event log — ✅ SHIPPED (Phase 13)
+
+> **✅ Shipped (PR #55).** `internal/trace` reconstructs a causal, navigable tree from the hash-chained log (groups `model_call`→`tool_exec`, clusters `race_outcome`, links a `verify` failure to the `advisor`/re-plan it caused), projects **metadata only** (I7 — no raw model/tool body renders), and marks every node **untrusted** over a tampered chain. Surfaced as `nilcore trace <task>` / `nilcore why <task>` (a `//go:build tui` explorer links zero Charm by default).
 
 **One-paragraph spec.** A new `nilcore trace <task-id>` subcommand (and a `report --format=trace`) that replays the hash-chained event log (`internal/eventlog`) into a **causal, collapsible walk**: goal → plan → each model_call → tool_exec → verify → gate → race_outcome → requeue, with parent/child threading for subagents and the per-claim verdict trail. It reuses the read-only replay discipline already in `internal/report` (`report.ReplayReport`, `report.go:185`) and refuses to render a clean trace over a broken chain (the report layer already enforces `FinalPass = ChainVerified AND …`, `report.go:257`).
 
@@ -111,12 +117,21 @@ Ideas were generated across six lenses, deduped, then ranked by **leverage × th
 
 ---
 
+### ⭐ A13. End-to-end browser agency — Phase 14 (full design: [`docs/ROADMAP-BROWSER-USE.md`](ROADMAP-BROWSER-USE.md))
+
+**One-paragraph spec.** Promote the one-shot `browser_view` behavioral seam (D1/R3 — `internal/tools/browser.go` launches Chromium, runs a fixed flow, captures one observation, exits) into a full **observe → plan → act → verify** browser agent the model drives over many turns against a **persistent, in-sandbox** session. The decisive upgrade is **accessibility-tree "set-of-marks" perception** (numbered, version-stamped element refs over the existing pure-Go `internal/cdp` client — **20–50× cheaper than screenshots**, deterministic element identity, no coordinate math), plus a rich, reliable action set (scroll/tabs/history/select/upload/download/wait-for/extract), a bounded loop (`internal/browseragent`: step/failure budgets, stagnation detection, single-snapshot retention), and **structural injection containment** (Rule-of-Two `internal/capguard` + plan-then-verify control-flow integrity + `{{secret}}` host-side substitution + per-task egress allowlist). A browse run that extracts data emits the **same verifier-gated `artifact.Artifact`** the Phase-11 spine already trusts — so it ships only because every claim re-derived in-box (I2).
+
+**Why high-leverage & thesis-aligned (Bucket A, do-now).** It is the *correct first GUI modality* for a zero-dependency, security-first Go agent: stdlib-only (extends `internal/cdp`, **no module — I6**), stays inside the sandbox + default-deny egress (I4), keeps page content as untrusted data (I7), and the verifier still governs (I2). It reuses the artifact/evverify/requeue/report/egressprofile/policy seams wholesale — additive, opt-in (`NILCORE_BROWSER_AGENT`), byte-identical when off. The 2025–26 field (browser-use, Stagehand v3, Skyvern) converged on exactly this CDP+a11y design, and NilCore is *already* raw-CDP + pure-Go — a structural head start. **15 tasks across 6 waves, ~3-worker parallelizable.**
+
+---
+
 ## BUCKET B — Gated / EXT-like (valuable, but cross the gate)
 
 - **B1. Multi-repo / cross-repo workspaces.** A verified swarm over N repos (a service + its client + its infra). Crosses the single-worktree / single-host boundary toward EXT-01's control plane; the per-repo verify is fine, the cross-repo task-state and dispatch are the gated jump.
 - **B2. Live TUI dashboard for `serve`/`swarm`.** The board already emits `scoreboard_snapshot` with a `//go:build tui` Charm dashboard scaffold (`internal/swarm/board`). A full operability dashboard (fleet view, per-shard drill-down) is borderline — the *single-host* version is arguably Bucket A, but anything aimed at fleet/multi-tenant operability belongs with EXT-05's dashboards. Ship the single-host board lens (A7-adjacent), gate the fleet console.
 - **B3. SLSA build provenance + signed release binaries.** Genuine supply-chain hardening (provenance attestation, cosign/sigstore-style signing). High value, but signing infra + a key-distribution story leans toward EXT-06 (centralized secret distribution) and a release pipeline that is external infra. The *reproducible-build* half (below, C-adjacent) is self-hostable; the signing/attestation half is gated.
 - **B4. Distributed trust ledger across hosts.** A1 federated so a fleet shares earned routing weights — directly EXT-01/EXT-05 territory (cross-host state).
+- **B5. Desktop computer use — gated tier `CU-T##` (full design: [`docs/ROADMAP-COMPUTER-USE.md`](ROADMAP-COMPUTER-USE.md)).** Full desktop/OS GUI control — screenshot in, mouse/keyboard out — over a **contained virtual desktop** (Xvfb + WM + apps *inside* the sandbox, never the host screen; Anthropic's `computer-use-demo` / E2B-Desktop pattern). It is **buildable without weakening any invariant** (the desktop lives in the sandbox I4, secrets stay host-side I3, the verifier governs I2, every action logged I5), and shares the loop discipline with A13 — but it is **gated like the EXT tier** because (1) it expands NilCore's identity from "coding/research harness" to "general computer operator" (a recorded human thesis decision, `CU-T00`), (2) its safe isolation tier is the microVM `EXT-08`, and (3) raw-screenshot-coordinate perception is **strictly worse** than A13's accessibility tree for NilCore's work (<2% generalist grounding on ScreenSpot-Pro, coordinate-rescale failure surface). **Build A13 first; this stays fully-blueprinted-but-unbuilt behind its §0 gate.** Depends on `EXT-08` for the strong-assurance form.
 
 ---
 
@@ -136,11 +151,11 @@ Ideas were generated across six lenses, deduped, then ranked by **leverage × th
 
 | Rank | Idea | Bucket | One-line |
 |------|------|--------|----------|
-| 1 | **A1 Trust Ledger** | A | Read back the already-logged `race_outcome`/eval data to earn routing — fulfills the routing package's own unkept promise. |
+| 1 | **A1 Trust Ledger** ✅ SHIPPED (P13) | A | Read back the already-logged `race_outcome`/eval data to earn routing — now LIVE via `-backends` + `trust.Selector` (PRs #55/#57); fulfills the routing package's own once-unkept promise. |
 | 2 | A2 Cross-model adversarial verify-pack | A | A second, independent model must fail to refute a claim before it goes green. |
 | 3 | A3 Mutation/property/fuzz verify-packs | A | Attack green-but-vacuous test suites with mutation/property/fuzz checks re-run in-box. |
 | 4 | A5 Incremental test-impact verification | A | Wire the dark `codeintel/impact` to run affected tests first; full suite still the gate. |
-| 5 | A7 "Why did it do that" trace explorer | A | A causal, collapsible replay of the hash-chained log; refuses a clean trace over a broken chain. |
+| 5 | A7 "Why did it do that" trace explorer ✅ SHIPPED (P13) | A | A causal, collapsible replay of the hash-chained log; refuses a clean trace over a broken chain (`nilcore trace`/`why`, PR #55). |
 | 6 | A4 Differential-test verify-pack | A | Re-run change vs reference over a corpus; assert behavioral equivalence (refactor/migration oracle). |
 | 7 | A6 Eval-driven cost/latency routing | A | Route down to the cheapest tier that clears a confidence bar; verifier still governs done. |
 | 8 | A8 Memory that compounds verification lessons | A | Distill recurring verifier-failure patterns into durable memory data the next task pre-empts. |
@@ -149,6 +164,8 @@ Ideas were generated across six lenses, deduped, then ranked by **leverage × th
 
 ---
 
-## THE SINGLE HIGHEST-LEVERAGE NEXT MOVE
+## THE SINGLE HIGHEST-LEVERAGE NEXT MOVE — ✅ DONE (Phase 13)
 
-**Build A1 — the Trust Ledger.** A new stdlib leaf `internal/trust` that folds the `race_outcome` events already written at `internal/route/route.go:61` and the eval harness's `Report` (`eval/eval.go:29`) into a durable per-`(task-class, backend, model, tier)` scoreboard of verifier-judged pass-rate/cost/latency, and feeds it back into `route.Race`/`RaceN` candidate ordering via a nil-gated `TrustOracle` (nil ⇒ byte-identical). It is the highest-leverage move because the substrate already exists and is wasted, it fulfills the routing package's own documented-but-unkept promise, it activates the top-ranked principle the codebase currently violates (#9, earn improvement from evidence), and it is the keystone every other routing/cost idea (A6, C1, C6) builds on — all while the verifier (I2) remains the sole authority on "done," so it can only make NilCore faster and cheaper, never less trustworthy.
+**A1 — the Trust Ledger — is built and live (PRs #55/#57).** The stdlib leaf `internal/trust` now folds the `race_outcome` events and the eval harness's `Report` into a durable verifier-judged scoreboard, and `trust.Selector` feeds it back into the orchestrator's backend ordering (`Backends`/`NewEnvFor`/`Selector`) — activated by `-backends native,codex,claude-code` and the race ladder on a verify-fail. It fulfilled the routing package's documented-but-unkept promise, activated principle #9 (earn improvement from evidence), and is the keystone every other routing/cost idea (A6, C1, C6) builds on — all while the verifier (I2) remains the sole authority on "done."
+
+**The next highest-leverage move** is now **A2 — cross-model adversarial verification as a verify-pack** (a second, independent model must fail to refute a claim before it goes green), with **A5 — incremental test-impact verification** (wire the still-dark `codeintel/impact`) close behind. Both extend the verifier-owned edge the same way the ledger extended routing, and neither crosses the external-infra gate.
