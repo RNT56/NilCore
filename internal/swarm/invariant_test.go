@@ -47,11 +47,10 @@ func TestNewShipGateRefusesPass(t *testing.T) {
 // nil value, not the whole type.
 func TestNewShipGateRefusesTypedNil(t *testing.T) {
 	var typedNil *ptrVerifier // nil pointer
-	// Sanity: as an interface it is NOT == nil (the typed-nil trap the old guard missed).
+	// As an interface this is NOT == nil — the typed-nil trap the old `v == nil` guard
+	// missed: the underlying pointer is nil yet the interface value is non-nil, so the
+	// gate must look deeper than a plain nil comparison (which is why it uses reflection).
 	var asIface verify.Verifier = typedNil
-	if asIface == nil {
-		t.Fatal("precondition: a typed-nil should be non-nil at the interface level")
-	}
 	if _, err := NewShipGate(asIface); !errors.Is(err, ErrNoShipVerifier) {
 		t.Fatalf("NewShipGate(typed-nil) err = %v, want ErrNoShipVerifier (must not let a panicking verifier ship)", err)
 	}

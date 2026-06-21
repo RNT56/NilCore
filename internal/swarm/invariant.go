@@ -77,7 +77,7 @@ func NewShipGate(v verify.Verifier) (ShipGate, error) {
 func isTypedNil(v verify.Verifier) bool {
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
-	case reflect.Ptr, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice, reflect.UnsafePointer, reflect.Interface:
+	case reflect.Pointer, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice, reflect.UnsafePointer, reflect.Interface:
 		return rv.IsNil()
 	default:
 		return false
