@@ -150,7 +150,7 @@ func (l *Ledger) Snapshot() Snapshot {
 //	score = (Wins + alpha) / (Races + 2*alpha)
 //
 // This pulls thin-evidence backends toward 0.5 and lets evidence overcome the
-// prior as races accumulate, so a 1-of-1 backend (score ≈ 0.625 at alpha=1) does
+// prior as races accumulate, so a 1-of-1 backend (score ≈ 0.667 at alpha=1) does
 // NOT outrank a 90-of-100 one (score ≈ 0.892). We chose Laplace over Wilson for
 // its single legible knob and stdlib-only arithmetic; alpha=1 is the classic
 // rule-of-succession choice and is strong enough that a single lucky sample never
