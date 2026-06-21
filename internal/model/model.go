@@ -62,6 +62,11 @@ type Tool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	// Builtin, when non-nil, marks this as a provider built-in tool (Anthropic's
+	// `computer` beta tool, Path A — CU-T12). The Anthropic provider serializes the
+	// typed shape + sets the beta header; other providers ignore it. nil in every
+	// existing path ⇒ a normal tool, serialized byte-identically (see builtin.go).
+	Builtin *BuiltinTool `json:"-"`
 }
 
 // Response is the model's reply: the content blocks, why it stopped, and usage.

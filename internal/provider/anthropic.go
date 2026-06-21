@@ -73,6 +73,14 @@ func (a *Anthropic) newRequest(ctx context.Context, system string, msgs []model.
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("x-api-key", a.key)
+	// Path A (CU-T12): a built-in tool (Anthropic's `computer` beta) requires its beta
+	// header. Set it when present; absent in every default path ⇒ byte-identical.
+	for _, t := range tools {
+		if h := t.BetaHeader(); h != "" {
+			req.Header.Set("anthropic-beta", h)
+			break
+		}
+	}
 	return req, nil
 }
 

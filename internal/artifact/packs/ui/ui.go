@@ -58,6 +58,7 @@ func RegisterAll(r *evverify.Registry) {
 	r.Register("ui.flow_passes", checkFlowPasses)
 	r.Register("ui.no_console_errors", checkNoConsoleErrors)
 	r.Register("ui.screenshot_captured", checkScreenshotCaptured)
+	r.Register("ui.value_present", checkValuePresent)
 }
 
 // Hosts is the documented egress host-set this pack reaches. A UI flow targets the
@@ -176,6 +177,39 @@ func checkFlowPasses(ctx context.Context, box sandbox.Sandbox, c artifact.Claim)
 	// The flow ran but the expected substring was not observed: the asserted outcome
 	// is false ⇒ Fail (re-derive), distinct from a driver failure (Unverifiable).
 	return artifact.StatusFail, "expected substring not present after flow"
+}
+
+// checkValuePresent is the EXTRACTION verifier-id (Phase 14): the browse agent
+// recorded "I extracted Value from SourceURL"; this re-navigates to SourceURL
+// INDEPENDENTLY (a fresh in-box driver run, never trusting the live session) and
+// asserts the extracted Value substring is actually present in the page's title or
+// text. A present value ⇒ Pass; absent after a successful render ⇒ Fail (re-derive);
+// a driver failure / empty value / no source ⇒ Unverifiable (never a vacuous Pass).
+// This closes the I2 loop for browse extraction: a finding ships GREEN only because
+// the harness re-derived it from the source, not because the agent reported it.
+func checkValuePresent(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) (artifact.Status, string) {
+	want := strings.TrimSpace(c.Evidence.Value)
+	if want == "" {
+		return artifact.StatusUnverifiable, "empty value: nothing to confirm at the source"
+	}
+	// Navigate to SourceURL directly (batch mode) — here Value is the extracted DATUM,
+	// not flow actions, so we do NOT route it through navArgTail (which would mis-treat
+	// it as an actions payload). A missing/invalid source ⇒ Unverifiable.
+	urlArg, err := flowURLArg(c.Evidence.SourceURL)
+	if err != nil {
+		return artifact.StatusUnverifiable, clip(err.Error())
+	}
+	if urlArg == "" {
+		return artifact.StatusUnverifiable, "no source_url to re-derive the value from"
+	}
+	obs, st, d, ok := drive(ctx, box, strings.TrimSpace(urlArg))
+	if !ok {
+		return st, d
+	}
+	if substringPresent(obs, want) {
+		return artifact.StatusPass, "value present at source"
+	}
+	return artifact.StatusFail, "extracted value not present at source on re-derivation"
 }
 
 // checkNoConsoleErrors navigates to the claim's SourceURL (or replays its flow when

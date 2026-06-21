@@ -198,12 +198,46 @@ nilcore swarm -goal "research 100 EV companies" -preset research \
 #   steering file (trusted, scoped below the safety core) gives the agent project marching orders.
 ```
 
-**Other commands** (`nilcore help` lists them all): `nilcore doctor` checks whether a host is ready to run/serve (keys resolve, runtime on PATH, serve allowlist) and exits non-zero when not — usable as a CI health gate; `nilcore inspect [health]` replays the append-only event log into a summary (events by kind, tasks, chain verified) or probes its health as a liveness gate; `nilcore trace <task>` (alias `nilcore why <task>`) reconstructs the **causal "why did it do that"** tree from the log — read-only, metadata-only, and marks the trace untrusted over a broken chain; `nilcore trust` shows the **Trust Ledger** scoreboard — each backend's verifier-judged race pass-rate (and per-model pass-rate/cost from a folded eval report), so strength is *earned from evidence*, never asserted — and with multiple backends configured (`-backends`) it drives live routing: the strongest is tried first and a verify-fail races them all, the verifier picking the winner (never the ledger); `nilcore watch` self-starts tasks from dropped signal files — reversible work auto-runs, anything irreversible routes to the human gate (add `--open-pr` to open a **gated draft PR** once approved); `nilcore schedule` self-starts on a cron/interval (same `--open-pr` gate); `nilcore registry list|install <manifest.json>` manages versioned local skills + MCP server specs (remote fetch stays gated as external infra); `nilcore propose-edit -goal … -paths …` is the gated self-edit flow (the agent may change its own prompts/skills/tools, never the core or contracts — scope-checked, verified, human-gated); `nilcore config show` prints the active, secret-free config; `nilcore secret set <name>` stores or rotates one credential; `nilcore version` reports the build.
+### Other commands
 
-**Capability plug-ins.** Drop a `SKILL.md` (frontmatter + instructions) under `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) and it surfaces to the loop as a `skill_<name>` tool — unused skills cost ~zero context. Configure MCP servers in `mcp.json` (`{name, command}`) and `nilcore` generates typed wrappers under `mcp/servers/` that the executor discovers on demand and invokes via `nilcore mcp-call`. Point `NILCORE_LSP_COMMAND` at a language server (e.g. `gopls`) for compiler-grade "precise" retrieval, and `NILCORE_LIVE_INDEX=1` for a worktree-aware, incrementally-updated `live` code-intelligence tool. All of these are opt-in; the default binary stays dependency-light and the loop byte-identical when they are absent.
+`nilcore help` lists them all. Each is one focused verb over the same audited core:
 
-**Model selection** is `provider:model` via `NILCORE_MODEL` (default `claude-sonnet-4-6`; a bare name → Anthropic, e.g. `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`). Selecting the OpenRouter provider with no model — `openrouter` or `openrouter:` — defaults to **`openrouter/fusion`**, OpenRouter's multi-model panel that fuses several frontier models into one answer (it bills the cumulative cost of the panel).
-**Every step** is appended to a hash‑chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Plaintext secrets never hit disk, logs, or prompts; on a headless host they are sealed in an encrypted-file vault (AES‑256‑GCM, owner‑only key).
+| Command | What it does |
+|---|---|
+| `nilcore doctor` | **Host-readiness gate** — keys resolve, runtime on PATH, serve allowlist sane. Exits non-zero when not ready, so it doubles as a CI health check. |
+| `nilcore inspect [health]` | Replays the append-only event log into a summary (events by kind, tasks, chain verified); `health` probes it as a liveness gate. |
+| `nilcore trace <task>` &nbsp;(alias `why`) | Reconstructs the causal **"why did it do that"** tree from the log — read-only, metadata-only; marks the trace *untrusted* over a broken hash chain. |
+| `nilcore trust` | The **Trust Ledger** scoreboard — each backend's verifier-judged race pass-rate (plus per-model pass-rate/cost from a folded eval report). Strength is *earned from evidence*, never asserted. With `-backends`, it drives live routing: the strongest is tried first; a verify-fail **races them all** and the **verifier** picks the winner (never the ledger). |
+| `nilcore watch` | Self-starts tasks from dropped signal files — reversible work auto-runs, anything irreversible routes to the **human gate** (`--open-pr` opens a gated draft PR once approved). |
+| `nilcore schedule` | Same as `watch`, but self-starts on a cron/interval (same `--open-pr` gate). |
+| `nilcore browse -goal …` | Drives a **persistent, in-sandbox browser** (observe → plan → act → verify); recorded findings are re-verified in-box before they ship. |
+| `nilcore desktop -goal …` | Drives a **contained virtual desktop** via the Set-of-Marks ladder; `--mac-host` (doubly gated) drives a real Mac. |
+| `nilcore registry list\|install <manifest.json>` | Manages versioned local skills + MCP server specs (remote fetch stays gated as external infra). |
+| `nilcore propose-edit -goal … -paths …` | The gated **self-edit** flow — the agent may change its own prompts/skills/tools, *never* the core or contracts (scope-checked, verified, human-gated). |
+| `nilcore config show` | Prints the active, **secret-free** config. |
+| `nilcore secret set <name>` | Stores or rotates one credential (into the SecretStore — never disk/log/prompt). |
+| `nilcore version` | Reports the build. |
+
+### Capability plug-ins
+
+All opt-in — the default binary stays dependency-light and the loop is **byte-identical when they're absent**:
+
+| Plug-in | Turn it on with | What you get |
+|---|---|---|
+| **Skills** | A `SKILL.md` (frontmatter + instructions) in `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) | Surfaces to the loop as a `skill_<name>` tool; unused skills cost **~zero context**. |
+| **MCP servers** | `{name, command}` entries in `mcp.json` | `nilcore` generates typed wrappers under `mcp/servers/`; the executor discovers them on demand and invokes via `nilcore mcp-call`. |
+| **LSP retrieval** | `NILCORE_LSP_COMMAND=gopls` (or any language server) | Compiler-grade **"precise"** retrieval. |
+| **Live index** | `NILCORE_LIVE_INDEX=1` | A worktree-aware, incrementally-updated `live` code-intelligence tool. |
+
+### Model selection
+
+Set `NILCORE_MODEL=provider:model` (default `claude-sonnet-4-6`):
+
+- **Bare name → Anthropic** — e.g. `claude-sonnet-4-6`.
+- **Other providers** — `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`.
+- **OpenRouter fusion** — `openrouter` or `openrouter:` with no model defaults to **`openrouter/fusion`**, a multi-model panel that fuses several frontier models into one answer (it bills the panel's *cumulative* cost).
+
+**Every step** is appended to a hash-chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Plaintext secrets never hit disk, logs, or prompts; on a headless host they are sealed in an encrypted-file vault (AES-256-GCM, owner-only key).
 
 ---
 

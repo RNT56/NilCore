@@ -72,7 +72,7 @@ func TestPresets(t *testing.T) {
 // TestNames asserts the closed, sorted set.
 func TestNames(t *testing.T) {
 	got := Names()
-	want := []string{"docs", "finance", "web-research"}
+	want := []string{"browse", "docs", "finance", "web-research"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
 	}

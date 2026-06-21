@@ -56,7 +56,7 @@ func TestUIPack(t *testing.T) {
 			}
 		}
 		RegisterAll(r)
-		for _, id := range []string{"ui.flow_passes", "ui.no_console_errors", "ui.screenshot_captured"} {
+		for _, id := range []string{"ui.flow_passes", "ui.no_console_errors", "ui.screenshot_captured", "ui.value_present"} {
 			if _, ok := r.Lookup(id); !ok {
 				t.Fatalf("id %q absent after RegisterAll", id)
 			}
@@ -286,4 +286,62 @@ func TestUIPackRegisteredCheckRuns(t *testing.T) {
 			t.Fatalf("id %q PASSed against an unreachable driver — always-pass verifier", id)
 		}
 	}
+}
+
+// TestUIValuePresent covers the Phase-14 extraction verifier: navigate to the
+// source and confirm the extracted value re-derives (Pass), is absent (Fail), or
+// cannot be checked (Unverifiable) — the I2 loop for browse findings.
+func TestUIValuePresent(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("value present at source => Pass", func(t *testing.T) {
+		box := okBox(`{"title":"Releases","text":"latest is v1.4.2 stable"}`)
+		st, _ := checkValuePresent(ctx, box, claim(artifact.Evidence{
+			Value: "v1.4.2", SourceURL: "https://example.com/releases"}))
+		if st != artifact.StatusPass {
+			t.Fatalf("status = %q, want pass", st)
+		}
+		if !strings.Contains(box.lastCmd, "--url") {
+			t.Fatalf("expected a navigate (--url) driver call, got %q", box.lastCmd)
+		}
+	})
+
+	t.Run("value absent at source => Fail", func(t *testing.T) {
+		box := okBox(`{"title":"Releases","text":"latest is v1.4.2"}`)
+		st, _ := checkValuePresent(ctx, box, claim(artifact.Evidence{
+			Value: "v9.9.9", SourceURL: "https://example.com/releases"}))
+		if st != artifact.StatusFail {
+			t.Fatalf("status = %q, want fail (value not on page)", st)
+		}
+	})
+
+	t.Run("empty value => Unverifiable", func(t *testing.T) {
+		box := okBox(`{"text":"anything"}`)
+		st, _ := checkValuePresent(ctx, box, claim(artifact.Evidence{
+			Value: "", SourceURL: "https://example.com/"}))
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("status = %q, want unverifiable (no value to confirm)", st)
+		}
+	})
+
+	t.Run("no source_url => Unverifiable", func(t *testing.T) {
+		box := okBox(`{"text":"anything"}`)
+		st, _ := checkValuePresent(ctx, box, claim(artifact.Evidence{Value: "x"}))
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("status = %q, want unverifiable (no source)", st)
+		}
+	})
+
+	t.Run("driver failure => Unverifiable", func(t *testing.T) {
+		box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+			return sandbox.Result{ExitCode: 1, Stderr: "host denied"}, nil
+		}}
+		st, _ := checkValuePresent(ctx, box, claim(artifact.Evidence{
+			Value: "x", SourceURL: "https://blocked.example.com/"}))
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("status = %q, want unverifiable (driver failed)", st)
+		}
+	})
+
+	_ = errors.New // keep the errors import used by the existing file
 }

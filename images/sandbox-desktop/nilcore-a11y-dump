@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+# nilcore-a11y-dump — the AT-SPI set-of-marks source for the nilcore-desktop driver
+# (CU-T05, Rung 1). It walks the live accessibility tree via pyatspi and prints a
+# compact JSON array of the INTERACTIVE, on-screen widgets — the Go driver shells
+# to this and parses its stdout (exactly as nilcore-browser parses chromium's).
+#
+# WHY a script, not a Go D-Bus client: keeping the a11y dependency as an image-baked
+# Python tool (pyatspi) — never the Go core's go.mod — mirrors the chromium pattern
+# and keeps the Go core stdlib-only / CGO-free (I6). The Go side stays a thin,
+# unit-testable JSON parser.
+#
+# Output contract (the Go driver depends on this shape; see desktopwire.Ref):
+#   [{"role": "...", "name": "...", "value": "...",
+#     "box": {"x": int, "y": int, "w": int, "h": int},
+#     "actions": ["click", ...]}, ...]
+#
+# Discipline (token control, CU-T05): only nodes that are SHOWING && SENSITIVE and
+# whose role is interactive are emitted, and the list is capped — raw trees are ~5x
+# too verbose. Every string is UNTRUSTED screen data the Go side fences (I7).
+import json
+import sys
+
+MAX_NODES = 200
+
+# Interactive roles worth a numbered ref. Names match pyatspi role name strings.
+INTERACTIVE = {
+    "push button", "toggle button", "radio button", "check box", "menu item",
+    "check menu item", "radio menu item", "link", "text", "entry", "password text",
+    "combo box", "list item", "tab", "page tab", "slider", "spin button", "icon",
+    "tree item", "table cell", "menu", "button",
+}
+
+
+def main():
+    try:
+        import pyatspi
+    except Exception as e:  # pyatspi missing / no a11y bus → empty tree, fail soft
+        sys.stderr.write("nilcore-a11y-dump: pyatspi unavailable: %s\n" % e)
+        print("[]")
+        return 0
+
+    out = []
+
+    def visit(node):
+        if len(out) >= MAX_NODES:
+            return
+        try:
+            role = node.getRoleName()
+            states = node.getState()
+            showing = states.contains(pyatspi.STATE_SHOWING)
+            sensitive = states.contains(pyatspi.STATE_SENSITIVE)
+            if role in INTERACTIVE and showing and sensitive:
+                comp = node.queryComponent() if node.get_interfaces and True else None
+                try:
+                    ext = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    box = {"x": int(ext.x), "y": int(ext.y), "w": int(ext.width), "h": int(ext.height)}
+                except Exception:
+                    box = {"x": 0, "y": 0, "w": 0, "h": 0}
+                if box["w"] > 0 and box["h"] > 0:
+                    actions = []
+                    try:
+                        act = node.queryAction()
+                        actions = [act.getName(i) for i in range(act.nActions)]
+                    except Exception:
+                        actions = []
+                    value = ""
+                    try:
+                        value = str(node.queryText().getText(0, -1))[:200]
+                    except Exception:
+                        value = ""
+                    out.append({
+                        "role": role,
+                        "name": (node.name or "")[:200],
+                        "value": value,
+                        "box": box,
+                        "actions": actions,
+                    })
+        except Exception:
+            pass
+        try:
+            for child in node:
+                if len(out) >= MAX_NODES:
+                    break
+                visit(child)
+        except Exception:
+            pass
+
+    try:
+        desktop = pyatspi.Registry.getDesktop(0)
+        for app in desktop:
+            if len(out) >= MAX_NODES:
+                break
+            visit(app)
+    except Exception as e:
+        sys.stderr.write("nilcore-a11y-dump: walk failed: %s\n" % e)
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
