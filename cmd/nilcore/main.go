@@ -486,6 +486,7 @@ func secretMain(args []string) {
 type commonFlags struct {
 	dir, backendName, backends, runtime, image, checkCmd, logPath, config, sandboxPref *string
 	maxSteps, advisorMaxCalls, escalateAfter, raceN                                    *int
+	autoSupervise                                                                      *bool
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
@@ -509,6 +510,7 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		advisorMaxCalls: fs.Int("advisor-max-calls", 4, "per-task ceiling on advisor escalations (native backend)"),
 		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
 		raceN:           fs.Int("race-n", 1, "on a verify failure, race N parallel attempts and keep a verifier-green one (1 = off; adaptive — only fires after the single attempt fails)"),
+		autoSupervise:   fs.Bool("auto-supervise", false, "let a complex goal opportunistically scale up to the supervised project loop (bounded by the same caps as `nilcore build`); off = single-task, byte-identical"),
 	}
 }
 
@@ -585,6 +587,11 @@ func runMain(args []string) {
 	// Phase 13: when -backends names two or more backends, activate strength-routing
 	// (Backends/NewEnvFor/Selector). EMPTY/single ⇒ no-op (byte-identical single path).
 	wireMultiBackend(orch, c, b, log, mem, absDir)
+	// Phase 13: when -auto-supervise is set, wire the optional supervised seam so a
+	// complex goal opportunistically scales up to the bounded project loop. DEFAULT
+	// OFF ⇒ Project/ShouldSupervise stay nil ⇒ Execute is byte-identical single-task.
+	cleanup := wireAutoSupervise(orch, c, b, prov, log, *goal)
+	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
@@ -597,6 +604,116 @@ func runMain(args []string) {
 	if !out.Verified {
 		fmt.Printf("\nchecks did not pass:\n%s\n", out.Detail)
 		os.Exit(1)
+	}
+}
+
+// wireAutoSupervise is the optional `-auto-supervise` seam for `nilcore run`: when
+// the flag is set, it builds the SAME bounded project loop `nilcore build`
+// constructs (the build caps verbatim — max-iterations 12, max-fanout 8, max-agents
+// 64, max-depth 1, concurrency 1, budget 25, max-steps 80) and wires it onto the
+// orchestrator's Project/ShouldSupervise seam, so a goal the model sizes "big
+// enough to decompose" opportunistically scales up to the supervised fan-out
+// instead of running as a single task. It adds NO new authority: the supervisor
+// caps, the budget wall, and the verifier (I2) are the build path's rails verbatim;
+// the single human promote still gates the only irreversible step.
+//
+// When -auto-supervise is FALSE (the default) it is a no-op — Project/ShouldSupervise
+// stay nil, so Execute is byte-identical to today's single-task run. It returns a
+// cleanup func the caller defers (a no-op when off, the build stack's read-worktree
+// teardown when on).
+//
+// The ShouldSupervise trigger is MODEL-DRIVEN when a native model.Provider is
+// available (prov != nil): it reuses the session classifier (the same router Part 1
+// made authoritative) so run's sizing is consistent with chat/serve — the model
+// proposes, and a supervise/project proposal triggers the scale-up. With no provider
+// (a delegated codex/claude-code backend) or on a classifier error it falls back to
+// the cheap chatShouldSupervise heuristic, so the capability is gained either way.
+func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.Provider, log *eventlog.Log, goal string) func() {
+	noop := func() {}
+	if c.autoSupervise == nil || !*c.autoSupervise {
+		return noop // default off: byte-identical single-task run
+	}
+
+	// Size the goal ONCE, up front (model-driven when possible), so the potentially
+	// expensive stack — incl. a greenfield bootstrap — is only constructed when the
+	// goal actually warrants the scale-up. A simple goal stays the single-task path
+	// with no stack built. This mirrors the orchestrator's "ShouldSupervise gates the
+	// Project loop" contract: here the gate is evaluated before construction.
+	if !autoSuperviseTrigger(prov, log)(goal) {
+		return noop // sized simple: single-task run (Project/ShouldSupervise stay nil)
+	}
+
+	// Resolve the executor (cheap) and strong (advisor) tiers exactly as buildMain
+	// does, so the supervised seam runs the identical stack.
+	exec, err := resolveProvider("native", b)
+	if err != nil {
+		fatal(err)
+	}
+	strong := resolveAdvisor("native", b, c).prov
+	if strong == nil {
+		strong = exec // no advisor configured: reuse the executor as the strong tier
+	}
+
+	// The build caps VERBATIM (the same construction `nilcore build` uses), so the
+	// scaled-up run is bounded identically — no new rails.
+	stack, err := buildStack(buildDeps{
+		goal:        goal, // the project loop bakes this goal; matches the chat supervised path
+		dir:         o.BaseRepo,
+		runtime:     *c.runtime,
+		image:       *c.image,
+		sandboxPref: *c.sandboxPref,
+		verify:      *c.checkCmd,
+		maxIter:     12,
+		maxFan:      8,
+		maxAgent:    64,
+		maxDepth:    1,
+		concurrency: 1,
+		maxSteps:    80,
+		budget:      25.00,
+		executor:    exec,
+		strong:      strong,
+		log:         log,
+		approver:    policy.NewConsoleApprover(os.Stdin, os.Stdout),
+	})
+	if err != nil {
+		fatal(err)
+	}
+
+	o.Project = stack.loop
+	// The goal was already sized supervise above; the orchestrator re-checks
+	// ShouldSupervise(t.Goal) before running the loop, so hand it a constant-true
+	// predicate (a second classifier call would be redundant and re-bill).
+	o.ShouldSupervise = func(string) bool { return true }
+	return stack.cleanup
+}
+
+// autoSuperviseTrigger builds the ShouldSupervise predicate for an -auto-supervise
+// run. When a native provider is available it is MODEL-DRIVEN — it reuses the
+// session SupervisorFirstRouter (Part 1's now-authoritative classifier) to size the
+// goal, so a supervise/project route triggers the scale-up and run's trigger matches
+// chat/serve. The classifier is NOT metered here (a single one-shot sizing call on a
+// run with no conversation ledger); the supervised loop it gates is itself budget-
+// walled. A classifier error or a non-work route falls back to chatShouldSupervise,
+// and with no provider (codex/claude-code) the heuristic is the trigger outright — so
+// the supervised capability is gained on every backend.
+func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal string) bool {
+	if prov == nil {
+		return chatShouldSupervise // delegated backend: no model to classify; heuristic trigger
+	}
+	router := &session.SupervisorFirstRouter{
+		Classifier:      prov,
+		ShouldSupervise: chatShouldSupervise, // the router's own unparseable/no-model fallback
+		Log:             log,
+		ID:              "auto-supervise",
+	}
+	return func(goal string) bool {
+		route, err := router.Route(context.Background(), goal, session.WorkState{})
+		if err != nil {
+			// Classifier transport fault: degrade to the cheap heuristic rather than
+			// failing the run — the supervised seam is an enhancement, never required.
+			return chatShouldSupervise(goal)
+		}
+		return route == session.RouteSupervise || route == session.RouteProject
 	}
 }
 

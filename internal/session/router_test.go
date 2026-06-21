@@ -71,25 +71,34 @@ func TestRouteClassifierProposals(t *testing.T) {
 			want:      RouteChat,
 		},
 		{
-			name:      "native proposal upgraded to supervise when heuristic says complex",
-			reply:     `{"route":"native","reason":"looks small"}`,
+			// Fix A: a model "native" on 40 words of trivial chatter is HONORED as
+			// native — the heuristic no longer UPGRADES it to supervise. (Previously
+			// this asserted an upgrade.)
+			name:      "native proposal wins even when heuristic says complex",
+			reply:     `{"route":"native","reason":"a one-line tweak despite the long ask"}`,
 			heuristic: alwaysComplex,
-			text:      "refactor the auth layer",
+			text:      "please could you go ahead and adjust the copy in the footer of the landing page so that the year reads two thousand and twenty six instead of the old value that is currently shown there right now today",
+			want:      RouteNative,
+		},
+		{
+			// Fix A: a model "supervise" on a SHORT, no-keyword goal is HONORED as
+			// supervise — the heuristic no longer DOWNGRADES it to native.
+			// "rewrite the auth subsystem" is <40 words and has no trigger keyword, so
+			// the old string heuristic would have wrongly sized it simple.
+			name:      "supervise proposal wins even when heuristic says simple",
+			reply:     `{"route":"supervise","reason":"a cross-cutting rewrite"}`,
+			heuristic: alwaysSimple,
+			text:      "rewrite the auth subsystem",
 			want:      RouteSupervise,
 		},
 		{
-			name:      "supervise proposal downgraded to native when heuristic says simple",
-			reply:     `{"route":"supervise","reason":"seems big"}`,
+			// Fix A: a model "project" is HONORED — the heuristic no longer downgrades
+			// a too-large estimate. The classifier's whole-project sizing wins.
+			name:      "project proposal wins even when heuristic says simple",
+			reply:     `{"route":"project","reason":"scaffold a whole service"}`,
 			heuristic: alwaysSimple,
-			text:      "rename a field",
-			want:      RouteNative,
-		},
-		{
-			name:      "project proposal downgraded to native when heuristic says simple",
-			reply:     `{"route":"project","reason":"seems huge"}`,
-			heuristic: alwaysSimple,
-			text:      "tweak the readme",
-			want:      RouteNative,
+			text:      "stand up a new billing service",
+			want:      RouteProject,
 		},
 		{
 			name:      "chatty wrapper around the json still parses",
@@ -231,20 +240,20 @@ func TestRouteNilClassifierDegradesToHeuristic(t *testing.T) {
 	}
 }
 
-// TestRouteNilHeuristic asserts a nil ShouldSupervise is treated as "not complex":
-// a proposal is taken at face value with no upgrade, and the fallback path defaults
-// to RouteNative.
+// TestRouteNilHeuristic asserts that with no heuristic wired (the clamp can't fire),
+// a parseable proposal is honored as-is, and the unparseable FALLBACK path — which
+// is the only place the (here nil) heuristic is consulted — defaults to RouteNative.
 func TestRouteNilHeuristic(t *testing.T) {
-	// Parseable supervise proposal, nil heuristic ⇒ honored at face value.
+	// Parseable supervise proposal, nil heuristic ⇒ honored as-is (Fix A: the
+	// classifier proposal wins; the heuristic is never an overrule).
 	cls := &scriptModel{reply: `{"route":"supervise"}`}
 	r := &SupervisorFirstRouter{Classifier: cls}
 	got, err := r.Route(context.Background(), "a feature", WorkState{})
 	if err != nil {
 		t.Fatalf("Route err = %v", err)
 	}
-	if got != RouteNative {
-		// nil heuristic ⇒ supervise(goal)==false ⇒ supervise proposal downgraded.
-		t.Errorf("route = %v, want RouteNative (nil heuristic ⇒ not complex)", got)
+	if got != RouteSupervise {
+		t.Errorf("route = %v, want RouteSupervise (proposal honored as-is, nil heuristic does not overrule)", got)
 	}
 
 	// Unparseable, nil heuristic ⇒ fallback to RouteNative (not a crash).
@@ -256,6 +265,43 @@ func TestRouteNilHeuristic(t *testing.T) {
 	}
 	if got2 != RouteNative {
 		t.Errorf("route = %v, want RouteNative (nil heuristic fallback)", got2)
+	}
+}
+
+// TestRouteClampDownBackstop covers the OPTIONAL, default-off ClampDownToNative
+// lever: it is INERT by default (proposal wins) and, when enabled, ONLY clamps a
+// large proposal DOWN to native when the heuristic says simple — it never upgrades.
+func TestRouteClampDownBackstop(t *testing.T) {
+	cases := []struct {
+		name  string
+		reply string
+		clamp bool
+		heur  func(string) bool
+		want  Route
+	}{
+		// Default-off: the supervise proposal wins even though the heuristic says simple.
+		{"default off ⇒ supervise wins", `{"route":"supervise"}`, false, alwaysSimple, RouteSupervise},
+		// Enabled + heuristic simple ⇒ clamp supervise down to native.
+		{"clamp on + simple ⇒ native", `{"route":"supervise"}`, true, alwaysSimple, RouteNative},
+		// Enabled + heuristic simple ⇒ clamp project down to native too.
+		{"clamp on + simple ⇒ project→native", `{"route":"project"}`, true, alwaysSimple, RouteNative},
+		// Enabled but heuristic complex ⇒ no clamp (proposal kept).
+		{"clamp on + complex ⇒ supervise kept", `{"route":"supervise"}`, true, alwaysComplex, RouteSupervise},
+		// Clamp is one-directional: it never UPGRADES a native proposal.
+		{"clamp on never upgrades native", `{"route":"native"}`, true, alwaysComplex, RouteNative},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cls := &scriptModel{reply: tc.reply}
+			r := &SupervisorFirstRouter{Classifier: cls, ShouldSupervise: tc.heur, ClampDownToNative: tc.clamp}
+			got, err := r.Route(context.Background(), "do the thing", WorkState{})
+			if err != nil {
+				t.Fatalf("Route err = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("route = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
