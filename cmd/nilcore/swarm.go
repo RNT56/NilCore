@@ -233,8 +233,9 @@ type swarmDeps struct {
 // it drives, the shared ledger and pool (exposed so a test asserts the single-wall
 // invariant), the live board, the resolved preset (so a test inspects the routing),
 // the run-level deliverable set, and the cleanup hook. repo is the integration repo
-// the per-shard worktrees are cut from; collateRoot is the shared worktree
-// requeue.Scan reads every shard's verified artifact from.
+// the per-shard worktrees are cut from; collateRoot is the PER-RUN directory
+// (.nilcore/swarm/<runID>) requeue.Scan reads every shard's verified artifact from —
+// namespaced by runID so a stale artifact from a prior run can never bleed in (MAJOR #2).
 type swarmAssembly struct {
 	controller *swarm.Controller
 	initial    []swarm.Shard
@@ -434,14 +435,21 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	}
 	pl.SetGlobalCeiling(*sf.budget)
 
-	// --- the collate root: ONE shared worktree directory requeue.Scan reads every
-	// shard's verified artifact from. Each shard runs+verifies in its OWN disposable
-	// worktree (I4); on green its verified artifact is copied here so the Controller's
-	// requeue.Scan (which reads <collateRoot>/.nilcore/artifacts/*.json) sees it. The
-	// integration repo the per-shard worktrees are cut from is --dir (a real git repo
-	// for code shards; for collate presets it is only the worktree source). ---
+	// --- the collate root: a PER-RUN directory requeue.Scan reads every shard's verified
+	// artifact from, NAMESPACED by runID (.nilcore/swarm/<runID>) so a stale RED artifact
+	// from a prior abandoned run can NEVER be ingested by a fresh run — which would make a
+	// fully-green fresh run terminate Done=false/exhausted/exit 1 (MAJOR #2). Each shard
+	// runs+verifies in its OWN disposable worktree (I4); on green its verified artifact is
+	// copied here so the Controller's requeue.Scan (which reads
+	// <collateRoot>/.nilcore/artifacts/*.json) sees ONLY this run's artifacts. The
+	// integration repo the per-shard worktrees are cut from is --dir (a real git repo for
+	// code shards; for collate presets it is only the worktree source). The whole
+	// .nilcore/swarm tree is git-ignored, so the persistent repo is never polluted. ---
 	repo := d.dir
-	collateRoot := repo
+	collateRoot := filepath.Join(repo, ".nilcore", "swarm", runID)
+	if err := os.MkdirAll(filepath.Join(collateRoot, ".nilcore", "artifacts"), 0o755); err != nil {
+		return swarmAssembly{}, fmt.Errorf("swarm: collate root: %w", err)
+	}
 
 	// --- the per-worktree env factory (sandbox + project verifier), reused from
 	// build.go. The project verifier is only the raw build child for code/ui packs;
@@ -453,6 +461,14 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	}, *sf.common.checkCmd)
 
 	// --- the Integrator (FanInMerge / code preset only) or nil (FanInCollate). ---
+	// The swarm threads each pass's PRIOR verified tip into the Integrator's BaseRef so
+	// a pass folds its newly-green branches ONTO the prior tip rather than re-merging the
+	// whole accumulated green set from base HEAD (MAJOR #6). buildIntegrateFunc's closure
+	// is base-ref-less (it reads the Integrator's static BaseRef), so we wrap it in a
+	// per-pass adapter that pins intr.BaseRef before each fold. Pinning is safe because
+	// the Controller folds serially between passes (one fold per pass, never concurrent),
+	// so no two folds race on the shared field. The integrator re-verifies every merge,
+	// so the tip is ALWAYS verifier-green (I2).
 	var integrateFn swarm.IntegrateFunc
 	if pre.FanIn == preset.FanInMerge {
 		intr := &integrate.Integrator{
@@ -460,7 +476,11 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 			NewEnv:   func(dir string) integrate.Env { return integrate.Env{Verifier: newEnv(dir).Verifier} },
 			Log:      d.log,
 		}
-		integrateFn = swarm.IntegrateFunc(buildIntegrateFunc(intr))
+		base := buildIntegrateFunc(intr)
+		integrateFn = func(ctx context.Context, baseRef string, order []integrate.MergeItem) (string, []integrate.MergeResult, error) {
+			intr.BaseRef = baseRef // "" ⇒ the integrator starts from HEAD (first pass)
+			return base(ctx, order)
+		}
 	}
 
 	// --- the shardFn I2 closure (the heart): write+verify each shard's typed artifact
@@ -487,13 +507,14 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	}
 
 	controller := &swarm.Controller{
-		Runner:    runner,
-		Queue:     queue,
-		Worktree:  collateRoot,
-		Policy:    policyPasses,
-		Integrate: integrateFn,
-		Budget:    ledger,
-		Log:       d.log,
+		Runner:        runner,
+		Queue:         queue,
+		Worktree:      collateRoot,
+		Policy:        policyPasses,
+		Integrate:     integrateFn,
+		Budget:        ledger,
+		GlobalCeiling: *sf.budget, // the same wall SetGlobalCeiling got; read non-recordingly each pass
+		Log:           d.log,
 	}
 
 	// --- the initial shard set + the run state. A FRESH run shards the goal via the
@@ -679,8 +700,15 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	// wt.Path()), mirroring the proven typed-research path (build.go): evverify reads
 	// RelPath host-side via worktreefs.OpenNoFollow, so a CWD-relative path would look
 	// under the nilcore process dir, not the worktree the worker actually wrote into —
-	// every shard would read "artifact missing" and fail closed. s.ID is a valid
-	// single-component artifact id (no '/'), so the file is one component, not nested.
+	// every shard would read "artifact missing" and fail closed.
+	//
+	// This is PIN-and-verify, safe by construction: the harness AUTHORS the artifact id
+	// (s.ID, a valid single-component id with no '/') in shardGoal and instructs the
+	// worker to write exactly .nilcore/artifacts/<s.ID>.json — so the verifier checks the
+	// one path the harness pinned, not a filename the worker chose. (The report-side
+	// projection below is separately id-agnostic — it DISCOVERS the artifact the worker
+	// wrote — because by then the run is over and the trust comes from the verified
+	// status, not the path; the two stages are intentionally different.)
 	relPath := filepath.Join(env.Box.Workdir(), ".nilcore", "artifacts", s.ID+".json")
 	plan, perr := packs.Build(c.packName, env.Box, relPath, packs.DefaultSchemas())
 	if perr != nil {
@@ -708,6 +736,13 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	} else {
 		prof := c.preset.Profile
 		prof.Model = c.pool.WorkerFor(s.ID) // attach the LIVE worker provider (Resolve left it nil)
+		// Apply the operator's unioned egress (preset hosts ∪ --egress-allow) to the
+		// worker's profile via roster.EgressFor, which INTERSECTS the role's allowlist
+		// with that tree (narrow-only — R9: it can only narrow within the tree, never
+		// over-permit). Without this the --egress-allow flag was dead: worker egress came
+		// solely from the preset profile (MAJOR #5). A deny-all role still intersects to
+		// empty and keeps --network none.
+		prof.Egress = roster.EgressFor(prof, c.egress)
 		worker := roster.NewWorker(prof, env.Box, gov, c.deps.log, c.pool.WorkerFor(s.ID), nil)
 		if _, rerr := worker.Run(ctx, task); rerr != nil {
 			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,

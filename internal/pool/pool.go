@@ -204,7 +204,14 @@ func Build(cfg PoolConfig, ledger *budget.Ledger, cred func(string) string, runI
 		if primary == "" {
 			primary = fallbackDefault
 		}
-		eff := effectiveCap(t, cfg.Caps)
+		// Key the cap lookup on the RESOLVED primary — the SAME key the stack
+		// cache uses below — not on the raw t.Spec. An inherited-spec strong tier
+		// (empty t.Spec, the default `nilcore swarm` path) would otherwise look up
+		// caps[""] (uncapped) while the worker tier looks up caps[workerSpec]
+		// (capped); the two would compute different effective caps, land under
+		// different cache keys, and the strong tier would get a SECOND, uncapped
+		// stack — splitting the shared per-provider concurrency-cap/breaker.
+		eff := effectiveCap(primary, t.Cap, cfg.Caps)
 		key := primary + "\x00" + t.Fallback + "\x00" + fmt.Sprint(eff)
 		if s, ok := cache[key]; ok {
 			return s, nil
@@ -413,16 +420,19 @@ func newResilientFunc() resilientFunc {
 	}
 }
 
-// effectiveCap is the concurrency cap that applies to a tier's spec: the larger
-// of the tier's own Cap and any per-spec Caps entry keyed by the primary spec.
-// "Larger" is deliberate — a per-spec Caps entry and a tier Cap are two operators
-// expressing a bound; we honor the more permissive of the two declared bounds, so
-// neither silently tightens the other. 0 ⇒ uncapped (no strongcap layer).
-func effectiveCap(t TierSpec, caps map[string]int) int {
-	eff := t.Cap
+// effectiveCap is the concurrency cap that applies to a tier's stack: the larger
+// of the tier's own Cap (tierCap) and any per-spec Caps entry keyed by the
+// RESOLVED primary spec. The lookup MUST use the resolved primary (the same key
+// the stack cache uses) — an inherited tier with an empty raw Spec resolves to
+// the worker/default spec, and it must share that spec's single capped stack, not
+// fork an uncapped one. "Larger" is deliberate — a per-spec Caps entry and a tier
+// Cap are two operators expressing a bound; we honor the more permissive of the
+// two declared bounds, so neither silently tightens the other. 0 ⇒ uncapped (no
+// strongcap layer).
+func effectiveCap(primary string, tierCap int, caps map[string]int) int {
+	eff := tierCap
 	if caps != nil {
-		spec := t.Spec
-		if c, ok := caps[spec]; ok && c > eff {
+		if c, ok := caps[primary]; ok && c > eff {
 			eff = c
 		}
 	}

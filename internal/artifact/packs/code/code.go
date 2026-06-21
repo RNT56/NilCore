@@ -228,15 +228,30 @@ func buildTestCommand(c artifact.Claim) (string, error) {
 	if err := validateSelector(selector); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf(strings.ReplaceAll(shape, "%s", "'%s'"), selector), nil
+	// Insert a literal "--" before the single-quoted selector so the test runner
+	// reads it strictly as a positional argument, never as a flag — a defense-in-depth
+	// behind validateSelector's leading-dash rejection. Even a future bypass of that
+	// guard cannot turn a selector like "-run=^$" into a flag that selects zero tests
+	// and launders a green verdict (I2).
+	return fmt.Sprintf(strings.ReplaceAll(shape, "%s", "-- '%s'"), selector), nil
 }
 
 // validateSelector constrains a model-authored test selector before it is placed into
-// a single-quoted command argument: no single quote (which would close the quoting),
-// and no whitespace or control byte (which could smuggle a flag or a second token).
-// Mirrors the URL/name defense-in-depth the other packs use. A rejected selector makes
-// the caller fail closed to Unverifiable — never a silent broad test run.
+// a single-quoted command argument. It rejects:
+//   - a leading '-' — so a selector like "-run=^$" / "-count=0" / "--list" can never be
+//     read as a flag that silently selects zero tests (or otherwise neuters the suite)
+//     and launders a green verdict past the verifier (I2);
+//   - a single quote — which would close the quoting and break the selector out as DATA;
+//   - any whitespace or control byte — which could smuggle a flag or a second token.
+//
+// buildTestCommand additionally prefixes a literal "--" before the quoted selector, so
+// even a future bypass of the leading-dash rule cannot be read as a flag. Together these
+// mirror the URL/name defense-in-depth the other packs use. A rejected selector makes the
+// caller fail closed to Unverifiable — never a silent broad (or empty) test run.
 func validateSelector(sel string) error {
+	if strings.HasPrefix(strings.TrimSpace(sel), "-") {
+		return fmt.Errorf("test selector may not begin with '-' (it could be read as a flag)")
+	}
 	for _, r := range sel {
 		if r == '\'' {
 			return fmt.Errorf("test selector may not contain a single quote")

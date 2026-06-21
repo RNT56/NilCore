@@ -2,6 +2,11 @@ package finance
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -228,16 +233,24 @@ func TestFinanceKeyed(t *testing.T) {
 		if st != artifact.StatusPass {
 			t.Fatalf("status = %q, want pass", st)
 		}
-		// The literal key value MUST NOT appear in the command string — only $NAME.
+		// The literal key value MUST NOT appear in the command string — the resolved
+		// (key-bearing) URL rides only in the env map under $NILCORE_KEYED_URL.
 		if strings.Contains(box.lastCmd, secret) {
 			t.Fatalf("literal key leaked into command: %q", box.lastCmd)
 		}
-		if !strings.Contains(box.lastCmd, "$"+EnvFREDKey) {
-			t.Fatalf("command should reference $%s: %q", EnvFREDKey, box.lastCmd)
+		// The command must reference the resolved URL by env-var name, DOUBLE-quoted so
+		// the box-side shell expands it (single quotes were the #3 bug).
+		if !strings.Contains(box.lastCmd, `"$NILCORE_KEYED_URL"`) {
+			t.Fatalf("command should reference \"$NILCORE_KEYED_URL\" (double-quoted): %q", box.lastCmd)
 		}
-		// The env map must carry the value for box-side $VAR expansion.
-		if box.lastEnv[EnvFREDKey] != secret {
-			t.Fatalf("env map missing key value, got %v", box.lastEnv)
+		// The env map must carry the fully-resolved URL (which embeds the key) for
+		// box-side $VAR expansion. The key value lives ONLY here.
+		ru := box.lastEnv["NILCORE_KEYED_URL"]
+		if !strings.Contains(ru, secret) {
+			t.Fatalf("env map NILCORE_KEYED_URL must embed the resolved key, got %q", ru)
+		}
+		if !strings.Contains(ru, "api_key=") {
+			t.Fatalf("resolved URL should carry api_key=: %q", ru)
 		}
 		// The persisted SourceURL (on the claim) stays key-free — it is never rewritten.
 		if strings.Contains(c.Evidence.SourceURL, secret) || strings.Contains(c.Evidence.SourceURL, "api_key=") {
@@ -270,8 +283,9 @@ func TestFinanceKeyed(t *testing.T) {
 		if strings.Contains(box.lastCmd, secret) {
 			t.Fatalf("literal key leaked into command: %q", box.lastCmd)
 		}
-		if box.lastEnv[EnvMarketKey] != secret {
-			t.Fatalf("env map missing key value")
+		ru := box.lastEnv["NILCORE_KEYED_URL"]
+		if !strings.Contains(ru, secret) {
+			t.Fatalf("env map NILCORE_KEYED_URL must embed the resolved key, got %q", ru)
 		}
 	})
 
@@ -298,6 +312,134 @@ func TestFinanceKeyed(t *testing.T) {
 			t.Fatalf("detail leaked the key: %q", d)
 		}
 	})
+}
+
+// shellBox is a REAL-execution sandbox.Sandbox stand-in: it runs the command through
+// `sh -c` with the per-run env map applied, exactly as the box would. It exists to catch
+// the #3 single-vs-double-quote bug, which a non-shelling fakeBox cannot see — only an
+// actual shell decides whether "$NILCORE_KEYED_URL" expands or is sent literally.
+type shellBox struct{ lastCmd string }
+
+func (b *shellBox) Exec(ctx context.Context, cmd string) (sandbox.Result, error) {
+	return b.ExecWithEnv(ctx, cmd, nil)
+}
+func (b *shellBox) ExecWithEnv(ctx context.Context, cmd string, env map[string]string) (sandbox.Result, error) {
+	b.lastCmd = cmd
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Env = os.Environ()
+	for k, v := range env {
+		c.Env = append(c.Env, k+"="+v)
+	}
+	out, err := c.Output()
+	res := sandbox.Result{Stdout: string(out)}
+	if ee, ok := err.(*exec.ExitError); ok {
+		res.ExitCode = ee.ExitCode()
+		res.Stderr = string(ee.Stderr)
+		return res, nil
+	}
+	return res, err
+}
+func (b *shellBox) Workdir() string { return "/work" }
+
+// TestFinanceKeyedRealShell is the #9 keystone: it runs the keyed command through an
+// ACTUAL shell (sh -c + curl) against a local server and captures the URL the endpoint
+// receives. This proves the key actually EXPANDS (the #3 bug — single quotes — would send
+// the literal "$NILCORE_KEYED_URL" and the server would never see the key), while
+// asserting the command string the shell was handed stays key-free (I3).
+func TestFinanceKeyedRealShell(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not available")
+	}
+	ctx := context.Background()
+	const secret = "REALSHELLKEY-abc123"
+
+	var gotRawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"observations":[{"value":"42"}]}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv(EnvFREDKey, secret)
+	box := &shellBox{}
+	// buildURL points the keyed reach at the local server but resolves the key exactly as
+	// production does. fetchKeyedBody handles the env-map injection + double-quoted command.
+	buildURL := func(key string) string {
+		return srv.URL + "/fred?api_key=" + url.QueryEscape(key)
+	}
+	body, ok, why := fetchKeyedBody(ctx, box, EnvFREDKey, buildURL)
+	if !ok {
+		t.Fatalf("fetchKeyedBody failed: %s", why)
+	}
+	if !strings.Contains(body, `"value":"42"`) {
+		t.Fatalf("unexpected body: %q", body)
+	}
+	// Expansion proof: the server SAW the key. Under the #3 bug it would have received the
+	// literal "$NILCORE_KEYED_URL" (curl would error) — never the secret.
+	if !strings.Contains(gotRawQuery, "api_key="+secret) {
+		t.Fatalf("server did not receive the expanded key; raw query = %q", gotRawQuery)
+	}
+	// I3: the command string the shell was handed must NOT carry the key — it references
+	// only the env var, double-quoted, so the shell (not the command text) holds the value.
+	if strings.Contains(box.lastCmd, secret) {
+		t.Fatalf("key leaked into the command string: %q", box.lastCmd)
+	}
+	if !strings.Contains(box.lastCmd, `"$NILCORE_KEYED_URL"`) {
+		t.Fatalf("command must reference the double-quoted env var: %q", box.lastCmd)
+	}
+}
+
+// TestFinanceKeyedRealShellEndToEnd drives checkFREDSeries through the real shell to a
+// local server, proving the WHOLE keyed path (URL derivation → env injection → shell
+// expansion → JSON parse → verdict) yields Pass when the value matches, AND that neither
+// the command string nor the persisted SourceURL nor the returned detail carries the key.
+func TestFinanceKeyedRealShellEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not available")
+	}
+	ctx := context.Background()
+	const secret = "E2EKEY-xyz789"
+
+	var gotRawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRawQuery = r.URL.RawQuery
+		// FRED-shaped body so fredLatest parses 27000.5 as the newest observation.
+		_, _ = w.Write([]byte(`{"observations":[{"date":"2024-01-01","value":"27000.5"}]}`))
+	}))
+	defer srv.Close()
+
+	// Re-point the keyed FRED reach at the local server for this test only, restoring the
+	// real public base afterward. checkFREDSeries reads fredBaseURL for the key-free base.
+	orig := fredBaseURL
+	fredBaseURL = srv.URL + "/fred/series/observations"
+	defer func() { fredBaseURL = orig }()
+
+	t.Setenv(EnvFREDKey, secret)
+	box := &shellBox{}
+	c := claim(IDFREDSeries, "gdp", "27000.5",
+		"https://api.stlouisfed.org/fred/series/observations?series_id=GDP")
+	st, d := checkFREDSeries(ctx, box, c)
+	if st != artifact.StatusPass {
+		t.Fatalf("status = %q (detail %q), want pass", st, d)
+	}
+	// Expansion + derivation proof: the server received the key AND the derived series_id.
+	if !strings.Contains(gotRawQuery, "api_key="+secret) {
+		t.Fatalf("server did not receive expanded key; raw query = %q", gotRawQuery)
+	}
+	if !strings.Contains(gotRawQuery, "series_id=GDP") {
+		t.Fatalf("server did not receive derived series_id; raw query = %q", gotRawQuery)
+	}
+	// I3: key absent from command string, persisted SourceURL, and the returned detail.
+	if strings.Contains(box.lastCmd, secret) {
+		t.Fatalf("key leaked into command: %q", box.lastCmd)
+	}
+	if strings.Contains(c.Evidence.SourceURL, secret) || strings.Contains(c.Evidence.SourceURL, "api_key=") {
+		t.Fatalf("persisted SourceURL not key-free: %q", c.Evidence.SourceURL)
+	}
+	if strings.Contains(d, secret) {
+		t.Fatalf("detail leaked the key: %q", d)
+	}
 }
 
 // TestFinanceTolerance pins the documented numeric rule directly.

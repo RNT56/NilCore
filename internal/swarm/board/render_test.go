@@ -118,3 +118,55 @@ func TestRenderEmptySnapshot(t *testing.T) {
 		t.Fatalf("empty snapshot showed clean headline:\n%s", out)
 	}
 }
+
+// TestRenderRedactsAndEscapes is the MINOR #12 regression: a per-shard row's
+// Status/Verifier/SourceURL is routed through the SAME redactor + control/markup
+// sanitizer the matrix renderer uses, so a secret-looking token never reaches output and
+// a control byte cannot repaint the terminal. The fields are TRUSTED (verifier-set,
+// key-free by I3), but the board still defends in depth — exactly as the matrix does.
+func TestRenderRedactsAndEscapes(t *testing.T) {
+	// A SourceURL carrying an api_key= query param (the keyed-source leak shape) plus a
+	// provider-token-shaped param; a Verifier with a raw control byte (ESC) that would
+	// otherwise inject an ANSI sequence; a Status with markup metacharacters.
+	const leakKey = "AKIAIOSFODNN7EXAMPLE"      // an AWS-key-shaped secret
+	const ghToken = "ghp_abcdefghijklmnop12345" // a GitHub-token-shaped secret
+	snap := Snapshot{
+		Pass: 1, Total: 1,
+		Shards: []ShardRow{{
+			ID:        "s0",
+			Pass:      1,
+			Passed:    false,
+			Status:    "fail<script>",
+			Verifier:  "v\x1b[31mk", // embedded ESC — a control byte
+			SourceURL: "https://api.example.com/x?api_key=" + ghToken + "&q=ok#frag-" + leakKey,
+		}},
+	}
+	out := RenderScoreboard(snap, offStyle())
+
+	// 1. No secret shape survives anywhere in the rendered board.
+	for _, secret := range []string{ghToken, leakKey, "api_key=" + ghToken} {
+		if strings.Contains(out, secret) {
+			t.Errorf("rendered board leaked a secret-looking token %q:\n%q", secret, out)
+		}
+	}
+	// 2. The api_key param value is gone (stripped by name) and a redaction marker is shown.
+	if strings.Contains(out, "ghp_") || strings.Contains(out, "AKIA") {
+		t.Errorf("a secret prefix survived redaction:\n%q", out)
+	}
+	// 3. No raw ESC / C0 control byte survives (it would have come from the Verifier).
+	if strings.ContainsRune(out, 0x1b) {
+		t.Errorf("a raw ESC control byte survived sanitization:\n%q", out)
+	}
+	// 4. Markup metacharacters in Status are escaped to inert entities (no live '<').
+	if strings.Contains(out, "<script>") {
+		t.Errorf("a raw <script> survived markup escaping:\n%q", out)
+	}
+	if !strings.Contains(out, "&lt;script&gt;") {
+		t.Errorf("expected the escaped markup form &lt;script&gt; in:\n%q", out)
+	}
+	// 5. The benign part of the URL (host/path/non-key query) still renders — redaction
+	// strips the key, it does not blank the whole locator.
+	if !strings.Contains(out, "api.example.com") {
+		t.Errorf("redaction blanked the benign part of the SourceURL:\n%q", out)
+	}
+}

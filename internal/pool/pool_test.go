@@ -383,6 +383,64 @@ func TestSharedStackAcrossSameSpecTiers(t *testing.T) {
 	}
 }
 
+// TestInheritedTierSharesCappedStack proves the MAJOR-#4 fix: an inherited-spec
+// strong tier (empty Spec, the DEFAULT `nilcore swarm` path) must share the
+// worker's ONE capped stack, not fork a second uncapped one.
+//
+// The cap is declared ONLY via the per-spec Caps map keyed on the worker's
+// resolved spec — NOT via TierSpec.Cap. Planner/Verifier carry an empty Spec, so
+// they inherit the worker spec. Under the pre-fix code effectiveCap looked up
+// caps[""] for the strong tiers (→ 0, uncapped) while the worker looked up
+// caps["w:m"] (→ 5, capped); the differing effective caps produced different
+// cache keys and thus a SECOND, uncapped stack for the shared provider. The fix
+// keys the lookup on the resolved primary, so all three tiers collapse to one
+// capped stack: ONE resolve, ONE strongcap.
+func TestInheritedTierSharesCappedStack(t *testing.T) {
+	inner := newFake("w")
+	resolve := newScriptedResolve(map[string]model.Provider{"w:m": inner})
+	cf := newCapFactory()
+	cfg := PoolConfig{
+		// Worker names the spec explicitly; Planner+Verifier inherit it (empty Spec).
+		Worker:   TierSpec{Spec: "w:m"},
+		Planner:  TierSpec{}, // inherits w:m
+		Verifier: TierSpec{}, // inherits w:m
+		// Cap declared by RESOLVED spec only — discriminates the bug: the raw
+		// strong-tier Spec is "", so a caps[""] lookup would miss and leave them
+		// uncapped, while the worker is capped.
+		Caps: map[string]int{"w:m": 5},
+	}
+	p, err := Build(cfg, budget.New(), noCred, "run1", testOpts(resolve.fn, cf.fn, nil))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// All three tiers collapse onto the one resolved spec.
+	if got := resolve.resolveCount("w:m"); got != 1 {
+		t.Fatalf("inherited tiers must dedup onto the worker spec: resolved %d times, want 1", got)
+	}
+	// Exactly ONE capped stack — the strong tiers did NOT fork a second uncapped one.
+	if cf.count != 1 {
+		t.Fatalf("inherited strong tiers must share the worker's single capped stack: got %d strongcaps, want 1", cf.count)
+	}
+	// And it is genuinely the capped stack (cap=5), shared by planner/verifier/worker:
+	// every tier's inner is the one countingCap instance over the shared provider.
+	cap := cf.made["w"]
+	if cap == nil {
+		t.Fatal("the shared stack must be the capped one (no strongcap recorded for the worker spec)")
+	}
+	// Behavioral proof: a call through the inherited planner tier and a call through
+	// the worker tier both pass through the SAME capped countingCap (its in-flight
+	// counter and the shared inner fake see both), confirming one shared stack.
+	if _, err := p.Planner().Complete(context.Background(), "", nil, nil, 0); err != nil {
+		t.Fatalf("planner call: %v", err)
+	}
+	if _, err := p.WorkerFor("s0").Complete(context.Background(), "", nil, nil, 0); err != nil {
+		t.Fatalf("worker call: %v", err)
+	}
+	if inner.calls() != 2 {
+		t.Fatalf("inherited planner + worker must share the one capped inner: inner saw %d calls, want 2", inner.calls())
+	}
+}
+
 // TestSharedBreakerAcrossSameSpecTiers proves the breaker is shared: with the
 // real Resilient and a breaker threshold of 1, a failure through the planner tier
 // opens the breaker that the verifier tier (same shared stack) also sees.
@@ -637,6 +695,130 @@ func TestZeroConfigDefaultsToCheapWorker(t *testing.T) {
 	if def.calls() != 2 {
 		t.Fatalf("default provider should have served both calls, got %d", def.calls())
 	}
+}
+
+// --- I3: the credential never escapes the resolve seam ----------------------
+
+// sentinelModel is a model.Provider whose Model() returns whatever id it is
+// given, so the test can assert the sentinel did NOT bleed into a model id.
+type sentinelModel struct{ id string }
+
+func (s sentinelModel) Model() string { return s.id }
+func (s sentinelModel) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
+	return model.Response{Usage: model.Usage{InputTokens: 1, OutputTokens: 1}}, nil
+}
+
+// TestCredentialNeverEscapesResolveSeam pins invariant I3: a real credential
+// flows ONLY to the by-name resolve seam (the getenv argument) and NEVER appears
+// in a meter scope label, a backend Task key, a model id, or anything handed to a
+// decorator. The other pool tests use noCred→"" so this property is structurally
+// true but UNPINNED; here we feed a SENTINEL key and prove it does not leak.
+func TestCredentialNeverEscapesResolveSeam(t *testing.T) {
+	const sentinel = "sk-SECRET-DO-NOT-LEAK-7f3a9c"
+	// cred returns the sentinel for any name — the pool must never invoke it
+	// itself, only forward it to the resolve seam as getenv.
+	var credCalls int64
+	cred := func(string) string {
+		atomic.AddInt64(&credCalls, 1)
+		return sentinel
+	}
+
+	// The resolve seam captures the getenv it is handed and verifies that getenv
+	// IS the sentinel-bearing cred (i.e. the credential is reachable at the seam,
+	// the one place it is allowed). It builds providers whose Model() ids are
+	// plain specs, NOT the resolved key.
+	var seamSawSentinel bool
+	var seamMu sync.Mutex
+	resolveFn := func(spec string, getenv func(string) string) (model.Provider, error) {
+		if getenv == nil {
+			t.Errorf("resolve seam got nil getenv; cred must be threaded through")
+		} else if getenv("ANY") == sentinel {
+			seamMu.Lock()
+			seamSawSentinel = true
+			seamMu.Unlock()
+		}
+		return sentinelModel{id: spec}, nil
+	}
+
+	// Capture every value handed to the cap decorator (the inner provider and its
+	// model id) so we can assert the sentinel is not among them.
+	var capInnerIDs []string
+	capFn := func(inner model.Provider, max int) model.Provider {
+		capInnerIDs = append(capInnerIDs, inner.Model())
+		return inner // pass-through; we only need to observe what flows in
+	}
+
+	led := budget.New()
+	cfg := PoolConfig{
+		Planner:  TierSpec{Spec: "anthropic:strong"},
+		Verifier: TierSpec{Spec: "anthropic:strong"},
+		Worker:   TierSpec{Spec: "anthropic:cheap", Fallback: "openai:backup", Cap: 2},
+		Caps:     map[string]int{"anthropic:cheap": 2},
+	}
+	opts := Options{Pricer: flatPricer{}, resolve: resolveFn, cap: capFn, resilient: realResilient}
+	p, err := Build(cfg, led, cred, "run-secret", opts)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// The credential MUST have reached the resolve seam (its sanctioned sink) ...
+	seamMu.Lock()
+	saw := seamSawSentinel
+	seamMu.Unlock()
+	if !saw {
+		t.Fatal("credential never reached the resolve seam; the test cannot prove non-leakage")
+	}
+	// ... and the pool MUST NOT have invoked cred itself (it only forwards it).
+	if n := atomic.LoadInt64(&credCalls); n == 0 {
+		t.Fatal("cred was never called via the seam; non-leakage is unproven")
+	}
+
+	// Run real calls so every observable surface (scope Task labels, model ids) is
+	// materialized through the live providers.
+	for _, prov := range []model.Provider{p.Planner(), p.Verifier(), p.WorkerFor("shard0")} {
+		if _, err := prov.Complete(context.Background(), "", nil, nil, 0); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		if got := prov.Model(); got == sentinel {
+			t.Fatalf("model id leaked the credential: %q", got)
+		}
+	}
+
+	// Collect every surface that an event/log/ledger reader can see and assert the
+	// sentinel appears in NONE of them.
+	surfaces := []string{
+		p.Scope("shard0"),
+		p.scopeRoot() + "planner",
+		p.scopeRoot() + "verifier",
+		p.CodeBackendFor("implementer"),
+		p.Planner().Model(),
+		p.Verifier().Model(),
+		p.WorkerFor("shard0").Model(),
+	}
+	surfaces = append(surfaces, capInnerIDs...)
+	for _, s := range surfaces {
+		if s == sentinel {
+			t.Fatalf("credential leaked verbatim into an observable surface: %q", s)
+		}
+		// Substring check too: catch a key embedded in a composite label.
+		if len(sentinel) > 0 && contains(s, sentinel) {
+			t.Fatalf("credential leaked as a substring of an observable surface: %q", s)
+		}
+	}
+}
+
+// contains is a tiny strings.Contains stand-in kept local so the test file's
+// import set stays minimal (matches the package's stdlib-lean style).
+func contains(haystack, needle string) bool {
+	if len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // --- nil ledger guard -------------------------------------------------------

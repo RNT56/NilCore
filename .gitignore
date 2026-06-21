@@ -4,6 +4,13 @@
 # Append-only event log output
 *.events.jsonl
 
+# NilCore-local working state under a target repo (per-run, never committed):
+# verified-artifact carriers and the per-run swarm collate roots (.nilcore/swarm/<runID>).
+# Ignored so a stale RED artifact from a prior run can never be picked up by a fresh one
+# and so the swarm never pollutes the persistent repo.
+.nilcore/artifacts/
+.nilcore/swarm/
+
 # Built binaries
 /nilcore
 /cmd/nilcore/nilcore

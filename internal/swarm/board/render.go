@@ -93,14 +93,19 @@ func renderShardRow(r ShardRow, st termui.Style) string {
 	if r.Elapsed > 0 {
 		parts = append(parts, humanDuration(r.Elapsed))
 	}
+	// Status/Verifier/SourceURL are TRUSTED (verifier-set + key-free by I3), but a
+	// verifier Detail tail or a smuggled query param could still carry a key-shaped
+	// substring or a control byte — so route each through the same redactor+sanitizer the
+	// matrix renderer uses before it reaches the row (MINOR #12): secret-mask THEN
+	// control/markup-escape, so neither a leaked key nor an ANSI repaint survives.
 	if r.Status != "" {
-		parts = append(parts, "status="+r.Status)
+		parts = append(parts, "status="+safeField(r.Status))
 	}
 	if r.Verifier != "" {
-		parts = append(parts, "by="+r.Verifier)
+		parts = append(parts, "by="+safeField(r.Verifier))
 	}
 	if r.SourceURL != "" {
-		parts = append(parts, "src="+r.SourceURL)
+		parts = append(parts, "src="+safeSource(r.SourceURL))
 	}
 	return head + "  " + st.Dim(strings.Join(parts, " · "))
 }

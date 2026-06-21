@@ -35,8 +35,10 @@ import (
 	"nilcore/internal/budget"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/meter"
+	"nilcore/internal/policy"
 	"nilcore/internal/pool"
 	"nilcore/internal/requeue"
+	"nilcore/internal/roster"
 	"nilcore/internal/store"
 	"nilcore/internal/swarm"
 	"nilcore/internal/swarm/board"
@@ -220,6 +222,59 @@ func TestSwarmArtifactReportMatrix(t *testing.T) {
 	}
 }
 
+// TestSwarmEgressAllowNarrowsWorker is the MAJOR #5 regression: the operator's
+// --egress-allow union (carried in shardContext.egress, built by shardEgress) must
+// actually reach the worker — applied via roster.EgressFor(prof, c.egress), a NARROW-ONLY
+// intersection (R9) — instead of being a dead flag whose value the worker never sees.
+//
+// The test exercises the EXACT composition the shardFn now performs:
+//
+//	tree := shardEgress(preset, splitCSV("--egress-allow"))   // role-host union ∪ extra
+//	prof.Egress = roster.EgressFor(prof, tree)                // intersect with the role allowlist
+//
+// and asserts it discriminates on BOTH sides:
+//   - a host the role allows AND the operator added survives (the flag TOOK EFFECT);
+//   - a host the operator added but the role does NOT allow is DROPPED (R9 narrow-only —
+//     the flag can never WIDEN past the role's own allowlist);
+//   - a deny-all role stays --network none regardless of the flag.
+func TestSwarmEgressAllowNarrowsWorker(t *testing.T) {
+	// A synthetic preset whose role profile allows exactly {a.example, b.example} and
+	// whose derived Egress (the verify-pack host union, the "tree" base) is the same set.
+	roleProf := roster.Profile{Egress: policy.Egress{Allowed: []string{"a.example", "b.example"}}}
+	pre := preset.Preset{
+		Profile: roleProf,
+		Egress:  []string{"a.example", "b.example"}, // the pack-host union shardEgress starts from
+	}
+
+	// Operator widens the tree with one in-role host (b.example, already allowed) and one
+	// OUT-of-role host (evil.example, NOT in the profile allowlist).
+	tree := shardEgress(pre, splitCSV("b.example,evil.example"))
+	got := roster.EgressFor(pre.Profile, tree)
+
+	allows := map[string]bool{}
+	for _, h := range got.Allowed {
+		allows[h] = true
+	}
+	// b.example: in the role AND in the operator's union ⇒ survives (the flag took effect).
+	if !allows["b.example"] {
+		t.Errorf("--egress-allow host b.example was dropped; the flag had no effect: %+v", got.Allowed)
+	}
+	// a.example: in the role and the union (pack host) ⇒ survives.
+	if !allows["a.example"] {
+		t.Errorf("role host a.example was dropped: %+v", got.Allowed)
+	}
+	// evil.example: operator-added but NOT in the role allowlist ⇒ MUST be dropped (R9).
+	if allows["evil.example"] {
+		t.Errorf("--egress-allow WIDENED past the role allowlist (R9 broken): %+v", got.Allowed)
+	}
+
+	// A deny-all role stays --network none even with the operator flag set.
+	denyAll := roster.Profile{Egress: policy.Egress{}}
+	if eg := roster.EgressFor(denyAll, tree); !eg.Empty() {
+		t.Errorf("deny-all role got egress %+v with --egress-allow set; must stay --network none", eg.Allowed)
+	}
+}
+
 // TestSwarmPerShardVerifierIsArtifactOnlyForCollate asserts the per-shard verifier the
 // shardFn builds for a COLLATE preset (research → web/finance) is the packs.Build
 // composite (schema + per-claim evidence), NEVER a verify.Pass, and that the ship gate
@@ -326,6 +381,79 @@ func TestCollateArtifactMakesRedVisibleToScan(t *testing.T) {
 	collateArtifact(collate, wt, "swarm/run/0")
 	if wl2, _ := requeue.Scan(collate, nil); len(wl2.Units) != 1 {
 		t.Fatalf("an invalid-id collate must be a no-op, got %d units", len(wl2.Units))
+	}
+}
+
+// TestSwarmCollateRootNamespacedPerRun is the MAJOR #2 regression: the collate root the
+// Controller's requeue.Scan reads from must be NAMESPACED by runID (under
+// .nilcore/swarm/<runID>), NOT the persistent --dir repo. Otherwise a STALE red artifact
+// left in <repo>/.nilcore/artifacts/ by a prior abandoned run is ingested by a fresh run,
+// and a fully-green fresh run terminates Done=false/exhausted/exit 1.
+//
+// The test seeds a stale red artifact directly in the repo's .nilcore/artifacts/, then
+// builds a swarm and asserts: (a) the assembly's collateRoot is the per-run dir, NOT the
+// repo; and (b) a requeue.Scan over that collateRoot finds NOTHING — the stale red is
+// invisible to the fresh run. To prove the second leg discriminates, it also confirms a
+// Scan over the REPO root WOULD have seen the stale red (the pre-fix behavior). Finally it
+// drives the assembled Controller over the clean collate root and asserts it converges
+// Done=true — a fresh run is not blocked by the prior run's debris.
+func TestSwarmCollateRootNamespacedPerRun(t *testing.T) {
+	repo := newGoRepo(t)
+
+	// A prior abandoned run left a RED artifact in the PERSISTENT repo's carrier dir.
+	stale := &artifact.Artifact{
+		SchemaVersion: artifact.SchemaVersion, ID: "swarm-stale-0", Kind: artifact.KindReport,
+		Claims: []artifact.Claim{{ID: "c1", Field: "x",
+			Evidence: artifact.Evidence{Status: artifact.StatusFail, Verifier: "v"}}},
+	}
+	if err := artifact.Write(repo, stale); err != nil {
+		t.Fatalf("seed stale red artifact: %v", err)
+	}
+
+	// Sanity: the stale red IS visible at the repo root — so a non-namespaced collate root
+	// (the pre-fix `collateRoot = repo`) would ingest it and block convergence.
+	if wl, _ := requeue.Scan(repo, nil); len(wl.Units) != 1 {
+		t.Fatalf("precondition: stale red must be visible at the repo root, got %d units", len(wl.Units))
+	}
+
+	shardFile := filepath.Join(t.TempDir(), "shards.txt")
+	if err := writeFile(shardFile, "freshA\n"); err != nil {
+		t.Fatal(err)
+	}
+	sf := parseSwarmFlags(t, "-preset", "benchmark", "-shard-file", shardFile)
+	asm, err := buildSwarm(swarmDeps{flags: sf, boot: testBoot(), log: discardLog(t), dir: repo,
+		ledger: budget.New(), pool: testPool(t), store: testStore(t)})
+	if err != nil {
+		t.Fatalf("buildSwarm: %v", err)
+	}
+
+	// (a) The collate root is the per-run namespaced dir, NOT the repo.
+	if asm.collateRoot == repo {
+		t.Fatal("collateRoot == repo: the stale-artifact ingestion bug is NOT fixed (MAJOR #2)")
+	}
+	wantPrefix := filepath.Join(repo, ".nilcore", "swarm", asm.runID)
+	if asm.collateRoot != wantPrefix {
+		t.Errorf("collateRoot = %q, want the per-run dir %q", asm.collateRoot, wantPrefix)
+	}
+
+	// (b) A Scan over the fresh collate root sees NOTHING — the stale red is isolated.
+	if wl, err := requeue.Scan(asm.collateRoot, nil); err != nil {
+		t.Fatalf("scan collate root: %v", err)
+	} else if len(wl.Units) != 0 {
+		t.Fatalf("fresh collate root ingested %d stale unit(s); must be isolated from the repo", len(wl.Units))
+	}
+
+	// A fresh fully-green run (here: an empty worklist over the clean collate root) must
+	// converge Done=true — not be dragged red by the prior run's debris. We drive the
+	// assembled Controller over an EMPTY initial set: with no red on disk it converges on
+	// the first pass. (A real run would write fresh green artifacts here; the point is the
+	// Controller reads ONLY this run's collate root, which the stale red never reaches.)
+	out, err := asm.controller.Run(context.Background(), asm.state, nil)
+	if err != nil {
+		t.Fatalf("controller run: %v", err)
+	}
+	if !out.Done || out.Remaining != 0 {
+		t.Fatalf("fresh run did not converge clean: out = %+v (stale red leaked into the run)", out)
 	}
 }
 

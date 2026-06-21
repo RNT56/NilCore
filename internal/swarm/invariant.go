@@ -18,6 +18,7 @@ package swarm
 import (
 	"context"
 	"errors"
+	"reflect"
 
 	"nilcore/internal/artifact"
 	"nilcore/internal/budget"
@@ -36,25 +37,51 @@ type ShipGate struct {
 	v verify.Verifier
 }
 
-// NewShipGate wraps v in a ShipGate, refusing the two verifiers that would make
-// "done" vacuous: a nil interface (no authority at all) and verify.Pass{} (the
-// always-true read-only verifier, which ships nothing and must never gate work
-// that SHIPS). verify.Pass is detected by a type assertion rather than by calling
-// Check — a stub that always returns Passed must be refused at construction, not
-// trusted at runtime. Fail-closed: any verifier we cannot positively accept is
-// rejected with ErrNoShipVerifier.
+// NewShipGate wraps v in a ShipGate, refusing the verifiers that would make "done"
+// vacuous or unsafe. It is a DENYLIST, not an allowlist: any concrete verifier the
+// project composes is accepted, and only three explicitly-bad shapes are refused —
+//
+//   - a nil interface (no authority at all);
+//   - verify.Pass{}, the always-true read-only verifier (it ships nothing and must
+//     never gate work that SHIPS), detected by a type assertion rather than by calling
+//     Check, so a stub that always returns Passed is refused at construction;
+//   - a TYPED-NIL interface (e.g. a (*evverify.Verifier)(nil) whose concrete type is
+//     non-nil at the interface level but whose value is a nil pointer/func/etc.). Such
+//     a value passes the `v == nil` check yet PANICS on Check; reflect lets us catch it
+//     here and reject it cleanly rather than crash a shard at verify time.
+//
+// "Fail-closed" here means a verifier we cannot SAFELY forward to (nil/typed-nil) or
+// that is provably vacuous (verify.Pass) is rejected with ErrNoShipVerifier; it does
+// NOT mean an allowlist of known-good types (that would reject every real composite
+// verifier the packs build).
 func NewShipGate(v verify.Verifier) (ShipGate, error) {
 	if v == nil {
 		return ShipGate{}, ErrNoShipVerifier
 	}
-	// A typed-nil interface (e.g. a (*CommandVerifier)(nil)) is non-nil at the
-	// interface level but would panic on Check; reject the concrete nil pointer
-	// types we know about is out of scope here — the documented refusal is the
-	// vacuous verify.Pass value, caught by this assertion.
 	if _, isPass := v.(verify.Pass); isPass {
 		return ShipGate{}, ErrNoShipVerifier
 	}
+	// Typed-nil guard: a non-nil interface wrapping a nil pointer/func/chan/map/slice
+	// is non-nil above but would panic when Check dereferences it. Reflect over the
+	// concrete value and refuse it so the gate fails closed at construction.
+	if isTypedNil(v) {
+		return ShipGate{}, ErrNoShipVerifier
+	}
 	return ShipGate{v: v}, nil
+}
+
+// isTypedNil reports whether an interface value is non-nil at the interface level but
+// holds a nil concrete value (a nil pointer, func, chan, map, slice, or unsafe pointer).
+// Calling a method on such a value panics, so the ship gate refuses it. A non-nilable
+// concrete kind (struct, int, …) is never typed-nil.
+func isTypedNil(v verify.Verifier) bool {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice, reflect.UnsafePointer, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // Check forwards verbatim to the underlying verifier. The gate's only safety

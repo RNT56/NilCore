@@ -20,15 +20,20 @@ package swarm
 //
 // THE TERMINATION RAILS, in the order they are checked each pass:
 //   1. converged — Scan returns an empty Worklist. The only GREEN exit.
-//   2. budget    — a global-ceiling headroom probe (ClassifyCeiling/Budget) shows no
-//                  global headroom: stop, no shard can make progress. ErrCeiling is a
-//                  termination rail, NEVER a done-signal.
-//   3. exhausted — every still-red Unit has spent its Ledger budget: no shard is
+//   2. hard-cap  — the ABSOLUTE HardMaxPasses backstop (always on, even UntilClean):
+//                  a claim-id-rotating worker that defeats the per-Unit retry Ledger
+//                  cannot spin forever burning the budget.
+//   3. budget    — the shared ledger's live Total() has reached the GlobalCeiling
+//                  (read NON-RECORDINGLY, no probe charge): stop, no shard can make
+//                  progress. The global ceiling is a termination rail, never a done-signal.
+//   4. exhausted — every still-red Unit has spent its Ledger budget: no shard is
 //                  eligible to requeue, so the run converges RED.
-//   4. passes    — !UntilClean and the pass count reached MaxPasses: the operator
+//   5. stalled   — two consecutive passes resolved zero NEW units (the worklist did
+//                  not shrink): a no-progress loop is stopped RED rather than spun.
+//   6. passes    — !UntilClean and the pass count reached MaxPasses: the operator
 //                  capped the work; remaining red is reported, not retried.
-//   5. ctx       — the context was cancelled/deadlined mid-loop.
-//   6. error     — a store/integrate fault aborted the loop (returned as the error).
+//   7. ctx       — the context was cancelled/deadlined mid-loop.
+//   8. error     — a store/integrate fault aborted the loop (returned as the error).
 //
 // DURABILITY each pass: SaveState writes the run row (Pass/Ledger/TipSHA) and Queue.Mark
 // writes each shard row, so a crash mid-run resumes by re-Scanning the persisted
@@ -68,12 +73,33 @@ func (c *Controller) effectiveMaxPasses() int {
 	return c.Policy.MaxPasses
 }
 
-// IntegrateFunc folds the passing shard branches into one verified integration tip. It
-// is EXACTLY super.IntegrateFunc's signature so the cmd wiring passes the same
-// integrate.Integrator-backed closure both surfaces use. A nil IntegrateFunc means
-// "do not integrate" — the collate presets (research dossiers) keep each shard's
-// artifact independent and never merge code, so they pass Integrate=nil.
-type IntegrateFunc func(ctx context.Context, order []integrate.MergeItem) (branch string, results []integrate.MergeResult, err error)
+// effectiveHardMaxPasses is the ABSOLUTE pass backstop, enforced on every run including
+// an UntilClean one: HardMaxPasses when set, else defaultHardMaxPasses. It is the rail
+// that stops a claim-id-rotating worker (one that defeats the per-Unit retry Ledger by
+// minting fresh claim ids each pass) from spinning forever and burning the dollar
+// budget — the exhausted rail alone would never fire for such a worker.
+func (c *Controller) effectiveHardMaxPasses() int {
+	if c.HardMaxPasses > 0 {
+		return c.HardMaxPasses
+	}
+	return defaultHardMaxPasses
+}
+
+// IntegrateFunc folds the passing shard branches into one verified integration tip,
+// rooted at baseRef. baseRef is the PRIOR pass's verified tip (st.TipSHA): each pass
+// folds its newly-green branches ONTO that tip instead of re-merging the whole
+// accumulated green set from base HEAD, so the persisted TipSHA is load-bearing (MAJOR
+// #6) — and the tip stays verifier-green throughout (I2: the integrator re-verifies
+// every merge). An empty baseRef means "from HEAD" (the first pass, or a collate run).
+// A nil IntegrateFunc means "do not integrate" — the collate presets (research
+// dossiers) keep each shard's artifact independent and never merge code, so they pass
+// Integrate=nil.
+//
+// It takes baseRef where the sibling super.IntegrateFunc does not, because the swarm's
+// multi-pass loop must re-root each pass on the prior verified tip; the cmd wiring
+// supplies a swarm-specific adapter that pins the Integrator's BaseRef to baseRef before
+// each fold (cmd/nilcore/swarm.go), rather than reusing the base-ref-less build.go closure.
+type IntegrateFunc func(ctx context.Context, baseRef string, order []integrate.MergeItem) (branch string, results []integrate.MergeResult, err error)
 
 // Scoreboard is the Controller's plain-value projection of one pass's tally. It is a
 // COPY-OUT, not a live board: the cmd's board sub-leaf (internal/swarm/board) is fed
@@ -111,6 +137,8 @@ const (
 	ReasonExhausted = "exhausted" // every still-red Unit spent its retry budget
 	ReasonBudget    = "budget"    // global ceiling: no headroom to continue
 	ReasonPasses    = "passes"    // MaxPasses reached with red remaining
+	ReasonHardCap   = "hard-cap"  // the absolute HardMaxPasses backstop tripped
+	ReasonStalled   = "stalled"   // two consecutive passes made no progress (no new units resolved)
 	ReasonCtx       = "ctx"       // context cancelled/deadlined
 	ReasonError     = "error"     // a store/integrate fault aborted the loop
 )
@@ -128,6 +156,27 @@ type Controller struct {
 	Integrate IntegrateFunc
 	Budget    *budget.Ledger
 	Log       *eventlog.Log
+
+	// GlobalCeiling is the run's hard dollar wall (the same value the wiring passed to
+	// Budget.SetGlobalCeiling). The per-pass headroom probe reads it NON-RECORDINGLY:
+	// it compares the ledger's live Total() against this ceiling instead of charging a
+	// sub-cent probe each pass (which would accrue a residue against a reserved task).
+	// 0 (or a nil Budget) means "no ceiling" — the probe never blocks.
+	GlobalCeiling float64
+
+	// HardMaxPasses is an absolute backstop on the number of passes, ALWAYS enforced —
+	// even under UntilClean. It exists so a pathological worker that rotates its claim
+	// ids (so the retry Ledger never recognizes a Unit as exhausted) cannot spin the
+	// loop forever burning the dollar budget. 0 means "use the built-in default"
+	// (defaultHardMaxPasses); a positive value overrides it.
+	HardMaxPasses int
+
+	// noProgress counts consecutive passes that resolved zero NEW red Units (the
+	// remaining worklist did not shrink). Two such passes in a row stop the run — a
+	// claim-id-rotating worker makes no progress yet keeps every Unit "fresh", which
+	// the exhausted rail alone would never catch. It is run-scoped loop state, reset by
+	// Run, so a Controller stays reusable across runs.
+	noProgress int
 }
 
 // Run executes the multi-pass loop from the initial shard set and returns the terminal
@@ -147,11 +196,25 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	passed := make(map[string]spawn.Result, len(initial))
 	var board Scoreboard
 
+	// prevRemaining anchors the no-progress detector: a pass that leaves the remaining
+	// worklist no smaller than the prior pass resolved zero NEW units. -1 is the
+	// "no prior pass" sentinel so the FIRST pass can never be counted as a stall.
+	prevRemaining := -1
+	c.noProgress = 0
+
 	for {
 		// Honor cancellation at the top of every pass so a deadline between passes stops
 		// the loop with a Skipped-style outcome rather than dispatching another wave.
 		if err := ctx.Err(); err != nil {
 			return c.finish(ctx, st, board, passed, ReasonCtx, false), nil
+		}
+
+		// Hard backstop BEFORE dispatch, enforced even under UntilClean: if the run has
+		// already spent the absolute pass budget, stop. This is the rail that bounds a
+		// claim-id-rotating worker — one whose every red Unit reads "fresh" to the retry
+		// Ledger, so the exhausted rail never fires — from looping forever (MINOR #10).
+		if st.Pass >= c.effectiveHardMaxPasses() {
+			return c.finish(ctx, st, board, passed, ReasonHardCap, false), nil
 		}
 
 		// Budget rail BEFORE dispatch: if the global ceiling has no headroom there is no
@@ -232,6 +295,23 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			return c.finish(ctx, st, board, passed, ReasonConverged, true), nil
 		}
 
+		// No-progress detector: count a pass that did not SHRINK the remaining worklist
+		// as zero new units resolved. Two such passes in a row stop the run RED — a
+		// claim-id-rotating worker keeps the worklist the same size (or larger) forever
+		// while every Unit reads "fresh" to the Ledger, so neither the exhausted nor the
+		// budget rail would catch it promptly. A pass that DID shrink the worklist resets
+		// the counter, so a slowly-converging run is never mistaken for a stall. The
+		// first pass (prevRemaining<0) can never count as a stall.
+		if prevRemaining >= 0 && board.Remaining >= prevRemaining {
+			c.noProgress++
+			if c.noProgress >= 2 {
+				return c.finish(ctx, st, board, passed, ReasonStalled, false), nil
+			}
+		} else {
+			c.noProgress = 0
+		}
+		prevRemaining = board.Remaining
+
 		// Bump the Ledger for the still-red Units and compute the requeue set: the
 		// shards whose artifact still has a NON-EXHAUSTED red Unit. A shard with every
 		// red Unit exhausted is dropped (no budget); a passed shard contributes none.
@@ -306,7 +386,11 @@ func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn
 	if len(order) == 0 {
 		return st.TipSHA, nil // nothing green with a branch to fold yet
 	}
-	branch, results, err := c.Integrate(ctx, order)
+	// Fold THIS pass's green branches onto the prior verified tip (st.TipSHA), not base
+	// HEAD: the swarm-wiring adapter pins the Integrator's BaseRef to this baseRef before
+	// merging, so each pass extends the already-merged work rather than re-deriving it
+	// (MAJOR #6). The first pass passes "" ⇒ the integrator starts from HEAD.
+	branch, results, err := c.Integrate(ctx, st.TipSHA, order)
 	if err != nil {
 		return st.TipSHA, err
 	}
@@ -371,24 +455,23 @@ func (c *Controller) requeueSet(current []Shard, eligibleIDs []string) []Shard {
 	return out
 }
 
-// globalBudgetExhausted probes the shared ledger for global headroom WITHOUT spending
-// any real charge: it asks ClassifyCeiling whether a (forced) ErrCeiling would be
-// global. We synthesize the ceiling condition by attempting a zero-token probe charge
-// against a reserved global-probe task; if the ledger refuses it, the global wall is
-// binding. A nil Budget has no ceiling and never blocks.
+// globalBudgetExhausted reports whether the shared ledger has run out of global
+// headroom, read NON-RECORDINGLY: it compares the ledger's live Total() dollars against
+// the run's GlobalCeiling rather than attempting a probe Charge (the old path charged a
+// sub-cent budgetProbe against a reserved task EVERY pass, accruing a residue that the
+// dollar report then had to explain away). A nil Budget or a non-positive ceiling has no
+// wall and never blocks. The epsilon mirrors budget.Ledger's own ceiling tolerance so a
+// run that lands EXACTLY on the ceiling is not spuriously stopped a pass early.
 func (c *Controller) globalBudgetExhausted(ctx context.Context) bool {
-	if c.Budget == nil {
+	if c.Budget == nil || c.GlobalCeiling <= 0 {
 		return false
 	}
-	// ClassifyCeiling only acts on a real ErrCeiling, so we first reproduce one with a
-	// tiny zero-token probe against the reserved global key; a refusal means no global
-	// headroom. The probe records nothing on refusal (the ledger rejects before
-	// recording), so this check perturbs nothing.
-	err := c.Budget.Charge(ctx, swarmGlobalProbeTask, 0, budgetProbe)
-	if err == nil {
-		return false // headroom exists; back the probe out is unnecessary (sub-cent)
-	}
-	return ClassifyCeiling(ctx, c.Budget, swarmGlobalProbeTask, err) == ScopeGlobal
+	_, spent := c.Budget.Total()
+	// No headroom iff the next infinitesimal charge would breach: spent has already
+	// reached (within epsilon) the ceiling. Charge refuses when spent+amount >
+	// ceiling+epsilon; here we stop one pass BEFORE dispatching when there is no room
+	// left for even a token of work, i.e. spent >= ceiling - epsilon.
+	return spent >= c.GlobalCeiling-budgetHeadroomEpsilon
 }
 
 // emit appends one metadata-only controller event (a nil log is a no-op).
@@ -399,15 +482,17 @@ func (c *Controller) emit(kind string, detail map[string]any) {
 	c.Log.Append(eventlog.Event{Kind: kind, Detail: detail})
 }
 
-// swarmGlobalProbeTask is the reserved, ceiling-free task name the global headroom
-// probe charges against. The control prefix keeps it from colliding with any real
-// shard key ("swarm/<runID>/<n>").
-const swarmGlobalProbeTask = "\x00swarm-controller-global-probe"
+// budgetHeadroomEpsilon mirrors budget.Ledger's own ceiling tolerance (1e-9) so the
+// NON-RECORDING headroom check in globalBudgetExhausted treats a run that landed
+// exactly on the ceiling the same way Charge would — no spurious early stop.
+const budgetHeadroomEpsilon = 1e-9
 
-// budgetProbe is the tiny dollar amount the headroom probe charges — just above the
-// ledger's 1e-9 epsilon so a charge at the global ceiling is refused (no headroom),
-// while a charge with headroom records a negligible, sub-cent residue.
-const budgetProbe = 2e-9
+// defaultHardMaxPasses is the built-in absolute backstop on the pass count when the
+// Controller's HardMaxPasses is unset. It bounds even an UntilClean run so a worker
+// that rotates claim ids (defeating the per-Unit retry Ledger) cannot spin forever
+// burning the dollar budget. It is generous — a real until-clean run converges in a
+// handful of passes — so it only ever trips on a genuinely non-converging loop.
+const defaultHardMaxPasses = 50
 
 // hasDeps reports whether any shard in the set declares a dependency. The Controller
 // uses it to choose the flat (no deps) vs DAG (deps present) topology for a pass, so a
