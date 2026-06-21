@@ -264,6 +264,25 @@ func TestValidate(t *testing.T) {
 	if err := base.Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
+	// Positive cases the new routing fields must accept: Backend "auto" (let the
+	// system pick), and a concrete PreferredBackend that seeds auto's cold start.
+	good := []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{"backend auto", func(c *Config) { c.Backend = "auto" }},
+		{"preferred claude-code", func(c *Config) { c.PreferredBackend = "claude-code" }},
+		{"preferred native", func(c *Config) { c.PreferredBackend = "native" }},
+		{"auto with preference", func(c *Config) { c.Backend = "auto"; c.PreferredBackend = "codex" }},
+		{"empty preference", func(c *Config) { c.PreferredBackend = "" }},
+	}
+	for _, g := range good {
+		c := base
+		g.mut(&c)
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: expected valid, got %v", g.name, err)
+		}
+	}
 	bad := []struct {
 		name string
 		mut  func(*Config)
@@ -271,6 +290,9 @@ func TestValidate(t *testing.T) {
 		{"version", func(c *Config) { c.Version = 99 }},
 		{"runtime", func(c *Config) { c.Runtime = "lxc" }},
 		{"backend", func(c *Config) { c.Backend = "magic" }},
+		{"backend bogus", func(c *Config) { c.Backend = "bogus" }},
+		{"preferred auto rejected", func(c *Config) { c.PreferredBackend = "auto" }}, // a preference must name a concrete backend
+		{"preferred bogus", func(c *Config) { c.PreferredBackend = "bogus" }},
 		{"channel", func(c *Config) { c.Channel.Type = "discord" }},
 		{"provider", func(c *Config) { c.Providers = []ProviderConfig{{Name: "groq", KeyRef: "k"}} }},
 		{"keyref", func(c *Config) { c.Providers = []ProviderConfig{{Name: "anthropic", KeyRef: ""}} }},
@@ -281,6 +303,34 @@ func TestValidate(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", b.name)
 		}
+	}
+}
+
+// TestPreferredBackendRoundTrip proves the new preferred_backend + backend:auto
+// settings survive Save→Load through the strict (DisallowUnknownFields) decoder
+// unchanged — the additive keys are recognized, not rejected as typos.
+func TestPreferredBackendRoundTrip(t *testing.T) {
+	cfg := Config{
+		Version:          CurrentConfigVersion,
+		Backend:          "auto",
+		PreferredBackend: "claude-code",
+		Runtime:          "podman",
+		Providers:        []ProviderConfig{{Name: "anthropic", KeyRef: "k"}},
+		Channel:          ChannelConfig{Type: "none"},
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Backend != "auto" {
+		t.Errorf("Backend = %q, want auto", got.Backend)
+	}
+	if got.PreferredBackend != "claude-code" {
+		t.Errorf("PreferredBackend = %q, want claude-code", got.PreferredBackend)
 	}
 }
 

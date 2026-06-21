@@ -484,15 +484,19 @@ func secretMain(args []string) {
 
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
-	dir, backendName, backends, runtime, image, checkCmd, logPath, config, sandboxPref *string
-	maxSteps, advisorMaxCalls, escalateAfter, raceN                                    *int
-	autoSupervise                                                                      *bool
+	dir, backendName, backends, preferBackend, runtime, image, checkCmd, logPath, config, sandboxPref *string
+	maxSteps, advisorMaxCalls, escalateAfter, raceN                                                   *int
+	autoSupervise                                                                                     *bool
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
 	return commonFlags{
 		dir:         fs.String("dir", ".", "git repository tasks run against (in a disposable worktree)"),
-		backendName: fs.String("backend", "native", "native | codex | claude-code"),
+		backendName: fs.String("backend", "native", "native | codex | claude-code | auto (auto = the system picks the best AVAILABLE backend, seeded by -prefer-backend / config, learned by the Trust Ledger)"),
+		// One-run override of the durable PreferredBackend setting (config.preferred_backend).
+		// Only consulted when the resolved backend is "auto"; it seeds the auto cold-start
+		// order (preferred-first). Empty ⇒ fall back to config.preferred_backend, else native.
+		preferBackend: fs.String("prefer-backend", "", "preferred backend to try first under -backend auto: native | codex | claude-code (overrides config preferred_backend for this run)"),
 		// Phase 13 multi-backend strength-routing (additive, default-off). EMPTY ⇒ the
 		// single -backend path, byte-identical. A single name ⇒ same as -backend <name>.
 		// Two or more DISTINCT names ⇒ the orchestrator tries the historically-strongest
@@ -520,11 +524,13 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 var knownBackendNames = map[string]bool{"native": true, "codex": true, "claude-code": true}
 
 // parseBackends turns the -backends flag into the de-duplicated, order-preserving
-// list of backend names for the multi-backend path. EMPTY ⇒ nil (the caller stays on
-// the single -backend path, byte-identical). Each name is validated against
-// knownBackendNames; an unknown name is FATAL (like other flags). A single distinct
-// name ⇒ a one-element slice, which the orchestrator treats as the single path
-// (multiBackend() needs len > 1), so it remains byte-identical to -backend <name>.
+// list of backend tokens for the multi-backend path. EMPTY ⇒ nil (the caller stays
+// on the single -backend path, byte-identical). Each token is either a concrete
+// backend (validated against knownBackendNames; an unknown name is FATAL like other
+// flags) or the sentinel "auto", which the caller (wireMultiBackend) EXPANDS to the
+// host's availableBackends before the len<=1 single-path check. A single distinct
+// concrete name ⇒ a one-element slice, which the orchestrator treats as the single
+// path (multiBackend() needs len > 1), byte-identical to -backend <name>.
 func parseBackends(spec string) []string {
 	if strings.TrimSpace(spec) == "" {
 		return nil
@@ -536,8 +542,8 @@ func parseBackends(spec string) []string {
 		if name == "" {
 			continue
 		}
-		if !knownBackendNames[name] {
-			fatal(fmt.Errorf("unknown backend %q in -backends (want native | codex | claude-code)", name))
+		if name != "auto" && !knownBackendNames[name] {
+			fatal(fmt.Errorf("unknown backend %q in -backends (want native | codex | claude-code | auto)", name))
 		}
 		if seen[name] {
 			continue
@@ -546,6 +552,195 @@ func parseBackends(spec string) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// expandAutoBackends replaces every "auto" token in tokens with the host's
+// availableBackends (ledger-orderable downstream), preserving the operator's
+// explicit order and de-duplicating. `-backends auto` ⇒ ALL available backends
+// compete; "auto" mixed with explicit names ⇒ their union (explicit names keep
+// their position; auto's expansion fills in the rest in canonical order). No "auto"
+// token ⇒ tokens returned unchanged (byte-identical to the pre-expansion list). An
+// empty avail under auto contributes nothing, so e.g. `-backends auto` on a
+// native-only host collapses to [native] ⇒ the single path.
+func expandAutoBackends(tokens []string, cfg onboard.Config, cred func(string) string) []string {
+	hasAuto := false
+	for _, t := range tokens {
+		if t == "auto" {
+			hasAuto = true
+			break
+		}
+	}
+	if !hasAuto {
+		return tokens
+	}
+	avail := availableBackends(cfg, cred)
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	for _, t := range tokens {
+		if t == "auto" {
+			for _, a := range avail {
+				add(a)
+			}
+			continue
+		}
+		add(t)
+	}
+	return out
+}
+
+// canonicalBackendOrder is the baseline order availableBackends emits before any
+// preference or Trust-Ledger reordering: native (the always-considered baseline),
+// then the delegated CLIs. It is the deterministic floor the auto selector builds
+// on, so an empty ledger with no preference yields native first (today's default).
+var canonicalBackendOrder = []string{"native", "codex", "claude-code"}
+
+// availableBackends reports which of {native, codex, claude-code} are actually
+// USABLE on this host, in canonical order. A backend is available when both its
+// tool and its credential are present, so the auto selector never picks a backend
+// that would fatal at resolve time:
+//
+//   - native:      a configured executor model spec AND its provider key resolvable
+//     via cred (env-first, then SecretStore). native is the baseline,
+//     but it still needs a model+key — a host with no provider key
+//     configured genuinely has no usable native backend.
+//   - codex:       the `codex` CLI on PATH AND CODEX_API_KEY resolvable.
+//   - claude-code: the `claude` CLI on PATH AND ANTHROPIC_API_KEY resolvable.
+//
+// cred is the SecretStore-backed resolver (b.cred): it returns "" when neither the
+// environment nor the store holds the key, and never logs or exposes a value (I3).
+// The result may be empty (nothing configured); the caller decides whether that is
+// fatal. Availability is config DATA derived from presence checks — no key flows
+// through the result.
+func availableBackends(cfg onboard.Config, cred func(string) string) []string {
+	var out []string
+	for _, name := range canonicalBackendOrder {
+		switch name {
+		case "native":
+			if cfg.Executor != "" && cred(providerEnv(vendorOf(cfg.Executor))) != "" {
+				out = append(out, name)
+			}
+		case "codex":
+			if onboard.OnPath("codex") && cred("CODEX_API_KEY") != "" {
+				out = append(out, name)
+			}
+		case "claude-code":
+			if onboard.OnPath("claude") && cred("ANTHROPIC_API_KEY") != "" {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+// preferredBackendName resolves the preference that seeds the auto cold-start
+// order: the one-run -prefer-backend flag if set, else the durable
+// config.preferred_backend, else "native". It is validated upstream (registerCommon
+// flag validation + onboard.Validate), so it always names a concrete backend here.
+func preferredBackendName(c commonFlags, cfg onboard.Config) string {
+	if p := strings.TrimSpace(*c.preferBackend); p != "" {
+		return p
+	}
+	if cfg.PreferredBackend != "" {
+		return cfg.PreferredBackend
+	}
+	return "native"
+}
+
+// orderPreferredFirst returns avail with preferred moved to the front (preserving
+// the relative order of the rest), IFF preferred is actually in avail. A preferred
+// backend that is not available is ignored — preference only reorders what the host
+// can run, it never conjures an unavailable backend. The input slice is not mutated.
+func orderPreferredFirst(avail []string, preferred string) []string {
+	idx := -1
+	for i, n := range avail {
+		if n == preferred {
+			idx = i
+			break
+		}
+	}
+	if idx <= 0 {
+		// Not present, or already first ⇒ nothing to do (and a defensive copy is
+		// unnecessary because the caller treats the result as read-only).
+		return avail
+	}
+	out := make([]string, 0, len(avail))
+	out = append(out, avail[idx])
+	out = append(out, avail[:idx]...)
+	out = append(out, avail[idx+1:]...)
+	return out
+}
+
+// resolveAutoBackend turns `-backend auto` into a single concrete backend name for
+// the rest of runMain (resolveProvider, envFactory) to consume UNCHANGED. It is the
+// system's "pick the best available backend" decision:
+//
+//  1. compute availableBackends(host) — if empty, FATAL with init guidance (mirrors
+//     resolveProvider's missing-key remedy), because there is nothing to run.
+//  2. seed a cold-start order: put the preferred backend (flag > config > native)
+//     FIRST among the available set, so a fresh install honors the operator's stated
+//     preference before any evidence exists.
+//  3. overlay verifier-judged evidence: trust.Replay(log) then Ledger.Order(avail).
+//     Order ranks KNOWN backends best-first and PRESERVES the preferred-first order
+//     among UNPROVEN ones, so "prefer X until evidence overtakes" falls out for free
+//     (the ledger needs no change). A broken-chain Replay error is LOGGED
+//     (trust_replay_error) and we keep the preferred-first order — fail-soft, never
+//     abort, exactly like wireMultiBackend.
+//  4. return avail[0] — the chosen single backend.
+//
+// A metadata-only `backend_auto` event records the choice, the ordered candidates,
+// and whether the ledger reordered them — names only, never a secret (I3). The
+// ledger/preference only ORDER which backend runs; the verifier still judges (I2).
+func resolveAutoBackend(c commonFlags, b boot, log *eventlog.Log) string {
+	avail := availableBackends(b.cfg, b.cred)
+	if len(avail) == 0 {
+		fatal(fmt.Errorf("backend \"auto\": no usable backend on this host — configure an executor model + key (native) or install codex/claude with its API key; run `nilcore init` to set one up"))
+	}
+	preferred := preferredBackendName(c, b.cfg)
+	ordered := orderPreferredFirst(avail, preferred)
+
+	trustOrdered := false
+	led, err := trust.Replay(*c.logPath)
+	if err != nil {
+		// Fail-soft on a broken chain: keep the preferred-first order rather than
+		// aborting the run (mirrors wireMultiBackend's degrade-to-configured-order).
+		fmt.Fprintf(os.Stderr, "trust: ledger unavailable (%v); using preferred-first backend order\n", err)
+		log.Append(eventlog.Event{Kind: "trust_replay_error", Detail: map[string]any{"error": err.Error()}})
+	} else {
+		ordered = led.Order(ordered)
+		trustOrdered = true
+	}
+
+	chosen := ordered[0]
+	// Metadata-only audit of the auto decision: names + flags, never a secret (I3).
+	log.Append(eventlog.Event{Kind: "backend_auto", Backend: chosen, Detail: map[string]any{
+		"preferred":     preferred,
+		"available":     avail,
+		"candidates":    ordered,
+		"trust_ordered": trustOrdered,
+	}})
+	return chosen
+}
+
+// validateConcreteBackendFlag fatals if the operator passed a -prefer-backend value
+// that is not a concrete backend (native | codex | claude-code). It mirrors the
+// onboard validation so a typo fails loudly at flag time rather than silently
+// degrading the auto cold-start order. "auto" is rejected: a preference must name a
+// real backend. Empty ⇒ no preference (valid).
+func validateConcreteBackendFlag(name, value string) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return
+	}
+	if !knownBackendNames[v] {
+		fatal(fmt.Errorf("unknown %s %q (want native | codex | claude-code)", name, v))
+	}
 }
 
 // runMain executes a single task and exits.
@@ -562,11 +757,19 @@ func runMain(args []string) {
 
 	b := loadBoot(*c.config)
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
+	validateConcreteBackendFlag("-prefer-backend", *c.preferBackend)
 
 	absDir := mustAbs(*c.dir)
 	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
 	log := openLog(*c.logPath)
 	defer log.Close()
+	// Resolve `-backend auto` (or config backend:auto, which applyConfigDefaults maps
+	// onto *c.backendName) to a single concrete backend BEFORE anything reads the name.
+	// The rest of runMain (resolveProvider, envFactory's capture of *c.backendName) is
+	// unchanged and sees a concrete name. No "auto" ⇒ this is a no-op (byte-identical).
+	if *c.backendName == "auto" {
+		*c.backendName = resolveAutoBackend(c, b, log)
+	}
 	prov, err := resolveProvider(*c.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -724,6 +927,12 @@ func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal stri
 // the verifier remains the sole authority on done (I2), the gate on irreversible
 // actions (I3/policy).
 func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string) *agent.Orchestrator {
+	// Resolve `-backend auto` / config backend:auto to a concrete name so the
+	// self-started run paths (propose-edit / watch / scheduler / webhook) honor the
+	// same system-selection seam as `nilcore run`. No "auto" ⇒ no-op (byte-identical).
+	if *c.backendName == "auto" {
+		*c.backendName = resolveAutoBackend(c, b, log)
+	}
 	prov, err := resolveProvider(*c.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -781,6 +990,14 @@ func serveMain(args []string) {
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.
 	serveGC(context.Background(), absDir, log)
+	validateConcreteBackendFlag("-prefer-backend", *c.preferBackend)
+	// Resolve `-backend auto` / config backend:auto to a concrete name before serve
+	// reads it. serve still requires native below; auto simply lets the system pick
+	// the best available backend, and a non-native pick surfaces the same clear
+	// "serve requires native" remedy rather than a bare "unknown backend".
+	if *c.backendName == "auto" {
+		*c.backendName = resolveAutoBackend(c, b, log)
+	}
 	prov, err := resolveProvider(*c.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -1599,7 +1816,10 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 // aborts the run; a clean/missing log yields an empty ledger ⇒ configured order until
 // evidence accrues. The Selector only ORDERS; the verifier still governs "done" (I2).
 func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) {
-	names := parseBackends(*c.backends)
+	// Expand the "auto" token to the host's available backends BEFORE the len<=1
+	// check, so `-backends auto` competes every available backend (ledger-ordered)
+	// and `-backends auto` on a single-backend host collapses to the single path.
+	names := expandAutoBackends(parseBackends(*c.backends), b.cfg, b.cred)
 	if len(names) <= 1 {
 		return // single path — leave Backends/NewEnvFor/Selector unset (byte-identical)
 	}

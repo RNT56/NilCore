@@ -55,15 +55,21 @@ type Config struct {
 	Providers []ProviderConfig `json:"providers"`         //
 	Executor  string           `json:"executor"`          // native model spec: provider:model
 	Advisor   string           `json:"advisor"`           // advisor model spec: provider:model
-	Backend   string           `json:"backend,omitempty"` // native | codex | claude-code
-	Runtime   string           `json:"runtime"`           // podman | docker
-	Image     string           `json:"image"`             //
-	Channel   ChannelConfig    `json:"channel"`           //
-	Web       WebConfig        `json:"web,omitempty"`     // sandboxed web access (egress allowlist + search)
-	Delegated []string         `json:"delegated"`         // detected CLIs (informational): codex, claude
-	Codex     DelegatedConfig  `json:"codex,omitempty"`   // optional config for the Codex delegated CLI (R1)
-	Claude    DelegatedConfig  `json:"claude,omitempty"`  // optional config for the Claude Code delegated CLI (R1)
-	Pool      *pool.PoolConfig `json:"pool,omitempty"`    // optional swarm provider-pool tiers/caps (P12); nil ⇒ today's single-worker wiring, so an existing config is byte-identical
+	Backend   string           `json:"backend,omitempty"` // native | codex | claude-code | auto (auto ⇒ the system selects the best AVAILABLE backend at run time)
+	// PreferredBackend is the durable "I'd prefer X" setting (e.g. claude-code). It
+	// names a CONCRETE backend (never "auto") and seeds the cold-start order of the
+	// `auto` selector: the preferred backend is tried first until the verifier-judged
+	// Trust Ledger earns a different one ahead of it. Empty ⇒ no preference (auto
+	// cold-starts at native). It is config DATA, never a credential (I3).
+	PreferredBackend string           `json:"preferred_backend,omitempty"` // native | codex | claude-code
+	Runtime          string           `json:"runtime"`                     // podman | docker
+	Image            string           `json:"image"`                       //
+	Channel          ChannelConfig    `json:"channel"`                     //
+	Web              WebConfig        `json:"web,omitempty"`               // sandboxed web access (egress allowlist + search)
+	Delegated        []string         `json:"delegated"`                   // detected CLIs (informational): codex, claude
+	Codex            DelegatedConfig  `json:"codex,omitempty"`             // optional config for the Codex delegated CLI (R1)
+	Claude           DelegatedConfig  `json:"claude,omitempty"`            // optional config for the Claude Code delegated CLI (R1)
+	Pool             *pool.PoolConfig `json:"pool,omitempty"`              // optional swarm provider-pool tiers/caps (P12); nil ⇒ today's single-worker wiring, so an existing config is byte-identical
 }
 
 // DelegatedConfig configures a delegated coding CLI (Codex / Claude Code). All
@@ -104,11 +110,17 @@ type WebConfig struct {
 // Recognized values. Kept as closed sets so Validate and the wizard share one
 // vocabulary and a typo fails loudly instead of surfacing as a runtime error.
 var (
-	validRuntimes  = map[string]bool{"podman": true, "docker": true}
-	validBackends  = map[string]bool{"native": true, "codex": true, "claude-code": true}
-	validProviders = map[string]bool{"anthropic": true, "openai": true, "openrouter": true, "codex": true}
-	validChannels  = map[string]bool{"": true, "none": true, "telegram": true, "slack": true}
-	validSearch    = map[string]bool{"": true, "off": true, "ddg": true, "brave": true}
+	validRuntimes = map[string]bool{"podman": true, "docker": true}
+	// validBackends is the set of CONCRETE backends a build can construct — the only
+	// values PreferredBackend may take (a preference must name a real backend, never
+	// "auto"). validBackendOrAuto additionally accepts "auto", which Config.Backend
+	// may carry (the durable "always let the system decide" setting): the operator
+	// asks for system selection and the run resolves it to a concrete backend.
+	validBackends      = map[string]bool{"native": true, "codex": true, "claude-code": true}
+	validBackendOrAuto = map[string]bool{"native": true, "codex": true, "claude-code": true, "auto": true}
+	validProviders     = map[string]bool{"anthropic": true, "openai": true, "openrouter": true, "codex": true}
+	validChannels      = map[string]bool{"": true, "none": true, "telegram": true, "slack": true}
+	validSearch        = map[string]bool{"": true, "off": true, "ddg": true, "brave": true}
 )
 
 // Validate reports whether c is internally consistent enough for boot to trust
@@ -123,8 +135,15 @@ func (c Config) Validate() error {
 	if c.Runtime != "" && !validRuntimes[c.Runtime] {
 		return fmt.Errorf("unknown runtime %q; valid values are %s", c.Runtime, oneOf(validRuntimes))
 	}
-	if c.Backend != "" && !validBackends[c.Backend] {
-		return fmt.Errorf("unknown backend %q; valid values are %s", c.Backend, oneOf(validBackends))
+	// Backend may name a concrete backend OR "auto" (let the system pick the best
+	// available backend at run time, seeded by PreferredBackend, learned by the
+	// Trust Ledger). PreferredBackend, when set, MUST name a concrete backend — a
+	// preference that itself said "auto" would be meaningless to seed an order with.
+	if c.Backend != "" && !validBackendOrAuto[c.Backend] {
+		return fmt.Errorf("unknown backend %q; valid values are %s", c.Backend, oneOf(validBackendOrAuto))
+	}
+	if c.PreferredBackend != "" && !validBackends[c.PreferredBackend] {
+		return fmt.Errorf("unknown preferred_backend %q; valid values are %s (a preference must name a concrete backend, not auto)", c.PreferredBackend, oneOf(validBackends))
 	}
 	if !validChannels[c.Channel.Type] {
 		return fmt.Errorf("unknown channel %q; valid values are none, telegram, slack", c.Channel.Type)
