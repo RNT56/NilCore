@@ -55,6 +55,25 @@ func main() {
 // it, and prints the JSON observation. The browser invocation is isolated behind
 // the runBrowser function variable so tests can drive run without a real browser.
 func run(ctx context.Context, args []string, stdout *os.File) error {
+	// The session (serve) path is opt-in via --serve: a long-lived daemon driving
+	// one Chrome over a file-queue (serve.go). It short-circuits before the batch/
+	// flow dispatch so their flag sets are unchanged when --serve is absent.
+	serve, control, afterServe, err := extractServe(args)
+	if err != nil {
+		return err
+	}
+	if serve {
+		chromium, err := resolveChromium(os.Getenv(envChromium))
+		if err != nil {
+			return err
+		}
+		url, _, err := parseInteractiveArgs(afterServe) // --url optional; --format ignored in serve
+		if err != nil {
+			return err
+		}
+		return runServe(ctx, chromium, control, url)
+	}
+
 	// The interactive flow path is opt-in via --actions; we split it out first so
 	// the batch path's flag set (and its tests) are unchanged when --actions is
 	// absent. When present, we drive Chrome over CDP through the steps in order.

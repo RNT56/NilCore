@@ -42,6 +42,16 @@ type ImageRunner interface {
 	RunWithImage(ctx context.Context, workdir string, input json.RawMessage) (string, *Image, error)
 }
 
+// BuiltinProvider is an OPTIONAL Tool capability: a tool that is a PROVIDER BUILT-IN
+// (e.g. Anthropic's native `computer` beta tool, Path A of desktop computer use).
+// When a tool implements it, Defs() carries the returned *model.BuiltinTool onto the
+// advertised model.Tool, so the provider serializes the typed shape + sets the beta
+// header. A tool that does not implement it is a normal tool — byte-identical. nil
+// return ⇒ normal tool too. The seam is additive and off every default path.
+type BuiltinProvider interface {
+	BuiltinDef() *model.BuiltinTool
+}
+
 // Registry holds the registered tools in a stable order.
 type Registry struct {
 	tools map[string]Tool
@@ -98,7 +108,13 @@ func (r *Registry) Defs() []model.Tool {
 	defs := make([]model.Tool, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
-		defs = append(defs, model.Tool{Name: t.Name(), Description: t.Description(), InputSchema: t.Schema()})
+		def := model.Tool{Name: t.Name(), Description: t.Description(), InputSchema: t.Schema()}
+		// A provider built-in (e.g. the native `computer` tool) carries its typed def
+		// so the provider serializes the builtin shape + sets the beta header (Path A).
+		if bp, ok := t.(BuiltinProvider); ok {
+			def.Builtin = bp.BuiltinDef()
+		}
+		defs = append(defs, def)
 	}
 	return defs
 }

@@ -33,6 +33,12 @@ const (
 	ProfileFinance     = "finance"
 	ProfileDocs        = "docs"
 	ProfileWebResearch = "web-research"
+	// ProfileBrowse is the starting allowlist for Phase-14 browser agency: a
+	// conservative set of general reference hosts. A real browse task almost always
+	// narrows further via a project-local .nilcore/egress.json (the task's specific
+	// app domains) — Resolve unions the two — so the default is a safe floor, not a
+	// blanket grant. It ships NO wildcard, so it never trips capguard's open-egress axis.
+	ProfileBrowse = "browse"
 )
 
 // presets maps each preset name to its host set. Hosts are co-designed with the
@@ -76,6 +82,16 @@ var presets = map[string][]string{
 		"web.archive.org",  // wayback snapshots
 		"*.wikipedia.org",  // wildcard: requires matching role-side wildcard
 		"*.gov",            // wildcard: requires matching role-side wildcard
+	},
+	// browse — a conservative reference floor for the Phase-14 browse agent. All
+	// literal, all key-free, NO wildcard (so it never trips capguard's open-egress
+	// axis); a browse task widens to its own app domains via .nilcore/egress.json.
+	ProfileBrowse: {
+		"en.wikipedia.org",
+		"www.wikidata.org",
+		"developer.mozilla.org",
+		"example.com",
+		"example.org",
 	},
 }
 

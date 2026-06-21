@@ -14,6 +14,8 @@
 # Built binaries
 /nilcore
 /cmd/nilcore/nilcore
+/nilcore-desktop
+/nilcore-desktop-darwin
 
 # macOS
 .DS_Store

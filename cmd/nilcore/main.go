@@ -1679,6 +1679,48 @@ func resolveProvider(backendName string, b boot) (model.Provider, error) {
 	}
 }
 
+// defaultGUIModel is the model the GUI-agent features (computer-use / browser-use)
+// run on when nothing is set. These features want a strong, current GUI-grounding
+// model rather than the general executor config, so the default is Opus 4.8.
+const defaultGUIModel = "claude-opus-4-8"
+
+// guiModelSpec picks the SINGLE model spec for a GUI-agent feature run (CU-T11):
+// the per-run flag wins, then the feature env var, then defaultGUIModel. It is one
+// model for the whole feature — never multi-model routing.
+func guiModelSpec(flag, env string) string {
+	if s := strings.TrimSpace(flag); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(env); s != "" {
+		return s
+	}
+	return defaultGUIModel
+}
+
+// resolveNativeSpec resolves an EXPLICIT provider:model spec (used by the GUI-agent
+// features, which pick their own single model via guiModelSpec) into a resilient
+// provider, mirroring resolveProvider's native path but without the NILCORE_MODEL /
+// executor-config lookup.
+func resolveNativeSpec(spec string, b boot) (model.Provider, error) {
+	p, err := provider.ResolveWith(spec, b.cred)
+	if err != nil {
+		if env := providerEnv(vendorOf(spec)); env != "" {
+			return nil, fmt.Errorf("%w; run `nilcore init` to store the key, or set %s in the environment", err, env)
+		}
+		return nil, fmt.Errorf("%w; run `nilcore init` to store the key", err)
+	}
+	res, rerr := model.NewResilient([]model.Provider{p}, model.Options{
+		MaxRetries:       2,
+		Jitter:           200 * time.Millisecond,
+		BreakerThreshold: 4,
+		CallTimeout:      modelCallTimeout,
+	})
+	if rerr != nil {
+		return p, nil
+	}
+	return res, nil
+}
+
 // advisorCfg carries the optional strong-model advisor tier from boot into the
 // per-task native backend. A nil prov means no advisor (the loop runs without
 // escalation, exactly as before).
