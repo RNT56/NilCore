@@ -8,13 +8,17 @@ package session
 // One cheap, METERED classifier call (JSON-out, ~256 tokens) proposes a route; it
 // is parsed with the same defensive firstText + brace-extraction pattern that
 // route.Review and summarize use, so a chatty or malformed reply never crashes the
-// router. The classifier's native-vs-feature-vs-project sizing is reconciled with
-// the existing agent.ShouldSupervise heuristic so that judgment stays the single
-// source of truth: a "feature/project" proposal is only honored if ShouldSupervise
-// agrees the goal is complex, and a "native" proposal is upgraded to supervise
-// when ShouldSupervise says the goal warrants it. On unparseable output the router
-// falls back to the pure-function ShouldSupervise over the goal text (no model
-// call) — never silently RouteNative.
+// router. Sizing "is this goal big enough to decompose?" is exactly the model-side
+// coding judgment the North Star (CLAUDE.md §1) puts in the model, so a PARSEABLE
+// classifier proposal WINS: the frontier-model classifier names the cheapest route
+// that honestly satisfies the goal (native single loop < supervised fan-out <
+// whole-project loop) and the router honors it as-is. The string-heuristic
+// (ShouldSupervise) survives ONLY as the no-model / unparseable-output FALLBACK —
+// it never overrules a proposal the model could parse. This changes nothing about
+// the blast-radius rails: the supervisor caps, the budget wall, and the verifier
+// (I2) stay deterministic; routing only chooses WHICH bounded machine runs. On
+// unparseable output (or no classifier) the router falls back to the pure-function
+// ShouldSupervise over the goal text (no model call) — never silently RouteNative.
 //
 // RouteContinue (the persistence requirement) is detected locally, before the
 // model call, when the message references the active goal carried in
@@ -37,15 +41,22 @@ import (
 // SupervisorFirstRouter is the default auto-router. Classifier MUST be the
 // conversation-metered provider (so the routing call counts against the
 // conversation ceiling, §6); ShouldSupervise is the pure-function heuristic reused
-// from the agent wiring (orchestrator.go) — the single source of the
-// native-vs-supervise sizing judgment, and the no-model fallback on unparseable
-// classifier output. Log is the append-only audit (nil-safe); a nil Log simply
-// records nothing.
+// from the agent wiring (orchestrator.go) — now ONLY the no-model FALLBACK on
+// unparseable classifier output (or when no classifier is wired), never an
+// overrule of a parseable proposal. Log is the append-only audit (nil-safe); a nil
+// Log simply records nothing.
+//
+// ClampDownToNative is an OPTIONAL, default-OFF operator backstop: when true it
+// one-directionally clamps a parseable supervise/project proposal down to
+// RouteNative whenever the heuristic judges the goal simple. It is INERT by default
+// (the zero value) so the documented behavior is "classifier proposal wins"; it
+// exists only as a conservative operator lever and never UPGRADES a proposal.
 type SupervisorFirstRouter struct {
-	Classifier      model.Provider         // the METERED provider (same conversation ledger)
-	ShouldSupervise func(goal string) bool // reused agent heuristic; also the parse-failure fallback
-	Log             *eventlog.Log          // metadata-only session_route audit; nil-safe
-	ID              string                 // conversation id for the audit Task field (optional)
+	Classifier        model.Provider         // the METERED provider (same conversation ledger)
+	ShouldSupervise   func(goal string) bool // reused agent heuristic; now ONLY the parse-failure fallback
+	Log               *eventlog.Log          // metadata-only session_route audit; nil-safe
+	ID                string                 // conversation id for the audit Task field (optional)
+	ClampDownToNative bool                   // OPTIONAL default-OFF backstop: clamp supervise/project→native when the heuristic says simple (one-directional, never upgrades)
 }
 
 // classifierSys is the system prompt for the one cheap routing call. It asks for a
@@ -53,14 +64,14 @@ type SupervisorFirstRouter struct {
 // length only (never the body). The four work routes mirror the Route enum's
 // machines; "continue" is decided locally (not by the model) so it is intentionally
 // omitted from the model's choices.
-const classifierSys = `You are a fast request classifier for a coding agent. Decide which machine should handle the user's request and reply with ONLY a JSON object:
+const classifierSys = `You are a fast request classifier for a coding agent. Pick the CHEAPEST machine that honestly satisfies the request and reply with ONLY a JSON object:
 {"route": string, "reason": string}
-"route" is exactly one of:
-- "chat"      — a meta or conversational question that needs no code change (e.g. "what are you working on?", "explain this", "why did you do that?").
-- "native"    — a small, localized code change a single loop can finish (a typo, a one-file fix, a rename, a small function).
-- "supervise" — a multi-step feature or change spanning several files that benefits from planning and sub-tasks.
-- "project"   — building or scaffolding a whole project/service from little or nothing (multiple components, tests, packaging).
-"reason" is one short sentence. Respond with ONLY the JSON object.`
+Each "route" names a machine and what it costs to run:
+- "chat"      — answer only; no code change, no worktree. Cost: one reply. Use for meta/conversational questions ("what are you working on?", "explain this", "why did you do that?").
+- "native"    — one single coding loop in ONE disposable worktree+sandbox. CHEAPEST coding route. Use for a localized change a single loop can finish (a typo, a one-file fix, a rename, a small function) — even when phrased tersely.
+- "supervise" — a bounded fan-out of N worker worktrees+sandboxes (up to the operator's fan-out/agent caps), each judged by the verifier. Costlier (N sandboxes + planning). Use for a multi-step change spanning several files that genuinely needs decomposition into sub-tasks.
+- "project"   — the supervised loop run under an outer budget/deadline. Costliest. Use only for building or scaffolding a whole project/service from little or nothing (multiple components, tests, packaging).
+Size by the WORK, not the wording: terse but large ("rewrite the auth subsystem") is supervise/project; verbose but trivial is native. Prefer the cheaper route on a tie. "reason" is one short sentence. Respond with ONLY the JSON object.`
 
 // Route classifies one principal message into a Route. It first checks the local,
 // no-model RouteContinue rule (does the message reference the active goal?), then
@@ -106,45 +117,30 @@ func (r *SupervisorFirstRouter) Route(ctx context.Context, text string, st WorkS
 	return route, nil
 }
 
-// reconcile folds the classifier's proposal together with the ShouldSupervise
-// heuristic so that the native-vs-supervise sizing stays the heuristic's single
-// judgment. RouteChat is honored as-is (a meta answer needs no sizing). For the
-// work routes:
+// reconcile honors the classifier's PARSEABLE proposal as-is — the model's sizing
+// is the single source of truth for which bounded machine runs (CLAUDE.md §1). The
+// former upgrade/downgrade arms that let the string heuristic OVERRULE the model
+// are gone: the heuristic now lives only in fallback() (the unparseable-output / no-
+// classifier path). RouteChat/native/supervise/project are returned unchanged.
 //
-//   - a "native" proposal is UPGRADED to RouteSupervise when ShouldSupervise judges
-//     the goal complex (the heuristic overrules a too-small estimate);
-//   - a "supervise"/"project" proposal is honored only if ShouldSupervise agrees the
-//     goal is complex; if the heuristic says simple, it is DOWNGRADED to RouteNative
-//     (the heuristic overrules a too-large estimate). "project" that survives the
-//     heuristic stays RouteProject (whole-project is a project-loop concern the
-//     classifier alone names).
-//
-// When ShouldSupervise is nil the proposal is taken at face value (no heuristic to
-// reconcile against), so the router still works before the heuristic is wired.
+// The one exception is the OPTIONAL, default-OFF ClampDownToNative backstop: when an
+// operator enables it, a supervise/project proposal is clamped DOWN to RouteNative
+// whenever the heuristic judges the goal simple. It is one-directional (it only ever
+// makes a route cheaper, never larger) and INERT by default, so the documented
+// behavior remains "classifier proposal wins". An unknown route value from
+// parseRoute (shouldn't happen) is sized by the heuristic, never blindly trusted.
 func (r *SupervisorFirstRouter) reconcile(proposed Route, goal string) Route {
-	if proposed == RouteChat {
-		return RouteChat
-	}
-	complex := r.supervise(goal)
 	switch proposed {
-	case RouteNative:
-		if complex {
-			return RouteSupervise
+	case RouteChat, RouteNative:
+		return proposed
+	case RouteSupervise, RouteProject:
+		// Default-off operator backstop only: clamp a large proposal down to native
+		// when explicitly enabled AND the cheap heuristic says the goal is simple.
+		if r.ClampDownToNative && !r.supervise(goal) {
+			return RouteNative
 		}
-		return RouteNative
-	case RouteSupervise:
-		if complex {
-			return RouteSupervise
-		}
-		return RouteNative
-	case RouteProject:
-		if complex {
-			return RouteProject
-		}
-		return RouteNative
+		return proposed
 	default:
-		// An unknown route value from parseRoute (shouldn't happen) is sized by the
-		// heuristic, never blindly trusted.
 		return r.fallback(goal)
 	}
 }

@@ -124,6 +124,8 @@ The native loop, Codex, and Claude Code are interchangeable behind this. Adding 
 
 **Multi-backend strength-routing seam (the Trust Ledger goes live, additive, contract-untouched, Phase 13).** The orchestrator carries a nil/empty-gated `Selector` seam plus `Backends []string` and `NewEnvFor func(dir, name) Env`. `multiBackend()` holds when `len(Backends) > 1 && NewEnvFor != nil`; with either unset — every default path — `executeSingle`/`raceEscalate` are **byte-identical** to the single `-backend` path. The `-backends native,codex,claude-code` flag (on `run` and the run-style commands sharing `buildRunOrchestrator`) activates it: `executeSingle` runs the trust-strongest backend first (`orderBackends` → `NewEnvFor(dir, names[0])`), and on a verify-FAIL `raceEscalate` cuts one fresh worktree per **distinct** backend so `route.Race` competes *different* backends and the verifier picks the winner. `agent.Selector` is satisfied by `trust.Selector` (built from `trust.Replay(<log>)`) **without** `internal/trust` importing `agent` — the Ledger plugs in, ranks by smoothed verifier-judged pass-rate, and a broken-chain `Replay` degrades to the configured order, never aborting. **I2 is preserved by construction:** the Selector only ORDERS attempt order; the verifier still decides "done" and judges the race. Per-backend providers/creds resolve through the SecretStore seam, never reaching the model (I3).
 
+**Earned backend selection — `-backend auto` + preferred-backend (additive, Phase 13).** The default backend is no longer hard-wired to native. `-backend auto` (and config `backend: auto`, mapped by `applyConfigDefaults`) resolves to a single concrete backend at run time via `resolveAutoBackend`: `availableBackends(cfg, cred)` reports which of {native, codex, claude-code} actually have their CLI + key present on the host, and the survivors are ordered PREFERENCE-FIRST — the one-run `-prefer-backend` flag, else durable config `preferred_backend` (a CONCRETE backend, validated never to be "auto") — then re-ordered by the verifier-judged Trust Ledger (`trust.Replay` → `Order`), so a cold install honors the stated preference and accumulated evidence overtakes it. `-backends auto` expands the same available set into the multi-backend race (the `Selector` seam above). The selector and the preference only ORDER which backend RUNS; the verifier still judges every result (I2), and per-backend creds resolve through the SecretStore seam (I3).
+
 ### I2 — The verifier is the only authority on "done"
 `Result.SelfClaimed` is advisory. After **any** backend runs, the orchestrator re-runs the project's checks (`verify.Verifier.Check`) and that boolean decides whether work ships. This is what makes delegating to black-box agents safe: their self-report never governs.
 
@@ -447,6 +449,18 @@ restart re-hydrates and continues rather than restarting.
 `run` / `build` / `serve` stay first-class for scripting/CI: `runMain` (one bounded
 native task) and `buildMain` (supervisor/project) pass a nil `Inbox`/`Emitter` and
 are byte-identical.
+
+**Work-route authority (Phase 13).** For the auto-router (`SupervisorFirstRouter`),
+the frontier-model **classifier is AUTHORITATIVE** for the work-route: a parseable
+proposal (`chat` < `native` < `supervise` < `project`, sized by the work via a
+capability+cost manifest) is honored as-is by `reconcile`. The string heuristic
+(`ShouldSupervise`) is now ONLY the no-model / unparseable-output **fallback**
+(`fallback`), never an overrule of a parseable proposal. Routing is still a
+dispatcher, never a rail — every route terminates in the same verifier (I2) and the
+same conversation budget ceiling, so a mis-route can only cost money, never defeat a
+rail. `nilcore run` gains an optional default-OFF `-auto-supervise` seam that wires
+the SAME classifier (when a native provider exists) to let a complex goal scale up to
+the supervised loop; off ⇒ byte-identical single-task run.
 
 ### New event-log kinds (metadata only, redacted — I5)
 

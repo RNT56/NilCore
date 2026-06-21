@@ -426,6 +426,15 @@ func detectDelegated() []string {
 }
 
 func onPath(bin string) bool {
+	return OnPath(bin)
+}
+
+// OnPath reports whether bin resolves on the host PATH (exec.LookPath). It is the
+// exported form of the wizard's CLI-detection probe so the run path can reuse the
+// exact same "is this delegated CLI installed?" check when computing which
+// backends are AVAILABLE on this host. It only LOOKS UP a path — it never runs
+// anything (I4); execution stays in the sandbox / delegated-CLI layer.
+func OnPath(bin string) bool {
 	if bin == "" {
 		return false
 	}
