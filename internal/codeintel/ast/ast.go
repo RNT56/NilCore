@@ -6,7 +6,12 @@
 // Scope note: this is a multi-language seam (D3-T01). The public API — Symbols /
 // References / Calls plus the Symbol/Reference/Span/Kind types — is the stable
 // contract; behind it sits a per-language backend keyed by file extension. Go is
-// served by the standard library (go/parser); Python by a pure-Go line scanner.
+// served by the standard library (go/parser); Python, JS/TS, Rust, the Tier-1
+// brace-delimited languages (Java, C, C++, C#), the Tier-2 languages (Ruby — a
+// `def`/`end` scanner; PHP, Kotlin, Swift — brace-delimited), and the Tier-3 languages
+// (Scala, Dart, Zig — brace-delimited; Bash — brace-ish with an intra-file call graph;
+// Lua, Elixir — `end`-delimited; SQL — a CREATE-keyword scanner) by pure-Go heuristic
+// line scanners.
 // Everything here is stdlib only — no cgo, no tree-sitter — so the zero-cgo build
 // holds. A richer per-language backend (a tree-sitter binding behind an external
 // service, say) can slot in later without changing callers.
@@ -76,6 +81,43 @@ var parsers = map[string]languageParser{
 	".mjs": jsParser{},
 	".cjs": jsParser{},
 	".rs":  rustParser{},
+	// Tier-1 brace-delimited languages (Phase 13). Each has a dedicated heuristic
+	// line-scanner backend reusing the shared brace machinery (brace.go).
+	".java": javaParser{},
+	// C: .c sources and .h headers (the .h family is shared with C++ below, but C is
+	// the conservative default for a bare .h — only C++-specific files claim .hpp/.hh/
+	// .hxx).
+	".c": cParser{},
+	".h": cParser{},
+	// C++: source and header variants.
+	".cc":  cppParser{},
+	".cpp": cppParser{},
+	".cxx": cppParser{},
+	".hpp": cppParser{},
+	".hh":  cppParser{},
+	".hxx": cppParser{},
+	// C#.
+	".cs": csharpParser{},
+	// Tier-2 languages (Phase 13). Ruby uses a `def`/`class`/`module` + `end` scanner;
+	// PHP, Kotlin, and Swift reuse the shared brace machinery (brace.go).
+	".rb":    rubyParser{},
+	".php":   phpParser{},
+	".kt":    kotlinParser{},
+	".kts":   kotlinParser{},
+	".swift": swiftParser{},
+	// Tier-3 languages (Phase 13). Scala, Dart, and Zig reuse the shared brace machinery
+	// (brace.go); Bash is brace-ish with an intra-file call graph; Lua and Elixir are
+	// `end`-delimited scanners (like Ruby); SQL is a CREATE-keyword scanner.
+	".scala": scalaParser{},
+	".sc":    scalaParser{},
+	".dart":  dartParser{},
+	".zig":   zigParser{},
+	".sh":    bashParser{},
+	".bash":  bashParser{},
+	".lua":   luaParser{},
+	".ex":    elixirParser{},
+	".exs":   elixirParser{},
+	".sql":   sqlParser{},
 }
 
 // SupportedExtensions returns the file extensions (dot included, e.g. ".go", ".py")

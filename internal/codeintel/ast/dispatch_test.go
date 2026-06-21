@@ -67,6 +67,34 @@ func TestNewExtensionsDispatch(t *testing.T) {
 		{"a.mjs", "export function m() {\n  return 3;\n}\n", "m"},
 		{"a.cjs", "function c() {\n  return 4;\n}\n", "c"},
 		{"a.rs", "fn r() -> i32 {\n    0\n}\n", "r"},
+		// Tier-1 brace languages (Phase 13).
+		{"a.java", "class J {\n    void m() {\n    }\n}\n", "J"},
+		{"a.c", "int cf(void) {\n    return 0;\n}\n", "cf"},
+		{"a.h", "struct S {\n    int x;\n};\n", "S"},
+		{"a.cc", "int cc() {\n    return 0;\n}\n", "cc"},
+		{"a.cpp", "int cpp() {\n    return 0;\n}\n", "cpp"},
+		{"a.cxx", "int cxx() {\n    return 0;\n}\n", "cxx"},
+		{"a.hpp", "class H {\n};\n", "H"},
+		{"a.hh", "class HH {\n};\n", "HH"},
+		{"a.hxx", "class HX {\n};\n", "HX"},
+		{"a.cs", "class CS {\n    void M() {\n    }\n}\n", "CS"},
+		// Tier-2 languages (Phase 13).
+		{"a.rb", "def rb\n  1\nend\n", "rb"},
+		{"a.php", "<?php\nfunction pf() {\n    return 1;\n}\n", "pf"},
+		{"a.kt", "fun kf() {\n    return\n}\n", "kf"},
+		{"a.kts", "fun ks() {\n    return\n}\n", "ks"},
+		{"a.swift", "func sf() {\n    return\n}\n", "sf"},
+		// Tier-3 languages (Phase 13).
+		{"a.scala", "object O {\n  def sf() = 1\n}\n", "O"},
+		{"a.sc", "def scf() = 1\n", "scf"},
+		{"a.dart", "class D {\n  void m() {}\n}\n", "D"},
+		{"a.zig", "fn zf() void {\n}\n", "zf"},
+		{"a.sh", "shf() {\n  echo hi\n}\n", "shf"},
+		{"a.bash", "function bf {\n  echo hi\n}\n", "bf"},
+		{"a.lua", "function lf()\n  return 1\nend\n", "lf"},
+		{"a.ex", "defmodule M do\n  def ef() do\n    1\n  end\nend\n", "M"},
+		{"a.exs", "defmodule S do\nend\n", "S"},
+		{"a.sql", "CREATE TABLE users (id int);\n", "users"},
 	}
 	for _, tc := range cases {
 		p := filepath.Join(t.TempDir(), tc.file)
@@ -94,9 +122,16 @@ func TestSupportedExtensions(t *testing.T) {
 	got := SupportedExtensions()
 	sort.Strings(got)
 	// The full set now spans every registered backend: Go, Python, the JS/TS family,
-	// and Rust. Kept exhaustive so a forgotten registration (or an accidental drop)
-	// fails loudly.
-	want := []string{".cjs", ".go", ".js", ".jsx", ".mjs", ".py", ".rs", ".ts", ".tsx"}
+	// Rust, the Tier-1 brace languages (Java, C, C++, C#), the Tier-2 languages (Ruby,
+	// PHP, Kotlin, Swift), and the Tier-3 languages (Scala, Dart, Zig, Bash, Lua, Elixir,
+	// SQL). Kept exhaustive so a forgotten registration (or an accidental drop) fails
+	// loudly.
+	want := []string{
+		".bash", ".c", ".cc", ".cjs", ".cpp", ".cs", ".cxx", ".dart", ".ex", ".exs",
+		".go", ".h", ".hh", ".hpp", ".hxx", ".java", ".js", ".jsx", ".kt", ".kts",
+		".lua", ".mjs", ".php", ".py", ".rb", ".rs", ".sc", ".scala", ".sh", ".sql",
+		".swift", ".ts", ".tsx", ".zig",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedExtensions() = %v, want %v", got, want)
 	}
