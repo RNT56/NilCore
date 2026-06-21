@@ -164,6 +164,22 @@ func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []stri
 		seen[n] = true
 		out = append(out, n)
 	}
+	// A Selector is documented as ordering AND filtering, so it may legitimately return
+	// fewer — or, pathologically, zero — names. The multi-backend path needs at least one
+	// runnable backend (executeSingle indexes [0]; raceEscalate needs candidates), and
+	// o.Backends is non-empty by construction (multiBackend requires len>1). So if a
+	// Selector dropped everything, fall back to the configured set (de-duped) rather than
+	// hand the caller an empty slice — defending the hot path in ONE place.
+	if len(out) == 0 {
+		seen = make(map[string]bool, len(o.Backends))
+		for _, n := range o.Backends {
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
 	return out
 }
 

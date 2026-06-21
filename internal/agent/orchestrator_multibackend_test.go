@@ -145,6 +145,43 @@ func TestMultiBackendSelectsStrongestFirst(t *testing.T) {
 	}
 }
 
+// ROBUSTNESS — the empty-Selector guard: a Selector is documented as ordering AND
+// FILTERING, so a conforming one may return fewer or (pathologically) ZERO names.
+// executeSingle indexes names[0], so orderBackends must never hand back an empty slice —
+// it falls back to the configured set. Assert no panic/abort and that the first CONFIGURED
+// backend runs.
+func TestMultiBackendEmptySelectorFallsBackToConfigured(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initGitRepo(t)
+	logPath := filepath.Join(t.TempDir(), "events.log")
+	lg, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatalf("eventlog.Open: %v", err)
+	}
+	built := map[string]*fakeBackend{}
+	orch := &agent.Orchestrator{
+		BaseRepo: repo,
+		Log:      lg,
+		Backends: []string{"a", "b"},
+		NewEnvFor: func(_, name string) agent.Env {
+			fb := &fakeBackend{name: name}
+			built[name] = fb
+			return agent.Env{Backend: fb, Verifier: &fakeVerifier{passed: true}}
+		},
+		Selector: &rankSelector{order: nil}, // drops every name
+	}
+	out, err := orch.Execute(context.Background(), backend.Task{ID: "multi-empty", Goal: "x"})
+	if err != nil {
+		t.Fatalf("Execute (empty Selector must not panic/abort): %v", err)
+	}
+	_ = lg.Close()
+	if out.Backend != "a" {
+		t.Errorf("ran backend %q, want a (first configured) on the empty-Selector fallback", out.Backend)
+	}
+}
+
 // MULTI race: with two DISTINCT backends where the verifier passes ONLY the
 // second-ordered one, raceEscalate races BOTH and returns the verifier-passing one
 // — proving the verifier judges the winner, not the Selector. The per-candidate
