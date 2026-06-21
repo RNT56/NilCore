@@ -6,7 +6,8 @@
 // Scope note: this is a multi-language seam (D3-T01). The public API — Symbols /
 // References / Calls plus the Symbol/Reference/Span/Kind types — is the stable
 // contract; behind it sits a per-language backend keyed by file extension. Go is
-// served by the standard library (go/parser); Python by a pure-Go line scanner.
+// served by the standard library (go/parser); Python, JS/TS, Rust, and the Tier-1
+// brace-delimited languages (Java, C, C++, C#) by pure-Go heuristic line scanners.
 // Everything here is stdlib only — no cgo, no tree-sitter — so the zero-cgo build
 // holds. A richer per-language backend (a tree-sitter binding behind an external
 // service, say) can slot in later without changing callers.
@@ -76,6 +77,23 @@ var parsers = map[string]languageParser{
 	".mjs": jsParser{},
 	".cjs": jsParser{},
 	".rs":  rustParser{},
+	// Tier-1 brace-delimited languages (Phase 13). Each has a dedicated heuristic
+	// line-scanner backend reusing the shared brace machinery (brace.go).
+	".java": javaParser{},
+	// C: .c sources and .h headers (the .h family is shared with C++ below, but C is
+	// the conservative default for a bare .h — only C++-specific files claim .hpp/.hh/
+	// .hxx).
+	".c": cParser{},
+	".h": cParser{},
+	// C++: source and header variants.
+	".cc":  cppParser{},
+	".cpp": cppParser{},
+	".cxx": cppParser{},
+	".hpp": cppParser{},
+	".hh":  cppParser{},
+	".hxx": cppParser{},
+	// C#.
+	".cs": csharpParser{},
 }
 
 // SupportedExtensions returns the file extensions (dot included, e.g. ".go", ".py")

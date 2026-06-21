@@ -67,6 +67,17 @@ func TestNewExtensionsDispatch(t *testing.T) {
 		{"a.mjs", "export function m() {\n  return 3;\n}\n", "m"},
 		{"a.cjs", "function c() {\n  return 4;\n}\n", "c"},
 		{"a.rs", "fn r() -> i32 {\n    0\n}\n", "r"},
+		// Tier-1 brace languages (Phase 13).
+		{"a.java", "class J {\n    void m() {\n    }\n}\n", "J"},
+		{"a.c", "int cf(void) {\n    return 0;\n}\n", "cf"},
+		{"a.h", "struct S {\n    int x;\n};\n", "S"},
+		{"a.cc", "int cc() {\n    return 0;\n}\n", "cc"},
+		{"a.cpp", "int cpp() {\n    return 0;\n}\n", "cpp"},
+		{"a.cxx", "int cxx() {\n    return 0;\n}\n", "cxx"},
+		{"a.hpp", "class H {\n};\n", "H"},
+		{"a.hh", "class HH {\n};\n", "HH"},
+		{"a.hxx", "class HX {\n};\n", "HX"},
+		{"a.cs", "class CS {\n    void M() {\n    }\n}\n", "CS"},
 	}
 	for _, tc := range cases {
 		p := filepath.Join(t.TempDir(), tc.file)
@@ -94,9 +105,12 @@ func TestSupportedExtensions(t *testing.T) {
 	got := SupportedExtensions()
 	sort.Strings(got)
 	// The full set now spans every registered backend: Go, Python, the JS/TS family,
-	// and Rust. Kept exhaustive so a forgotten registration (or an accidental drop)
-	// fails loudly.
-	want := []string{".cjs", ".go", ".js", ".jsx", ".mjs", ".py", ".rs", ".ts", ".tsx"}
+	// Rust, and the Tier-1 brace languages (Java, C, C++, C#). Kept exhaustive so a
+	// forgotten registration (or an accidental drop) fails loudly.
+	want := []string{
+		".c", ".cc", ".cjs", ".cpp", ".cs", ".cxx", ".go", ".h", ".hh", ".hpp",
+		".hxx", ".java", ".js", ".jsx", ".mjs", ".py", ".rs", ".ts", ".tsx",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("SupportedExtensions() = %v, want %v", got, want)
 	}
