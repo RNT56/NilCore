@@ -55,6 +55,7 @@ import (
 	"nilcore/internal/store"
 	"nilcore/internal/summarize"
 	"nilcore/internal/tools"
+	"nilcore/internal/trust"
 	"nilcore/internal/verify"
 	"nilcore/internal/wake"
 	"nilcore/internal/worktree"
@@ -483,14 +484,21 @@ func secretMain(args []string) {
 
 // commonFlags registers the flags shared by run and serve on fs.
 type commonFlags struct {
-	dir, backendName, runtime, image, checkCmd, logPath, config, sandboxPref *string
-	maxSteps, advisorMaxCalls, escalateAfter, raceN                          *int
+	dir, backendName, backends, runtime, image, checkCmd, logPath, config, sandboxPref *string
+	maxSteps, advisorMaxCalls, escalateAfter, raceN                                    *int
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
 	return commonFlags{
-		dir:             fs.String("dir", ".", "git repository tasks run against (in a disposable worktree)"),
-		backendName:     fs.String("backend", "native", "native | codex | claude-code"),
+		dir:         fs.String("dir", ".", "git repository tasks run against (in a disposable worktree)"),
+		backendName: fs.String("backend", "native", "native | codex | claude-code"),
+		// Phase 13 multi-backend strength-routing (additive, default-off). EMPTY ⇒ the
+		// single -backend path, byte-identical. A single name ⇒ same as -backend <name>.
+		// Two or more DISTINCT names ⇒ the orchestrator tries the historically-strongest
+		// first (Trust Ledger) and, on a verify-fail, races the distinct backends with the
+		// VERIFIER as judge (I2). When both are given, -backends wins. COST: each race runs
+		// N backends — the budget meter ceiling caps the spend.
+		backends:        fs.String("backends", "", "comma-separated backend set for multi-backend strength-routing, e.g. native,codex,claude-code (empty = single -backend path; two or more activates routing; -backends wins over -backend)"),
 		runtime:         fs.String("runtime", "podman", "container runtime: podman | docker"),
 		image:           fs.String("image", onboard.DefaultImage, "sandbox image"),
 		sandboxPref:     fs.String("sandbox", "auto", "sandbox backend: auto | namespace | container"),
@@ -502,6 +510,40 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
 		raceN:           fs.Int("race-n", 1, "on a verify failure, race N parallel attempts and keep a verifier-green one (1 = off; adaptive — only fires after the single attempt fails)"),
 	}
+}
+
+// knownBackendNames is the set of backend names buildBackend can construct. A
+// -backends entry outside this set is FATAL (mirrors resolveProvider's unknown-name
+// rejection), so an operator typo never silently routes nowhere.
+var knownBackendNames = map[string]bool{"native": true, "codex": true, "claude-code": true}
+
+// parseBackends turns the -backends flag into the de-duplicated, order-preserving
+// list of backend names for the multi-backend path. EMPTY ⇒ nil (the caller stays on
+// the single -backend path, byte-identical). Each name is validated against
+// knownBackendNames; an unknown name is FATAL (like other flags). A single distinct
+// name ⇒ a one-element slice, which the orchestrator treats as the single path
+// (multiBackend() needs len > 1), so it remains byte-identical to -backend <name>.
+func parseBackends(spec string) []string {
+	if strings.TrimSpace(spec) == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range strings.Split(spec, ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if !knownBackendNames[name] {
+			fatal(fmt.Errorf("unknown backend %q in -backends (want native | codex | claude-code)", name))
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // runMain executes a single task and exits.
@@ -540,6 +582,9 @@ func runMain(args []string) {
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
+	// Phase 13: when -backends names two or more backends, activate strength-routing
+	// (Backends/NewEnvFor/Selector). EMPTY/single ⇒ no-op (byte-identical single path).
+	wireMultiBackend(orch, c, b, log, mem, absDir)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
@@ -567,7 +612,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 		fatal(err)
 	}
 	mem, cp := setupPersistence(log)
-	return &agent.Orchestrator{
+	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
 		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
 		Log:        log,
@@ -578,6 +623,10 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
+	// Phase 13: -backends (two or more) activates strength-routing for the run-style
+	// commands (propose-edit / watch / self-improve / schedule). EMPTY/single ⇒ no-op.
+	wireMultiBackend(orch, c, b, log, mem, absDir)
+	return orch
 }
 
 // serveMain listens on a chat channel and gives every thread the SAME
@@ -1388,6 +1437,66 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 		}
 		return agent.Env{Backend: be, Verifier: v}
 	}
+}
+
+// multiEnvFactory is the NewEnvFor analogue of envFactory for the Phase-13 multi-
+// backend path: it builds the SAME per-worktree env the single factory does — the
+// backend-INDEPENDENT sandbox + verifier for `dir` — but with the backend resolved by
+// NAME (buildBackend(name, ...)) rather than by the single -backend flag. Each named
+// backend resolves its OWN provider/advisor (native gets the executor provider + the
+// advisor tier; codex/claude-code get a nil provider, exactly as resolveProvider /
+// resolveAdvisor return today) and its OWN creds via the SecretStore-backed cred
+// resolver — the model never sees a key (I3). The verifier is identical across
+// backends (the project's checks for the worktree), so only the backend is swapped.
+func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) func(dir, name string) agent.Env {
+	return func(dir, name string) agent.Env {
+		// Per-NAME deps: native needs the executor provider + advisor; codex/claude-code
+		// get nil (resolveProvider/resolveAdvisor already special-case them). A provider
+		// resolution failure here is FATAL — the operator listed a backend whose key is
+		// missing, which would otherwise silently degrade the race.
+		prov, perr := resolveProvider(name, b)
+		if perr != nil {
+			fatal(perr)
+		}
+		adv := resolveAdvisor(name, b, c)
+		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+		v := behavioralVerifier(box, *c.checkCmd)
+		be := buildBackend(name, prov, b.cred, adv, box, v, log, *c.maxSteps, mem, project, b.cfg)
+		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
+		// once for the native backend (nil/empty ⇒ byte-identical; only native reads it).
+		if n, ok := be.(*backend.Native); ok {
+			if steer, _ := steering.DiscoverAndLoad(dir); steer != "" {
+				n.SteeringContext = func() string { return steer }
+			}
+		}
+		return agent.Env{Backend: be, Verifier: v}
+	}
+}
+
+// wireMultiBackend activates the Phase-13 multi-backend strength-routing path on o
+// when -backends names two or more DISTINCT backends. It is ADDITIVE and default-off:
+// names==nil or a single name ⇒ it does NOTHING (o keeps NewEnv only, byte-identical
+// to the single path). Otherwise it sets o.Backends, o.NewEnvFor (the by-name env
+// factory), and o.Selector (the Trust Ledger over the run's event log). A broken-chain
+// Replay error is LOGGED and degrades to a nil Selector (configured order) — it never
+// aborts the run; a clean/missing log yields an empty ledger ⇒ configured order until
+// evidence accrues. The Selector only ORDERS; the verifier still governs "done" (I2).
+func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) {
+	names := parseBackends(*c.backends)
+	if len(names) <= 1 {
+		return // single path — leave Backends/NewEnvFor/Selector unset (byte-identical)
+	}
+	o.Backends = names
+	o.NewEnvFor = multiEnvFactory(c, b, log, mem, project)
+	led, err := trust.Replay(*c.logPath)
+	if err != nil {
+		// Fail-soft on a broken chain: no trustworthy ranking, so fall back to the
+		// configured order (nil Selector) rather than aborting the run.
+		fmt.Fprintf(os.Stderr, "trust: ledger unavailable (%v); using configured backend order\n", err)
+		log.Append(eventlog.Event{Kind: "trust_replay_error", Detail: map[string]any{"error": err.Error()}})
+		return
+	}
+	o.Selector = trust.NewSelector(led)
 }
 
 // resolveDelegated merges a delegated CLI's config-file settings (onboard.Config)
