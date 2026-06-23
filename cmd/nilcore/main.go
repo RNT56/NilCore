@@ -2084,7 +2084,56 @@ type boot struct {
 
 func loadBoot(configPath string) boot {
 	cfg := loadConfig(configPath)
-	return boot{cfg: cfg, cred: newCredResolver(cfg, detectStore(false), os.Getenv)}
+	return boot{cfg: cfg, cred: compatCredOverlay(cfg, newCredResolver(cfg, detectStore(false), os.Getenv))}
+}
+
+// compatCredOverlay bridges the config file to provider resolution for the
+// operator-typed "openai-compatible" vendor. provider.ResolveWith reads the
+// endpoint knobs through the cred/getenv seam by NAME — NILCORE_COMPAT_BASE_URL,
+// NILCORE_COMPAT_AUTH_SCHEME, NILCORE_COMPAT_KEY_ENV — but nothing maps the
+// onboard.Config equivalents (BaseURL/AuthScheme/CompatKeyEnv) into that seam, so
+// without this overlay the config-file path is dead and only real env vars work.
+//
+// The returned resolver populates exactly those three NAMES from the config when
+// the corresponding field is set, and falls through to base for every other name
+// (and for these names when the config field is empty). Precedence: a real env var
+// WINS — base(name) is consulted first and only an empty result falls back to the
+// configured value — so an operator can still override the file from the
+// environment, and the file fills in only what the environment leaves unset.
+//
+// Only NAMES flow through this overlay: the compat KEY value itself is never read
+// or carried here — provider.ResolveWith reads it via the (unmodified) base cred
+// under whatever NAME CompatKeyEnv selects, so no secret VALUE is logged or
+// duplicated (invariant I3).
+//
+// CRITICAL: when the config sets NONE of the three compat fields (the common
+// case), this overlay is a pure pass-through — the returned func behaves
+// identically to base for every name, so existing setups see zero behavior change.
+func compatCredOverlay(cfg onboard.Config, base func(string) string) func(string) string {
+	overrides := map[string]string{}
+	if v := strings.TrimSpace(cfg.BaseURL); v != "" {
+		overrides["NILCORE_COMPAT_BASE_URL"] = cfg.BaseURL
+	}
+	if v := strings.TrimSpace(cfg.AuthScheme); v != "" {
+		overrides["NILCORE_COMPAT_AUTH_SCHEME"] = cfg.AuthScheme
+	}
+	if v := strings.TrimSpace(cfg.CompatKeyEnv); v != "" {
+		overrides["NILCORE_COMPAT_KEY_ENV"] = cfg.CompatKeyEnv
+	}
+	if len(overrides) == 0 {
+		return base // no compat config ⇒ pure pass-through, byte-identical to base.
+	}
+	return func(name string) string {
+		// Real env wins: consult base first, fall back to the configured value only
+		// when the environment leaves the name unset.
+		if v := base(name); v != "" {
+			return v
+		}
+		if v, ok := overrides[name]; ok {
+			return v
+		}
+		return ""
+	}
 }
 
 // detectStore selects the host SecretStore. It resolves the config dir and

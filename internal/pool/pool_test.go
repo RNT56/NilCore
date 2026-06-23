@@ -74,6 +74,17 @@ func (flatPricer) Price(modelID string, in, out int) float64 {
 	return 1
 }
 
+// PriceUsage satisfies the widened Pricer interface (P15-T15). It stays a faithful
+// flat double: an authoritative reported cost wins when set, otherwise it delegates
+// to Price over the usage's token split so the swarm's $1/call ledger assertions
+// hold byte-identically.
+func (f flatPricer) PriceUsage(modelID string, u model.Usage) float64 {
+	if u.CostUSD > 0 {
+		return u.CostUSD
+	}
+	return f.Price(modelID, u.InputTokens, u.OutputTokens)
+}
+
 // scriptedResolve maps spec strings to pre-built fakes, recording how many times
 // each spec was resolved so dedup/sharing can be asserted. An unmapped spec is an
 // error (forces tests to declare every spec they use).

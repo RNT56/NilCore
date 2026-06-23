@@ -3,6 +3,8 @@ package meter
 import (
 	"math"
 	"testing"
+
+	"nilcore/internal/model"
 )
 
 // almostEqual compares dollar amounts within a sub-cent epsilon so binary
@@ -35,6 +37,22 @@ func TestPrice(t *testing.T) {
 		{"gpt-5.5 1k+1k", "gpt-5.5", 1000, 1000, 0.00125 + 0.010},
 		{"gpt-5.5-pro 1k+1k", "gpt-5.5-pro", 1000, 1000, 0.015 + 0.120},
 		{"gpt-5.4-mini 1k+1k", "gpt-5.4-mini", 1000, 1000, 0.00025 + 0.002},
+
+		// Newly reachable ids (P15): GPT-5.x standard snapshots and the o-series
+		// reasoning models now land on a real tier instead of the fallback floor.
+		{"gpt-5.4 standard", "gpt-5.4-2026-05", 1000, 1000, 0.00125 + 0.010},
+		{"gpt-5 standard", "gpt-5-turbo", 1000, 1000, 0.00125 + 0.010},
+		{"o3 reasoning", "o3-mini", 1000, 1000, 0.002 + 0.008},
+		{"o4 reasoning", "o4-mini-high", 1000, 1000, 0.003 + 0.012},
+		{"o1 reasoning", "o1-preview", 1000, 1000, 0.015 + 0.060},
+
+		// OpenAI-compatible / self-hosted open-weight ids reachable via the P15
+		// compat provider now resolve to a realistic hosted rate.
+		{"llama compat", "llama-3.3-70b", 1000, 1000, 0.0009 + 0.0009},
+		{"mistral compat", "mistral-large", 1000, 1000, 0.002 + 0.006},
+		{"qwen compat", "qwen-2.5-72b", 1000, 1000, 0.0009 + 0.0009},
+		{"deepseek compat", "deepseek-v3", 1000, 1000, 0.0014 + 0.0028},
+		{"gemini-2 compat", "gemini-2.0-flash", 1000, 1000, 0.00125 + 0.010},
 
 		// OpenRouter — fusion is priced high (cumulative panel); the generic
 		// openrouter prefix is the per-provider fallback.
@@ -155,4 +173,162 @@ func TestPriceNegativeClamped(t *testing.T) {
 // matching the interface the metering decorator (P1-T01) depends on.
 func TestTableSatisfiesPricer(t *testing.T) {
 	var _ Pricer = NewTable()
+}
+
+// TestPriceUsageMatchesPriceForPlainSplit asserts the richer PriceUsage path is
+// a strict superset of Price: with only InputTokens/OutputTokens set (no cached,
+// reasoning, or cost), it returns the exact same number Price does, for known
+// AND unknown ids. This locks the regression — adding the Usage-aware path never
+// changes the dollar figure for the plain two-count case every existing caller
+// produces.
+func TestPriceUsageMatchesPriceForPlainSplit(t *testing.T) {
+	p := NewTable()
+	ids := []string{
+		"claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-fable-5",
+		"gpt-5.5", "gpt-5.5-pro", "gpt-5.4-mini", "openrouter/fusion",
+		"totally-unknown-model", // unknown ⇒ both paths hit the same fallback floor
+	}
+	splits := [][2]int{{1000, 1000}, {2000, 500}, {0, 0}, {500, 0}, {0, 750}}
+	for _, id := range ids {
+		for _, s := range splits {
+			plain := p.Price(id, s[0], s[1])
+			usage := p.PriceUsage(id, model.Usage{InputTokens: s[0], OutputTokens: s[1]})
+			if !almostEqual(plain, usage) {
+				t.Errorf("PriceUsage(%q, in=%d out=%d)=%v != Price=%v", id, s[0], s[1], usage, plain)
+			}
+		}
+	}
+}
+
+// TestPriceUsageCostOverridesEstimate asserts an authoritative Usage.CostUSD
+// (what OpenRouter actually charged) wins over the local table estimate — the
+// table can only drift from a real bill, so the reported figure is returned
+// verbatim regardless of the token split or model id.
+func TestPriceUsageCostOverridesEstimate(t *testing.T) {
+	p := NewTable()
+
+	// Huge token counts that would estimate far above the reported cost — the
+	// reported cost must still win.
+	got := p.PriceUsage("gpt-5.5-pro", model.Usage{
+		InputTokens:  1_000_000,
+		OutputTokens: 1_000_000,
+		CostUSD:      0.0042,
+	})
+	if !almostEqual(got, 0.0042) {
+		t.Errorf("PriceUsage with CostUSD=0.0042 = %v, want 0.0042 (authoritative override)", got)
+	}
+
+	// Tiny token counts that would estimate near-zero — a reported cost above
+	// the estimate must also win (override is unconditional, both directions).
+	got = p.PriceUsage("claude-haiku-4-5", model.Usage{
+		InputTokens:  10,
+		OutputTokens: 10,
+		CostUSD:      0.99,
+	})
+	if !almostEqual(got, 0.99) {
+		t.Errorf("PriceUsage with CostUSD=0.99 = %v, want 0.99 (authoritative override)", got)
+	}
+
+	// CostUSD == 0 means "not reported" → fall through to local estimation.
+	est := p.PriceUsage("claude-opus-4-8", model.Usage{InputTokens: 1000, OutputTokens: 1000, CostUSD: 0})
+	if !almostEqual(est, 0.005+0.025) {
+		t.Errorf("PriceUsage with CostUSD=0 = %v, want local estimate %v", est, 0.005+0.025)
+	}
+}
+
+// TestPriceUsageCachedTokensDiscounted asserts CachedTokens (input served from a
+// prompt cache) bills at the reduced rate — strictly cheaper than charging the
+// same input at the full rate, but never free.
+func TestPriceUsageCachedTokensDiscounted(t *testing.T) {
+	p := NewTable()
+	// Opus: input rate 0.005/1k. 1000 input total, of which 800 are cached.
+	// Fresh 200 @ full + cached 800 @ (full * cachedDiscount).
+	const inRate = 0.005
+	want := 200.0/1000*inRate + 800.0/1000*inRate*cachedDiscount
+	got := p.PriceUsage("claude-opus-4-8", model.Usage{InputTokens: 1000, CachedTokens: 800})
+	if !almostEqual(got, want) {
+		t.Errorf("PriceUsage cached = %v, want %v", got, want)
+	}
+
+	// A cache hit must be strictly cheaper than billing all input at full rate,
+	// and strictly more than free (the cached tokens still cost something).
+	full := p.PriceUsage("claude-opus-4-8", model.Usage{InputTokens: 1000})
+	if !(got < full-1e-12) {
+		t.Errorf("cached charge %v not cheaper than full-rate %v", got, full)
+	}
+	if !(got > 0) {
+		t.Errorf("cached charge %v should be > 0 (not free)", got)
+	}
+
+	// CachedTokens > InputTokens (mis-reported) must clamp, never go negative.
+	clamped := p.PriceUsage("claude-opus-4-8", model.Usage{InputTokens: 1000, CachedTokens: 5000})
+	allCached := 1000.0 / 1000 * inRate * cachedDiscount
+	if !almostEqual(clamped, allCached) {
+		t.Errorf("over-reported cached = %v, want all-cached %v (clamped)", clamped, allCached)
+	}
+	if clamped < 0 {
+		t.Errorf("clamped cached charge %v must not be negative", clamped)
+	}
+}
+
+// TestPriceUsageReasoningBilledAsOutput asserts ReasoningTokens (hidden thinking)
+// are accounted at the output rate, added on top of the visible OutputTokens.
+func TestPriceUsageReasoningBilledAsOutput(t *testing.T) {
+	p := NewTable()
+	// Sonnet: output rate 0.015/1k. 500 visible + 1500 reasoning = 2000 @ output.
+	const outRate = 0.015
+	want := 2000.0 / 1000 * outRate // input is 0
+	got := p.PriceUsage("claude-sonnet-4-6", model.Usage{OutputTokens: 500, ReasoningTokens: 1500})
+	if !almostEqual(got, want) {
+		t.Errorf("PriceUsage reasoning = %v, want %v", got, want)
+	}
+
+	// Reasoning tokens are billed identically to the same count of output tokens.
+	asOutput := p.PriceUsage("claude-sonnet-4-6", model.Usage{OutputTokens: 2000})
+	if !almostEqual(got, asOutput) {
+		t.Errorf("reasoning charge %v != equivalent output charge %v", got, asOutput)
+	}
+}
+
+// TestPriceUsageUnknownStillConservative asserts the conservative floor survives
+// the richer path: an unknown id priced through PriceUsage (with cached/reasoning
+// splits) still bills at the fallback tier, never below it — the budget ceiling
+// stays a hard wall (docs/MULTI-AGENT.md §7).
+func TestPriceUsageUnknownStillConservative(t *testing.T) {
+	p := NewTable()
+	// No cached/reasoning: must equal the plain conservative floor for 1k+1k.
+	got := p.PriceUsage("some-brand-new-model", model.Usage{InputTokens: 1000, OutputTokens: 1000})
+	wantFloor := 0.020 + 0.150
+	if !almostEqual(got, wantFloor) {
+		t.Errorf("unknown id PriceUsage = %v, want conservative floor %v", got, wantFloor)
+	}
+
+	// With a cache hit the unknown id is still priced at the fallback INPUT rate
+	// (discounted on the cached portion), never cheaper than the known tiers for
+	// the same fresh/cached split.
+	fresh, cached := 600, 400
+	const flrIn, flrOut = 0.020, 0.150
+	wantCached := float64(fresh)/1000*flrIn + float64(cached)/1000*flrIn*cachedDiscount + 1000.0/1000*flrOut
+	gotCached := p.PriceUsage("some-brand-new-model", model.Usage{InputTokens: 1000, CachedTokens: 400, OutputTokens: 1000})
+	if !almostEqual(gotCached, wantCached) {
+		t.Errorf("unknown cached PriceUsage = %v, want %v", gotCached, wantCached)
+	}
+	for _, id := range []string{"claude-haiku-4-5", "gpt-5.4-mini", "llama-3.3-70b"} {
+		known := p.PriceUsage(id, model.Usage{InputTokens: 1000, CachedTokens: 400, OutputTokens: 1000})
+		if gotCached < known-1e-9 {
+			t.Errorf("unknown cached %v cheaper than known %q %v — not conservative", gotCached, id, known)
+		}
+	}
+}
+
+// TestPriceUsageNegativeClamped guards the ceiling on the richer path: negative
+// counts in any Usage field must not produce a negative (ceiling-relaxing) charge.
+func TestPriceUsageNegativeClamped(t *testing.T) {
+	p := NewTable()
+	got := p.PriceUsage("claude-opus-4-8", model.Usage{
+		InputTokens: -1000, OutputTokens: -1000, CachedTokens: -500, ReasoningTokens: -500,
+	})
+	if got != 0 {
+		t.Errorf("PriceUsage all-negative = %v, want 0", got)
+	}
 }

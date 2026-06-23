@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -17,18 +18,178 @@ import (
 
 // OpenAI is the Chat Completions adapter. It translates the canonical model.*
 // format to/from OpenAI's wire shape (tool_use/tool_result blocks ↔
-// tool_calls/tool messages). OpenRouter reuses this adapter with a different base
-// URL and key (it is OpenAI-compatible).
+// tool_calls/tool messages). The same adapter serves every OpenAI-compatible
+// endpoint — OpenRouter, Groq, Fireworks, Azure, local vLLM/Ollama/LM-Studio —
+// by varying baseURL and the auth descriptor (it is OpenAI-compatible).
+//
+// baseURL is the FULL endpoint prefix (it already carries any "/v1"); newRequest
+// appends only "/chat/completions". The auth descriptor names the header and its
+// value prefix (default "authorization" / "Bearer "; Azure uses "api-key" with no
+// prefix; an empty key emits no auth header at all, for keyless local servers).
+// maxTokensField records the JSON field name for the token cap so a later task can
+// switch it per backend — it is stored but not yet read by the marshaller, so the
+// request body stays byte-identical to today.
 type OpenAI struct {
-	key     string
-	model   string
-	baseURL string
-	http    *http.Client
+	key            string
+	model          string
+	baseURL        string
+	authHeader     string
+	authPrefix     string
+	maxTokensField string
+	http           *http.Client
+
+	// SOTA Chat-Completions request fields (P15-T05). All opt-in: a zero value
+	// for every one of these leaves the corresponding oaiRequest field at its
+	// zero value, which is omitempty, so the request body stays byte-identical to
+	// today when none is configured.
+	reasoningEffort   string             // "low" | "medium" | "high" | "minimal"
+	responseFormat    *oaiResponseFormat // structured-output json_schema
+	parallelToolCalls *bool              // pointer: false is meaningful
+	toolChoice        json.RawMessage    // "auto" | "none" | {"type":"function",...}
+	serviceTier       string             // "auto" | "default" | "flex" | "priority"
+	promptCacheKey    string             // routing hint for prompt caching
+
+	// OpenRouter-only typed extras (P15-T06). These are gated on isOpenRouter:
+	// they are merged into the request body / set as headers ONLY when this adapter
+	// targets the OpenRouter base, and only when the operator configured them — so a
+	// bare OpenRouter request stays byte-identical to a plain OpenAI-compatible one.
+	// isOpenRouter is set by NewOpenRouter and by the compat path when the base host
+	// is openrouter.ai. openRouterExtras is nil until a WithOpenRouter* option runs;
+	// the attribution strings are static config (NEVER the key, invariant I3).
+	isOpenRouter      bool
+	openRouterExtras  *openRouterExtras
+	openRouterReferer string // HTTP-Referer attribution header (empty ⇒ not sent)
+	openRouterTitle   string // X-Title attribution header (empty ⇒ not sent)
+}
+
+// Option configures an OpenAI-compatible adapter built via NewOpenAICompatible.
+// Options are applied in order over the defaults (OpenAI's base URL, Bearer auth,
+// "max_tokens").
+type Option func(*OpenAI)
+
+// WithBaseURL overrides the endpoint prefix. It is the FULL prefix (including any
+// "/v1"); only "/chat/completions" is appended, with no "/v1" injected. A trailing
+// slash is trimmed, so there is never a doubled slash.
+func WithBaseURL(baseURL string) Option {
+	return func(o *OpenAI) { o.baseURL = baseURL }
+}
+
+// WithAuth sets the auth header name and the value prefix. Bearer is
+// headerName="authorization", valuePrefix="Bearer "; Azure is headerName="api-key",
+// valuePrefix="" (raw key). The header is emitted only when the key is non-empty.
+func WithAuth(headerName, valuePrefix string) Option {
+	return func(o *OpenAI) {
+		o.authHeader = headerName
+		o.authPrefix = valuePrefix
+	}
+}
+
+// WithMaxTokensField sets the JSON field name used for the token cap (default
+// "max_tokens"). The value is stored for a later task; the body marshals
+// unchanged for now.
+func WithMaxTokensField(field string) Option {
+	return func(o *OpenAI) { o.maxTokensField = field }
+}
+
+// WithKey sets the API key. The key is held only to set a per-request header
+// (invariant I3): it is never logged, never placed in a prompt, and never given
+// to the model.
+func WithKey(key string) Option {
+	return func(o *OpenAI) { o.key = key }
+}
+
+// WithReasoningEffort sets the reasoning_effort hint for reasoning models
+// (gpt-5.x / o-series): "minimal" | "low" | "medium" | "high". Empty (the
+// default) omits the field, keeping the request body byte-identical to today.
+func WithReasoningEffort(effort string) Option {
+	return func(o *OpenAI) { o.reasoningEffort = effort }
+}
+
+// WithResponseFormat requests structured output: the model must emit JSON
+// conforming to the given JSON Schema. name labels the schema; strict toggles
+// strict-schema enforcement; schema is the raw JSON Schema. A nil/zero config
+// omits response_format entirely (byte-identical to today).
+func WithResponseFormat(name string, strict bool, schema json.RawMessage) Option {
+	return func(o *OpenAI) {
+		o.responseFormat = &oaiResponseFormat{Type: "json_schema"}
+		o.responseFormat.JSONSchema.Name = name
+		o.responseFormat.JSONSchema.Strict = strict
+		o.responseFormat.JSONSchema.Schema = schema
+	}
+}
+
+// WithParallelToolCalls controls whether the model may emit multiple tool calls
+// in one turn. It takes a pointer because false ("force one tool call at a
+// time") is a meaningful, distinct value from unset; unset omits the field.
+func WithParallelToolCalls(enabled bool) Option {
+	return func(o *OpenAI) { o.parallelToolCalls = &enabled }
+}
+
+// WithToolChoice pins how the model selects tools: a raw JSON value, e.g.
+// "auto", "none", "required", or {"type":"function","function":{"name":"x"}}.
+// Empty/nil omits the field (byte-identical to today).
+func WithToolChoice(choice json.RawMessage) Option {
+	return func(o *OpenAI) { o.toolChoice = choice }
+}
+
+// WithServiceTier selects the service tier: "auto" | "default" | "flex" |
+// "priority". Empty (the default) omits the field.
+func WithServiceTier(tier string) Option {
+	return func(o *OpenAI) { o.serviceTier = tier }
+}
+
+// WithPromptCacheKey sets a routing hint that improves prompt-cache hit rates by
+// steering identical-prefix requests to the same cache. Empty omits the field.
+func WithPromptCacheKey(key string) Option {
+	return func(o *OpenAI) { o.promptCacheKey = key }
+}
+
+// NewOpenAICompatible builds a Chat Completions adapter for any OpenAI-compatible
+// endpoint. With no options it targets OpenAI itself (api.openai.com/v1, Bearer
+// auth). Pass WithBaseURL / WithAuth / WithKey / WithMaxTokensField to retarget it
+// (OpenRouter, Groq, Fireworks, Azure, local vLLM/Ollama, …).
+func NewOpenAICompatible(model string, opts ...Option) *OpenAI {
+	o := &OpenAI{
+		model:          model,
+		baseURL:        "https://api.openai.com/v1",
+		authHeader:     "authorization",
+		authPrefix:     "Bearer ",
+		maxTokensField: "max_tokens",
+		http:           &http.Client{Timeout: 5 * time.Minute},
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	// Infer the OpenRouter base from the configured URL host so the compat path
+	// (NILCORE_COMPAT_BASE_URL pointed at OpenRouter, P15-T02) also gates the typed
+	// extras + attribution headers. NewOpenRouter sets isOpenRouter explicitly; this
+	// is the belt-and-suspenders host check for an operator-typed base. It NEVER
+	// changes the body/headers on its own — extras and attribution are still
+	// emitted only when separately configured, so a bare OpenRouter compat base
+	// stays byte-identical.
+	if !o.isOpenRouter && hostIsOpenRouter(o.baseURL) {
+		o.isOpenRouter = true
+	}
+	return o
+}
+
+// hostIsOpenRouter reports whether baseURL's host is openrouter.ai (or a subdomain
+// of it). It parses the URL so a path/query containing the string cannot trip it;
+// a malformed URL is simply "not OpenRouter".
+func hostIsOpenRouter(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	// DNS host names are case-insensitive; fold to lower so an operator-typed base
+	// like https://OpenRouter.ai/... still gates the extras.
+	host := strings.ToLower(u.Hostname())
+	return host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai")
 }
 
 // NewOpenAI returns an OpenAI Chat Completions provider.
 func NewOpenAI(key, modelID string) *OpenAI {
-	return &OpenAI{key: key, model: modelID, baseURL: "https://api.openai.com/v1", http: &http.Client{Timeout: 5 * time.Minute}}
+	return NewOpenAICompatible(modelID, WithKey(key))
 }
 
 // DefaultOpenRouterModel is OpenRouter's Fusion alias: a multi-model panel that
@@ -47,7 +208,16 @@ func NewOpenRouter(key, modelID string) *OpenAI {
 	if modelID == "" {
 		modelID = DefaultOpenRouterModel
 	}
-	return &OpenAI{key: key, model: modelID, baseURL: "https://openrouter.ai/api/v1", http: &http.Client{Timeout: 5 * time.Minute}}
+	return NewOpenAICompatible(modelID, WithKey(key), WithBaseURL("https://openrouter.ai/api/v1"), withOpenRouterBase())
+}
+
+// withOpenRouterBase marks the adapter as targeting OpenRouter, gating the typed
+// extras and the attribution headers (P15-T06). It is unexported: NewOpenRouter
+// sets it directly, and the compat path infers it from the base host, so an
+// operator never flips it by hand. With the flag set but no extras/attribution
+// configured, the request stays byte-identical to a bare OpenRouter call.
+func withOpenRouterBase() Option {
+	return func(o *OpenAI) { o.isOpenRouter = true }
 }
 
 // Model returns the configured model id.
@@ -99,13 +269,52 @@ type oaiStreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
+// oaiResponseFormat requests structured output via a JSON Schema. It is a
+// pointer on oaiRequest with omitempty, so it vanishes from the body when unset.
+type oaiResponseFormat struct {
+	Type       string `json:"type"` // "json_schema"
+	JSONSchema struct {
+		Name   string          `json:"name"`
+		Strict bool            `json:"strict,omitempty"`
+		Schema json.RawMessage `json:"schema,omitempty"`
+	} `json:"json_schema"`
+}
+
+// oaiRequest is the chat-completions request body. MaxTokens and maxTokensField
+// carry NO json tag of their own (`json:"-"`): the token cap is emitted by the
+// custom MarshalJSON in openai_maxtokens.go under the single dynamic key name in
+// maxTokensField (default "max_tokens"; reasoning models use
+// "max_completion_tokens"). This makes it structurally impossible to emit both
+// keys — gpt-5.x / o-series reject a body carrying both. Every other field keeps
+// its tag and omitempty exactly as before.
 type oaiRequest struct {
-	Model         string            `json:"model"`
-	MaxTokens     int               `json:"max_tokens,omitempty"`
-	Messages      []oaiMessage      `json:"messages"`
-	Tools         []oaiTool         `json:"tools,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	StreamOptions *oaiStreamOptions `json:"stream_options,omitempty"`
+	Model          string            `json:"model"`
+	MaxTokens      int               `json:"-"`
+	maxTokensField string            // json key for the token cap; never serialized directly
+	Messages       []oaiMessage      `json:"messages"`
+	Tools          []oaiTool         `json:"tools,omitempty"`
+	Stream         bool              `json:"stream,omitempty"`
+	StreamOptions  *oaiStreamOptions `json:"stream_options,omitempty"`
+
+	// SOTA fields (P15-T05) — all additive and omitempty, so a zero-valued
+	// request marshals byte-identically to before. They ride the T04 custom
+	// MarshalJSON automatically because the oaiRequestAlias shares this exact
+	// struct shape (same tags, same order, same omitempty).
+	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
+	ResponseFormat    *oaiResponseFormat `json:"response_format,omitempty"`
+	ParallelToolCalls *bool              `json:"parallel_tool_calls,omitempty"`
+	ToolChoice        json.RawMessage    `json:"tool_choice,omitempty"`
+	ServiceTier       string             `json:"service_tier,omitempty"`
+	PromptCacheKey    string             `json:"prompt_cache_key,omitempty"`
+
+	// OpenRouter-only extras (P15-T06), embedded as an ANONYMOUS pointer so
+	// encoding/json PROMOTES its tagged fields (provider, models, reasoning,
+	// transforms, plugins) to the top level of the request body — exactly where
+	// OpenRouter expects them. When nil (every non-OpenRouter call, and a bare
+	// OpenRouter call) it promotes nothing, so the body is byte-identical to today.
+	// The promotion survives the T04 oaiRequestAlias because the alias preserves the
+	// embedded field and its tags.
+	*openRouterExtras
 }
 
 type oaiResponse struct {
@@ -116,10 +325,45 @@ type oaiResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage oaiUsage `json:"usage"`
+}
+
+// oaiUsage is the shared usage shape for both the non-stream response and the
+// trailing stream usage frame. The first two fields are the original, frozen
+// counts. The nested detail structs and OpenRouter's cost are pointers so a
+// response lacking them decodes to nil ⇒ the derived model.Usage stays exactly
+// what it was before this widening.
+type oaiUsage struct {
+	PromptTokens            int `json:"prompt_tokens"`
+	CompletionTokens        int `json:"completion_tokens"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+	Cost *float64 `json:"cost,omitempty"` // OpenRouter reports call cost in USD
+}
+
+// toModelUsage maps the wire usage onto the canonical model.Usage. The three
+// trailing fields are populated only when the corresponding nested detail (or
+// cost) is present; absent ⇒ they stay zero ⇒ model.Usage is byte-identical to
+// the pre-widening shape.
+func (u oaiUsage) toModelUsage() model.Usage {
+	mu := model.Usage{
+		InputTokens:  u.PromptTokens,
+		OutputTokens: u.CompletionTokens,
+	}
+	if u.CompletionTokensDetails != nil {
+		mu.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if u.PromptTokensDetails != nil {
+		mu.CachedTokens = u.PromptTokensDetails.CachedTokens
+	}
+	if u.Cost != nil {
+		mu.CostUSD = *u.Cost
+	}
+	return mu
 }
 
 // newRequest marshals the canonical inputs into the chat-completions request body
@@ -129,26 +373,72 @@ type oaiResponse struct {
 // (invariant I3).
 func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, stream bool) (*http.Request, error) {
 	reqBody := oaiRequest{
-		Model:     o.model,
-		MaxTokens: maxTokens,
-		Messages:  toOpenAIMessages(system, msgs),
-		Tools:     toOpenAITools(tools),
-		Stream:    stream,
+		Model:          o.model,
+		MaxTokens:      maxTokens,
+		maxTokensField: o.maxTokensField,
+		Messages:       toOpenAIMessages(system, msgs),
+		Tools:          toOpenAITools(tools),
+		Stream:         stream,
+
+		// SOTA fields (P15-T05): each copies straight from the configured option,
+		// which is the zero value unless set, so unset ⇒ omitempty ⇒ omitted.
+		ReasoningEffort:   o.reasoningEffort,
+		ResponseFormat:    o.responseFormat,
+		ParallelToolCalls: o.parallelToolCalls,
+		ToolChoice:        o.toolChoice,
+		ServiceTier:       o.serviceTier,
+		PromptCacheKey:    o.promptCacheKey,
 	}
 	if stream {
 		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
+	}
+
+	// OpenRouter extras ride the body ONLY on the OpenRouter base AND only when the
+	// operator configured at least one (o.openRouterExtras non-nil). On any other
+	// base, or a bare OpenRouter call, the embedded pointer stays nil so the body is
+	// byte-identical to today. applyDefaults injects require_parameters:true only
+	// WITHIN a present provider object — never on a bare call.
+	if o.isOpenRouter && o.openRouterExtras != nil {
+		extras := *o.openRouterExtras
+		if extras.Provider != nil {
+			p := *extras.Provider
+			extras.Provider = &p
+		}
+		extras.applyDefaults()
+		reqBody.openRouterExtras = &extras
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+	// baseURL is the full prefix; append only "/chat/completions". TrimRight folds
+	// a trailing slash so the join never doubles it and never injects a "/v1".
+	endpoint := strings.TrimRight(o.baseURL, "/") + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("authorization", "Bearer "+o.key)
+	// Per-request header only (I3) — never logged, never persisted. Emitted only
+	// when a key is present, so keyless local servers (vLLM/Ollama/LM-Studio) send
+	// no auth header at all.
+	if o.key != "" {
+		req.Header.Set(o.authHeader, o.authPrefix+o.key)
+	}
+	// OpenRouter attribution headers (P15-T06): static operator-supplied config
+	// strings that credit the calling app on OpenRouter's dashboards. Set ONLY on
+	// the OpenRouter base AND only when configured — so a bare OpenRouter request
+	// sends no extra header (byte-identical to today). These are NEVER the API key
+	// (invariant I3) and are never logged.
+	if o.isOpenRouter {
+		if o.openRouterReferer != "" {
+			req.Header.Set("HTTP-Referer", o.openRouterReferer)
+		}
+		if o.openRouterTitle != "" {
+			req.Header.Set("X-Title", o.openRouterTitle)
+		}
+	}
 	return req, nil
 }
 
@@ -270,10 +560,7 @@ type oaiStreamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage *oaiUsage `json:"usage"`
 }
 
 // oaiToolCallDelta is a streamed tool-call fragment. id and function.name arrive
@@ -396,10 +683,7 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 
 		// The trailing usage-only frame carries no choices.
 		if chunk.Usage != nil {
-			out.Usage = model.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-			}
+			out.Usage = chunk.Usage.toModelUsage()
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -467,7 +751,7 @@ func fromOpenAI(r oaiResponse) model.Response {
 		})
 	}
 	out.StopReason = stopReasonFromFinish(ch.FinishReason)
-	out.Usage = model.Usage{InputTokens: r.Usage.PromptTokens, OutputTokens: r.Usage.CompletionTokens}
+	out.Usage = r.Usage.toModelUsage()
 	return out
 }
 

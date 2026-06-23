@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -570,6 +571,234 @@ func TestStream_ConcurrentRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// errProvider is a Provider that always fails with a caller-supplied error. It
+// counts calls so a test can assert how many attempts the wrapper made before
+// stopping. Used by the typed-APIError proof gates.
+type errProvider struct {
+	model string
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (p *errProvider) Complete(_ context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	return Response{}, p.err
+}
+
+func (p *errProvider) Model() string { return p.model }
+
+func (p *errProvider) callCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// recordingResilient wires a Resilient that captures every backoff duration handed
+// to sleep (instead of actually sleeping), so a test can assert the Retry-After
+// floor was honored without real delays.
+func recordingResilient(t *testing.T, providers []Provider, opts Options) (*Resilient, *[]time.Duration) {
+	t.Helper()
+	r, err := NewResilient(providers, opts)
+	if err != nil {
+		t.Fatalf("NewResilient: %v", err)
+	}
+	var slept []time.Duration
+	r.sleep = func(ctx context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return ctx.Err()
+	}
+	return r, &slept
+}
+
+// --- GATE 1: backward compatibility for plain (untyped) errors. ---------------
+
+// TestGate1_UntypedErrorRetriesAndFailsOverExactlyAsBefore is the explicit
+// backward-compat proof: a plain errors.New error (NOT an *APIError) must retry the
+// primary the full budget (initial + MaxRetries) and THEN fail over to the
+// fallback — byte-for-byte the pre-change behavior. This mirrors the existing
+// TestComplete_Failover expectation and locks it against the new typed-error path.
+func TestGate1_UntypedErrorRetriesAndFailsOverExactlyAsBefore(t *testing.T) {
+	plain := errors.New("transient network blip") // untyped: NOT an *APIError
+	primary := &errProvider{model: "primary", err: plain}
+	fallback := &fakeProvider{model: "fallback"} // succeeds on first call
+	r := newTestResilient(t, []Provider{primary, fallback}, Options{
+		MaxRetries:  2,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	resp, err := r.Complete(context.Background(), "", nil, nil, 16)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.Content[0].Text != "fallback-ok" {
+		t.Fatalf("got %q, want fallback-ok (must fail over for untyped error)", resp.Content[0].Text)
+	}
+	// initial + 2 retries, all failed -> 3 calls, exactly as today.
+	if primary.callCount() != 3 {
+		t.Fatalf("primary calls = %d, want 3 (untyped error must use full retry budget)", primary.callCount())
+	}
+	if fallback.callCount() != 1 {
+		t.Fatalf("fallback calls = %d, want 1 (must fail over)", fallback.callCount())
+	}
+}
+
+// TestGate1_UntypedErrorExhaustsThenReturns proves a single-provider untyped-error
+// run still exhausts the budget and returns the wrapped error — unchanged from
+// TestComplete_RetryExhausted.
+func TestGate1_UntypedErrorExhaustsThenReturns(t *testing.T) {
+	plain := errors.New("still down")
+	p := &errProvider{model: "p", err: plain}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  2,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	_, err := r.Complete(context.Background(), "", nil, nil, 16)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if !errors.Is(err, plain) {
+		t.Fatalf("want wrapped plain error, got %v", err)
+	}
+	if p.callCount() != 3 { // initial + 2 retries
+		t.Fatalf("calls = %d, want 3", p.callCount())
+	}
+}
+
+// --- GATE 2: terminal APIError stops immediately; retryable honors Retry-After. -
+
+// TestGate2_TerminalAPIErrorStopsImmediately proves a NON-retryable *APIError
+// (401/403) stops on the FIRST attempt: no retry of the primary AND no failover to
+// the fallback, even though the fallback would succeed. The typed error surfaces to
+// the caller verbatim.
+func TestGate2_TerminalAPIErrorStopsImmediately(t *testing.T) {
+	for _, status := range []int{401, 403, 400} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			term := &APIError{StatusCode: status, Retryable: false, Type: "auth", Code: "bad"}
+			primary := &errProvider{model: "primary", err: term}
+			fallback := &fakeProvider{model: "fallback"} // would succeed if reached
+			r := newTestResilient(t, []Provider{primary, fallback}, Options{
+				MaxRetries:  5, // plenty of budget — must NOT be used
+				BaseBackoff: time.Millisecond,
+			}, nil)
+
+			_, err := r.Complete(context.Background(), "", nil, nil, 16)
+			if err == nil {
+				t.Fatal("want terminal error, got nil")
+			}
+			// The typed error must surface (caller can inspect it).
+			var got *APIError
+			if !errors.As(err, &got) || got.StatusCode != status {
+				t.Fatalf("err = %v, want *APIError status %d", err, status)
+			}
+			// Exactly one primary attempt: no retry.
+			if primary.callCount() != 1 {
+				t.Fatalf("primary calls = %d, want 1 (terminal must not retry)", primary.callCount())
+			}
+			// No failover.
+			if fallback.callCount() != 0 {
+				t.Fatalf("fallback calls = %d, want 0 (terminal must not fail over)", fallback.callCount())
+			}
+		})
+	}
+}
+
+// TestGate2_RetryableAPIErrorRetriesAndFailsOver proves a RETRYABLE *APIError (429
+// without a hint) behaves like an ordinary transient failure: it retries the full
+// budget and then fails over — i.e. retryable typed errors do not regress the
+// failover path.
+func TestGate2_RetryableAPIErrorRetriesAndFailsOver(t *testing.T) {
+	retry := &APIError{StatusCode: 429, Retryable: true, Type: "rate_limit"}
+	primary := &errProvider{model: "primary", err: retry}
+	fallback := &fakeProvider{model: "fallback"}
+	r := newTestResilient(t, []Provider{primary, fallback}, Options{
+		MaxRetries:  2,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	resp, err := r.Complete(context.Background(), "", nil, nil, 16)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp.Content[0].Text != "fallback-ok" {
+		t.Fatalf("got %q, want fallback-ok", resp.Content[0].Text)
+	}
+	if primary.callCount() != 3 { // initial + 2 retries
+		t.Fatalf("primary calls = %d, want 3 (retryable must use full budget)", primary.callCount())
+	}
+}
+
+// TestGate2_RetryAfterIsBackoffFloor proves a retryable *APIError carrying a
+// Retry-After LONGER than the computed backoff causes the wrapper to wait at least
+// that long: the recorded sleep duration is the Retry-After, not the small
+// exponential backoff.
+func TestGate2_RetryAfterIsBackoffFloor(t *testing.T) {
+	// Computed backoff for attempt 1 is BaseBackoff = 1ms; Retry-After = 3s should
+	// dominate it as the floor.
+	retry := &APIError{StatusCode: 429, Retryable: true, RetryAfter: 3 * time.Second}
+	p := &errProvider{model: "p", err: retry}
+	r, slept := recordingResilient(t, []Provider{p}, Options{
+		MaxRetries:  1,
+		BaseBackoff: time.Millisecond,
+		MaxBackoff:  time.Millisecond, // ensures computed backoff stays tiny
+	})
+
+	if _, err := r.Complete(context.Background(), "", nil, nil, 16); err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if len(*slept) != 1 {
+		t.Fatalf("recorded %d sleeps, want 1 (one retry)", len(*slept))
+	}
+	if (*slept)[0] != 3*time.Second {
+		t.Fatalf("slept %v, want 3s (Retry-After must be the backoff floor)", (*slept)[0])
+	}
+}
+
+// TestGate2_RetryAfterShorterThanBackoffUsesBackoff proves the floor is a floor,
+// not a ceiling: when Retry-After is SHORTER than the computed backoff, the
+// computed backoff wins — the timing of an ordinary retryable failure is unchanged.
+func TestGate2_RetryAfterShorterThanBackoffUsesBackoff(t *testing.T) {
+	retry := &APIError{StatusCode: 429, Retryable: true, RetryAfter: time.Millisecond}
+	p := &errProvider{model: "p", err: retry}
+	r, slept := recordingResilient(t, []Provider{p}, Options{
+		MaxRetries:  1,
+		BaseBackoff: 100 * time.Millisecond,
+		MaxBackoff:  time.Second,
+	})
+
+	if _, err := r.Complete(context.Background(), "", nil, nil, 16); err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if len(*slept) != 1 {
+		t.Fatalf("recorded %d sleeps, want 1", len(*slept))
+	}
+	// Computed backoff (100ms) exceeds the 1ms hint, so the backoff is used.
+	if (*slept)[0] != 100*time.Millisecond {
+		t.Fatalf("slept %v, want 100ms (computed backoff dominates a smaller hint)", (*slept)[0])
+	}
+}
+
+// TestGate1_UntypedErrorBackoffUnchanged is a timing companion to GATE 1: an
+// untyped error's retry delay is exactly the computed backoff (no Retry-After path
+// reachable), proving untyped-error timing did not change.
+func TestGate1_UntypedErrorBackoffUnchanged(t *testing.T) {
+	p := &errProvider{model: "p", err: errors.New("blip")}
+	r, slept := recordingResilient(t, []Provider{p}, Options{
+		MaxRetries:  1,
+		BaseBackoff: 50 * time.Millisecond,
+		MaxBackoff:  time.Second,
+	})
+	if _, err := r.Complete(context.Background(), "", nil, nil, 16); err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if len(*slept) != 1 || (*slept)[0] != 50*time.Millisecond {
+		t.Fatalf("slept %v, want exactly [50ms]", *slept)
+	}
 }
 
 // fakeClock is a deterministic, controllable clock for breaker timing.

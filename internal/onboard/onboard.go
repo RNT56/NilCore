@@ -29,10 +29,25 @@ import (
 // run path's default so a config written by the wizard is usable as-is.
 const DefaultImage = "docker.io/library/debian:stable-slim"
 
+// compatProvider is the vendor name for the operator-typed, self-hosted
+// OpenAI-compatible endpoint, and defaultCompatKeyEnv is the default NAME of the
+// env var that holds its key (never the key itself, I3). They mirror the provider
+// leaf's vocabulary so the wizard, the loader, and the adapter share one spelling.
+const (
+	compatProvider      = "openai-compatible"
+	defaultCompatKeyEnv = "NILCORE_COMPAT_API_KEY"
+)
+
 // CurrentConfigVersion is the schema version this build reads and writes. Load
 // migrates any older config to this version; anything newer is rejected with a
 // clear "upgrade NilCore" error rather than silently misread.
-const CurrentConfigVersion = 1
+//
+// v2 (P15) adds the additive openai-compatible vendor + provider knobs (BaseURL,
+// AuthScheme, MaxTokensField, CompatKeyEnv, OpenRouter Referer/Title, default
+// ReasoningEffort, and a small Routing sub-struct). Every new field is omitempty
+// and blank/absent ⇒ skipped, so a v1 config migrated to v2 is byte-identical in
+// behavior — the bump is purely so the strict decoder recognizes the new keys.
+const CurrentConfigVersion = 2
 
 // ProviderConfig records a provider and the SecretStore name under which its key
 // is stored — not the key.
@@ -70,6 +85,54 @@ type Config struct {
 	Codex            DelegatedConfig  `json:"codex,omitempty"`             // optional config for the Codex delegated CLI (R1)
 	Claude           DelegatedConfig  `json:"claude,omitempty"`            // optional config for the Claude Code delegated CLI (R1)
 	Pool             *pool.PoolConfig `json:"pool,omitempty"`              // optional swarm provider-pool tiers/caps (P12); nil ⇒ today's single-worker wiring, so an existing config is byte-identical
+
+	// Provider knobs (P15, schema v2). Every field is additive + omitempty: blank
+	// or absent ⇒ the field is skipped and behavior is byte-identical to a v1
+	// config. These are config DATA the wiring layer reads to construct providers;
+	// none holds a secret VALUE — only NAMES / refs (invariant I3).
+	//
+	// BaseURL/AuthScheme/CompatKeyEnv configure the operator-typed
+	// "openai-compatible" endpoint: BaseURL is the FULL endpoint prefix (it carries
+	// any "/v1"); AuthScheme is "bearer" (default) | "azure" | "none"; CompatKeyEnv
+	// is the NAME of the env var holding that endpoint's key — never the key — and
+	// defaults to NILCORE_COMPAT_API_KEY. It may not be a canonical first-party
+	// vendor key name (Validate rejects OPENAI/ANTHROPIC/OPENROUTER_API_KEY) so a
+	// real vendor key is never forwarded to a self-hosted endpoint (I3).
+	BaseURL      string `json:"base_url,omitempty"`       // openai-compatible endpoint prefix (carries any "/v1")
+	AuthScheme   string `json:"auth_scheme,omitempty"`    // bearer | azure | none ("" ⇒ bearer)
+	CompatKeyEnv string `json:"compat_key_env,omitempty"` // NAME of the env var holding the compat key (never the key)
+
+	// MaxTokensField is the JSON field name for the token cap on OpenAI-compatible
+	// requests ("max_tokens" default; some endpoints want "max_completion_tokens").
+	MaxTokensField string `json:"max_tokens_field,omitempty"`
+
+	// ReasoningEffort is the default reasoning_effort hint for reasoning models:
+	// "minimal" | "low" | "medium" | "high". Empty ⇒ the field is omitted.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+
+	// OpenRouter Referer/Title populate OpenRouter's optional HTTP-Referer / X-Title
+	// attribution headers. Both blank ⇒ neither header is sent. Not secrets (I3).
+	OpenRouterReferer string `json:"openrouter_referer,omitempty"`
+	OpenRouterTitle   string `json:"openrouter_title,omitempty"`
+
+	// Routing carries small provider-routing preferences. Zero ⇒ no routing knobs,
+	// byte-identical to a config that omits the block.
+	Routing RoutingConfig `json:"routing,omitempty"`
+}
+
+// RoutingConfig holds optional provider-routing preferences (P15). Every field is
+// omitempty and additive: a zero RoutingConfig is byte-identical to omitting the
+// block, so an existing config is unchanged. These are config DATA, not secrets.
+type RoutingConfig struct {
+	// ServiceTier hints the provider's service tier: "auto" | "default" | "flex" |
+	// "priority". Empty ⇒ the field is omitted.
+	ServiceTier string `json:"service_tier,omitempty"`
+	// PromptCacheKey steers identical-prefix requests to the same cache. Empty ⇒ omitted.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
+	// ParallelToolCalls controls whether the model may emit multiple tool calls in
+	// one turn. A pointer because false ("one tool call at a time") is meaningful
+	// and distinct from unset; nil ⇒ the field is omitted.
+	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
 }
 
 // DelegatedConfig configures a delegated coding CLI (Codex / Claude Code). All
@@ -118,9 +181,20 @@ var (
 	// asks for system selection and the run resolves it to a concrete backend.
 	validBackends      = map[string]bool{"native": true, "codex": true, "claude-code": true}
 	validBackendOrAuto = map[string]bool{"native": true, "codex": true, "claude-code": true, "auto": true}
-	validProviders     = map[string]bool{"anthropic": true, "openai": true, "openrouter": true, "codex": true}
+	validProviders     = map[string]bool{"anthropic": true, "openai": true, "openrouter": true, "codex": true, "openai-compatible": true}
 	validChannels      = map[string]bool{"": true, "none": true, "telegram": true, "slack": true}
 	validSearch        = map[string]bool{"": true, "off": true, "ddg": true, "brave": true}
+	// validAuthSchemes mirrors the provider adapter's accepted set for the
+	// operator-typed openai-compatible endpoint ("" ⇒ bearer). Kept here so a typo
+	// in AuthScheme fails loudly at config time rather than at provider-build time.
+	validAuthSchemes = map[string]bool{"": true, "bearer": true, "azure": true, "none": true}
+	// validReasoningEfforts mirrors the OpenAI reasoning_effort hints. "" ⇒ omitted.
+	validReasoningEfforts = map[string]bool{"": true, "minimal": true, "low": true, "medium": true, "high": true}
+	// canonicalVendorKeyEnvs are first-party vendor key-env names that must never be
+	// reused as a CompatKeyEnv — a real vendor key may not be forwarded to an
+	// operator-typed self-hosted endpoint (invariant I3). Mirrors the provider leaf's
+	// isCanonicalVendorKeyEnv; duplicated here (not imported) to keep onboard a leaf.
+	canonicalVendorKeyEnvs = map[string]bool{"OPENAI_API_KEY": true, "ANTHROPIC_API_KEY": true, "OPENROUTER_API_KEY": true}
 )
 
 // Validate reports whether c is internally consistent enough for boot to trust
@@ -164,6 +238,34 @@ func (c Config) Validate() error {
 		}
 		if strings.TrimSpace(p.KeyRef) == "" {
 			return fmt.Errorf("provider %q has no key_ref", p.Name)
+		}
+	}
+	// Provider knobs (P15). All optional: a present, wrong value is rejected; an
+	// absent field is fine, so a v1 config (none of these set) is still valid.
+	if !validAuthSchemes[c.AuthScheme] {
+		return fmt.Errorf("unknown auth_scheme %q; valid values are %s", c.AuthScheme, oneOf(validAuthSchemes))
+	}
+	if !validReasoningEfforts[c.ReasoningEffort] {
+		return fmt.Errorf("unknown reasoning_effort %q; valid values are %s", c.ReasoningEffort, oneOf(validReasoningEfforts))
+	}
+	if c.Routing.ServiceTier != "" && !validServiceTier(c.Routing.ServiceTier) {
+		return fmt.Errorf("unknown routing.service_tier %q; valid values are auto, default, flex, priority", c.Routing.ServiceTier)
+	}
+	// The compat key-env NAME may never be a first-party vendor key — a real vendor
+	// key must not be forwarded to an operator-typed self-hosted endpoint (I3). The
+	// error carries the rejected NAME only, never a value.
+	if canonicalVendorKeyEnvs[c.CompatKeyEnv] {
+		return fmt.Errorf("compat_key_env %q is a first-party vendor key and may not be forwarded to a self-hosted endpoint; use a dedicated env name (default %s)", c.CompatKeyEnv, defaultCompatKeyEnv)
+	}
+	// An openai-compatible provider needs both an endpoint (BaseURL) and, unless the
+	// auth scheme is keyless ("none"), a dedicated key-env NAME — reject key-free so
+	// a half-configured endpoint fails loudly at config time, not at run time.
+	if c.hasCompatProvider() {
+		if strings.TrimSpace(c.BaseURL) == "" {
+			return fmt.Errorf("provider %q requires base_url (the full endpoint prefix, including any /v1)", compatProvider)
+		}
+		if c.AuthScheme != "none" && strings.TrimSpace(c.CompatKeyEnv) == "" {
+			return fmt.Errorf("provider %q requires compat_key_env (the NAME of the env var holding the key; default %s)", compatProvider, defaultCompatKeyEnv)
 		}
 	}
 	// The optional swarm pool (P12) is validated against the SAME closed vendor
@@ -241,8 +343,12 @@ func parse(b []byte) (Config, error) {
 		return Config{}, fmt.Errorf("version %d is newer than this build supports (max %d); upgrade NilCore",
 			v, CurrentConfigVersion)
 	}
-	// No field migrations exist yet (CurrentConfigVersion == 1). When the schema
-	// bumps, rewrite b one version at a time here before the strict decode.
+	// Field migrations, applied one version at a time, lowest-first, before the
+	// strict decode. v1 → v2 (P15) is purely additive: every v2 field is omitempty
+	// and absent ⇒ default behavior, so a v1 body needs no rewriting — it parses
+	// cleanly under DisallowUnknownFields once its version is stamped current below.
+	// When a future bump adds a field that needs a value carried forward, rewrite b
+	// here for that step.
 
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
@@ -255,6 +361,29 @@ func parse(b []byte) (Config, error) {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// hasCompatProvider reports whether the config lists the operator-typed
+// openai-compatible vendor among its providers — the trigger for requiring a
+// BaseURL and (for keyed schemes) a dedicated CompatKeyEnv.
+func (c Config) hasCompatProvider() bool {
+	for _, p := range c.Providers {
+		if p.Name == compatProvider {
+			return true
+		}
+	}
+	return false
+}
+
+// validServiceTier reports whether tier is one of the provider's accepted service
+// tiers. Empty is handled by the caller (omitted ⇒ valid).
+func validServiceTier(tier string) bool {
+	switch tier {
+	case "auto", "default", "flex", "priority":
+		return true
+	default:
+		return false
+	}
 }
 
 // validEgressProfile reports whether name is one of the built-in egress presets.

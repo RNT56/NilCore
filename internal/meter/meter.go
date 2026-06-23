@@ -69,10 +69,12 @@ func (p *Provider) reportUsage(u model.Usage) {
 // is the wall, not an after-the-fact report.
 //
 // Charging is post-call because resp.Usage carries the authoritative token
-// counts only after the response returns. The total charged is input+output
-// tokens (for the ledger's token meter) priced in dollars by Price over the
-// inner provider's model id (for the dollar ceiling). ctx is threaded into
-// Charge so a cancelled context refuses the charge rather than recording it.
+// counts only after the response returns. The token total charged is
+// input+output (for the ledger's token meter); the dollar figure comes from
+// Price.PriceUsage over the inner provider's model id and the full resp.Usage,
+// so an authoritative vendor cost (Usage.CostUSD) and the cached-input discount
+// feed the dollar ceiling while the token count stays unchanged. ctx is threaded
+// into Charge so a cancelled context refuses the charge rather than recording it.
 func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
 	resp, err := p.Inner.Complete(ctx, system, msgs, tools, maxTokens)
 	if err != nil {
@@ -83,7 +85,7 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
-	dollars := p.Price.Price(p.Inner.Model(), resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
 	if cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars); cerr != nil {
 		// ErrCeiling (and any ctx error from Charge) propagates so the caller
 		// aborts. The response is returned for completeness but the non-nil
@@ -111,9 +113,9 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 //     Streamer contract (the concatenation of forwarded chunks equals the output
 //     text, just delivered as one big chunk). The Response is then charged.
 //
-// Charging mirrors Complete: tokens = input+output and the priced dollar cost of
-// resp.Usage, charged under p.Task with ctx threaded into Charge. ErrCeiling (or
-// a ctx error from Charge) propagates so the orchestrating loop aborts.
+// Charging mirrors Complete: tokens = input+output and the PriceUsage dollar cost
+// of resp.Usage, charged under p.Task with ctx threaded into Charge. ErrCeiling
+// (or a ctx error from Charge) propagates so the orchestrating loop aborts.
 //
 // Partial-on-cancel: if the inner stream is cut short (ctx cancelled mid-stream),
 // Inner.Stream returns the partial Response together with ctx.Err(); we STILL
@@ -142,7 +144,7 @@ func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Messa
 	// because the tokens it reports were genuinely produced and are billable.
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens
-	dollars := p.Price.Price(p.Inner.Model(), resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
 	cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars)
 
 	if callErr != nil {
