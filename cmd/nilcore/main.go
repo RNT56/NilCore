@@ -121,6 +121,10 @@ func main() {
 		scheduleMain(args[1:])
 	case "registry":
 		registryMain(args[1:])
+	case "browse":
+		browseMain(args[1:])
+	case "desktop":
+		desktopMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -145,6 +149,8 @@ Usage:
   nilcore swarm -goal "<objective>" -preset research   fan out a verified agent swarm (typed artifacts, requeue-until-clean)
   nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
   nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
+  nilcore browse -goal "..."            drive a persistent in-sandbox browser (observe→plan→act→verify; findings re-verified)
+  nilcore desktop -goal "..."           drive a contained virtual desktop (Set-of-Marks ladder; --mac-host drives a real Mac, gated)
   nilcore propose-edit -goal "..." -paths ...  gated self-edit of the agent's own prompts/skills/tools
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
