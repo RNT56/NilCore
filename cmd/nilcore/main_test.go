@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"nilcore/internal/onboard"
+	"nilcore/internal/provider"
 	"nilcore/internal/secrets"
 )
 
@@ -59,6 +60,135 @@ func TestCredResolverStoreFallbackWhenEnvEmpty(t *testing.T) {
 	cred := newCredResolver(cfg, store, func(string) string { return "" })
 	if got := cred("ANTHROPIC_API_KEY"); got != "sk-stored" {
 		t.Errorf("store fallback: got %q", got)
+	}
+}
+
+// TestCompatCredOverlayPassThrough is the no-behavior-change keystone for P15-T16:
+// when the config sets NONE of the compat fields (the overwhelmingly common case),
+// the overlay MUST be a pure pass-through — wrapped(name) == base(name) for every
+// name, including the compat NAMEs. Any divergence would silently change behavior
+// for every existing setup.
+func TestCompatCredOverlayPassThrough(t *testing.T) {
+	cfg := onboard.Config{} // no BaseURL / AuthScheme / CompatKeyEnv
+	base := func(name string) string {
+		switch name {
+		case "ANTHROPIC_API_KEY":
+			return "sk-base"
+		case "NILCORE_COMPAT_BASE_URL":
+			return "https://env.example/v1" // even if the env happens to set it
+		default:
+			return ""
+		}
+	}
+	wrapped := compatCredOverlay(cfg, base)
+	for _, name := range []string{
+		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY",
+		"NILCORE_COMPAT_BASE_URL", "NILCORE_COMPAT_AUTH_SCHEME",
+		"NILCORE_COMPAT_KEY_ENV", "NILCORE_COMPAT_API_KEY", "SOME_OTHER_VAR",
+	} {
+		if wrapped(name) != base(name) {
+			t.Errorf("pass-through broken for %q: wrapped=%q base=%q", name, wrapped(name), base(name))
+		}
+	}
+}
+
+// TestCompatCredOverlayPopulatesFromConfig proves the overlay maps the three
+// onboard.Config fields onto the env NAMES provider.ResolveWith reads, and ONLY
+// those names — every other name falls through to base unchanged.
+func TestCompatCredOverlayPopulatesFromConfig(t *testing.T) {
+	cfg := onboard.Config{
+		BaseURL:      "https://llm.internal/v1",
+		AuthScheme:   "bearer",
+		CompatKeyEnv: "MY_COMPAT_KEY",
+	}
+	base := func(name string) string {
+		if name == "MY_COMPAT_KEY" {
+			return "secret-value" // the key VALUE rides base, not the overlay
+		}
+		return ""
+	}
+	wrapped := compatCredOverlay(cfg, base)
+
+	if got := wrapped("NILCORE_COMPAT_BASE_URL"); got != "https://llm.internal/v1" {
+		t.Errorf("base url from config: got %q", got)
+	}
+	if got := wrapped("NILCORE_COMPAT_AUTH_SCHEME"); got != "bearer" {
+		t.Errorf("auth scheme from config: got %q", got)
+	}
+	if got := wrapped("NILCORE_COMPAT_KEY_ENV"); got != "MY_COMPAT_KEY" {
+		t.Errorf("key-env name from config: got %q", got)
+	}
+	// The key VALUE is read by NAME via base, never carried by the overlay.
+	if got := wrapped("MY_COMPAT_KEY"); got != "secret-value" {
+		t.Errorf("key value should fall through to base: got %q", got)
+	}
+	// An unrelated name is untouched.
+	if got := wrapped("ANTHROPIC_API_KEY"); got != "" {
+		t.Errorf("unrelated name should fall through: got %q", got)
+	}
+}
+
+// TestCompatCredOverlayEnvWins pins the chosen precedence: a real env var (surfaced
+// by base) OVERRIDES the configured value, while the config fills in only names the
+// environment leaves unset.
+func TestCompatCredOverlayEnvWins(t *testing.T) {
+	cfg := onboard.Config{
+		BaseURL:      "https://from-config/v1",
+		AuthScheme:   "azure",
+		CompatKeyEnv: "CFG_KEY",
+	}
+	base := func(name string) string {
+		if name == "NILCORE_COMPAT_BASE_URL" {
+			return "https://from-env/v1" // env set for the base URL only
+		}
+		return ""
+	}
+	wrapped := compatCredOverlay(cfg, base)
+
+	if got := wrapped("NILCORE_COMPAT_BASE_URL"); got != "https://from-env/v1" {
+		t.Errorf("real env must win: got %q", got)
+	}
+	// The other two names have no env, so the config value fills in.
+	if got := wrapped("NILCORE_COMPAT_AUTH_SCHEME"); got != "azure" {
+		t.Errorf("config fills unset name: got %q", got)
+	}
+	if got := wrapped("NILCORE_COMPAT_KEY_ENV"); got != "CFG_KEY" {
+		t.Errorf("config fills unset name: got %q", got)
+	}
+}
+
+// TestCompatCredOverlayResolvesProvider is the end-to-end acceptance: a wrapped cred
+// built from a config with BaseURL/AuthScheme/CompatKeyEnv lets
+// provider.ResolveWith("openai-compatible:...") succeed using those values, against
+// a fake base cred that holds ONLY the compat key under the configured NAME.
+func TestCompatCredOverlayResolvesProvider(t *testing.T) {
+	cfg := onboard.Config{
+		BaseURL:      "https://llm.internal/v1",
+		AuthScheme:   "bearer",
+		CompatKeyEnv: "MY_COMPAT_KEY",
+	}
+	base := func(name string) string {
+		if name == "MY_COMPAT_KEY" {
+			return "sk-compat"
+		}
+		return "" // no NILCORE_COMPAT_* in the real env — config must supply them
+	}
+	wrapped := compatCredOverlay(cfg, base)
+
+	prov, err := provider.ResolveWith("openai-compatible:some-model", wrapped)
+	if err != nil {
+		t.Fatalf("ResolveWith should succeed via config-supplied compat knobs: %v", err)
+	}
+	if prov == nil {
+		t.Fatal("resolved provider is nil")
+	}
+
+	// And with NONE of the fields set, resolution fails exactly as the raw env path
+	// would (NILCORE_COMPAT_BASE_URL is required) — proving the overlay adds nothing
+	// when unconfigured.
+	bare := compatCredOverlay(onboard.Config{}, func(string) string { return "" })
+	if _, err := provider.ResolveWith("openai-compatible:some-model", bare); err == nil {
+		t.Fatal("expected resolution to fail with no base url configured")
 	}
 }
 
