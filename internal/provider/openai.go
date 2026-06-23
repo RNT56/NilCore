@@ -36,6 +36,17 @@ type OpenAI struct {
 	authPrefix     string
 	maxTokensField string
 	http           *http.Client
+
+	// SOTA Chat-Completions request fields (P15-T05). All opt-in: a zero value
+	// for every one of these leaves the corresponding oaiRequest field at its
+	// zero value, which is omitempty, so the request body stays byte-identical to
+	// today when none is configured.
+	reasoningEffort   string             // "low" | "medium" | "high" | "minimal"
+	responseFormat    *oaiResponseFormat // structured-output json_schema
+	parallelToolCalls *bool              // pointer: false is meaningful
+	toolChoice        json.RawMessage    // "auto" | "none" | {"type":"function",...}
+	serviceTier       string             // "auto" | "default" | "flex" | "priority"
+	promptCacheKey    string             // routing hint for prompt caching
 }
 
 // Option configures an OpenAI-compatible adapter built via NewOpenAICompatible.
@@ -72,6 +83,52 @@ func WithMaxTokensField(field string) Option {
 // to the model.
 func WithKey(key string) Option {
 	return func(o *OpenAI) { o.key = key }
+}
+
+// WithReasoningEffort sets the reasoning_effort hint for reasoning models
+// (gpt-5.x / o-series): "minimal" | "low" | "medium" | "high". Empty (the
+// default) omits the field, keeping the request body byte-identical to today.
+func WithReasoningEffort(effort string) Option {
+	return func(o *OpenAI) { o.reasoningEffort = effort }
+}
+
+// WithResponseFormat requests structured output: the model must emit JSON
+// conforming to the given JSON Schema. name labels the schema; strict toggles
+// strict-schema enforcement; schema is the raw JSON Schema. A nil/zero config
+// omits response_format entirely (byte-identical to today).
+func WithResponseFormat(name string, strict bool, schema json.RawMessage) Option {
+	return func(o *OpenAI) {
+		o.responseFormat = &oaiResponseFormat{Type: "json_schema"}
+		o.responseFormat.JSONSchema.Name = name
+		o.responseFormat.JSONSchema.Strict = strict
+		o.responseFormat.JSONSchema.Schema = schema
+	}
+}
+
+// WithParallelToolCalls controls whether the model may emit multiple tool calls
+// in one turn. It takes a pointer because false ("force one tool call at a
+// time") is a meaningful, distinct value from unset; unset omits the field.
+func WithParallelToolCalls(enabled bool) Option {
+	return func(o *OpenAI) { o.parallelToolCalls = &enabled }
+}
+
+// WithToolChoice pins how the model selects tools: a raw JSON value, e.g.
+// "auto", "none", "required", or {"type":"function","function":{"name":"x"}}.
+// Empty/nil omits the field (byte-identical to today).
+func WithToolChoice(choice json.RawMessage) Option {
+	return func(o *OpenAI) { o.toolChoice = choice }
+}
+
+// WithServiceTier selects the service tier: "auto" | "default" | "flex" |
+// "priority". Empty (the default) omits the field.
+func WithServiceTier(tier string) Option {
+	return func(o *OpenAI) { o.serviceTier = tier }
+}
+
+// WithPromptCacheKey sets a routing hint that improves prompt-cache hit rates by
+// steering identical-prefix requests to the same cache. Empty omits the field.
+func WithPromptCacheKey(key string) Option {
+	return func(o *OpenAI) { o.promptCacheKey = key }
 }
 
 // NewOpenAICompatible builds a Chat Completions adapter for any OpenAI-compatible
@@ -166,6 +223,17 @@ type oaiStreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
+// oaiResponseFormat requests structured output via a JSON Schema. It is a
+// pointer on oaiRequest with omitempty, so it vanishes from the body when unset.
+type oaiResponseFormat struct {
+	Type       string `json:"type"` // "json_schema"
+	JSONSchema struct {
+		Name   string          `json:"name"`
+		Strict bool            `json:"strict,omitempty"`
+		Schema json.RawMessage `json:"schema,omitempty"`
+	} `json:"json_schema"`
+}
+
 // oaiRequest is the chat-completions request body. MaxTokens and maxTokensField
 // carry NO json tag of their own (`json:"-"`): the token cap is emitted by the
 // custom MarshalJSON in openai_maxtokens.go under the single dynamic key name in
@@ -181,6 +249,17 @@ type oaiRequest struct {
 	Tools          []oaiTool         `json:"tools,omitempty"`
 	Stream         bool              `json:"stream,omitempty"`
 	StreamOptions  *oaiStreamOptions `json:"stream_options,omitempty"`
+
+	// SOTA fields (P15-T05) — all additive and omitempty, so a zero-valued
+	// request marshals byte-identically to before. They ride the T04 custom
+	// MarshalJSON automatically because the oaiRequestAlias shares this exact
+	// struct shape (same tags, same order, same omitempty).
+	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
+	ResponseFormat    *oaiResponseFormat `json:"response_format,omitempty"`
+	ParallelToolCalls *bool              `json:"parallel_tool_calls,omitempty"`
+	ToolChoice        json.RawMessage    `json:"tool_choice,omitempty"`
+	ServiceTier       string             `json:"service_tier,omitempty"`
+	PromptCacheKey    string             `json:"prompt_cache_key,omitempty"`
 }
 
 type oaiResponse struct {
@@ -191,10 +270,45 @@ type oaiResponse struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage oaiUsage `json:"usage"`
+}
+
+// oaiUsage is the shared usage shape for both the non-stream response and the
+// trailing stream usage frame. The first two fields are the original, frozen
+// counts. The nested detail structs and OpenRouter's cost are pointers so a
+// response lacking them decodes to nil ⇒ the derived model.Usage stays exactly
+// what it was before this widening.
+type oaiUsage struct {
+	PromptTokens            int `json:"prompt_tokens"`
+	CompletionTokens        int `json:"completion_tokens"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+	Cost *float64 `json:"cost,omitempty"` // OpenRouter reports call cost in USD
+}
+
+// toModelUsage maps the wire usage onto the canonical model.Usage. The three
+// trailing fields are populated only when the corresponding nested detail (or
+// cost) is present; absent ⇒ they stay zero ⇒ model.Usage is byte-identical to
+// the pre-widening shape.
+func (u oaiUsage) toModelUsage() model.Usage {
+	mu := model.Usage{
+		InputTokens:  u.PromptTokens,
+		OutputTokens: u.CompletionTokens,
+	}
+	if u.CompletionTokensDetails != nil {
+		mu.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if u.PromptTokensDetails != nil {
+		mu.CachedTokens = u.PromptTokensDetails.CachedTokens
+	}
+	if u.Cost != nil {
+		mu.CostUSD = *u.Cost
+	}
+	return mu
 }
 
 // newRequest marshals the canonical inputs into the chat-completions request body
@@ -210,6 +324,15 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 		Messages:       toOpenAIMessages(system, msgs),
 		Tools:          toOpenAITools(tools),
 		Stream:         stream,
+
+		// SOTA fields (P15-T05): each copies straight from the configured option,
+		// which is the zero value unless set, so unset ⇒ omitempty ⇒ omitted.
+		ReasoningEffort:   o.reasoningEffort,
+		ResponseFormat:    o.responseFormat,
+		ParallelToolCalls: o.parallelToolCalls,
+		ToolChoice:        o.toolChoice,
+		ServiceTier:       o.serviceTier,
+		PromptCacheKey:    o.promptCacheKey,
 	}
 	if stream {
 		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
@@ -354,10 +477,7 @@ type oaiStreamChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
+	Usage *oaiUsage `json:"usage"`
 }
 
 // oaiToolCallDelta is a streamed tool-call fragment. id and function.name arrive
@@ -480,10 +600,7 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 
 		// The trailing usage-only frame carries no choices.
 		if chunk.Usage != nil {
-			out.Usage = model.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-			}
+			out.Usage = chunk.Usage.toModelUsage()
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -551,7 +668,7 @@ func fromOpenAI(r oaiResponse) model.Response {
 		})
 	}
 	out.StopReason = stopReasonFromFinish(ch.FinishReason)
-	out.Usage = model.Usage{InputTokens: r.Usage.PromptTokens, OutputTokens: r.Usage.CompletionTokens}
+	out.Usage = r.Usage.toModelUsage()
 	return out
 }
 
