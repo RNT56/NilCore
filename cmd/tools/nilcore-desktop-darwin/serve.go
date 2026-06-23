@@ -115,6 +115,13 @@ func (d *driver) apply(ctx context.Context, a desktopwire.Act) (desktopwire.Obse
 }
 
 func (d *driver) perform(ctx context.Context, a desktopwire.Act) error {
+	// Host-control hardening (CU-MAC-T09): the kill-switch + per-app allowlist gate
+	// every MUTATING act, fail-closed. Observe/wait never touch the desktop.
+	if a.Op != desktopwire.OpObserve && a.Op != desktopwire.OpWait {
+		if err := guardMutation(ctx); err != nil {
+			return err
+		}
+	}
 	switch a.Op {
 	case desktopwire.OpObserve:
 		return nil

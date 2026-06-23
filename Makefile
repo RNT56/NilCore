@@ -1,4 +1,4 @@
-.PHONY: build vet test verify run tidy tui tui-verify desktop-e2e desktop-image desktop-mac desktop-mac-smoke
+.PHONY: build vet test verify run tidy tui tui-verify desktop-e2e desktop-image desktop-mac desktop-mac-smoke desktop-mac-probe
 
 build:
 	go build ./...
@@ -51,3 +51,8 @@ desktop-mac:
 # capture; warns (does not fail) without it. Host-only — skips on non-Darwin.
 desktop-mac-smoke:
 	bash test/desktop-mac-smoke.sh
+
+# Probe macOS host-control readiness (Screen Recording + cliclick/Accessibility).
+# Builds the driver, then runs its live --probe; exits non-zero when not ready.
+desktop-mac-probe: desktop-mac
+	./nilcore-desktop-darwin --probe

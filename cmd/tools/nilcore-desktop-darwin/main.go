@@ -32,6 +32,18 @@ func main() {
 }
 
 func run(ctx context.Context, args []string) error {
+	// --probe is a standalone onboarding mode (CU-MAC-T07): report the live TCC
+	// grants and exit non-zero when not ready, so it doubles as a host-readiness gate.
+	for _, a := range args {
+		if a == "--probe" {
+			r := probePermissions(ctx)
+			fmt.Print(r.String())
+			if !r.Ready {
+				os.Exit(1)
+			}
+			return nil
+		}
+	}
 	serve, control, native, err := parseArgs(args)
 	if err != nil {
 		return err

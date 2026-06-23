@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -66,6 +67,7 @@ type desktopFlags struct {
 	native      *bool
 	model       *string
 	macHost     *bool
+	macProbe    *bool
 }
 
 func registerDesktopFlags(fs *flag.FlagSet) desktopFlags {
@@ -85,6 +87,7 @@ func registerDesktopFlags(fs *flag.FlagSet) desktopFlags {
 		native:      fs.Bool("native", false, "Path A: hand the Rung-3 pixel-grounding sub-call to Anthropic's native computer tool (NILCORE_COMPUTER_NATIVE)"),
 		model:       fs.String("model", "", "the single model for this computer-use run (default: "+defaultGUIModel+", a strong GUI model; or set NILCORE_COMPUTER_MODEL)"),
 		macHost:     fs.Bool("mac-host", false, "NATIVE macOS HOST CONTROL: drive your REAL Mac desktop (UNSANDBOXED — host ambient authority, I4 relaxed). Requires NILCORE_DESKTOP_HOST=1 + the nilcore-desktop-darwin driver on PATH. See docs/ROADMAP-COMPUTER-USE-DARWIN.md"),
+		macProbe:    fs.Bool("mac-probe", false, "check macOS host-control readiness (Screen Recording + cliclick/Accessibility) and exit non-zero if not ready — a host-readiness gate, no goal needed"),
 	}
 }
 
@@ -92,6 +95,23 @@ func desktopMain(args []string) {
 	fs := flag.NewFlagSet("desktop", flag.ExitOnError)
 	df := registerDesktopFlags(fs)
 	_ = fs.Parse(args)
+
+	// --mac-probe is a standalone host-readiness check (CU-MAC-T07): no goal, no gate
+	// (it's read-only onboarding). It shells to the darwin driver's --probe mode and
+	// mirrors its exit status, so it works as a CI/pre-flight gate.
+	if *df.macProbe {
+		driver := strings.TrimSpace(os.Getenv("NILCORE_DESKTOP_DRIVER"))
+		if driver == "" {
+			driver = "nilcore-desktop-darwin"
+		}
+		cmd := exec.Command(driver, "--probe") //nolint:gosec // operator-trusted driver name
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "nilcore desktop: host not ready (or %q not on PATH — build it: go build -o %s ./cmd/tools/nilcore-desktop-darwin)\n", driver, driver)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// GATE: the tier is inert unless explicitly opted into (the identity step).
 	if strings.TrimSpace(os.Getenv("NILCORE_COMPUTER_USE")) == "" {
@@ -145,6 +165,7 @@ func desktopMain(args []string) {
 			fatal(fmt.Errorf("--mac-host drives your REAL Mac desktop UNSANDBOXED (host ambient authority). Set NILCORE_DESKTOP_HOST=1 to confirm you accept this. See docs/ROADMAP-COMPUTER-USE-DARWIN.md §0"))
 		}
 		fmt.Fprintln(os.Stderr, "nilcore desktop: ⚠️  HOST CONTROL — the agent will drive your REAL macOS desktop (NOT sandboxed). Grant Accessibility + Screen Recording to your terminal, and watch it. Press Ctrl-C to abort.")
+		fmt.Fprintln(os.Stderr, "nilcore desktop:    Safety: `nilcore desktop --mac-probe` checks readiness first; set NILCORE_DESKTOP_ALLOW_APPS=\"App1,App2\" to pin acting to those apps; `touch ~/.nilcore/desktop/STOP` (or $NILCORE_DESKTOP_STOP) halts all actuation instantly.")
 		log.Append(eventlog.Event{Kind: "capguard", Detail: map[string]any{"verdict": "host-gate", "axes": []string{"A", "B", "C"}, "detail": "macOS host control — unsandboxed ambient authority"}})
 		if !approver.Approve("drive your REAL macOS desktop (UNSANDBOXED host control) toward: " + *df.goal) {
 			fatal(fmt.Errorf("host control denied at the gate"))
