@@ -17,18 +17,85 @@ import (
 
 // OpenAI is the Chat Completions adapter. It translates the canonical model.*
 // format to/from OpenAI's wire shape (tool_use/tool_result blocks ↔
-// tool_calls/tool messages). OpenRouter reuses this adapter with a different base
-// URL and key (it is OpenAI-compatible).
+// tool_calls/tool messages). The same adapter serves every OpenAI-compatible
+// endpoint — OpenRouter, Groq, Fireworks, Azure, local vLLM/Ollama/LM-Studio —
+// by varying baseURL and the auth descriptor (it is OpenAI-compatible).
+//
+// baseURL is the FULL endpoint prefix (it already carries any "/v1"); newRequest
+// appends only "/chat/completions". The auth descriptor names the header and its
+// value prefix (default "authorization" / "Bearer "; Azure uses "api-key" with no
+// prefix; an empty key emits no auth header at all, for keyless local servers).
+// maxTokensField records the JSON field name for the token cap so a later task can
+// switch it per backend — it is stored but not yet read by the marshaller, so the
+// request body stays byte-identical to today.
 type OpenAI struct {
-	key     string
-	model   string
-	baseURL string
-	http    *http.Client
+	key            string
+	model          string
+	baseURL        string
+	authHeader     string
+	authPrefix     string
+	maxTokensField string
+	http           *http.Client
+}
+
+// Option configures an OpenAI-compatible adapter built via NewOpenAICompatible.
+// Options are applied in order over the defaults (OpenAI's base URL, Bearer auth,
+// "max_tokens").
+type Option func(*OpenAI)
+
+// WithBaseURL overrides the endpoint prefix. It is the FULL prefix (including any
+// "/v1"); only "/chat/completions" is appended, with no "/v1" injected. A trailing
+// slash is trimmed, so there is never a doubled slash.
+func WithBaseURL(baseURL string) Option {
+	return func(o *OpenAI) { o.baseURL = baseURL }
+}
+
+// WithAuth sets the auth header name and the value prefix. Bearer is
+// headerName="authorization", valuePrefix="Bearer "; Azure is headerName="api-key",
+// valuePrefix="" (raw key). The header is emitted only when the key is non-empty.
+func WithAuth(headerName, valuePrefix string) Option {
+	return func(o *OpenAI) {
+		o.authHeader = headerName
+		o.authPrefix = valuePrefix
+	}
+}
+
+// WithMaxTokensField sets the JSON field name used for the token cap (default
+// "max_tokens"). The value is stored for a later task; the body marshals
+// unchanged for now.
+func WithMaxTokensField(field string) Option {
+	return func(o *OpenAI) { o.maxTokensField = field }
+}
+
+// WithKey sets the API key. The key is held only to set a per-request header
+// (invariant I3): it is never logged, never placed in a prompt, and never given
+// to the model.
+func WithKey(key string) Option {
+	return func(o *OpenAI) { o.key = key }
+}
+
+// NewOpenAICompatible builds a Chat Completions adapter for any OpenAI-compatible
+// endpoint. With no options it targets OpenAI itself (api.openai.com/v1, Bearer
+// auth). Pass WithBaseURL / WithAuth / WithKey / WithMaxTokensField to retarget it
+// (OpenRouter, Groq, Fireworks, Azure, local vLLM/Ollama, …).
+func NewOpenAICompatible(model string, opts ...Option) *OpenAI {
+	o := &OpenAI{
+		model:          model,
+		baseURL:        "https://api.openai.com/v1",
+		authHeader:     "authorization",
+		authPrefix:     "Bearer ",
+		maxTokensField: "max_tokens",
+		http:           &http.Client{Timeout: 5 * time.Minute},
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
 }
 
 // NewOpenAI returns an OpenAI Chat Completions provider.
 func NewOpenAI(key, modelID string) *OpenAI {
-	return &OpenAI{key: key, model: modelID, baseURL: "https://api.openai.com/v1", http: &http.Client{Timeout: 5 * time.Minute}}
+	return NewOpenAICompatible(modelID, WithKey(key))
 }
 
 // DefaultOpenRouterModel is OpenRouter's Fusion alias: a multi-model panel that
@@ -47,7 +114,7 @@ func NewOpenRouter(key, modelID string) *OpenAI {
 	if modelID == "" {
 		modelID = DefaultOpenRouterModel
 	}
-	return &OpenAI{key: key, model: modelID, baseURL: "https://openrouter.ai/api/v1", http: &http.Client{Timeout: 5 * time.Minute}}
+	return NewOpenAICompatible(modelID, WithKey(key), WithBaseURL("https://openrouter.ai/api/v1"))
 }
 
 // Model returns the configured model id.
@@ -143,12 +210,20 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+	// baseURL is the full prefix; append only "/chat/completions". TrimRight folds
+	// a trailing slash so the join never doubles it and never injects a "/v1".
+	endpoint := strings.TrimRight(o.baseURL, "/") + "/chat/completions"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("content-type", "application/json")
-	req.Header.Set("authorization", "Bearer "+o.key)
+	// Per-request header only (I3) — never logged, never persisted. Emitted only
+	// when a key is present, so keyless local servers (vLLM/Ollama/LM-Studio) send
+	// no auth header at all.
+	if o.key != "" {
+		req.Header.Set(o.authHeader, o.authPrefix+o.key)
+	}
 	return req, nil
 }
 
