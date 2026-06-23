@@ -11,12 +11,22 @@
 // docs/MULTI-AGENT.md §7).
 package meter
 
-import "strings"
+import (
+	"strings"
+
+	"nilcore/internal/model"
+)
 
 // Pricer turns a model id and a token split into a dollar cost. It is the seam
 // the metering decorator (P1-T01) calls once per model response; the id it
 // passes is exactly model.Provider.Model() (e.g. "claude-opus-4-8", "gpt-5.5",
 // "openrouter/fusion").
+//
+// The interface is the frozen, two-count form (input/output) every existing
+// caller depends on. The richer, Usage-aware path — authoritative vendor cost,
+// cached-input discount, reasoning tokens — is a concrete method on Table
+// (PriceUsage) rather than a new interface method, so adding it leaves every
+// Pricer implementation (and the contract every caller relies on) untouched.
 type Pricer interface {
 	// Price returns the dollar cost of a call that consumed in input tokens and
 	// out output tokens on model modelID. Negative counts are clamped to zero so
@@ -58,10 +68,27 @@ var knownRates = []struct {
 	// First-party cost figures vary by snapshot; values below are best-known
 	// published estimates and round high where uncertain. Re-verify on the
 	// OpenAI pricing page.
+	//
+	// P15 widened the provider so OpenAI's reasoning models and a few more
+	// snapshots are now actually reachable; their prefixes are listed here so a
+	// real call lands on a real tier instead of the conservative fallback floor.
+	// Longest-prefix-wins keeps the existing gpt-5.5-pro / gpt-5.5 / gpt-5.4-mini
+	// resolutions byte-identical — the new entries only catch ids that the older
+	// table sent to fallback.
 	{"gpt-5.5-pro", rate{0.015, 0.120}},    // GPT-5.5 Pro: ~$15 / $120 per 1M (est. 2026-06)
 	{"gpt-5.5", rate{0.00125, 0.010}},      // GPT-5.5: ~$1.25 / $10 per 1M    (est. 2026-06)
 	{"gpt-5.4-mini", rate{0.00025, 0.002}}, // GPT-5.4 mini: ~$0.25 / $2 per 1M (est. 2026-06)
-	{"gpt", rate{0.015, 0.120}},            // unrecognized gpt-* → priciest GPT tier (Pro), conservative
+	// GPT-5.x reasoning / general snapshots now reachable via P15. gpt-5.x (no
+	// -pro, no -mini) is the standard tier; round toward the standard $1.25/$10
+	// so a known-family snapshot is metered accurately rather than at the Pro max.
+	{"gpt-5.4", rate{0.00125, 0.010}}, // GPT-5.4 (standard): ~$1.25 / $10 per 1M (est. 2026-06)
+	{"gpt-5", rate{0.00125, 0.010}},   // GPT-5.x (standard snapshots): ~$1.25 / $10 per 1M (est. 2026-06)
+	// o-series reasoning models (o3 / o4-…): reasoning-heavy, priced above the
+	// standard chat tier. Round high where the published figure is uncertain.
+	{"o4", rate{0.003, 0.012}},  // o4-class reasoning: ~$3 / $12 per 1M (est. 2026-06, rounded high)
+	{"o3", rate{0.002, 0.008}},  // o3-class reasoning: ~$2 / $8 per 1M  (est. 2026-06, rounded high)
+	{"o1", rate{0.015, 0.060}},  // o1-class reasoning: ~$15 / $60 per 1M (est. 2026-06)
+	{"gpt", rate{0.015, 0.120}}, // unrecognized gpt-* → priciest GPT tier (Pro), conservative
 
 	// ── OpenRouter — a routing layer, not a single model.
 	//   openrouter/fusion bills the *cumulative* cost of every model on its
@@ -70,10 +97,38 @@ var knownRates = []struct {
 	//   openrouter/<provider>/<model> falls back to this generic prefix when no
 	//   more specific Claude/GPT prefix above matches the tail of the id.
 	// Estimates as of 2026-06 — OpenRouter passes through upstream prices, which
-	// drift; treat these as a conservative ceiling, not a quote.
+	// drift; treat these as a conservative ceiling, not a quote. NOTE: OpenRouter
+	// reports its own authoritative charged amount in Usage.CostUSD (decoded by
+	// P15-T05); PriceUsage prefers that over these estimates when present, so
+	// these rates only apply when a routed call returns no cost field.
 	{"openrouter/fusion", rate{0.020, 0.150}}, // Fusion panel (cumulative): priced high  (est. 2026-06)
 	{"openrouter", rate{0.015, 0.120}},        // other openrouter/* → priciest GPT-tier estimate (est. 2026-06)
+
+	// ── OpenAI-compatible / self-hosted vendors reachable via the P15 "compat"
+	// provider. These ids carry no canonical vendor prefix, so without an entry
+	// they would hit the conservative fallback floor. A common deployment is a
+	// Llama-class open weight behind an OpenAI-compatible endpoint; price the
+	// known open-weight families at their typical hosted list rate (cheaper than
+	// the frontier tiers) so a compat call is metered realistically, while any id
+	// NOT matched here still falls through to the conservative floor.
+	{"llama", rate{0.0009, 0.0009}},    // Llama-class hosted: ~$0.90 / $0.90 per 1M (est. 2026-06)
+	{"mistral", rate{0.002, 0.006}},    // Mistral-class hosted: ~$2 / $6 per 1M     (est. 2026-06)
+	{"qwen", rate{0.0009, 0.0009}},     // Qwen-class hosted: ~$0.90 / $0.90 per 1M  (est. 2026-06)
+	{"deepseek", rate{0.0014, 0.0028}}, // DeepSeek-class hosted: ~$1.4 / $2.8 per 1M (est. 2026-06)
+	{"gemini-2", rate{0.00125, 0.010}}, // Gemini 2.x (compat): ~$1.25 / $10 per 1M  (est. 2026-06)
+	{"gemini", rate{0.00125, 0.010}},   // other gemini-* (compat): standard tier    (est. 2026-06)
 }
+
+// cachedDiscount is the fraction of the full input rate charged for input tokens
+// served from a prompt cache (Usage.CachedTokens). Cached input is materially
+// cheaper than fresh input at every vendor that surfaces it (Anthropic ~0.1x,
+// OpenAI ~0.25–0.5x on the cached portion); we use a single conservative 0.25
+// factor — high enough never to under-charge, low enough that a cache hit is
+// genuinely cheaper than a full-price read. It only applies on the local-
+// estimation path (PriceUsage); when a vendor reports an authoritative
+// Usage.CostUSD that already reflects its real cache discount, PriceUsage uses
+// that figure directly and this factor is not consulted.
+const cachedDiscount = 0.25
 
 // fallbackRate prices any model id that matches no known prefix. It is at least
 // as expensive as every known tier in the table, so an unfamiliar provider is
@@ -103,6 +158,69 @@ func (Table) Price(modelID string, in, out int) float64 {
 	}
 	r := rateFor(modelID)
 	return float64(in)/1000*r.inPer1k + float64(out)/1000*r.outPer1k
+}
+
+// PriceUsage prices a full model.Usage — the richer path the metering decorator
+// uses now that providers report cached/reasoning splits and (on OpenRouter) an
+// authoritative charged amount (P15-T03/T05). It is a concrete Table method, not
+// a Pricer interface method, so it adds capability without touching the frozen
+// Pricer contract or any other implementation.
+//
+// Rules, in order:
+//
+//  1. AUTHORITATIVE COST WINS. If u.CostUSD > 0, the vendor (OpenRouter) already
+//     charged that exact amount — return it verbatim. Local estimation can only
+//     drift from a real bill, so a reported cost always overrides the table. A
+//     non-positive CostUSD means "not reported" and falls through to estimation.
+//
+//  2. CACHED INPUT IS DISCOUNTED. CachedTokens is the subset of InputTokens
+//     served from a prompt cache; it bills at cachedDiscount × the input rate,
+//     and only the remaining (fresh) input bills at the full input rate. Cached
+//     tokens are clamped to the input total so a mis-reported cache count can
+//     never drive the fresh portion (or the charge) negative.
+//
+//  3. REASONING IS OUTPUT. ReasoningTokens (hidden thinking) is billed at the
+//     output rate, added to the visible OutputTokens — vendors meter reasoning
+//     as completion tokens.
+//
+// Negative counts are clamped to zero (the ceiling can never be relaxed), and an
+// unknown model id still resolves to the conservative fallback floor via rateFor.
+func (Table) PriceUsage(modelID string, u model.Usage) float64 {
+	// Authoritative vendor cost short-circuits all local estimation.
+	if u.CostUSD > 0 {
+		return u.CostUSD
+	}
+
+	in := u.InputTokens
+	out := u.OutputTokens
+	cached := u.CachedTokens
+	reasoning := u.ReasoningTokens
+	if in < 0 {
+		in = 0
+	}
+	if out < 0 {
+		out = 0
+	}
+	if reasoning < 0 {
+		reasoning = 0
+	}
+	if cached < 0 {
+		cached = 0
+	}
+	// Cached input is a subset of total input; never let it exceed (which would
+	// otherwise produce a negative fresh-input count and relax the charge).
+	if cached > in {
+		cached = in
+	}
+	fresh := in - cached
+
+	r := rateFor(modelID)
+	// Fresh input at full rate, cached input at the reduced rate, and visible +
+	// reasoning output at the output rate.
+	cost := float64(fresh)/1000*r.inPer1k +
+		float64(cached)/1000*r.inPer1k*cachedDiscount +
+		float64(out+reasoning)/1000*r.outPer1k
+	return cost
 }
 
 // knownWindows maps a model-id prefix to its context-window size in tokens
