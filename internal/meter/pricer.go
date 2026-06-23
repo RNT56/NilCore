@@ -17,21 +17,28 @@ import (
 	"nilcore/internal/model"
 )
 
-// Pricer turns a model id and a token split into a dollar cost. It is the seam
+// Pricer turns a model id and a token usage into a dollar cost. It is the seam
 // the metering decorator (P1-T01) calls once per model response; the id it
 // passes is exactly model.Provider.Model() (e.g. "claude-opus-4-8", "gpt-5.5",
 // "openrouter/fusion").
 //
-// The interface is the frozen, two-count form (input/output) every existing
-// caller depends on. The richer, Usage-aware path — authoritative vendor cost,
-// cached-input discount, reasoning tokens — is a concrete method on Table
-// (PriceUsage) rather than a new interface method, so adding it leaves every
-// Pricer implementation (and the contract every caller relies on) untouched.
+// It carries two methods. Price is the original two-count (input/output) form.
+// PriceUsage (P15-T15) is the Usage-aware path the metering decorator now charges
+// through: it consults the authoritative vendor cost (Usage.CostUSD), the
+// cached-input discount, and reasoning tokens. For a plain split (no
+// CostUSD/cached/reasoning) PriceUsage equals Price(in,out), so existing charging
+// stays byte-identical (Table proved this in P15-T11).
 type Pricer interface {
 	// Price returns the dollar cost of a call that consumed in input tokens and
 	// out output tokens on model modelID. Negative counts are clamped to zero so
 	// a caller can never produce a negative (ceiling-relaxing) charge.
 	Price(modelID string, in, out int) float64
+
+	// PriceUsage returns the dollar cost of a full model.Usage on model modelID —
+	// preferring an authoritative reported cost (Usage.CostUSD), discounting cached
+	// input, and billing reasoning tokens at the output rate. For a usage that
+	// carries only InputTokens/OutputTokens it equals Price(modelID, in, out).
+	PriceUsage(modelID string, u model.Usage) float64
 }
 
 // rate is the per-1,000-token price split for one model family. Input and output

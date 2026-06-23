@@ -162,6 +162,61 @@ func TestCompleteChargesPerCall(t *testing.T) {
 	}
 }
 
+// TestChargesViaPriceUsage pins P15-T15: the decorator charges the dollar figure
+// from Price.PriceUsage (not the 2-count Price), so an authoritative reported cost
+// and the cached-input discount flow into the ledger — while a plain Usage (no
+// CostUSD/cached/reasoning) still charges exactly what Price(in,out) produced (no
+// regression). The token count charged stays input+output regardless of the dollar
+// override. Both the Complete and Stream paths are covered.
+func TestChargesViaPriceUsage(t *testing.T) {
+	const id = "openrouter/fusion"
+	// Authoritative cost the table would never guess from the token split alone.
+	const authoritative = 0.4242
+	costUsage := model.Usage{InputTokens: 1000, OutputTokens: 1000, CostUSD: authoritative}
+	// A plain split with no extras: PriceUsage must equal the old Price(in,out).
+	plainUsage := model.Usage{InputTokens: 1000, OutputTokens: 1000}
+	wantPlain := NewTable().Price(id, plainUsage.InputTokens, plainUsage.OutputTokens)
+
+	for _, tc := range []struct {
+		name        string
+		usage       model.Usage
+		wantDollars float64
+	}{
+		{"authoritative CostUSD wins", costUsage, authoritative},
+		{"plain usage matches Price(in,out)", plainUsage, wantPlain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Complete path.
+			ledC := budget.New()
+			pc := &Provider{Inner: &fakeProvider{id: id, usage: tc.usage}, Ledger: ledC, Task: "t", Price: NewTable()}
+			if _, err := pc.Complete(context.Background(), "sys", nil, nil, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			tokens, dollars := ledC.Total()
+			if tokens != 2000 {
+				t.Errorf("Complete tokens = %d, want 2000 (input+output, unchanged by the dollar override)", tokens)
+			}
+			if !almostEqualDollars(dollars, tc.wantDollars) {
+				t.Errorf("Complete dollars = %v, want %v", dollars, tc.wantDollars)
+			}
+
+			// Stream path (streaming Inner): must charge identically.
+			ledS := budget.New()
+			ps := &Provider{Inner: &streamingProvider{id: id, usage: tc.usage, deltas: []string{"x"}}, Ledger: ledS, Task: "t", Price: NewTable()}
+			if _, err := ps.Stream(context.Background(), "sys", nil, nil, 100, nil); err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			sTokens, sDollars := ledS.Total()
+			if sTokens != 2000 {
+				t.Errorf("Stream tokens = %d, want 2000", sTokens)
+			}
+			if !almostEqualDollars(sDollars, tc.wantDollars) {
+				t.Errorf("Stream dollars = %v, want %v", sDollars, tc.wantDollars)
+			}
+		})
+	}
+}
+
 // TestModelDelegates asserts Model() passes through unchanged so tier/pricer
 // resolution sees the real model id.
 func TestModelDelegates(t *testing.T) {
