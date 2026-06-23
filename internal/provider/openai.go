@@ -166,13 +166,21 @@ type oaiStreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
+// oaiRequest is the chat-completions request body. MaxTokens and maxTokensField
+// carry NO json tag of their own (`json:"-"`): the token cap is emitted by the
+// custom MarshalJSON in openai_maxtokens.go under the single dynamic key name in
+// maxTokensField (default "max_tokens"; reasoning models use
+// "max_completion_tokens"). This makes it structurally impossible to emit both
+// keys — gpt-5.x / o-series reject a body carrying both. Every other field keeps
+// its tag and omitempty exactly as before.
 type oaiRequest struct {
-	Model         string            `json:"model"`
-	MaxTokens     int               `json:"max_tokens,omitempty"`
-	Messages      []oaiMessage      `json:"messages"`
-	Tools         []oaiTool         `json:"tools,omitempty"`
-	Stream        bool              `json:"stream,omitempty"`
-	StreamOptions *oaiStreamOptions `json:"stream_options,omitempty"`
+	Model          string            `json:"model"`
+	MaxTokens      int               `json:"-"`
+	maxTokensField string            // json key for the token cap; never serialized directly
+	Messages       []oaiMessage      `json:"messages"`
+	Tools          []oaiTool         `json:"tools,omitempty"`
+	Stream         bool              `json:"stream,omitempty"`
+	StreamOptions  *oaiStreamOptions `json:"stream_options,omitempty"`
 }
 
 type oaiResponse struct {
@@ -196,11 +204,12 @@ type oaiResponse struct {
 // (invariant I3).
 func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, stream bool) (*http.Request, error) {
 	reqBody := oaiRequest{
-		Model:     o.model,
-		MaxTokens: maxTokens,
-		Messages:  toOpenAIMessages(system, msgs),
-		Tools:     toOpenAITools(tools),
-		Stream:    stream,
+		Model:          o.model,
+		MaxTokens:      maxTokens,
+		maxTokensField: o.maxTokensField,
+		Messages:       toOpenAIMessages(system, msgs),
+		Tools:          toOpenAITools(tools),
+		Stream:         stream,
 	}
 	if stream {
 		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}

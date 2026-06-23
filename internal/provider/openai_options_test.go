@@ -237,8 +237,9 @@ func TestNewOpenRouterDefaults(t *testing.T) {
 }
 
 // TestWithMaxTokensFieldStoredNotApplied proves WithMaxTokensField records the
-// field name but does NOT yet change how the body marshals — the wire body is
-// still "max_tokens" (the field-name switch lands in a later task).
+// field name AND (since P15-T04) drives the wire body: the cap is emitted under
+// "max_completion_tokens" and the body carries NO "max_tokens" key — reasoning
+// models reject a body bearing both, so exactly one is emitted.
 func TestWithMaxTokensFieldStoredNotApplied(t *testing.T) {
 	var body string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -255,11 +256,11 @@ func TestWithMaxTokensFieldStoredNotApplied(t *testing.T) {
 	if _, err := o.Complete(context.Background(), "", nil, nil, 100); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if !strings.Contains(body, `"max_tokens":100`) {
-		t.Errorf("body = %s, want it to still carry \"max_tokens\":100 (field switch not yet wired)", body)
+	if !strings.Contains(body, `"max_completion_tokens":100`) {
+		t.Errorf("body = %s, want it to carry \"max_completion_tokens\":100 (field switch wired in P15-T04)", body)
 	}
-	if strings.Contains(body, "max_completion_tokens") {
-		t.Errorf("body = %s, must NOT yet emit max_completion_tokens", body)
+	if strings.Contains(body, `"max_tokens"`) {
+		t.Errorf("body = %s, must NOT also emit max_tokens (exactly one key)", body)
 	}
 }
 
