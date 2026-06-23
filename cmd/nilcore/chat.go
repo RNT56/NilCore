@@ -187,6 +187,9 @@ func chatMain(args []string) {
 		// Web-search key resolved env-first then SecretStore (I3); used only by the
 		// brave backend, never logged, never placed in a prompt.
 		searchKey: searchKey,
+		// The executor model spec — only consulted to decide if native (provider-side)
+		// web search is available (Phase 15). modelSpec() matches resolveProvider.
+		execModelSpec: modelSpec(os.Getenv("NILCORE_MODEL"), b.cfg.Executor),
 	})
 	if err != nil {
 		fatal(err)
@@ -270,6 +273,11 @@ type chatDeps struct {
 	// and the backend's host is allowlisted.
 	searchBackend tools.SearchBackend
 	searchKey     string
+
+	// execModelSpec is the resolved `provider:model` of the executor — used only to
+	// decide whether native (provider-side) web search is available (Phase 15). Empty
+	// for a delegated backend (no model.Provider), which keeps Path A off.
+	execModelSpec string
 }
 
 // webEnabled reports whether sandboxed web access is configured (a non-empty
@@ -722,9 +730,15 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if d.webEnabled() {
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
-			// web_search is advertised when the resolved backend is not off AND its
-			// host is allowlisted (resolveWeb auto-adds it, so this holds in practice).
-			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+			// web_search — EXACTLY ONE path (Phase 15 capability switch). Path A: when
+			// NILCORE_WEB_SEARCH_NATIVE is opted in and the provider supports it, the
+			// model gets the provider-native server-side tool (no in-box fetch). Path B
+			// (else): the sandboxed, egress-confined, guard.Wrap'd client tool, when the
+			// backend is on and its host is allowlisted. Never both — a second web_search
+			// would leave a tool_use without its tool_result.
+			if nativeWS := selectNativeWebSearch(d.execModelSpec); nativeWS != nil {
+				reg.Register(nativeWS)
+			} else if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
 			// browser_view (P9-T02) is opt-in via NILCORE_BROWSER (the in-sandbox

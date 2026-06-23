@@ -8,9 +8,18 @@ without adding a Go module, and keeping the default binary byte-identical until 
 Read order: `CLAUDE.md` §2 (invariants) → `docs/ARCHITECTURE.md` (providers) → this file → `docs/TASKS.md`
 (the Phase-15 queue rows + specs).
 
-> **Status:** planned. Wave 1 (P15-T01 · P15-T03 · P15-T12) implementable today off `main`.
-> Web-search waves (P15-T07 · T08 · T09) carry a **cross-phase dependency**: they extend
-> `model.BuiltinTool`, which lands with the computer-use work — they unblock once that foundation is in `main`.
+> **Status: SHIPPED.** The provider upgrade (T01–T06, T10–T12, T15–T16) merged in PR #61.
+> **Web search (T07 · T08 · T09) is now shipped too** — the `model.BuiltinTool` foundation it
+> depended on landed via the computer-use work (#60). Native render: Anthropic tools-entry
+> (`web_search_20250305`), OpenAI top-level `web_search_options`, OpenRouter `web` plugin —
+> lifted out of the generic `tools[]` so a non-web body stays byte-identical. The **capability
+> switch** (`cmd/nilcore/webcap.go`) advertises EXACTLY ONE `web_search`: native (Path A, opt-in
+> via `NILCORE_WEB_SEARCH_NATIVE`, provider-side) or the sandboxed client-side tool (Path B), never
+> both. The **I7 fence** holds by construction — provider web results are the model's own
+> synthesized text (OpenAI) or distinct non-text blocks dropped from re-injection (Anthropic),
+> and the client path stays `guard.Wrap`'d; raw provider result blocks never re-enter as trusted
+> instructions. Remaining: the optional `eval/provider-compat` coverage harness (T13) and a live
+> end-to-end check against real provider keys (hermetic shape/byte-identity tests gate it today).
 
 ---
 
