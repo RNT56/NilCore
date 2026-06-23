@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -47,6 +48,18 @@ type OpenAI struct {
 	toolChoice        json.RawMessage    // "auto" | "none" | {"type":"function",...}
 	serviceTier       string             // "auto" | "default" | "flex" | "priority"
 	promptCacheKey    string             // routing hint for prompt caching
+
+	// OpenRouter-only typed extras (P15-T06). These are gated on isOpenRouter:
+	// they are merged into the request body / set as headers ONLY when this adapter
+	// targets the OpenRouter base, and only when the operator configured them — so a
+	// bare OpenRouter request stays byte-identical to a plain OpenAI-compatible one.
+	// isOpenRouter is set by NewOpenRouter and by the compat path when the base host
+	// is openrouter.ai. openRouterExtras is nil until a WithOpenRouter* option runs;
+	// the attribution strings are static config (NEVER the key, invariant I3).
+	isOpenRouter      bool
+	openRouterExtras  *openRouterExtras
+	openRouterReferer string // HTTP-Referer attribution header (empty ⇒ not sent)
+	openRouterTitle   string // X-Title attribution header (empty ⇒ not sent)
 }
 
 // Option configures an OpenAI-compatible adapter built via NewOpenAICompatible.
@@ -147,7 +160,31 @@ func NewOpenAICompatible(model string, opts ...Option) *OpenAI {
 	for _, opt := range opts {
 		opt(o)
 	}
+	// Infer the OpenRouter base from the configured URL host so the compat path
+	// (NILCORE_COMPAT_BASE_URL pointed at OpenRouter, P15-T02) also gates the typed
+	// extras + attribution headers. NewOpenRouter sets isOpenRouter explicitly; this
+	// is the belt-and-suspenders host check for an operator-typed base. It NEVER
+	// changes the body/headers on its own — extras and attribution are still
+	// emitted only when separately configured, so a bare OpenRouter compat base
+	// stays byte-identical.
+	if !o.isOpenRouter && hostIsOpenRouter(o.baseURL) {
+		o.isOpenRouter = true
+	}
 	return o
+}
+
+// hostIsOpenRouter reports whether baseURL's host is openrouter.ai (or a subdomain
+// of it). It parses the URL so a path/query containing the string cannot trip it;
+// a malformed URL is simply "not OpenRouter".
+func hostIsOpenRouter(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	// DNS host names are case-insensitive; fold to lower so an operator-typed base
+	// like https://OpenRouter.ai/... still gates the extras.
+	host := strings.ToLower(u.Hostname())
+	return host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai")
 }
 
 // NewOpenAI returns an OpenAI Chat Completions provider.
@@ -171,7 +208,16 @@ func NewOpenRouter(key, modelID string) *OpenAI {
 	if modelID == "" {
 		modelID = DefaultOpenRouterModel
 	}
-	return NewOpenAICompatible(modelID, WithKey(key), WithBaseURL("https://openrouter.ai/api/v1"))
+	return NewOpenAICompatible(modelID, WithKey(key), WithBaseURL("https://openrouter.ai/api/v1"), withOpenRouterBase())
+}
+
+// withOpenRouterBase marks the adapter as targeting OpenRouter, gating the typed
+// extras and the attribution headers (P15-T06). It is unexported: NewOpenRouter
+// sets it directly, and the compat path infers it from the base host, so an
+// operator never flips it by hand. With the flag set but no extras/attribution
+// configured, the request stays byte-identical to a bare OpenRouter call.
+func withOpenRouterBase() Option {
+	return func(o *OpenAI) { o.isOpenRouter = true }
 }
 
 // Model returns the configured model id.
@@ -260,6 +306,15 @@ type oaiRequest struct {
 	ToolChoice        json.RawMessage    `json:"tool_choice,omitempty"`
 	ServiceTier       string             `json:"service_tier,omitempty"`
 	PromptCacheKey    string             `json:"prompt_cache_key,omitempty"`
+
+	// OpenRouter-only extras (P15-T06), embedded as an ANONYMOUS pointer so
+	// encoding/json PROMOTES its tagged fields (provider, models, reasoning,
+	// transforms, plugins) to the top level of the request body — exactly where
+	// OpenRouter expects them. When nil (every non-OpenRouter call, and a bare
+	// OpenRouter call) it promotes nothing, so the body is byte-identical to today.
+	// The promotion survives the T04 oaiRequestAlias because the alias preserves the
+	// embedded field and its tags.
+	*openRouterExtras
 }
 
 type oaiResponse struct {
@@ -337,6 +392,21 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 	if stream {
 		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
 	}
+
+	// OpenRouter extras ride the body ONLY on the OpenRouter base AND only when the
+	// operator configured at least one (o.openRouterExtras non-nil). On any other
+	// base, or a bare OpenRouter call, the embedded pointer stays nil so the body is
+	// byte-identical to today. applyDefaults injects require_parameters:true only
+	// WITHIN a present provider object — never on a bare call.
+	if o.isOpenRouter && o.openRouterExtras != nil {
+		extras := *o.openRouterExtras
+		if extras.Provider != nil {
+			p := *extras.Provider
+			extras.Provider = &p
+		}
+		extras.applyDefaults()
+		reqBody.openRouterExtras = &extras
+	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -355,6 +425,19 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 	// no auth header at all.
 	if o.key != "" {
 		req.Header.Set(o.authHeader, o.authPrefix+o.key)
+	}
+	// OpenRouter attribution headers (P15-T06): static operator-supplied config
+	// strings that credit the calling app on OpenRouter's dashboards. Set ONLY on
+	// the OpenRouter base AND only when configured — so a bare OpenRouter request
+	// sends no extra header (byte-identical to today). These are NEVER the API key
+	// (invariant I3) and are never logged.
+	if o.isOpenRouter {
+		if o.openRouterReferer != "" {
+			req.Header.Set("HTTP-Referer", o.openRouterReferer)
+		}
+		if o.openRouterTitle != "" {
+			req.Header.Set("X-Title", o.openRouterTitle)
+		}
 	}
 	return req, nil
 }
