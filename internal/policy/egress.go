@@ -51,3 +51,40 @@ func DefaultEgress() Egress {
 		"static.crates.io",
 	}}
 }
+
+// EgressWith returns the DefaultEgress allowlist extended with operator-supplied
+// hosts, appended in order after the defaults and de-duplicated (case- and
+// space-insensitive on the host text). With no extra hosts it is identical to
+// DefaultEgress — the conservative default is never mutated.
+//
+// IMPORTANT: this allowlist governs the SANDBOX container network only — the
+// hosts that model-emitted (sandboxed) code is permitted to reach. It does NOT
+// gate the host-side model.Provider call. Pointing the chat adapter at a custom
+// or localhost model endpoint therefore needs no egress edit; add a host here
+// only when sandboxed code itself must reach that endpoint.
+func EgressWith(extra ...string) Egress {
+	base := DefaultEgress()
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]struct{}, len(base.Allowed)+len(extra))
+	allowed := make([]string, 0, len(base.Allowed)+len(extra))
+	add := func(host string) {
+		key := strings.ToLower(strings.TrimSpace(host))
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		allowed = append(allowed, host)
+	}
+	for _, h := range base.Allowed {
+		add(h)
+	}
+	for _, h := range extra {
+		add(h)
+	}
+	return Egress{Allowed: allowed}
+}
