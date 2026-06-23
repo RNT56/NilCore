@@ -161,6 +161,12 @@ func (r *Resilient) Complete(ctx context.Context, system string, msgs []Message,
 		if err == nil {
 			return resp, nil
 		}
+		// A terminal *APIError (e.g. 401/403/400) cannot be helped by a different
+		// provider either — the request itself is bad. Return it immediately,
+		// unwrapped, so the caller sees the typed error and no failover happens.
+		if apiErr := terminalAPIError(err); apiErr != nil {
+			return Response{}, apiErr
+		}
 		errs = append(errs, fmt.Errorf("provider %d (%s): %w", i, p.Model(), err))
 		// If the context is done, stop walking the list — no provider will help.
 		if ctx.Err() != nil {
@@ -199,6 +205,10 @@ func (r *Resilient) Stream(ctx context.Context, system string, msgs []Message, t
 		if err == nil {
 			return resp, nil
 		}
+		// Terminal *APIError: fail fast, no failover (same as Complete).
+		if apiErr := terminalAPIError(err); apiErr != nil {
+			return Response{}, apiErr
+		}
 		errs = append(errs, fmt.Errorf("provider %d (%s): %w", i, p.Model(), err))
 		// If the context is done, stop walking the list — no provider will help.
 		if ctx.Err() != nil {
@@ -218,7 +228,7 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 	var lastErr error
 	for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
 		if attempt > 0 {
-			if err := r.sleep(ctx, r.backoff(attempt)); err != nil {
+			if err := r.sleep(ctx, r.retryDelay(attempt, lastErr)); err != nil {
 				return Response{}, fmt.Errorf("backoff interrupted: %w", err)
 			}
 		}
@@ -229,6 +239,11 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 		}
 		lastErr = err
 		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
+		// A terminal *APIError cannot succeed on a retry — return it as-is so the
+		// caller's terminal check fires and stops the walk (no retry, no failover).
+		if isTerminalAPIError(err) {
+			return Response{}, err
+		}
 		// A cancelled/expired parent context is terminal — do not keep retrying.
 		if ctx.Err() != nil {
 			return Response{}, fmt.Errorf("attempt %d: %w", attempt+1, err)
@@ -305,7 +320,7 @@ func (r *Resilient) callWithRetry(ctx context.Context, p Provider, b *breaker, s
 	var lastErr error
 	for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
 		if attempt > 0 {
-			if err := r.sleep(ctx, r.backoff(attempt)); err != nil {
+			if err := r.sleep(ctx, r.retryDelay(attempt, lastErr)); err != nil {
 				return Response{}, fmt.Errorf("backoff interrupted: %w", err)
 			}
 		}
@@ -316,6 +331,12 @@ func (r *Resilient) callWithRetry(ctx context.Context, p Provider, b *breaker, s
 		}
 		lastErr = err
 		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
+		// A terminal *APIError (non-retryable, e.g. 401/403) cannot succeed on a
+		// retry — return it as-is so the caller's terminal check fires and stops
+		// the whole walk (no further retry, no failover).
+		if isTerminalAPIError(err) {
+			return Response{}, err
+		}
 		// A cancelled/expired parent context is terminal — do not keep retrying.
 		if ctx.Err() != nil {
 			return Response{}, fmt.Errorf("attempt %d: %w", attempt+1, err)
@@ -336,6 +357,45 @@ func (r *Resilient) callOnce(ctx context.Context, p Provider, system string, msg
 	cctx, cancel := context.WithTimeout(ctx, r.opts.CallTimeout)
 	defer cancel()
 	return p.Complete(cctx, system, msgs, tools, maxTokens)
+}
+
+// isTerminalAPIError reports whether err is (or wraps) an *APIError that is NOT
+// retryable. A terminal error stops the per-provider retry loop immediately and,
+// once it surfaces to Complete/Stream, stops the provider walk entirely (no
+// failover). A plain (untyped) error is never terminal here, so untyped errors
+// retry and fail over exactly as before — the backward-compatibility guarantee.
+func isTerminalAPIError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return !apiErr.Retryable
+	}
+	return false
+}
+
+// terminalAPIError returns the wrapped *APIError when err is terminal (a
+// non-retryable *APIError), else nil. Complete/Stream use it to short-circuit the
+// provider walk and return the typed error to the caller verbatim.
+func terminalAPIError(err error) *APIError {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && !apiErr.Retryable {
+		return apiErr
+	}
+	return nil
+}
+
+// retryDelay is the wait before retry attempt n. It is the computed exponential
+// backoff EXCEPT when the previous failure was a retryable *APIError carrying a
+// Retry-After hint that exceeds the computed backoff — then the server's hint is
+// the FLOOR (we wait at least that long). For any non-APIError, or a hint that is
+// shorter than the backoff, this returns exactly backoff(n) — so untyped-error
+// timing is unchanged.
+func (r *Resilient) retryDelay(attempt int, lastErr error) time.Duration {
+	d := r.backoff(attempt)
+	var apiErr *APIError
+	if errors.As(lastErr, &apiErr) && apiErr.RetryAfter > d {
+		return apiErr.RetryAfter
+	}
+	return d
 }
 
 // backoff computes the delay before retry attempt n (n >= 1): an exponential

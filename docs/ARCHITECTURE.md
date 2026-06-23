@@ -326,6 +326,43 @@ Because both decorators satisfy `Streamer`, the loop always sees a `Streamer`
 through the wrapper stack (meter charges, Resilient retries) while the live-token
 property and the single-Response contract are preserved end to end.
 
+**Typed model errors: `model.APIError` (terminal-vs-retryable + Retry-After).** A
+model call can fail for two very different reasons, and the resilience wrapper now
+distinguishes them. `model.APIError` is a small, vendor-neutral typed error a
+provider adapter may return for an HTTP-layer failure:
+`{ StatusCode int; Retryable bool; RetryAfter time.Duration; Type, Code, Message string }`.
+Its `Error()` is **key-free** (I3): it renders only the status, the vendor's
+machine-readable `Type`/`Code`, and the human `Message` — never an API key, a
+header, or the request body. `NewAPIError` classifies the status: **429/500/502/
+503/504 ⇒ retryable**, **400/401/403/404/422 ⇒ terminal** (an unlisted 5xx is
+treated as retryable, anything else terminal). A minimal stdlib `Retry-After`
+parser reads both wire forms — integer seconds and an HTTP-date — yielding `0` for
+an empty, malformed, or past value.
+
+`model.Resilient` inspects the failure with `errors.As(err, &apiErr)`:
+
+- A **terminal** `*APIError` (e.g. a bad key or malformed request) **fails fast** —
+  no further retry of that provider **and no failover**, because a different
+  provider cannot fix a request the caller got wrong. The typed error surfaces to
+  the caller verbatim (still extractable via `errors.As`).
+- A **retryable** `*APIError` retries using the existing exponential-backoff +
+  jitter + breaker logic, with one addition: its `RetryAfter` is treated as the
+  backoff **floor** — when the server's hint exceeds the computed backoff, the
+  wrapper waits at least that long (a shorter hint is ignored; the computed backoff
+  still dominates).
+- A **plain (untyped) error** is, by construction, neither terminal nor
+  Retry-After-bearing, so it retries, fails over, and times its backoff **exactly
+  as before** — the backward-compatibility guarantee, proven by GATE-1 tests. Every
+  existing provider that returns untyped errors is unaffected.
+
+**Additive `model.Usage` fields.** `Usage` gains three `omitempty` fields beyond the
+frozen `InputTokens`/`OutputTokens`: `ReasoningTokens` (hidden thinking tokens a
+vendor breaks out separately), `CachedTokens` (input tokens served from a prompt
+cache), and `CostUSD` (per-call cost when a vendor or the meter computes it). They
+are purely additive — a `Usage` that leaves them zero marshals byte-identically to
+the pre-change shape, so neither the `Provider.Complete`/`Stream` contract (I1) nor
+any existing adapter changes.
+
 **The `emit.KindToken` live-token surface.** The loop forwards each streamed delta
 to the wired `emit.Emitter` as a `KindToken` event. `WriterEmitter` renders a
 `KindToken` raw and inline (no glyph/step framing, no trailing newline) so a run of

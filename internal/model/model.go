@@ -76,10 +76,24 @@ type Response struct {
 	Usage      Usage   `json:"usage"`
 }
 
-// Usage reports token counts for the call.
+// Usage reports token counts (and, where a vendor reports it, cost) for the call.
+// The first two fields are the original, frozen shape: an InputTokens-only/
+// OutputTokens-only Usage marshals byte-identically to before. The trailing three
+// are purely additive and `omitempty`, so a provider that does not populate them
+// emits the exact same JSON it always has — existing providers are unchanged.
+//   - ReasoningTokens: tokens spent on hidden reasoning/thinking (e.g. extended
+//     thinking), reported separately from the visible OutputTokens by vendors that
+//     break it out.
+//   - CachedTokens: input tokens served from a prompt cache (a billing discount on
+//     the InputTokens total), surfaced by vendors with prompt caching.
+//   - CostUSD: the call's cost in US dollars when a vendor (or a meter) computes it;
+//     0 means "not reported", which is why it is omitempty.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens     int     `json:"input_tokens"`
+	OutputTokens    int     `json:"output_tokens"`
+	ReasoningTokens int     `json:"reasoning_tokens,omitempty"`
+	CachedTokens    int     `json:"cached_tokens,omitempty"`
+	CostUSD         float64 `json:"cost_usd,omitempty"`
 }
 
 // Provider is one model vendor behind a uniform call. Model selection is
