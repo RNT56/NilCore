@@ -859,6 +859,126 @@ control plane crosses into `EXT-01` and stays out of scope.
 
 ---
 
+## Phase 15 — OpenAI / OpenRouter / generic-endpoint provider upgrade
+
+Bring the `openai` / `openrouter` adapters and a **new generic `openai-compatible` vendor** to
+state-of-the-art (configurable endpoints, reasoning controls, structured outputs, prompt-cache accounting,
+OpenRouter provider-routing, web search) **without touching the frozen `backend.CodingBackend` contract,
+without a new `go.mod` dependency (I6), keeping the default binary byte-identical until opted in.** Full
+design + feature matrix + rollout in [`docs/ROADMAP-PROVIDERS.md`](ROADMAP-PROVIDERS.md).
+
+> **Status / scope.** OpenAI Responses-API migration is **deferred** (OpenRouter + compat are
+> Chat-Completions-only; we keep Chat Completions as the portable baseline). Batch API / `GET /generation`
+> are **out of scope** (don't fit the synchronous `Provider.Complete` seam). The web-search tasks
+> (P15-T07/T08/T09) extend `model.BuiltinTool` and carry a **cross-phase dependency** on that seam being in
+> `main` (it lands with the computer-use work); the rest is independent. Invariants hold by **reuse**: I1 the
+> `Provider.Complete` signature and `backend.CodingBackend` are untouched; I3 keys via env-name/SecretStore,
+> per-request header only, never logged — and a compat endpoint must use a **dedicated `NILCORE_COMPAT_API_KEY`**
+> (a canonical vendor key on a compat BaseURL is rejected with a key-free error); I4 the client-side web search
+> stays sandboxed; I6 stdlib only; I7 provider-returned web-search citations are `guard.Wrap`'d untrusted DATA,
+> never a text block, never via `emitReasoning`.
+
+| ID | Phase | Title | Depends on | Owns | Note |
+|---|---|---|---|---|---|
+| P15-T01 | 15 | Configurable BaseURL + Auth + options constructor | — | `internal/provider/openai.go` (+`openai_options_test.go`) | foundation; ∥ P15-T03, P15-T12 |
+| P15-T02 | 15 | `openai-compatible` vendor + dedicated-key validation | P15-T01 | `internal/provider/provider.go` (+test) | |
+| P15-T03 | 15 | Usage widening + `model.APIError` + resilience | — | `internal/model/{model,apierror,resilience}.go` (+tests), `docs/ARCHITECTURE.md` | **serialised seam**; 2 proof gates |
+| P15-T04 | 15 | `max_tokens` single-key marshal (REPLACE) | P15-T01 | `internal/provider/openai_maxtokens.go` (+test) | correctness blocker for gpt-5.x |
+| P15-T05 | 15 | SOTA request fields + widened usage/model decode | P15-T01, P15-T03, P15-T04 | `internal/provider/openai.go` (+tests) | sole `openai.go` owner this wave |
+| P15-T06 | 15 | OpenRouter typed extras (routing, `models[]`, transforms, headers) | P15-T05 | `internal/provider/openrouter_extras.go` (+test) | |
+| P15-T07 | 15 | Web-search `BuiltinTool` variant + adapter render | P15-T05 | `internal/model/builtin.go`, `internal/provider/openai_websearch.go` (+tests) | needs `BuiltinTool` in `main` |
+| P15-T08 | 15 | I7 fence: `web_search_result` block + `guard.Wrap` + native.go handler | P15-T05, P15-T07 | `internal/model/model.go`, `internal/provider/openai.go`, `internal/backend/native.go` (+tests) | solo wave |
+| P15-T09 | 15 | Exactly-one-web-tool capability switch | P15-T07, P15-T08 | `cmd/nilcore/webcap.go` (+test) | mutual-exclusion dispatch invariant |
+| P15-T10 | 15 | Onboarding config + wizard for compat vendor | P15-T02 | `internal/onboard/` (+tests) | |
+| P15-T11 | 15 | Metering/pricing for new ids + authoritative `usage.cost` | P15-T03 | `internal/meter/pricer.go` (+test) | |
+| P15-T12 | 15 | Egress allowlist extensibility (sandbox only) | — | `internal/policy/egress.go` (+test) | small; ∥ Wave 1 |
+| P15-T13 | 15 | Eval coverage (compat, reasoning, structured, native search) | P15-T06, P15-T08, P15-T09 | `eval/provider-compat/` | hermetic httptest fixtures |
+| P15-T14 | 15 | Docs: PREREQUISITES + ARCHITECTURE + TASKS specs | P15-T02, P15-T03, P15-T06, P15-T08, P15-T09, P15-T10, P15-T11, P15-T12 | `docs/PREREQUISITES.md`, `docs/ARCHITECTURE.md`, `docs/TASKS.md` | **contract**, serialised, last |
+
+**Waves (Owns disjoint within each; deps in strictly earlier waves):**
+W1 `T01·T03·T12` → W2 `T02·T04` → W3 `T05` → W4 `T06·T07·T10·T11` → W5 `T08` → W6 `T09` → W7 `T13` → W8 `T14`.
+
+### P15-T01 — Configurable BaseURL + Auth descriptor + functional-options constructor
+`NewOpenAICompatible(model, opts…)` with `WithBaseURL`/`WithAuth`/`WithMaxTokensField`; `NewOpenAI`/`NewOpenRouter`
+keep exact defaults. BaseURL is the full prefix (append only `/chat/completions` after `TrimRight`, no auto `/v1`).
+Auth header emitted only when `key != ""` (Bearer default · Azure `api-key` · None). Default options ⇒ request body
++ headers byte-identical (httptest baseline). Stdlib only; key in header only (I3). `make verify` green.
+
+### P15-T02 — `openai-compatible` vendor + dedicated key-env validation
+`ResolveWith` gains a `openai-compatible`/`compat` case building via `NewOpenAICompatible` from config-injected
+BaseURL/Auth/MaxTokensField + key-env name; `split()` unchanged (spec `openai-compatible:<modelID>` preserves `:`/`/`).
+Key-env defaults to `NILCORE_COMPAT_API_KEY`; a canonical vendor key name on a compat endpoint returns a key-free error
+(I3). Three existing vendor cases byte-identical. `make verify` green.
+
+### P15-T03 — Usage widening + `model.APIError` + resilience terminal/Retry-After (serialised seam)
+Additive `model.Usage{ReasoningTokens,CachedTokens,CostUSD}`; new `model.APIError{StatusCode,Retryable,RetryAfter,
+Type,Code,Message}` (key-free `Error()`); `resilience.go` via `errors.As` stops terminal `4xx` (no failover), retries
+`429/5xx`, honours `Retry-After` as floor. **Proof gate 1:** untyped error retries exactly as today. **Proof gate 2:**
+terminal `APIError` stops, `429` honours `Retry-After`. `Provider.Complete` signature untouched (I1). `docs/ARCHITECTURE.md`
+updated in this PR. `make verify` green.
+
+### P15-T04 — `max_tokens` single-key marshal (REPLACE not ADD)
+One `MaxTokens int` marshalled into exactly one configured key (`max_tokens` default; `max_completion_tokens` for
+reasoning models); emitting both is structurally impossible (test decodes the body and asserts exactly one key).
+Default ⇒ byte-identical. `make verify` green.
+
+### P15-T05 — SOTA request fields + widened usage/model decode
+Additive `omitempty`: `reasoning_effort`, `response_format` (json_schema strict), `parallel_tool_calls` (`*bool`),
+`tool_choice`, `service_tier`, optional `prompt_cache_key`. Decode reads `completion_tokens_details.reasoning_tokens`,
+`prompt_tokens_details.cached_tokens`, `usage.cost`, served top-level `model`. Every field zero ⇒ body byte-identical
+(extend `TestNormalToolByteIdentical`). `make verify` green.
+
+### P15-T06 — OpenRouter typed extras (provider routing · models[] · transforms · attribution headers)
+Typed `openRouterExtras` (provider `{order,allow_fallbacks,require_parameters,data_collection,zdr,sort,max_price}`,
+`models[]`, `reasoning`, transforms/plugins) merged only on the OpenRouter base; `require_parameters:true` default;
+`HTTP-Referer`/`X-Title` from static config (never the key, I3). Decode prefers authoritative `usage.cost` + served
+`model`. Zero/ non-OR base ⇒ byte-identical. `make verify` green.
+
+### P15-T07 — Web-search `BuiltinTool` variant + adapter render (kept OUT of generic tools[])
+Additive `BuiltinTool` web-search fields + constructors; `Tool.MarshalJSON` unchanged. Adapter filters the web-search
+`Builtin` out of the generic `tools[]` slice and renders it directly (OpenRouter entry / OpenAI `web_search_options`,
+search-capable models only). `TestNormalToolByteIdentical` covers nil-Builtin AND non-web Builtin. nil ⇒ byte-identical.
+**Depends on the `model.BuiltinTool` seam being in `main`.** `make verify` green.
+
+### P15-T08 — I7 fence: `web_search_result` block + `guard.Wrap` at decode + native.go re-entry
+Additive `Block{Type:"web_search_result"}` carrying the `guard.Wrap`'d citation payload; decoders never produce a text
+block from citations; `native.go` runs `guard.Suspicious` + `injection_flagged` and appends as fenced DATA only (never
+via `emitReasoning`; `textBlocks` drops it). No double-fence. Injection-string fixture proves it. `make verify` green.
+
+### P15-T09 — Exactly-one-web-tool capability switch
+`resolveWeb` in cmd selects exactly one path: native (server-side `BuiltinTool`, citations) or the sandboxed client-side
+`web_search` `model.Tool` — advertised as dispatchable ONLY on the client path, so the model never emits an orphan
+`web_search` tool_use. Default (no web) ⇒ byte-identical. `make verify` green.
+
+### P15-T10 — Onboarding config + wizard for compat vendor and provider knobs
+`validProviders` gains `openai-compatible`; additive `omitempty` config (BaseURL, AuthScheme, MaxTokensField,
+`CompatKeyEnv` default `NILCORE_COMPAT_API_KEY`, OR Referer/Title, default reasoning effort, routing prefs); bump
+`CurrentConfigVersion` + `Migrate`. Wizard surfaces the dedicated-key requirement; never echoes/persists the secret
+value (I3). Absent fields ⇒ byte-identical. `make verify` green.
+
+### P15-T11 — Metering + pricing for new model ids and authoritative cost
+`pricer.go` adds prefix rate/window entries for newly reachable ids; unknown ids keep the conservative floor. Prefers
+OpenRouter's authoritative `usage.cost`; bills `cached_tokens` at the reduced input rate; accounts `reasoning_tokens`
+(uses T03's `Usage` fields). Existing ids unchanged (regression test). `make verify` green.
+
+### P15-T12 — Egress allowlist extensibility for sandbox-reachable custom endpoints
+`policy/egress.go` gains a config-extensible host list (`EgressWith(extra…)`); `DefaultEgress` unchanged with no extras.
+Doc note: egress governs the SANDBOX only, not the host-side `model.Provider` call (a host-only base-URL change needs no
+egress edit). `make verify` green.
+
+### P15-T13 — Eval coverage for compat endpoints, reasoning, structured output, native search
+`eval/provider-compat/` fixtures exercise a generic compat endpoint, `max_completion_tokens` reasoning model,
+`json_schema` output, OpenRouter extras, and the native web-search-result fence (assert `injection_flagged` + fenced
+data end-to-end). Per-provider `httptest.Server`, golden fixtures, no network. `make verify` green.
+
+### P15-T14 — Docs: PREREQUISITES + ARCHITECTURE providers section + Phase-15 specs (contract, serialised)
+`PREREQUISITES.md` documents the dedicated compat key-env (hard requirement), auth schemes, BaseURL-as-full-prefix,
+tool/vision as per-model capability flags, and egress-governs-sandbox-not-host. `ARCHITECTURE.md` providers section
+reflects the new vendor, the web-search `BuiltinTool` variant, the `web_search_result` fenced block, and the
+`model.APIError`/resilience semantics (consistent with T03). `docs/TASKS.md` Phase-15 specs finalised. `make verify` green.
+
+---
+
 ## External infrastructure — GATED (not eligible queue tasks)
 
 The remaining gap-closers — managed cloud fleet, full-stack hosting/deploy, in-editor + custom models, remote vector index at scale, enterprise SSO/SCIM/RBAC, central secret distribution, remote skills/MCP registry, Firecracker microVM — are tracked in `docs/ROADMAP-EXTERNAL-INFRA.md` as `EXT-01..08`. They are **deliberately NOT enqueued here.** Each grants the process standing authority (a cloud control plane, a hosting backend, an identity provider, a remote credential store) that the design refuses by default, and each crosses the "one self-hosted Go binary, runs anywhere" identity (`docs/ARCHITECTURE.md`).
