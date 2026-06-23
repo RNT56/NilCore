@@ -56,13 +56,8 @@ func cliclickKey(chord string) []string {
 // the production signed helper does a real CGEvent scroll). amount → repeat count.
 func cliclickScroll(dir string, amount int) []string {
 	key := "page-down"
-	switch strings.ToLower(dir) {
-	case "up":
+	if strings.ToLower(dir) == "up" {
 		key = "page-up"
-	case "down":
-		key = "page-down"
-	default:
-		key = "page-down"
 	}
 	if amount < 1 {
 		amount = 1

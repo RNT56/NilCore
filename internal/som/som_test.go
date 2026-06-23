@@ -32,7 +32,7 @@ func TestOverlayMarksAndMap(t *testing.T) {
 		t.Fatalf("idbox[27] = %v", idbox[27])
 	}
 	// A top-border pixel AWAY from the corner badge is the mark colour (was white).
-	if r, g, b, _ := dst.At(35, 10).RGBA(); !(r > 0xf000 && g < 0x1000 && b > 0xf000) {
+	if r, g, b, _ := dst.At(35, 10).RGBA(); r <= 0xf000 || g >= 0x1000 || b <= 0xf000 {
 		t.Fatalf("border pixel not magenta: %v", dst.At(35, 10))
 	}
 	// The source is untouched (Overlay copies): the border was drawn on dst, not src.
