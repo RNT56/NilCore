@@ -23,8 +23,11 @@ type BuiltinTool struct {
 	DisplayWidthPx  int
 	DisplayHeightPx int
 	// Beta is the anthropic-beta header value enabling this tool version, e.g.
-	// "computer-use-2025-11-24".
+	// "computer-use-2025-11-24". Web search is GA on Anthropic, so it carries none.
 	Beta string
+	// MaxUses caps how many times a server-side tool (web search) may run per turn.
+	// Zero ⇒ omitted (provider default). Display tools leave it zero.
+	MaxUses int
 }
 
 // Computer tool versions + beta headers (Anthropic). The version↔header↔model triple
@@ -35,6 +38,36 @@ const (
 	ComputerToolV20250124 = "computer_20250124"
 	ComputerBeta20250124  = "computer-use-2025-01-24"
 )
+
+// Web-search built-in (Phase 15). Anthropic renders it as a tools[] entry with this
+// typed identifier (GA — no beta header); OpenAI/OpenRouter ignore the Type and
+// render their own request-level shape (web_search_options / web plugin), keyed off
+// the "web_search" Name. The model emits a `web_search` tool_use the PROVIDER
+// fulfils server-side — the harness makes no HTTP call.
+const (
+	WebSearchToolType = "web_search_20250305" // Anthropic native web search (GA)
+	WebSearchName     = "web_search"
+)
+
+// NewWebSearchTool builds the provider-native web-search built-in. maxUses<=0 ⇒ the
+// provider's default cap. It carries no display dims and no beta header.
+func NewWebSearchTool(maxUses int) Tool {
+	return Tool{
+		Name: WebSearchName,
+		Builtin: &BuiltinTool{
+			Type:    WebSearchToolType,
+			Name:    WebSearchName,
+			MaxUses: maxUses,
+		},
+	}
+}
+
+// IsWebSearch reports whether a tool advertises the native web-search built-in (so a
+// provider adapter can lift it out of the generic tools[] path and render its own
+// request-level shape).
+func (t Tool) IsWebSearch() bool {
+	return t.Builtin != nil && t.Builtin.Name == WebSearchName
+}
 
 // NewComputerTool builds the Anthropic native `computer` built-in tool for the given
 // display dimensions (the resized screenshot's pixel size the harness sends).
@@ -62,6 +95,9 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 		}
 		if t.Builtin.DisplayHeightPx > 0 {
 			m["display_height_px"] = t.Builtin.DisplayHeightPx
+		}
+		if t.Builtin.MaxUses > 0 {
+			m["max_uses"] = t.Builtin.MaxUses
 		}
 		return json.Marshal(m)
 	}

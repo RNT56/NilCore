@@ -307,6 +307,12 @@ type oaiRequest struct {
 	ServiceTier       string             `json:"service_tier,omitempty"`
 	PromptCacheKey    string             `json:"prompt_cache_key,omitempty"`
 
+	// WebSearchOptions enables OpenAI's server-side web search (Phase 15). Set only
+	// when a web-search builtin is advertised AND this is NOT the OpenRouter base
+	// (OpenRouter renders web search as a plugin instead); nil otherwise so the body
+	// stays byte-identical.
+	WebSearchOptions *oaiWebSearchOptions `json:"web_search_options,omitempty"`
+
 	// OpenRouter-only extras (P15-T06), embedded as an ANONYMOUS pointer so
 	// encoding/json PROMOTES its tagged fields (provider, models, reasoning,
 	// transforms, plugins) to the top level of the request body — exactly where
@@ -372,12 +378,15 @@ func (u oaiUsage) toModelUsage() model.Usage {
 // Stream. The API key rides a per-request header and never touches disk
 // (invariant I3).
 func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, stream bool) (*http.Request, error) {
+	// Web search rides a request-level field, not the generic tools[] array, so lift
+	// any web-search builtin out before rendering function tools (Phase 15).
+	funcTools, hasWeb := splitWebSearch(tools)
 	reqBody := oaiRequest{
 		Model:          o.model,
 		MaxTokens:      maxTokens,
 		maxTokensField: o.maxTokensField,
 		Messages:       toOpenAIMessages(system, msgs),
-		Tools:          toOpenAITools(tools),
+		Tools:          toOpenAITools(funcTools),
 		Stream:         stream,
 
 		// SOTA fields (P15-T05): each copies straight from the configured option,
@@ -393,16 +402,31 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 		reqBody.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
 	}
 
+	// Web-search rendering (Phase 15). OpenAI (and bare openai-compatible) emit the
+	// top-level web_search_options; OpenRouter renders web search as a `web` plugin
+	// merged into its extras instead. Both ONLY when a web-search builtin is present,
+	// so a non-web request stays byte-identical.
+	if hasWeb && !o.isOpenRouter {
+		reqBody.WebSearchOptions = &oaiWebSearchOptions{}
+	}
+
 	// OpenRouter extras ride the body ONLY on the OpenRouter base AND only when the
-	// operator configured at least one (o.openRouterExtras non-nil). On any other
-	// base, or a bare OpenRouter call, the embedded pointer stays nil so the body is
-	// byte-identical to today. applyDefaults injects require_parameters:true only
-	// WITHIN a present provider object — never on a bare call.
-	if o.isOpenRouter && o.openRouterExtras != nil {
-		extras := *o.openRouterExtras
-		if extras.Provider != nil {
-			p := *extras.Provider
-			extras.Provider = &p
+	// operator configured at least one (o.openRouterExtras non-nil) OR a web-search
+	// builtin needs the web plugin. On any other base, or a bare OpenRouter call with
+	// neither, the embedded pointer stays nil so the body is byte-identical to today.
+	// applyDefaults injects require_parameters:true only WITHIN a present provider
+	// object — never on a bare call.
+	if o.isOpenRouter && (o.openRouterExtras != nil || hasWeb) {
+		var extras openRouterExtras
+		if o.openRouterExtras != nil {
+			extras = *o.openRouterExtras
+			if extras.Provider != nil {
+				p := *extras.Provider
+				extras.Provider = &p
+			}
+		}
+		if hasWeb {
+			extras.Plugins = append(extras.Plugins, openRouterPlugin{ID: "web"})
 		}
 		extras.applyDefaults()
 		reqBody.openRouterExtras = &extras
@@ -532,6 +556,28 @@ func toOpenAIMessages(system string, msgs []model.Message) []oaiMessage {
 		}
 	}
 	return out
+}
+
+// oaiWebSearchOptions is OpenAI's top-level web-search request object (Phase 15). An
+// empty object enables provider-side search on a search-capable model; the optional
+// search_context_size tunes recall. It is omitted unless a web-search builtin is
+// advertised, so a non-web body is byte-identical.
+type oaiWebSearchOptions struct {
+	SearchContextSize string `json:"search_context_size,omitempty"`
+}
+
+// splitWebSearch separates the web-search builtin (which rides a request-level field,
+// not the tools[] array) from the function tools. hasWeb is true when the model was
+// offered native web search.
+func splitWebSearch(tools []model.Tool) (funcTools []model.Tool, hasWeb bool) {
+	for _, t := range tools {
+		if t.IsWebSearch() {
+			hasWeb = true
+			continue
+		}
+		funcTools = append(funcTools, t)
+	}
+	return funcTools, hasWeb
 }
 
 func toOpenAITools(tools []model.Tool) []oaiTool {
