@@ -42,14 +42,16 @@ var providerPrompts = []struct{ name, prompt, secret string }{
 // not default to an Anthropic model it has no key for).
 var (
 	execDefaults = map[string]string{
-		"anthropic":  "anthropic:claude-sonnet-4-6",
-		"openai":     "openai:gpt-5.5",
-		"openrouter": "openrouter:openrouter/fusion",
+		"anthropic":         "anthropic:claude-sonnet-4-6",
+		"openai":            "openai:gpt-5.5",
+		"openrouter":        "openrouter:openrouter/fusion",
+		"openai-compatible": "openai-compatible:model", // operator supplies the real model id
 	}
 	advDefaults = map[string]string{
-		"anthropic":  "anthropic:claude-opus-4-8",
-		"openai":     "openai:gpt-5.5",
-		"openrouter": "openrouter:openrouter/fusion",
+		"anthropic":         "anthropic:claude-opus-4-8",
+		"openai":            "openai:gpt-5.5",
+		"openrouter":        "openrouter:openrouter/fusion",
+		"openai-compatible": "openai-compatible:model", // operator supplies the real model id
 	}
 )
 
@@ -215,7 +217,55 @@ func (w *Wizard) Run() (Config, error) {
 	if sc.Scan() && strings.HasPrefix(strings.ToLower(strings.TrimSpace(sc.Text())), "n") {
 		return Config{}, ErrAborted
 	}
+
+	// Optional OpenAI-compatible endpoint, offered after the core config is
+	// confirmed so it is purely additive: declining (the default, and what a
+	// non-interactive / exhausted-input flow yields) leaves cfg byte-identical to a
+	// pre-P15 config. It is asked here — past the write gate — so the legacy linear
+	// prompt sequence is unchanged and the secret VALUE never enters the wizard
+	// (only the env-var NAME / KeyRef is persisted, invariant I3).
+	w.configureCompat(sc, ask, st, &cfg)
 	return cfg, nil
+}
+
+// configureCompat optionally captures an operator-typed OpenAI-compatible endpoint
+// (BaseURL + auth scheme + the NAME of a dedicated key env var). It never reads or
+// stores a secret VALUE — only the env-var NAME is recorded, and a first-party
+// vendor key name is refused outright (anti-exfiltration, invariant I3). A blank
+// opt-in (or exhausted input) leaves cfg unchanged.
+func (w *Wizard) configureCompat(sc *bufio.Scanner, ask func(prompt, def string) string, st style, cfg *Config) {
+	section(w.Out, st, "OpenAI-compatible endpoint (optional)")
+	fmt.Fprintln(w.Out, st.dim("Add a self-hosted or third-party OpenAI-compatible server (vLLM, Ollama, Azure, Groq, …)?"))
+	if !strings.HasPrefix(strings.ToLower(ask("Configure one now? (y/N)", "n")), "y") {
+		return
+	}
+	cfg.BaseURL = ask("  Endpoint base URL (full prefix, incl. any /v1)", "")
+	if strings.TrimSpace(cfg.BaseURL) == "" {
+		fmt.Fprintln(w.Out, st.dim("  no base URL entered — skipping the compatible endpoint"))
+		cfg.BaseURL = ""
+		return
+	}
+	fmt.Fprintln(w.Out, st.dim("  Auth: bearer (Authorization: Bearer …) | azure (api-key header) | none (keyless local servers)."))
+	cfg.AuthScheme = ask("  Auth scheme (bearer|azure|none)", "bearer")
+	// The endpoint needs a DEDICATED key. The wizard NEVER reads the value — the
+	// operator exports it in the environment under the NAME below; only the NAME is
+	// written to the config (invariant I3). Keyless local servers (scheme "none")
+	// still record the default name as a harmless reference so the provider entry
+	// keeps a non-empty key_ref.
+	cfg.CompatKeyEnv = defaultCompatKeyEnv
+	if cfg.AuthScheme != "none" {
+		fmt.Fprintln(w.Out, st.dim("  Set the key in the environment under a DEDICATED name (NOT OPENAI/ANTHROPIC/OPENROUTER_API_KEY)."))
+		fmt.Fprintln(w.Out, st.dim("  e.g.  export "+defaultCompatKeyEnv+"=…   — only the NAME is written to the config, never the value."))
+		cfg.CompatKeyEnv = ask("  Key env-var name", defaultCompatKeyEnv)
+		// Refuse a first-party vendor key name up front (anti-exfiltration, I3),
+		// falling back to the dedicated default rather than persisting a forbidden
+		// name. Validate enforces the same rule as a backstop.
+		if canonicalVendorKeyEnvs[cfg.CompatKeyEnv] {
+			fmt.Fprintln(w.Out, st.dim("  refusing a first-party vendor key name — using the dedicated default "+defaultCompatKeyEnv))
+			cfg.CompatKeyEnv = defaultCompatKeyEnv
+		}
+	}
+	cfg.Providers = append(cfg.Providers, ProviderConfig{Name: compatProvider, KeyRef: cfg.CompatKeyEnv})
 }
 
 // FromEnv assembles a config non-interactively from environment variables, for
@@ -282,6 +332,24 @@ func FromEnv(getenv func(string) string, store secrets.SecretStore) (Config, err
 				cfg.Web.Search = "brave"
 			}
 		}
+	}
+
+	// OpenAI-compatible endpoint (P15): provisioned from the same NILCORE_COMPAT_*
+	// names the provider leaf reads. NILCORE_COMPAT_BASE_URL is the trigger; the
+	// auth scheme defaults to bearer and the key-env NAME to NILCORE_COMPAT_API_KEY.
+	// FromEnv records only NAMES here — never the key VALUE: the operator's process
+	// environment holds the secret, the SecretStore is not written, and Validate
+	// refuses a first-party vendor key name (invariant I3).
+	if base := getenv("NILCORE_COMPAT_BASE_URL"); base != "" {
+		cfg.BaseURL = base
+		cfg.AuthScheme = getenv("NILCORE_COMPAT_AUTH_SCHEME")
+		cfg.CompatKeyEnv = orDefault(getenv("NILCORE_COMPAT_KEY_ENV"), defaultCompatKeyEnv)
+		cfg.Providers = append(cfg.Providers, ProviderConfig{Name: compatProvider, KeyRef: cfg.CompatKeyEnv})
+		// Re-seed the model defaults so a compat-only setup does not default to an
+		// Anthropic model it has no key for (an explicit NILCORE_EXECUTOR still wins).
+		exec, adv := defaultModels(cfg.Providers)
+		cfg.Executor = orDefault(getenv("NILCORE_EXECUTOR"), exec)
+		cfg.Advisor = orDefault(getenv("NILCORE_ADVISOR"), adv)
 	}
 
 	// Research egress preset (P11, Pillar 5): persisted so the front-door wiring can
@@ -373,7 +441,7 @@ func defaultModels(ps []ProviderConfig) (executor, advisor string) {
 	for _, p := range ps {
 		has[p.Name] = true
 	}
-	for _, name := range []string{"anthropic", "openai", "openrouter"} {
+	for _, name := range []string{"anthropic", "openai", "openrouter", compatProvider} {
 		if has[name] {
 			return execDefaults[name], advDefaults[name]
 		}
