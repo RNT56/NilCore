@@ -509,6 +509,19 @@ func (s *Session) CurrentMode() Mode {
 	return s.State.Mode
 }
 
+// LastAnswer returns the verbatim text of the agent's last terminal answer/plan
+// (WorkState.LastOutcome) under s.mu — for a Discuss/Plan drive that is the finish
+// summary (the plan/recap), for a chat reply it is the reply text. The front door's
+// principal-initiated /save verb persists it to a file. The model is NEVER handed a
+// write tool to do this: the human directs the write at the front door, so the
+// read-only modes' structural no-write guarantee is untouched (I7). Empty before any
+// drive has completed.
+func (s *Session) LastAnswer() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State.LastOutcome
+}
+
 // AddReadRoot registers an additional READ-ONLY context root (an absolute,
 // already-symlink-resolved host path — the caller validates it before calling, so
 // the session stays a pure state container with no filesystem dependency). It is
