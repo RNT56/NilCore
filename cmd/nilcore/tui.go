@@ -58,7 +58,7 @@ func tuiMain(args []string) {
 	// Persistence backbone (best-effort): cross-project memory + the checkpointer that
 	// lets the conversation survive a restart (set as Session.Store below). Nils keep
 	// it in-memory only — parity with chatMain.
-	mem, ckpt := setupPersistence(log, *cf.common.logPath)
+	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {

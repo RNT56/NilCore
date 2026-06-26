@@ -808,7 +808,7 @@ func runMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log, *c.logPath)
+	mem, cp, _ := setupPersistence(log, *c.logPath)
 
 	// One shared blast-radius budget for the whole run: the SAME meter fences the
 	// sandbox wall-time + egress hosts (BR-T02/T03) and the auto-approval $/rate/
@@ -984,9 +984,24 @@ func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal stri
 // the verifier remains the sole authority on done (I2), the gate on irreversible
 // actions (I3/policy).
 func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget) *agent.Orchestrator {
+	// Open the persistence backbone, then build the orchestrator over it. A one-shot
+	// command (propose-edit / watch / scheduler / webhook / `nilcore flywheel`) owns its
+	// own store for the process lifetime. A long-running serve must NOT call this for its
+	// folds — it would open a SECOND single-writer handle to the same DB; serve uses
+	// buildRunOrchestratorWith with the store it already opened (see serveMain).
+	mem, cp, _ := setupPersistence(log, *c.logPath)
+	return buildRunOrchestratorWith(c, b, log, absDir, blast, mem, cp)
+}
+
+// buildRunOrchestratorWith builds the single-task run orchestrator over an
+// ALREADY-OPENED memory + checkpointer, so a process that has already set up persistence
+// (serve) can share its one *sql.DB rather than opening competing handles. It mirrors
+// runMain's wiring: the native backend via envFactory, the console gate, memory
+// write-back, and the optional multi-backend / blast seams. The verifier stays the sole
+// authority on done (I2); the gate governs irreversible actions (I3).
+func buildRunOrchestratorWith(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget, mem *memory.Memory, cp *agent.Checkpoint) *agent.Orchestrator {
 	// Resolve `-backend auto` / config backend:auto to a concrete name so the
-	// self-started run paths (propose-edit / watch / scheduler / webhook) honor the
-	// same system-selection seam as `nilcore run`. No "auto" ⇒ no-op (byte-identical).
+	// self-started run paths honor the same system-selection seam as `nilcore run`.
 	if *c.backendName == "auto" {
 		*c.backendName = resolveAutoBackend(c, b, log)
 	}
@@ -994,7 +1009,6 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log, *c.logPath)
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
 		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg, blast),
@@ -1042,7 +1056,7 @@ func serveMain(args []string) {
 	// Persistence backbone (best-effort): durable event-log mirroring + cross-project
 	// memory (the opt-in live tool) + the checkpointer that gives serve threads
 	// conversation persistence and leftover-task resume across a restart.
-	mem, ckpt := setupPersistence(log, *c.logPath)
+	mem, ckpt, serveStore := setupPersistence(log, *c.logPath)
 	// Reclaim worktree admin entries left by a crashed prior process. SAFE: only
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.
@@ -1106,7 +1120,9 @@ func serveMain(args []string) {
 	// inside the goroutine; each tick runs one bounded cycle (verifier + gate own every
 	// ship — I2). It never edits the verifier of record (selfimprove.DefaultScope).
 	if os.Getenv("NILCORE_FLYWHEEL") != "" {
-		fwLoop := newFlywheelLoop(buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log)), log, *c.logPath, 1, time.Minute)
+		// Reuse serve's already-opened persistence (mem/ckpt) — never re-open the store
+		// (one *sql.DB for the whole serve process; no competing single-writer handles).
+		fwLoop := newFlywheelLoop(buildRunOrchestratorWith(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log), mem, ckpt), log, *c.logPath, 1, time.Minute)
 		go runFlywheelTicker(ctx, fwLoop)
 	}
 
@@ -1179,10 +1195,13 @@ func serveMain(args []string) {
 	// earned boundary inside the operator envelope + the shared blast fence — I3). The
 	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
 	// names. An empty backlog emits nothing, so this is inert until objectives exist.
-	if os.Getenv("NILCORE_AUTONOMY") != "" {
-		autoOrch := buildRunOrchestrator(c, b, log, absDir, d.blast)
+	if os.Getenv("NILCORE_AUTONOMY") != "" && serveStore != nil {
+		// Reuse serve's already-opened persistence (mem/ckpt + serveStore) — the daemon
+		// shares the one *sql.DB for both its orchestrator and the objective backlog, so
+		// it never opens a competing single-writer handle to the same file.
+		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
 		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
-		go runAutonomyDaemon(ctx, autoOrch, log)
+		go runAutonomyDaemon(ctx, autoOrch, log, serveStore)
 	}
 
 	// Durable resume: re-drive any native task a prior process left running or
@@ -2089,14 +2108,14 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 // setupPersistence opens the persistent store (best-effort), wires it as a second
 // backing for the event log, and returns the memory API and the task checkpointer
 // (both nil if the store is unavailable — persistence is optional, never blocking).
-func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent.Checkpoint) {
+func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent.Checkpoint, *store.Store) {
 	dir, err := paths.EnsureDir(paths.DataDir())
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	s, err := store.Open(filepath.Join(dir, "nilcore.db"))
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	log.UseStore(s)
 	wireExperience(log, s)
@@ -2104,7 +2123,11 @@ func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent
 	// LRN-T03: fold distilled verifier-failure scars into memory so the next same-class
 	// task sees them as context. Default-off (NILCORE_LESSONS unset ⇒ no-op).
 	wireLessons(logPath, mem)
-	return mem, agent.NewCheckpoint(s)
+	// The store is returned so a long-running process (serve) can SHARE this single
+	// *sql.DB across its folds (flywheel/autonomy orchestrators + the objective backlog)
+	// rather than opening competing single-writer handles to the same file — see
+	// buildRunOrchestratorWith / runAutonomyDaemon. One-shot commands ignore it.
+	return mem, agent.NewCheckpoint(s), s
 }
 
 // wireExperience activates the Phase-16 experience projection (EXP-T03). When

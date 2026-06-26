@@ -31,22 +31,21 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/objective"
+	"nilcore/internal/store"
 	"nilcore/internal/trigger"
 )
 
 // runAutonomyDaemon drives the autonomy daemon over the standing-objectives backlog
-// until ctx is cancelled (serve shutdown), draining gracefully. The orchestrator is
-// built by the caller at serve STARTUP (so a missing model key fails loudly at boot,
-// not inside this goroutine); here we only open the operator store, build the backlog
-// source, and run the bounded daemon. A store-open failure disables the daemon with a
-// visible message rather than taking down serve.
-func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *eventlog.Log) {
-	s, err := openObjectiveStore()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "nilcore: autonomy daemon disabled (store: %v)\n", err)
+// until ctx is cancelled (serve shutdown), draining gracefully. Both the orchestrator
+// AND the store are owned by the caller (serve, at startup) so a missing model key fails
+// loudly at boot, not inside this goroutine, and so the whole serve process shares ONE
+// *sql.DB rather than opening a competing single-writer handle here (the store is NOT
+// closed here — serve owns its lifetime).
+func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *eventlog.Log, s *store.Store) {
+	if s == nil {
+		fmt.Fprintln(os.Stderr, "nilcore: autonomy daemon disabled (no store)")
 		return
 	}
-	defer s.Close()
 
 	backlog := objective.New(s.ObjectiveStore())
 	src := autosrc.NewBacklogSource(backlog, autosrc.BacklogConfig{})

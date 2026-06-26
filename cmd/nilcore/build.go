@@ -172,7 +172,7 @@ func buildMain(args []string) {
 	// Persistence is opened best-effort so the event log gets its durable second
 	// backing (UseStore); build does not thread a memory hint into the workers (the
 	// supervisor seeds them with bounded ContextSummary state, never a transcript).
-	_, _ = setupPersistence(log, *bf.logPath)
+	_, _, _ = setupPersistence(log, *bf.logPath)
 
 	// One shared blast-radius budget for the whole build: the SAME meter fences the
 	// loop's sandboxes (wall-time, BR-T03) and the auto-approval gate ($/rate/
