@@ -84,6 +84,10 @@ type NativeRun struct {
 	// ReadRoots are the read-only context roots the closure wires onto the read/
 	// search tools (absolute, resolved). Empty ⇒ worktree-only (byte-identical).
 	ReadRoots []string
+	// AskUser is the attended human-clarification seam wired onto backend.Native
+	// (ask_user / set_ask_level). nil for every headless drive ⇒ the tools are never
+	// advertised (the structural never-block guarantee, I3/I4).
+	AskUser AskerHandle
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
@@ -137,6 +141,7 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		Emitter:   in.Out,
 		Mode:      in.Mode,      // capability captured at launch (read-only vs full)
 		ReadRoots: in.ReadRoots, // read-only context roots captured at launch
+		AskUser:   in.AskUser,   // attended ask seam (nil for headless / supervised)
 	})
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)

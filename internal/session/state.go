@@ -16,6 +16,7 @@ package session
 import (
 	"context"
 
+	"nilcore/internal/backend"
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
 	"nilcore/internal/summarize"
@@ -42,6 +43,13 @@ const (
 	// AwaitingGate: a drive is blocked on the human approver (an irreversible
 	// action). A Turn still pushes to the inbox; the gate answer resumes Working.
 	AwaitingGate
+	// AwaitingInput: a drive is parked on an ask_user question (the attended
+	// clarification seam). Unlike every other in-flight phase, a Turn arriving now is
+	// the ANSWER — it is routed to the ask box, not queued/steered — and the drive
+	// resumes Working once the whole batch is answered. The session sets this once on
+	// park entry and restores Working once on the single Ask return; the per-question
+	// sequencing lives in internal/ask, not here.
+	AwaitingInput
 )
 
 // String renders the phase for the metadata-only audit events (never a body).
@@ -57,6 +65,8 @@ func (p Phase) String() string {
 		return "terminal"
 	case AwaitingGate:
 		return "awaiting_gate"
+	case AwaitingInput:
+		return "awaiting_input"
 	default:
 		return "unknown"
 	}
@@ -114,6 +124,12 @@ type WorkState struct {
 	Branch      string                   // integration tip when project/super mid-flight
 	LastOutcome string                   // data-only tail of the last terminal result
 	Mode        Mode                     // user-set behavioral policy (auto/discuss/plan/execute)
+	// AskLevel is the user-set ask-aggressiveness on a 1..6 scale (off..max), sticky
+	// across drives and persisted so the posture survives a restart — like Mode. The
+	// zero value (0, an unset/old snapshot) is normalized to the default ("normal").
+	// It maps to a per-drive ask_user budget; the operator dials it by talking to the
+	// agent ("ask me fewer questions") or with the /questions control verb.
+	AskLevel int
 }
 
 // Mode is a USER-SET behavioral policy that governs what CAPABILITY a drive is
@@ -209,6 +225,23 @@ type DriveInput struct {
 	// ReadRoots are the additional READ-ONLY context roots (absolute, resolved) the
 	// drive's read/search tools may consult beyond the worktree — captured at launch.
 	ReadRoots []string
+	// AskUser is the ATTENDED-ONLY human-clarification seam wired onto the native
+	// backend (the ask_user / set_ask_level tools). It is the session-owned adapter
+	// over the ask box, set only when the front door enabled attended asking; nil for
+	// every headless drive and for supervised/project sub-drives (a worker asks its
+	// supervisor, not the human). Captured at launch like Inbox/Mode.
+	AskUser AskerHandle
+}
+
+// AskerHandle is the minimal handle the native loop needs onto the attended ask
+// seam. Its method set MATCHES backend.AskHandle exactly, so the session-owned
+// adapter that satisfies it is assignable straight onto backend.Native.AskUser at the
+// wiring site — the same decoupling discipline InboxHandle/backend.Inbox uses, so the
+// session need not be a build dependency of backend. nil ⇒ asking is not wired.
+type AskerHandle interface {
+	Ask(ctx context.Context, qs []backend.AskQuestion) ([]backend.AskAnswer, error)
+	MaxAsks() int
+	SetLevel(spec string) (ack string, err error)
 }
 
 // DriveResult is a driver's terminal outcome, folded into WorkState on

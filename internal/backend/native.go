@@ -155,6 +155,18 @@ type Native struct {
 	// `sleep` is for waiting on EXTERNAL async work (CI, a slow gate), not preserving a
 	// local process (a long local suite should just block on a synchronous `run`).
 	Wake func(ctx context.Context, after time.Duration, note string) error
+
+	// AskUser, if set, is the ATTENDED-ONLY seam that lets the loop put a sharp
+	// question (or up to 5 at once) to the HUMAN operator and block for the answer
+	// (the `ask_user` tool), and lets the operator dial how often it asks (the
+	// `set_ask_level` tool). It is wired ONLY when a human is synchronously reachable
+	// (interactive chat / serve-live); every headless path leaves it nil, so the tools
+	// are never advertised and a stray call fails closed — the never-block guarantee
+	// is a property of the wiring, not model goodwill (I3/I4). Gated exactly like
+	// Inbox/Peer/Wake: nil ⇒ byte-identical loop. The concrete adapter lives in the
+	// session (over internal/ask), so backend stays import-leaf; the operator's answer
+	// is trusted principal input the loop folds un-fenced but clamped (I7).
+	AskUser AskHandle
 }
 
 // Inbox is the minimal handle the native loop needs onto the conversational
@@ -206,7 +218,8 @@ working directory via the "run" tool, which executes shell commands and returns
 stdout, stderr, and the exit code. Make the smallest change that satisfies the
 goal. Inspect files before editing them. When you believe the goal is met and
 the project's checks should pass, call the "finish" tool with a short summary.
-Do not ask the user questions; act.`
+Default to acting: proceed on reasonable assumptions and state them in your finish
+summary so they can be corrected.`
 
 // peerGuidance is appended to the worker prompt ONLY when a Peer (a supervisor) is
 // wired — multi-agent mode. It is the encouragement to actually escalate: a worker
@@ -254,6 +267,17 @@ func (n *Native) systemFor() string {
 	}
 	if n.Wake != nil {
 		s += "\n\n" + sleepGuidance
+	}
+	// Attended ask guidance (the wired half of PERSONA §2): appended ONLY when an
+	// AskUser seam is wired, so a headless drive — which has no ask tool — is never
+	// told it may ask a human. Mode-aware: the "use a cheap probe instead" clause is
+	// dropped in a read-only drive (DisableShell), which has no shell to probe with,
+	// so the guidance never promises a capability the drive lacks.
+	if n.AskUser != nil {
+		s += "\n\n" + askGuidance
+		if !n.DisableShell {
+			s += askShellProbeNote
+		}
 	}
 	return s
 }
@@ -334,6 +358,14 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		})
 	}
 
+	// Attended ask tools (ask_user / set_ask_level): advertised ONLY when an AskUser
+	// seam is wired (interactive chat / serve-live). Every headless path leaves it nil
+	// so these are never advertised and a stray call fails closed — the loop is
+	// byte-identical when off, gated exactly like the sleep/bus tools above.
+	if n.AskUser != nil {
+		toolDefs = append(toolDefs, askUserToolDef(), setAskLevelToolDef())
+	}
+
 	user := "Goal:\n" + t.Goal
 	if len(t.Constraints) > 0 {
 		user += "\n\nConstraints:\n- " + strings.Join(t.Constraints, "\n- ")
@@ -366,6 +398,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 	var recent []string      // bounded trail of recent actions, for advisor context
 	consecutiveFailures := 0 // verifier failures in a row, for auto-escalation
+	asksUsed := 0            // ask_user calls this drive, bounded by AskUser.MaxAsks (per-drive, like consecutiveFailures)
 	sys := n.systemFor()     // base + role + (peer ask-guidance), computed once
 
 	for i := 0; i < steps; i++ {
@@ -585,6 +618,23 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 		finished := false
 		var summary string
 
+		// Pre-scan for the ask_user co-emission / single-flight rule: a blocking ask
+		// must be the ONLY action in a turn, else parking on it would freeze a
+		// half-built turn behind a human wait (and the API requires all tool_results to
+		// lead the user turn). askAlone is true iff exactly one tool_use block exists
+		// and it is ask_user; otherwise the ask_user case refuses (errorResult) and the
+		// co-emitted tools run normally.
+		nTool, nAsk := 0, 0
+		for _, b := range resp.Content {
+			if b.Type == "tool_use" {
+				nTool++
+				if b.Name == "ask_user" {
+					nAsk++
+				}
+			}
+		}
+		askAlone := nAsk == 1 && nTool == 1
+
 		for _, b := range resp.Content {
 			if b.Type != "tool_use" {
 				continue
@@ -741,6 +791,80 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					Detail: map[string]any{"tool": b.Name}})
 				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
 					Content: guard.Wrap(b.Name+" reply", reply)})
+
+			case "ask_user":
+				// Attended-only human clarification (PERSONA §2). A nil seam means the
+				// tool was never advertised (headless) — a stray call fails closed and
+				// NEVER blocks (I3/I4). It must be the sole action this turn, else parking
+				// would freeze a half-built turn behind a human wait. Bounded per-drive by
+				// the conversation's ask level (MaxAsks); on cancel the drive unwinds clean.
+				if n.AskUser == nil {
+					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
+					continue
+				}
+				if !askAlone {
+					results = append(results, errorResult(b.ID, "ask_user must be the only tool call in a turn — put all your questions (up to 5) in one ask_user and emit nothing else; for a dependent follow-up, ask again next turn"))
+					continue
+				}
+				if max := n.AskUser.MaxAsks(); max <= 0 {
+					results = append(results, errorResult(b.ID, "asking is turned off for this conversation — proceed on your best assumption and state it"))
+					continue
+				} else if asksUsed >= max {
+					results = append(results, errorResult(b.ID, "ask budget exhausted for this drive — proceed on your best assumptions and state them"))
+					continue
+				}
+				var ain askUserInput
+				if err := json.Unmarshal(b.Input, &ain); err != nil {
+					results = append(results, errorResult(b.ID, "bad input: "+err.Error()))
+					continue
+				}
+				qs, reason := validateAskQuestions(ain.Questions)
+				if reason != "" {
+					results = append(results, errorResult(b.ID, reason))
+					continue
+				}
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "ask_user",
+					Detail: map[string]any{"step": i, "questions": len(qs)}})
+				answers, aerr := n.AskUser.Ask(ctx, qs)
+				if aerr != nil && !errors.Is(aerr, ErrAskTimeout) {
+					if ctx.Err() != nil {
+						n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "task_cancel",
+							Detail: map[string]any{"step": i, "cause": "shutdown"}})
+						return Result{Backend: n.Name(), Summary: "interrupted: " + ctx.Err().Error()}, nil
+					}
+					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "ask_user_unanswered",
+						Detail: map[string]any{"step": i, "reason": "error"}})
+					results = append(results, errorResult(b.ID, "ask_user: "+aerr.Error()))
+					continue
+				}
+				asksUsed++
+				partial := errors.Is(aerr, ErrAskTimeout)
+				n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "ask_user_answered",
+					Detail: map[string]any{"step": i, "answers": len(answers), "partial": partial}})
+				// TRUSTED principal input: folded un-guard.Wrap'd, like a steer/user turn
+				// (the narrow I7 exception). The collection layer clamped each Custom and
+				// resolved Selected labels by index (never operator-typed text).
+				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID,
+					Content: formatAskResult(qs, answers, partial)})
+
+			case "set_ask_level":
+				// Honor a spoken request to ask more/fewer questions by moving the
+				// conversation's ask level. Advertised with ask_user; nil seam fails closed.
+				if n.AskUser == nil {
+					results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
+					continue
+				}
+				var sin struct {
+					Spec string `json:"spec"`
+				}
+				_ = json.Unmarshal(b.Input, &sin)
+				ack, serr := n.AskUser.SetLevel(sin.Spec)
+				if serr != nil {
+					results = append(results, errorResult(b.ID, "set_ask_level: "+serr.Error()))
+					continue
+				}
+				n.emit(emit.Event{Kind: emit.KindTool, Step: i, Text: ack})
+				results = append(results, model.Block{Type: "tool_result", ToolUseID: b.ID, Content: ack})
 
 			default:
 				if n.Tools != nil && n.Tools.Has(b.Name) {
