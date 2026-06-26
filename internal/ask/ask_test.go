@@ -22,6 +22,38 @@ func (e *chanEmitter) Emit(ev emit.Event) {
 	}
 }
 
+// TestEmitQuestionStructured asserts the question is surfaced with BOTH the plain
+// Text (the fallback every surface can render) and a populated *emit.AskPrompt (what a
+// widget surface renders natively) — the foundation for the per-surface native UI.
+func TestEmitQuestionStructured(t *testing.T) {
+	em := &chanEmitter{ch: make(chan emit.Event, 4)}
+	b := New(em)
+	qs := []backend.AskQuestion{{
+		Prompt:      "which db?",
+		Choices:     []backend.AskChoice{{Label: "Postgres", Detail: "managed"}, {Label: "SQLite"}},
+		MultiSelect: true,
+	}}
+	go func() { _, _ = b.Ask(context.Background(), qs) }()
+	ev := <-em.ch
+	if ev.Kind != emit.KindAsk {
+		t.Fatalf("kind = %q, want ask", ev.Kind)
+	}
+	if ev.Text == "" {
+		t.Fatal("plain Text fallback must still be populated")
+	}
+	if ev.Ask == nil {
+		t.Fatal("structured Ask payload must be populated")
+	}
+	a := ev.Ask
+	if a.Index != 1 || a.Total != 1 || a.Question != "which db?" || !a.MultiSelect {
+		t.Fatalf("payload header wrong: %+v", *a)
+	}
+	if len(a.Choices) != 2 || a.Choices[0].Label != "Postgres" || a.Choices[0].Detail != "managed" || a.Choices[1].Label != "SQLite" {
+		t.Fatalf("payload choices wrong: %+v", a.Choices)
+	}
+	_ = b.Resolve("1")
+}
+
 // TestResolveReply is the normative resolution table (§3.4): single-select takes a
 // bare integer else free-form verbatim; multi-select splits on ';'; an out-of-range
 // or non-integer token makes the whole line free-form; empty declines.

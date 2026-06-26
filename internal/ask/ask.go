@@ -130,7 +130,7 @@ func (b *Box) Ask(ctx context.Context, qs []backend.AskQuestion) ([]backend.AskA
 // "" (the caller resolves it to "declined — you decide"), so a garbage/empty path
 // always terminates and never wedges.
 func (b *Box) collectOne(ctx context.Context, q backend.AskQuestion, idx, total int) (line string, timedOut bool, err error) {
-	b.emit(renderQuestion(q, idx, total))
+	b.emitQuestion(q, idx, total)
 	for attempt := 0; ; attempt++ {
 		timer := time.NewTimer(b.backstop)
 		select {
@@ -154,6 +154,33 @@ func (b *Box) emit(text string) {
 	if b.em != nil {
 		b.em.Emit(emit.Event{Kind: emit.KindAsk, Text: text})
 	}
+}
+
+// emitQuestion surfaces one question carrying BOTH the plain rendered Text (the
+// authoritative menu every surface can fall back to) and the STRUCTURED *emit.AskPrompt
+// a widget surface (TUI modal / styled REPL box / channel buttons) renders natively.
+// The structured payload is an emit-local mirror of the backend question, so emit stays
+// an import-leaf. A widget still answers by FORMATTING its selection into the line
+// grammar resolveReply parses — Text and the payload never diverge.
+func (b *Box) emitQuestion(q backend.AskQuestion, idx, total int) {
+	if b.em == nil {
+		return
+	}
+	choices := make([]emit.AskChoice, len(q.Choices))
+	for i, c := range q.Choices {
+		choices[i] = emit.AskChoice{Label: c.Label, Detail: strings.TrimSpace(c.Detail)}
+	}
+	b.em.Emit(emit.Event{
+		Kind: emit.KindAsk,
+		Text: renderQuestion(q, idx, total),
+		Ask: &emit.AskPrompt{
+			Index:       idx + 1,
+			Total:       total,
+			Question:    strings.TrimSpace(q.Prompt),
+			Choices:     choices,
+			MultiSelect: q.MultiSelect,
+		},
+	})
 }
 
 // renderQuestion formats one question, its numbered menu, and the free-form hint.
