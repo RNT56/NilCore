@@ -120,7 +120,7 @@ func chatMain(args []string) {
 	// that lets the conversation survive a restart (set as the Session.Store below)
 	// and durable event-log mirroring. Nils keep the conversation in-memory only and
 	// the live tool off.
-	mem, ckpt := setupPersistence(log)
+	mem, ckpt := setupPersistence(log, *cf.common.logPath)
 
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {

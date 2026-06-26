@@ -171,7 +171,7 @@ func buildMain(args []string) {
 	// Persistence is opened best-effort so the event log gets its durable second
 	// backing (UseStore); build does not thread a memory hint into the workers (the
 	// supervisor seeds them with bounded ContextSummary state, never a transcript).
-	_, _ = setupPersistence(log)
+	_, _ = setupPersistence(log, *bf.logPath)
 
 	stack, err := buildStack(buildDeps{
 		goal:        *bf.goal,

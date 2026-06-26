@@ -113,6 +113,8 @@ func main() {
 		trustMain(args[1:])
 	case "experience":
 		experienceMain(args[1:])
+	case "lessons":
+		lessonsMain(args[1:])
 	case "capability":
 		capabilityMain(args[1:])
 	case "trace", "why":
@@ -800,7 +802,7 @@ func runMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log)
+	mem, cp := setupPersistence(log, *c.logPath)
 
 	orch := &agent.Orchestrator{
 		BaseRepo: absDir,
@@ -975,7 +977,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log)
+	mem, cp := setupPersistence(log, *c.logPath)
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
 		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
@@ -1023,7 +1025,7 @@ func serveMain(args []string) {
 	// Persistence backbone (best-effort): durable event-log mirroring + cross-project
 	// memory (the opt-in live tool) + the checkpointer that gives serve threads
 	// conversation persistence and leftover-task resume across a restart.
-	mem, ckpt := setupPersistence(log)
+	mem, ckpt := setupPersistence(log, *c.logPath)
 	// Reclaim worktree admin entries left by a crashed prior process. SAFE: only
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.
@@ -2022,7 +2024,7 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 // setupPersistence opens the persistent store (best-effort), wires it as a second
 // backing for the event log, and returns the memory API and the task checkpointer
 // (both nil if the store is unavailable — persistence is optional, never blocking).
-func setupPersistence(log *eventlog.Log) (*memory.Memory, *agent.Checkpoint) {
+func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent.Checkpoint) {
 	dir, err := paths.EnsureDir(paths.DataDir())
 	if err != nil {
 		return nil, nil
@@ -2033,7 +2035,11 @@ func setupPersistence(log *eventlog.Log) (*memory.Memory, *agent.Checkpoint) {
 	}
 	log.UseStore(s)
 	wireExperience(log, s)
-	return memory.New(s), agent.NewCheckpoint(s)
+	mem := memory.New(s)
+	// LRN-T03: fold distilled verifier-failure scars into memory so the next same-class
+	// task sees them as context. Default-off (NILCORE_LESSONS unset ⇒ no-op).
+	wireLessons(logPath, mem)
+	return mem, agent.NewCheckpoint(s)
 }
 
 // wireExperience activates the Phase-16 experience projection (EXP-T03). When
