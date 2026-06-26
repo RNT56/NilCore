@@ -11,6 +11,33 @@ import (
 	"nilcore/internal/store"
 )
 
+func TestOnAppendHook(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hook.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Event
+	log.OnAppend(func(e Event) { got = append(got, e) })
+	log.Append(Event{Kind: "a"})
+	log.Append(Event{Kind: "b"})
+	if len(got) != 2 || got[0].Kind != "a" || got[1].Kind != "b" {
+		t.Fatalf("hook must fire once per append, in order: %+v", got)
+	}
+	// The hook receives the DURABLE, hash-chained event (Seq/Prev/Hash already set),
+	// so a projector can fold it as it lands.
+	if got[0].Seq != 0 || got[1].Seq != 1 || got[1].Prev != got[0].Hash || got[1].Hash == "" {
+		t.Fatalf("hook must receive the chained event: %+v", got)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The hook must not disturb the authoritative chain.
+	if err := Verify(path); err != nil {
+		t.Fatalf("OnAppend hook broke the chain: %v", err)
+	}
+}
+
 func TestChainIntegrity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ev.jsonl")
 	log, err := Open(path)

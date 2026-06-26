@@ -44,7 +44,13 @@ type Log struct {
 	seq   uint64       // sequence number for the next event
 	key   []byte       // optional HMAC key (NILCORE_LOG_HMAC_KEY); nil = plain SHA-256
 	store *store.Store // optional second backing (P4-T02); JSONL stays the export
-	err   error        // first write failure, if any (a broken audit trail is loud)
+	// onAppend is an optional hook invoked with each event AFTER it is durably written
+	// (and mirrored to the store). It is the Phase-16 experience seam (EXP-T03): the
+	// projector folds a verifier-judged race_outcome into its DERIVED projection as the
+	// event lands, so OverStore stays warm without a full replay. nil (the default) is a
+	// no-op, so an unwired log is byte-identical.
+	onAppend func(e Event)
+	err      error // first write failure, if any (a broken audit trail is loud)
 }
 
 // logKey reads the optional chain HMAC key from the environment (invariant I3:
@@ -62,6 +68,19 @@ func logKey() []byte {
 func (l *Log) UseStore(s *store.Store) {
 	if l != nil {
 		l.store = s
+	}
+}
+
+// OnAppend registers an optional hook called with each event AFTER it is durably
+// appended and mirrored to the store. It is the seam the Phase-16 experience
+// projector uses to fold a verifier-judged race_outcome into its derived projection
+// as it lands (EXP-T03). The hook runs under the log lock (appends stay serialized)
+// and its result is IGNORED: a derived projection failing must never break or stall
+// the authoritative append-only log (I5). nil (the default) installs nothing, so an
+// unwired log is byte-identical. Set it once, before traffic.
+func (l *Log) OnAppend(fn func(e Event)) {
+	if l != nil {
+		l.onAppend = fn
 	}
 }
 
@@ -131,6 +150,23 @@ func (l *Log) Append(e Event) {
 		}); serr != nil {
 			l.fail(fmt.Errorf("mirror event to store: %w", serr))
 		}
+	}
+
+	// Phase-16 experience seam: fold the now-durable event into the derived projection
+	// (EXP-T03). Best-effort and after the authoritative write — the projection is
+	// rebuildable from the log, so a fold failure degrades only the warm cache, never
+	// the audit trail. A panic in a buggy projector is RECOVERED (and surfaced) rather
+	// than allowed to take down the audit-log writer; the event is already durable.
+	// nil hook ⇒ no-op (byte-identical).
+	if l.onAppend != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "nilcore: experience fold hook panicked: %v\n", r)
+				}
+			}()
+			l.onAppend(e)
+		}()
 	}
 }
 

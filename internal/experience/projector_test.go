@@ -71,6 +71,38 @@ func TestProjectorRebuildAndOverStoreParity(t *testing.T) {
 	}
 }
 
+// TestActivationViaOnAppendHook exercises the EXP-T03 activation path end-to-end:
+// a live eventlog wired with OnAppend(proj.Fold) (exactly as cmd's wireExperience
+// does) keeps the store projection warm as events land — no manual Rebuild needed.
+func TestActivationViaOnAppendHook(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "live.jsonl")
+	log, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	s := openStore(t)
+	log.UseStore(s)
+	proj := experience.NewProjector(s)
+	log.OnAppend(func(e eventlog.Event) { _ = proj.Fold(ctx, e) })
+
+	// A non-race_outcome event must NOT change any standing (I2: only verifier verdicts
+	// fold) — and it takes seq 0 so the first race_outcome lands above the watermark.
+	log.Append(eventlog.Event{Kind: "task_start", Backend: "native"})
+	log.Append(eventlog.Event{Kind: "race_outcome", Backend: "native", Detail: map[string]any{"passed": true}})
+	log.Append(eventlog.Event{Kind: "race_outcome", Backend: "native", Detail: map[string]any{"passed": false}})
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// OverStore reflects the folded outcomes WITHOUT a manual Rebuild — the hook kept
+	// the projection warm as the events landed.
+	st, _ := experience.OverStore(s, nil).BackendStanding(ctx, "")
+	if standingMap(st)["native"] != [2]int{2, 1} {
+		t.Fatalf("live projection = %v, want native 2 races / 1 win", standingMap(st))
+	}
+}
+
 func TestProjectorFoldIdempotent(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -86,6 +118,31 @@ func TestProjectorFoldIdempotent(t *testing.T) {
 	st, _ := experience.OverStore(s, nil).BackendStanding(ctx, "")
 	if standingMap(st)["native"] != [2]int{1, 1} {
 		t.Errorf("double-fold not idempotent: %v", standingMap(st))
+	}
+}
+
+// TestProjectorFoldSeqZero guards the watermark edge surfaced by live activation: a
+// race_outcome that is the literal first log event (seq 0) must fold on a fresh
+// projection, not be dropped by a spurious 0 <= 0 watermark comparison.
+func TestProjectorFoldSeqZero(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	p := experience.NewProjector(s)
+	ev := eventlog.Event{Seq: 0, Kind: "race_outcome", Backend: "native", Detail: map[string]any{"passed": true}}
+	if err := p.Fold(ctx, ev); err != nil {
+		t.Fatalf("fold seq 0: %v", err)
+	}
+	st, _ := experience.OverStore(s, nil).BackendStanding(ctx, "")
+	if standingMap(st)["native"] != [2]int{1, 1} {
+		t.Fatalf("seq-0 race_outcome must fold on a fresh projection, got %v", standingMap(st))
+	}
+	// Folding the same seq-0 event again is a no-op (a meta row now exists ⇒ 0 <= 0).
+	if err := p.Fold(ctx, ev); err != nil {
+		t.Fatalf("re-fold seq 0: %v", err)
+	}
+	st2, _ := experience.OverStore(s, nil).BackendStanding(ctx, "")
+	if standingMap(st2)["native"] != [2]int{1, 1} {
+		t.Fatalf("seq-0 re-fold must be idempotent, got %v", standingMap(st2))
 	}
 }
 

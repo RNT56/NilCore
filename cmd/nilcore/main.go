@@ -40,6 +40,7 @@ import (
 	"nilcore/internal/channel/telegram"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/experience"
 	"nilcore/internal/maint"
 	"nilcore/internal/memory"
 	"nilcore/internal/meter"
@@ -2031,7 +2032,24 @@ func setupPersistence(log *eventlog.Log) (*memory.Memory, *agent.Checkpoint) {
 		return nil, nil
 	}
 	log.UseStore(s)
+	wireExperience(log, s)
 	return memory.New(s), agent.NewCheckpoint(s)
+}
+
+// wireExperience activates the Phase-16 experience projection (EXP-T03). When
+// NILCORE_EXPERIENCE is set, every appended event is folded into the store-backed
+// projection as it lands — only verifier-judged race_outcome events change state
+// (I2) — so the OverStore reader stays warm for consumers without a full log replay.
+// The fold is best-effort behind the authoritative append (a derived projection is
+// rebuildable from the log, so a fold error never breaks the log). DEFAULT-OFF: with
+// the env unset no hook is installed and Append is byte-identical. The projection is
+// also (re)derivable on demand via `nilcore experience --rebuild`.
+func wireExperience(log *eventlog.Log, s *store.Store) {
+	if os.Getenv("NILCORE_EXPERIENCE") == "" {
+		return
+	}
+	proj := experience.NewProjector(s)
+	log.OnAppend(func(e eventlog.Event) { _ = proj.Fold(context.Background(), e) })
 }
 
 // memWriteBack persists a durable record after a verified task (P4-T05).
