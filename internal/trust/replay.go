@@ -12,10 +12,11 @@ import (
 )
 
 // raceEvent mirrors only the fields of an on-disk eventlog.Event that a
-// race_outcome carries trust signal in: the Backend that raced and the verifier's
-// pass/fail verdict, which route.Race writes into Detail["passed"]. Every other
-// field (time, seq, hash, …) is ignored by encoding/json — the chain integrity is
-// eventlog.Verify's job, not ours.
+// race_outcome carries trust signal in: the Backend that raced, the verifier's
+// pass/fail verdict (Detail["passed"]), and — added in Phase 16 — the task-class
+// bucket (Detail["class"]) and verifier-judged cost (Detail["cost"]) the router
+// writes. Every other field (time, seq, hash, …) is ignored by encoding/json —
+// the chain integrity is eventlog.Verify's job, not ours.
 type raceEvent struct {
 	Kind    string         `json:"kind"`
 	Backend string         `json:"backend"`
@@ -65,7 +66,14 @@ func Replay(logPath string) (*Ledger, error) {
 		// route.Race. A missing or non-bool value reads as a non-pass (fail-safe:
 		// absent evidence never counts as a win).
 		passed, _ := e.Detail["passed"].(bool)
-		l.Record(Outcome{Backend: e.Backend, Passed: passed})
+		// Detail["class"] / Detail["cost"] are the Phase-16 routing dimensions.
+		// Both are OPTIONAL: a pre-Phase-16 race_outcome carries neither, so class
+		// reads as "" (folding into the global-view cell exactly as before) and
+		// cost reads as 0. JSON decodes numbers as float64, so a present cost lands
+		// directly. A missing or wrong-typed value is the zero value (fail-safe).
+		class, _ := e.Detail["class"].(string)
+		cost, _ := e.Detail["cost"].(float64)
+		l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("reading event log: %w", err)

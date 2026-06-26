@@ -30,9 +30,17 @@ import (
 // result on one task attempt. Passed is the verifier's verdict (never a backend
 // self-report). Config and Cost are optional context carried from eval reports;
 // race_outcome events fold in with just Backend + Passed.
+//
+// Class is the deterministic task-class bucket the attempt belonged to (see
+// classify.go), keying the per-(class, backend) cell. It is OPTIONAL and
+// defaults to the empty string: an Outcome with Class == "" folds into the
+// global per-backend scoreboard EXACTLY as before and additionally into the
+// "" class cell, so a caller that never sets Class observes today's behaviour
+// byte-identically. Class is a routing hint only (I2) — it never judges work.
 type Outcome struct {
 	Backend string
 	Config  string
+	Class   string
 	Passed  bool
 	Cost    float64
 }
@@ -59,12 +67,38 @@ type ConfigStat struct {
 	Cases     int
 }
 
-// Ledger accumulates verifier-judged evidence: per-backend race outcomes and
-// per-config eval reports. It is an in-memory fold — the durable record is the
-// event log, which Replay reads. A Ledger is not safe for concurrent mutation;
-// build it (Record / FoldEvalReport / Replay) then Snapshot for read-out.
+// ClassStat is the per-(task-class, backend) cell: how a single backend has done
+// on a single task class. It carries the same race/win rollup as Stat plus the
+// accumulated verifier-judged cost for that cell, so cost-aware routing (RTE-T06)
+// can read "what has this backend cost me on REFACTOR tasks, and how often did it
+// pass". PassRate is the raw observed rate (display-only); ranking still uses the
+// smoothed score (see classScore). Cost accumulates additively per attempt.
+type ClassStat struct {
+	Class     string
+	Backend   string
+	Races     int
+	Wins      int
+	PassRate  float64 // raw Wins/Races (0 when Races == 0); display-only
+	TotalCost float64
+}
+
+// classKey keys the per-class cell on the (class, backend) pair. A zero-value
+// Class ("") is a first-class key, not a sentinel — it is the bucket every
+// Class-less Outcome folds into, so the "" class is simply "the cell view of the
+// global per-backend ledger".
+type classKey struct {
+	class   string
+	backend string
+}
+
+// Ledger accumulates verifier-judged evidence: per-backend race outcomes, the
+// per-(class, backend) cells, and per-config eval reports. It is an in-memory
+// fold — the durable record is the event log, which Replay reads. A Ledger is not
+// safe for concurrent mutation; build it (Record / FoldEvalReport / Replay) then
+// Snapshot for read-out.
 type Ledger struct {
 	backends map[string]*Stat
+	classes  map[classKey]*ClassStat
 	configs  map[string]ConfigStat
 }
 
@@ -72,14 +106,19 @@ type Ledger struct {
 func New() *Ledger {
 	return &Ledger{
 		backends: map[string]*Stat{},
+		classes:  map[classKey]*ClassStat{},
 		configs:  map[string]ConfigStat{},
 	}
 }
 
-// Record folds one verifier-judged outcome into the per-backend scoreboard. An
-// empty backend name is ignored (a race_outcome with no backend carries no
-// attributable signal). The config dimension is folded separately, via
-// FoldEvalReport, because a single eval report aggregates many cases.
+// Record folds one verifier-judged outcome into the per-backend scoreboard AND
+// into the per-(class, backend) cell keyed by o.Class (default "" — see Outcome).
+// An empty backend name is ignored (a race_outcome with no backend carries no
+// attributable signal). The global per-backend fold is unchanged; the class cell
+// is an additive second view that also accumulates o.Cost, so a caller that never
+// sets Class still sees today's global scoreboard exactly. The config dimension is
+// folded separately, via FoldEvalReport, because a single eval report aggregates
+// many cases.
 func (l *Ledger) Record(o Outcome) {
 	if o.Backend == "" {
 		return
@@ -94,6 +133,20 @@ func (l *Ledger) Record(o Outcome) {
 		s.Wins++
 	}
 	s.PassRate = float64(s.Wins) / float64(s.Races)
+
+	// Per-(class, backend) cell. o.Class == "" is the global-view cell.
+	k := classKey{class: o.Class, backend: o.Backend}
+	cs := l.classes[k]
+	if cs == nil {
+		cs = &ClassStat{Class: o.Class, Backend: o.Backend}
+		l.classes[k] = cs
+	}
+	cs.Races++
+	if o.Passed {
+		cs.Wins++
+	}
+	cs.PassRate = float64(cs.Wins) / float64(cs.Races)
+	cs.TotalCost += o.Cost
 }
 
 // FoldEvalReport folds one measure-first eval report (eval.Report) into the
@@ -122,6 +175,7 @@ func (l *Ledger) FoldEvalReport(r eval.Report) {
 type Snapshot struct {
 	Backends []Stat
 	Configs  []ConfigStat
+	Classes  []ClassStat
 }
 
 // Snapshot returns an immutable copy of the ledger in deterministic order:
@@ -141,7 +195,29 @@ func (l *Ledger) Snapshot() Snapshot {
 	sort.Slice(snap.Configs, func(i, j int) bool {
 		return snap.Configs[i].Config < snap.Configs[j].Config
 	})
+
+	for _, c := range l.classes {
+		snap.Classes = append(snap.Classes, *c)
+	}
+	sortClassStats(snap.Classes)
 	return snap
+}
+
+// sortClassStats orders class cells deterministically: by class name first, then
+// best-first by smoothed score within a class, ties broken by backend name. So a
+// Snapshot's Classes slice is a stable per-class scoreboard.
+func sortClassStats(cs []ClassStat) {
+	sort.Slice(cs, func(i, j int) bool {
+		a, b := cs[i], cs[j]
+		if a.Class != b.Class {
+			return a.Class < b.Class
+		}
+		sa, sb := classScore(a), classScore(b)
+		if math.Abs(sa-sb) > 1e-12 {
+			return sa > sb
+		}
+		return a.Backend < b.Backend
+	})
 }
 
 // score is the SMOOTHED pass-rate used for ranking. We use additive (Laplace /
@@ -160,6 +236,13 @@ const smoothingAlpha = 1.0
 
 func score(s Stat) float64 {
 	return (float64(s.Wins) + smoothingAlpha) / (float64(s.Races) + 2*smoothingAlpha)
+}
+
+// classScore is the same Laplace-smoothed pass rate as score, applied to a
+// per-class cell. Sharing the smoothing keeps per-class ranking consistent with
+// the global scoreboard: a thin 1-of-1 cell never leapfrogs a well-proven one.
+func classScore(c ClassStat) float64 {
+	return (float64(c.Wins) + smoothingAlpha) / (float64(c.Races) + 2*smoothingAlpha)
 }
 
 // sortStatsByScore orders stats best-first by smoothed score. Ties (including the
@@ -235,5 +318,25 @@ func (l *Ledger) Order(backends []string) []string {
 	for i, it := range items {
 		out[i] = it.name
 	}
+	return out
+}
+
+// ClassStandings returns the per-(class, backend) cells for a single task class,
+// ordered best-first by the SAME smoothed score the global scoreboard uses (ties
+// broken by backend name). Passing "" returns the global-view cells — the cell
+// projection of the per-backend ledger. A class with no recorded evidence returns
+// nil (a nil slice ranges zero times, so callers need no special case). The
+// returned slice is fresh, so the caller cannot mutate the ledger through it.
+func (l *Ledger) ClassStandings(class string) []ClassStat {
+	var out []ClassStat
+	for k, c := range l.classes {
+		if k.class == class {
+			out = append(out, *c)
+		}
+	}
+	if out == nil {
+		return nil
+	}
+	sortClassStats(out) // already class-grouped (single class), so this orders by score
 	return out
 }
