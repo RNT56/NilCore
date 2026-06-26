@@ -188,7 +188,11 @@ func buildMain(args []string) {
 		executor:    exec,
 		strong:      strong,
 		log:         log,
-		approver:    policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		// The supervised-promote gate (the one human gate of a build, §9/§10) is
+		// wrapped with graduated auto-approval ONLY when an operator envelope is
+		// configured; with none, this returns the console approver unchanged
+		// (byte-identical default-off). The blast meter is wired by BR-T05.
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, nil),
 	})
 	if err != nil {
 		fatal(err)
