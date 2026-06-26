@@ -464,7 +464,11 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 			rt := t
 			rt.Dir = rwt.Path()
 			renv := o.NewEnvFor(rt.Dir, name)
-			cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+			rc := route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class}
+			if o.Cost != nil {
+				rc.Cost = o.Cost(class, name)
+			}
+			cands = append(cands, rc)
 		}
 		if len(cands) == 0 {
 			return Outcome{}, false
@@ -486,7 +490,7 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 		rt := t
 		rt.Dir = rwt.Path()
 		renv := o.NewEnv(rt.Dir)
-		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class})
 	}
 	if len(cands) == 0 {
 		return Outcome{}, false
