@@ -145,6 +145,38 @@ func TestWallAxisAndReconcile(t *testing.T) {
 	}
 }
 
+func TestIrreversibleCreditRollsBack(t *testing.T) {
+	ctx := context.Background()
+	b := New()
+	b.SetIrreversibleCeiling(3)
+
+	if err := b.ChargeIrreversible(ctx, 2); err != nil {
+		t.Fatalf("charge 2: %v", err)
+	}
+	// Roll one slot back (the rollback pattern graapprove uses when a later gate in the
+	// same decision — the $ ceiling — refuses after the irreversible slot was taken).
+	b.CreditIrreversible(1)
+	if u := b.Used(""); u.Irreversible != 1 {
+		t.Fatalf("after charge 2 + credit 1, irreversible = %d, want 1", u.Irreversible)
+	}
+	// The freed slot is genuinely chargeable again (3 fit: 1 + 2 = 3 == ceiling).
+	if err := b.ChargeIrreversible(ctx, 2); err != nil {
+		t.Fatalf("recharge after credit: %v", err)
+	}
+	// A 4th would breach (3 == ceiling).
+	if err := b.ChargeIrreversible(ctx, 1); !errors.Is(err, ErrIrrevCeiling) {
+		t.Fatalf("breach err = %v, want ErrIrrevCeiling", err)
+	}
+	// Credit never drops below zero.
+	b.CreditIrreversible(100)
+	if u := b.Used(""); u.Irreversible != 0 {
+		t.Fatalf("irreversible = %d, want clamped to 0", u.Irreversible)
+	}
+	// Nil receiver is a no-op.
+	var nilB *Budget
+	nilB.CreditIrreversible(1)
+}
+
 func TestDayDollarAxisRolls(t *testing.T) {
 	ctx := context.Background()
 	b := New()

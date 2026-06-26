@@ -533,6 +533,78 @@ func TestApproveStructuredOverDollarCeiling(t *testing.T) {
 	assertDenyReason(t, sink, "over_ceiling")
 }
 
+// BR-T04: every auto-approval consumes one slot of the SHARED blast meter's
+// irreversible axis (composition law min(P5, blast)); a breach falls through to the
+// human, regardless of how much earned trust the clause has.
+func TestApproveStructuredBlastIrreversibleFence(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	path := writeLog(t, dir, greenRun("open-pr", "feat/x", 3))
+
+	blast := blastbudget.New()
+	blast.SetIrreversibleCeiling(1) // exactly one auto-approval allowed this run
+
+	human := &recHuman{reply: false}
+	sink := &recSink{}
+	g := newGraded(human, trustedEnv(), path, blast,
+		WithSink(sink), WithClock(fixedClock(now)), WithRoot(dir))
+
+	// First clears the trust bar AND fits the irreversible budget.
+	if !g.ApproveStructured(openPR("feat/x")) {
+		t.Fatal("first auto-approval must pass within the blast budget")
+	}
+	if human.called {
+		t.Fatal("a pass must not consult the human")
+	}
+	// Second is identically trusted but the irreversible axis is now exhausted, so it
+	// is denied and delegated — earned trust cannot exceed the hard runtime fence.
+	if g.ApproveStructured(openPR("feat/x")) {
+		t.Fatal("second auto-approval must be denied by the blast irreversible fence")
+	}
+	assertDenyReason(t, sink, "blast_radius")
+	if !human.called {
+		t.Fatal("a blast-radius breach must fall through to the human")
+	}
+}
+
+// BR-T04: the irreversible slot is taken BEFORE the per-day $ charge; if the dollar
+// ceiling refuses, the slot is rolled back so a denied action consumes nothing.
+func TestApproveStructuredDollarBreachRollsBackIrreversible(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLog(t, dir, greenRun("deploy", "staging", 3))
+
+	env := Envelope{Classes: []ClassClause{{
+		Type:          "deploy",
+		AllowBranches: []string{"staging"},
+		DenyBranches:  commonDeny,
+		Environments:  []string{"staging"},
+		MinSuccesses:  2,
+		MinSample:     2,
+		RecencyDays:   7,
+		MaxPerDay:     5,
+		MaxDollarsDay: 25,
+	}}}
+
+	blast := blastbudget.New()
+	blast.SetIrreversibleCeiling(5)        // irreversible has plenty of room
+	blast.SetAutoApprovalDollarCeiling(10) // but the $ ceiling ($10) < the $25 charge
+
+	human := &recHuman{reply: false}
+	sink := &recSink{}
+	g := newGraded(human, env, path, blast,
+		WithSink(sink), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
+
+	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging"}
+	if g.ApproveStructured(deploy) {
+		t.Fatal("over-$-ceiling deploy must not auto-approve")
+	}
+	assertDenyReason(t, sink, "over_ceiling")
+	// The slot taken before the $ charge must be released — a denied action is free.
+	if u := blast.Used(dayKey(time.Now().UTC())); u.Irreversible != 0 {
+		t.Fatalf("denied auto-approval must consume no irreversible slot, got %d", u.Irreversible)
+	}
+}
+
 func TestApproveStructuredDeployProdAlwaysDenied(t *testing.T) {
 	dir := t.TempDir()
 	path := writeLog(t, dir, greenRun("deploy", "prod", 3))

@@ -238,6 +238,23 @@ func (b *Budget) CreditWall(d time.Duration) {
 	}
 }
 
+// CreditIrreversible returns n previously-charged irreversible slots to the budget
+// (clamped at zero). It lets a charge taken speculatively at the top of a decision be
+// rolled back when a LATER gate in the SAME decision refuses (e.g. the per-day dollar
+// ceiling) — so a denied auto-approval consumes nothing and the axes never over-count.
+// n must be non-negative; crediting never emits a breach. A nil receiver is a no-op.
+func (b *Budget) CreditIrreversible(n int) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.irrev -= n
+	if b.irrev < 0 {
+		b.irrev = 0
+	}
+}
+
 // ChargeAutoApprovalDollars records amount against the per-UTC-day auto-approval
 // window keyed by day ("2006-01-02"). The caller supplies the day key (so the
 // leaf stays pure and testable — no wall-clock read here), and the window rolls
