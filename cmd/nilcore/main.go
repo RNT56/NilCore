@@ -33,6 +33,7 @@ import (
 	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
+	"nilcore/internal/blastbudget"
 	"nilcore/internal/budget"
 	"nilcore/internal/channel"
 	"nilcore/internal/channel/slack"
@@ -801,12 +802,16 @@ func runMain(args []string) {
 	mem, cp := setupPersistence(log)
 
 	orch := &agent.Orchestrator{
-		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
-		Log:        log,
-		Router:     agent.SingleRouter{},
-		Spawner:    agent.NoSpawner{},
-		Approver:   policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		BaseRepo: absDir,
+		NewEnv:   envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
+		Log:      log,
+		Router:   agent.SingleRouter{},
+		Spawner:  agent.NoSpawner{},
+		// GAA-T07: graduated auto-approval on the run front door. With no operator
+		// envelope configured (cfg.AutoApprove empty) wrapAutoApprove returns the console
+		// approver UNCHANGED, so the default is byte-identical; an envelope lets an
+		// earned-trust boundary auto-proceed within the shared blast-radius fence.
+		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
 		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
@@ -906,7 +911,9 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 		executor:    exec,
 		strong:      strong,
 		log:         log,
-		approver:    policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		// GAA-T07: the -auto-supervise scale-up honors the same auto-approval envelope as
+		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged.
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
 	})
 	if err != nil {
 		fatal(err)
@@ -1118,6 +1125,7 @@ func serveMain(args []string) {
 		baseRepo:        absDir,
 		budget:          *budgetCeil,
 		gate:            gate,
+		blast:           mintBlastBudget(*c.blastRadius, log), // one shared fence for the whole serve process (nil when off)
 		mem:             mem,
 		checkpoint:      ckpt,
 		wakeReg:         wakeReg,
@@ -1325,13 +1333,17 @@ func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) 
 // the serve-mode budget ceiling and is keyed per CONVERSATION (the channel
 // threadID) rather than the single "chat-local".
 type serveDeps struct {
-	flags      commonFlags
-	provider   model.Provider
-	boot       boot
-	log        *eventlog.Log
-	baseRepo   string
-	budget     float64
-	gate       *driveGate        // shared serve drive-concurrency cap
+	flags    commonFlags
+	provider model.Provider
+	boot     boot
+	log      *eventlog.Log
+	baseRepo string
+	budget   float64
+	gate     *driveGate // shared serve drive-concurrency cap
+	// blast is the serve process's SHARED blast-radius budget (one envelope for the
+	// whole process, so N threads cannot each spend the per-day ceiling). Minted from
+	// -blast-radius; nil ("off", the default) ⇒ unfenced, byte-identical (GAA-T07/BR-T04).
+	blast      *blastbudget.Budget
 	mem        *memory.Memory    // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
 	checkpoint *agent.Checkpoint // durable task/conversation persistence (nil ⇒ in-memory only, no resume)
 	wakeReg    *wake.Registry    // durable self-timer registry behind the `sleep` tool (nil ⇒ sleep off)
@@ -1391,6 +1403,12 @@ func formatNotification(n session.Notification) string {
 
 func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.Context) server.SessionFactory {
 	return func(ctx context.Context, threadID, sender string, out emit.Emitter, approver policy.Approver) *session.Session {
+		// GAA-T07: graduated auto-approval on the serve surface. The per-thread channel
+		// approver (built upstream in server.threadFor) is wrapped here so an earned-trust
+		// boundary may auto-proceed within the operator envelope + the shared blast fence;
+		// fall-through still routes the gate question back over the channel. Default-off
+		// (no envelope, or a nil channel approver on a headless path) ⇒ unchanged.
+		approver = wrapAutoApprove(approver, d.boot.cfg, *d.flags.logPath, d.log, d.blast)
 		// One conversation = one ledger + one global ceiling = one metered provider
 		// keyed by the threadID. Routing, drives, chat replies, and the summarize
 		// fold-back all charge this single wall (§6).

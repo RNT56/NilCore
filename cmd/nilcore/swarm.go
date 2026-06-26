@@ -589,6 +589,12 @@ func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
 		// Offer the converged tip to the single human gate. A nil approver
 		// default-denies, so this NEVER auto-lands; it records the gate decision.
 		if out.TipBranch != "" {
+			// GAA-T04: record the verifier-green promote boundary so graapprove.TrustView
+			// can fold it into earned trust for promote-to-base on this tip — the swarm is a
+			// boundary_outcome SOURCE even though it never auto-lands itself. `passed` is the
+			// verifier verdict (clean ⇐ out.Done && Remaining==0 && chainOK), never a backend
+			// self-report (I2). Emitted before the gate so the audit order stays causal.
+			emitBoundaryOutcome(a.log(), policy.PromoteToBase.String(), out.TipBranch, true)
 			_ = a.gate(policy.GateAction{Type: policy.PromoteToBase, Branch: out.TipBranch})
 		}
 	}
