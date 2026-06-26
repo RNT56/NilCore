@@ -129,7 +129,7 @@ func TestHumanHelpers(t *testing.T) {
 	if humanDuration(8*time.Second) != "8s" || humanDuration(75*time.Second) != "1m15s" {
 		t.Error("humanDuration")
 	}
-	if humanTokens(842) != "842" || humanTokens(3100) != "3.1k" {
-		t.Error("humanTokens")
+	if HumanTokens(842) != "842" || HumanTokens(3100) != "3.1k" {
+		t.Error("HumanTokens")
 	}
 }

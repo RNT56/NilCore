@@ -136,7 +136,7 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 	out, err := d.run(ctx, NativeRun{
 		TaskID:    fmt.Sprintf("%s-%d", d.id, atomic.AddInt64(&d.seq, 1)),
 		Goal:      in.Goal,
-		Seed:      in.History, // continue, not restart (the persistence requirement)
+		Seed:      nativeSeed(in), // History, or the restored Summary after a restart
 		Inbox:     in.Inbox,
 		Emitter:   in.Out,
 		Mode:      in.Mode,      // capability captured at launch (read-only vs full)
@@ -147,6 +147,31 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)
 	}
 	return foldOutcome(ctx, d.sum, in.Goal, out), nil
+}
+
+// resumeSeedPreamble frames a restored bounded summary that is seeded into a native
+// drive after a process restart, so the model reads it as prior-session context to
+// continue from (a principal-trusted handoff, never untrusted data).
+const resumeSeedPreamble = "[resumed session — prior context; continue from here]\n\n"
+
+// nativeSeed picks the message seed for a native drive. Normally it is the
+// accumulated turn History (continue, not restart). But History is never persisted —
+// only the bounded WorkState is (persist.go) — so after a process RESTART the
+// History is gone and a continuation would re-enter with just the new goal turn and
+// silently RESTART, contradicting the "↻ resumed the previous conversation" promise.
+// When the History carries nothing but the current turn yet a bounded Summary was
+// restored, prepend that Summary as one context turn so "continue" actually
+// continues. In normal in-process operation History has grown past one turn, so this
+// never fires and the seed is byte-identical to before. (Only the native path needs
+// this; projectDriver already passes State.Summary to its loop directly.)
+func nativeSeed(in DriveInput) []model.Message {
+	if len(in.History) <= 1 && in.State.Summary.Goal != "" {
+		seed := make([]model.Message, 0, len(in.History)+1)
+		seed = append(seed, userTurn(resumeSeedPreamble+in.State.Summary.String()))
+		seed = append(seed, in.History...)
+		return seed
+	}
+	return in.History
 }
 
 // superviseDriver maps RouteSupervise onto super.Supervisor.Run.

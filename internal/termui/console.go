@@ -239,7 +239,7 @@ func (c *Console) renderSpinLocked() string {
 	meta = append(meta, humanDuration(elapsed))
 	if s.tokens != nil {
 		if n := s.tokens(); n > 0 {
-			meta = append(meta, humanTokens(n)+" tok")
+			meta = append(meta, HumanTokens(n)+" tok")
 		}
 	}
 	frame := c.st.Warn(s.sp.Frame(elapsed))
@@ -255,7 +255,10 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%dm%02ds", s/60, s%60)
 }
 
-func humanTokens(n int) string {
+// HumanTokens renders a token count compactly: the raw integer below 1000, else a
+// one-decimal "k" (e.g. 1500 → "1.5k"). Exported so both front doors — the REPL live
+// line and the TUI activity line — render the estimate identically.
+func HumanTokens(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
 	}

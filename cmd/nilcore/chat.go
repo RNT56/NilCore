@@ -623,7 +623,10 @@ func gaugePrefix(con *termui.Console, sess chatSession) string {
 		return ""
 	}
 	g := con.Gauge(pct) + " "
-	if pct >= 85 {
+	// Match the ring's documented red band exactly (green <60, amber 60–85, red >85,
+	// see termui.Console.Gauge) so the red "/clear" nudge and a red ring appear at the
+	// same threshold — at pct==85 the ring is still amber, so no nudge yet.
+	if pct > 85 {
 		g += con.Style().Danger("/clear ")
 	}
 	return g
@@ -963,7 +966,7 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 		if sess.PhaseNow() == session.Working {
 			if !working {
 				working = true
-				em.Begin(verb.General)
+				em.Begin(verbCategory(sess.ActiveRoute()))
 			}
 			return
 		}
@@ -999,7 +1002,7 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 				prompt()
 			case !working && p == session.Working:
 				working = true
-				em.Begin(verb.General)
+				em.Begin(verbCategory(sess.ActiveRoute()))
 			}
 		case line := <-lines:
 			if c, ok := session.ParseControl(line); ok {
@@ -1045,6 +1048,26 @@ type chatSession interface {
 	RepoDir() string
 	SetAskLevelSpec(spec string) (string, error)
 	AskLevelName() string
+	ActiveRoute() session.Route
+}
+
+// verbCategory maps the active route to the thinking-spinner verb bucket, so the
+// cycling word fits the work (a focused code change vs coordinating subagents vs a
+// whole project vs a chat reply). An unknown/continue route falls back to the full
+// General list. Shared by both front doors so the flavour is identical.
+func verbCategory(r session.Route) verb.Category {
+	switch r {
+	case session.RouteNative:
+		return verb.Native
+	case session.RouteSupervise:
+		return verb.Supervise
+	case session.RouteProject:
+		return verb.Project
+	case session.RouteChat:
+		return verb.Chat
+	default:
+		return verb.General
+	}
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).

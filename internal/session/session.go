@@ -105,7 +105,7 @@ type Session struct {
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
 	State   WorkState       // bounded carry-over (never raw transcripts)
-	drives  sync.WaitGroup  // tracks the in-flight drive goroutine (test sync)
+	drives  sync.WaitGroup  // in-flight drive tracker; incremented UNDER mu at the Routing flip (not at launch), so a concurrent Cancel during Routing always observes a positive counter before Wait — see Turn/toIdle/drive
 
 	// driveCancel cancels the CURRENT drive's context — the Routing model call and
 	// the running loop — so Cancel() aborts the in-flight run while leaving the
@@ -199,6 +199,12 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 	// pushes to the Inbox instead of racing into a second launch.
 	s.History = append(s.History, userMsg)
 	s.Phase = Routing
+	// Track the drive from the Routing flip, UNDER mu — not at launch. A concurrent
+	// Cancel acquires mu only after this unlock, so it always observes a positive
+	// counter before drives.Wait(); the matching Done() fires either in drive() (the
+	// launched path) or in toIdle() (every route/launch failure path). This closes
+	// the Add-vs-Wait race a Cancel during the Routing window could otherwise hit.
+	s.drives.Add(1)
 	st := s.State
 	history := s.snapshotHistory()
 	// Wrap the conversation ctx in a per-drive cancellable context so Cancel() can
@@ -363,7 +369,8 @@ func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState
 		Backend: r.String(),
 	})
 
-	s.drives.Add(1)
+	// drives was already incremented at the Routing flip (see Turn); drive()'s
+	// deferred Done() balances it on the launched path.
 	go s.drive(ctx, drv, in)
 	return nil
 }
@@ -479,12 +486,17 @@ func (s *Session) driverFor(r Route, st WorkState) Driver {
 }
 
 // toIdle returns the Session to Idle under s.mu after a routing failure, so a
-// failed route never wedges the conversation in Routing.
+// failed route never wedges the conversation in Routing. It is reached ONLY on the
+// non-launching exits (errNoRouter, a Router error, errNoDriver) — exactly the
+// paths where drive() never runs — so it owns the matching drives.Done() for the
+// Add(1) taken at the Routing flip. (The launched path's Done() is drive()'s defer;
+// the two exits are mutually exclusive, so the counter balances either way.)
 func (s *Session) toIdle() {
 	s.mu.Lock()
 	s.Phase = Idle
 	s.clearDriveCancelLocked()
 	s.mu.Unlock()
+	s.drives.Done()
 }
 
 // snapshotHistory returns a copy of History so a launched drive owns its seed and
@@ -508,6 +520,16 @@ func (s *Session) PhaseNow() Phase {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Phase
+}
+
+// ActiveRoute reads the route that currently (or last) owned the work under s.mu.
+// The front doors use it to flavour the thinking spinner's verbs by what the agent
+// is doing (a native code change vs a whole-project build vs a chat reply). It is
+// the launch-resolved route, so reading it once a drive is Working is accurate.
+func (s *Session) ActiveRoute() Route {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State.Active
 }
 
 // SetMode pins the conversation's behavioral mode (auto/discuss/plan/execute). It
