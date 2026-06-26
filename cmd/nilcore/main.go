@@ -109,6 +109,10 @@ func main() {
 		reportMain(args[1:])
 	case "trust":
 		trustMain(args[1:])
+	case "experience":
+		experienceMain(args[1:])
+	case "capability":
+		capabilityMain(args[1:])
 	case "trace", "why":
 		traceMain(args[1:])
 	case "mcp-call":
