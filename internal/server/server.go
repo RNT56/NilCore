@@ -551,11 +551,12 @@ func (e *channelEmitter) Emit(ev emit.Event) {
 	}
 }
 
-// coalesce drops the oldest pending KindToken to keep the queue within emitBuffer
-// WITHOUT discarding a framed event (a dropped frame would lose a turn boundary and
-// merge two turns). Order is otherwise preserved. As a last resort, if there is no
-// token to shed (a pathological all-frames backlog), it drops the oldest event so
-// the queue can never grow unbounded. Caller holds e.mu.
+// coalesce keeps the queue within emitBuffer by shedding the oldest STREAMED TOKEN
+// (cheap, never a turn boundary). When there is no token to shed, it drops the oldest
+// NON-ask frame — but a KindAsk frame is LOAD-BEARING (dropping it would strand a drive
+// parked on ask_user for the full wall-clock backstop), so it is NEVER shed; in the
+// pathological all-ask backlog the buffer grows transiently rather than lose a question.
+// Order is otherwise preserved. Caller holds e.mu.
 func (e *channelEmitter) coalesce() {
 	for i, ev := range e.buf {
 		if ev.Kind == emit.KindToken {
@@ -563,7 +564,14 @@ func (e *channelEmitter) coalesce() {
 			return
 		}
 	}
-	e.buf = e.buf[1:]
+	for i, ev := range e.buf {
+		if ev.Kind != emit.KindAsk {
+			e.buf = append(e.buf[:i], e.buf[i+1:]...)
+			return
+		}
+	}
+	// Every pending event is a KindAsk question — keep them all; a question must never
+	// be dropped (the parked drive depends on it reaching the operator).
 }
 
 // dequeue pops the next pending event in order, or reports empty. Concurrent-safe.
@@ -596,6 +604,28 @@ func (e *channelEmitter) start() {
 	}()
 }
 
+// deliver renders one framed event to the thread. A KindAsk question whose structured
+// payload is present is rendered as NATIVE choice buttons when the transport implements
+// channel.ChoicePoster (Telegram/Slack); otherwise (and for every other framed event)
+// it is a plain Channel.Update line — byte-identical to before. The tapped answer comes
+// back as an authorized TaskRequest through the normal Receive→intake→Turn path.
+func (e *channelEmitter) deliver(ev emit.Event) {
+	if ev.Kind == emit.KindAsk && ev.Ask != nil {
+		if poster, ok := e.ch.(channel.ChoicePoster); ok {
+			choices := make([]channel.AskChoice, len(ev.Ask.Choices))
+			for i, c := range ev.Ask.Choices {
+				choices[i] = channel.AskChoice{Label: c.Label, Detail: c.Detail}
+			}
+			if err := poster.PostChoices(e.ctx, e.thread, ev.Ask.Question, choices, ev.Ask.MultiSelect); err == nil {
+				return
+			}
+			// PostChoices failed — fall through to the plain line so the question is
+			// never silently lost (the operator can still answer by typing).
+		}
+	}
+	_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+}
+
 // runPlain drains events and renders each as one progress line via Channel.Update —
 // the original sink behaviour, unchanged, for a transport that cannot stream.
 func (e *channelEmitter) runPlain() {
@@ -609,7 +639,7 @@ func (e *channelEmitter) runPlain() {
 				if !ok {
 					break
 				}
-				_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+				e.deliver(ev)
 			}
 		}
 	}
@@ -688,7 +718,7 @@ func (e *channelEmitter) runStream(ds channel.DraftStreamer) {
 					continue
 				}
 				finalize() // commit the streamed reasoning before the framed line
-				_ = e.ch.Update(e.ctx, e.thread, surfaceLine(ev))
+				e.deliver(ev)
 			}
 		}
 	}

@@ -101,11 +101,20 @@ type Session struct {
 	Summarizer model.Provider
 	usage      usageState // latest model usage (the context-gauge signal); guarded by mu
 
-	mu      sync.Mutex      // guards Phase + History + driveCancel
+	mu      sync.Mutex      // guards Phase + History + driveCancel + gatePending
 	Phase   Phase           // current conversational state
 	History []model.Message // canonical turns — the shape native/super build
 	State   WorkState       // bounded carry-over (never raw transcripts)
 	drives  sync.WaitGroup  // in-flight drive tracker; incremented UNDER mu at the Routing flip (not at launch), so a concurrent Cancel during Routing always observes a positive counter before Wait — see Turn/toIdle/drive
+
+	// gateReply/gatePending are the chat front door's yes/no rendezvous for an
+	// irreversible-action gate (gate.go): the session-backed approver parks the drive in
+	// AwaitingGate and blocks on gateReply; a typed Turn while AwaitingGate resolves it.
+	// This makes AwaitingGate a real phase and lets the chat REPL keep ONE stdin reader
+	// (no ConsoleApprover racing it). nil/false on a session that never wires the
+	// session gate approver (serve uses Channel.Ask; the TUI uses its modal approver).
+	gateReply   chan string
+	gatePending bool
 
 	// driveCancel cancels the CURRENT drive's context — the Routing model call and
 	// the running loop — so Cancel() aborts the in-flight run while leaving the
@@ -129,12 +138,13 @@ type Drivers struct {
 // and the metered Budget; History and State start empty (a fresh conversation).
 func New(id, sender, repo string, log *eventlog.Log) *Session {
 	return &Session{
-		ID:     id,
-		Sender: sender,
-		Repo:   repo,
-		Log:    log,
-		Inbox:  inbox.New(log, id),
-		Phase:  Idle,
+		ID:        id,
+		Sender:    sender,
+		Repo:      repo,
+		Log:       log,
+		Inbox:     inbox.New(log, id),
+		Phase:     Idle,
+		gateReply: make(chan string, 1),
 	}
 }
 
@@ -176,6 +186,17 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 		// normal follow-up path below so it is never lost.
 		if phase == AwaitingInput && askBox != nil && askBox.Resolve(text) {
 			s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_answer",
+				Detail: map[string]any{"phase": phase.String()}})
+			return nil
+		}
+
+		// AwaitingGate: the drive is parked on the session-backed approver, so this
+		// typed line is the y/n gate answer — routed to the gate rendezvous, never the
+		// queue/steer inbox or the ask box (the explicit phase predicate). A non-y/n
+		// line re-prompts inside approveViaTurn. If the gate just resolved, it falls
+		// through to the normal follow-up.
+		if phase == AwaitingGate && s.resolveGate(text) {
+			s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_gate_reply",
 				Detail: map[string]any{"phase": phase.String()}})
 			return nil
 		}
@@ -352,6 +373,10 @@ func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState
 	// tools are never advertised (the structural never-block guarantee).
 	if s.askBox != nil {
 		in.AskUser = &askAdapter{s: s, box: s.askBox}
+		// The session-backed gate approver is bound to THIS drive's ctx, so a Cancel/
+		// shutdown unblocks a parked gate with a deny (fail-closed). Wired alongside the
+		// ask box (attended); the chat REPL closure uses it instead of ConsoleApprover.
+		in.Gate = s.NewGateApprover(ctx)
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the

@@ -43,6 +43,31 @@ func TestConsoleEmitterRendersKinds(t *testing.T) {
 	}
 }
 
+// A KindAsk event carrying a structured AskPrompt renders the styled box: the batch
+// header, the question, the numbered choice menu (label + detail), and a hint —
+// while a KindAsk without a payload falls back to the plain "? " line (byte-identical).
+func TestConsoleEmitterRendersAskBox(t *testing.T) {
+	var buf bytes.Buffer
+	e := NewEmitter(New(&buf), verb.Native)
+	e.Emit(emit.Event{Kind: emit.KindAsk, Text: "fallback text", Ask: &emit.AskPrompt{
+		Index: 2, Total: 3, Question: "Which database?", MultiSelect: false,
+		Choices: []emit.AskChoice{{Label: "Postgres", Detail: "managed"}, {Label: "SQLite"}},
+	}})
+	got := buf.String()
+	for _, want := range []string{"question 2/3", "Which database?", "1", "Postgres", "managed", "2", "SQLite", "type a number"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("ask box missing %q in:\n%s", want, got)
+		}
+	}
+	// Fallback: no payload ⇒ the plain "? "+Text line.
+	var buf2 bytes.Buffer
+	e2 := NewEmitter(New(&buf2), verb.Native)
+	e2.Emit(emit.Event{Kind: emit.KindAsk, Text: "plain question"})
+	if !strings.Contains(buf2.String(), "? plain question") {
+		t.Errorf("no-payload KindAsk should render the plain line, got:\n%s", buf2.String())
+	}
+}
+
 // On a forced-styled console, Begin starts an animated live line and End clears
 // it — and a streamed token's char count feeds the spinner's token estimate.
 func TestConsoleEmitterSpinnerLifecycle(t *testing.T) {

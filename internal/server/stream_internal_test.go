@@ -174,3 +174,76 @@ func (p *plainOnly) Update(_ context.Context, _ string, msg string) error {
 	return nil
 }
 func (p *plainOnly) Ask(context.Context, string, string) (bool, error) { return true, nil }
+
+// choiceFake is a Channel that ALSO implements channel.ChoicePoster, recording every
+// PostChoices call so a test can assert a structured ask renders as native buttons.
+type choiceFake struct {
+	draftFake
+	pmu     sync.Mutex
+	posted  []string
+	choices [][]channel.AskChoice
+	multi   []bool
+}
+
+func (f *choiceFake) PostChoices(_ context.Context, _, question string, choices []channel.AskChoice, m bool) error {
+	f.pmu.Lock()
+	f.posted = append(f.posted, question)
+	f.choices = append(f.choices, choices)
+	f.multi = append(f.multi, m)
+	f.pmu.Unlock()
+	return nil
+}
+
+// TestDeliverPostsChoices: a structured KindAsk renders as native buttons via
+// ChoicePoster; a KindAsk WITHOUT a payload (a re-prompt) falls back to a plain Update;
+// and a transport without ChoicePoster always falls back to Update (byte-identical).
+func TestDeliverPostsChoices(t *testing.T) {
+	f := &choiceFake{}
+	e := &channelEmitter{ctx: context.Background(), ch: f, thread: "t"}
+	e.deliver(emit.Event{Kind: emit.KindAsk, Text: "fallback", Ask: &emit.AskPrompt{
+		Question: "Which database?", MultiSelect: true,
+		Choices: []emit.AskChoice{{Label: "Postgres"}, {Label: "SQLite"}},
+	}})
+	if len(f.posted) != 1 || f.posted[0] != "Which database?" || !f.multi[0] {
+		t.Fatalf("structured ask should PostChoices, got posted=%v multi=%v", f.posted, f.multi)
+	}
+	if len(f.choices[0]) != 2 || f.choices[0][0].Label != "Postgres" {
+		t.Fatalf("choices not passed through: %+v", f.choices)
+	}
+	// A payload-less KindAsk must NOT post choices — it is a plain progress line.
+	e.deliver(emit.Event{Kind: emit.KindAsk, Text: "(re-prompt)"})
+	if len(f.posted) != 1 {
+		t.Fatalf("payload-less ask must not post choices, posted=%v", f.posted)
+	}
+
+	// A transport WITHOUT ChoicePoster falls back to a plain Update (no panic).
+	plain := &draftFake{}
+	ep := &channelEmitter{ctx: context.Background(), ch: plain, thread: "t"}
+	ep.deliver(emit.Event{Kind: emit.KindAsk, Text: "Q", Ask: &emit.AskPrompt{Question: "Q"}})
+	if len(plain.updates) != 1 {
+		t.Fatalf("non-poster transport should Update once, got %v", plain.updates)
+	}
+}
+
+// TestCoalesceNeverDropsAsk: under a heavy framed backlog (no tokens to shed), coalesce
+// drops other frames but NEVER the KindAsk question — a dropped ask would strand a
+// parked drive for the full backstop.
+func TestCoalesceNeverDropsAsk(t *testing.T) {
+	e := &channelEmitter{ctx: context.Background(), ch: &draftFake{}, thread: "t"}
+	for i := 0; i < 40; i++ {
+		e.buf = append(e.buf, emit.Event{Kind: emit.KindTool, Text: "x"})
+	}
+	e.buf = append(e.buf, emit.Event{Kind: emit.KindAsk, Ask: &emit.AskPrompt{Question: "the question"}})
+	for i := 0; i < 50; i++ {
+		e.coalesce()
+	}
+	asks := 0
+	for _, ev := range e.buf {
+		if ev.Kind == emit.KindAsk {
+			asks++
+		}
+	}
+	if asks != 1 {
+		t.Fatalf("KindAsk must survive coalesce, found %d in buf of %d", asks, len(e.buf))
+	}
+}

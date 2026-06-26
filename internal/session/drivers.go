@@ -39,6 +39,7 @@ import (
 
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/summarize"
 )
 
@@ -88,13 +89,19 @@ type NativeRun struct {
 	// (ask_user / set_ask_level). nil for every headless drive ⇒ the tools are never
 	// advertised (the structural never-block guarantee, I3/I4).
 	AskUser AskerHandle
+	// Gate is the session-backed irreversible-action approver (parks AwaitingGate,
+	// resolves via a typed Turn). The chat REPL native closure uses it in place of
+	// ConsoleApprover; nil ⇒ the closure keeps its own approver.
+	Gate policy.Approver
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
-// super.Supervisor with the session's Inbox + Out WIRED IN and calls Run(ctx,
-// goal). The user Inbox is the second concurrent source the supervisor folds at
-// the round boundary beside its subagent findings. The wiring site supplies it.
-type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter) (DriveOutcome, error)
+// super.Supervisor with the session's Inbox + Out + AskUser WIRED IN and calls
+// Run(ctx, goal). The user Inbox is the second concurrent source the supervisor
+// folds at the round boundary beside its subagent findings; AskUser lets the
+// supervisor pose a human question between waves (nil ⇒ no ask tool). The wiring
+// site supplies them.
+type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter, ask AskerHandle) (DriveOutcome, error)
 
 // RunProjectFunc runs one whole-project drive: project.Loop.Run(ctx), seeding the
 // loop's initial ContextSummary from the carried WorkState so a follow-up
@@ -142,6 +149,7 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		Mode:      in.Mode,      // capability captured at launch (read-only vs full)
 		ReadRoots: in.ReadRoots, // read-only context roots captured at launch
 		AskUser:   in.AskUser,   // attended ask seam (nil for headless / supervised)
+		Gate:      in.Gate,      // session-backed gate approver (chat REPL; nil otherwise)
 	})
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)
@@ -194,7 +202,7 @@ func (d *superviseDriver) Drive(ctx context.Context, in DriveInput) (DriveResult
 	if d.run == nil {
 		return DriveResult{}, fmt.Errorf("session: supervise driver has no run closure")
 	}
-	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out)
+	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out, in.AskUser)
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("supervise drive: %w", err)
 	}

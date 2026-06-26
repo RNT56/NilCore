@@ -302,6 +302,21 @@ func (d chatDeps) approverOr() policy.Approver {
 	return policy.NewConsoleApprover(os.Stdin, os.Stdout)
 }
 
+// gateApproverFor picks a chat drive's irreversible-action approver: the TUI's injected
+// modal approver if present (d.approver); otherwise the SESSION-backed gate approver
+// (the line-REPL — it parks AwaitingGate and is answered by a typed y/n Turn, so the
+// REPL keeps its single stdin reader instead of a ConsoleApprover racing it); falling
+// back to a ConsoleApprover only when neither is wired (a non-interactive/test build).
+func gateApproverFor(d chatDeps, gate policy.Approver) policy.Approver {
+	if d.approver != nil {
+		return d.approver
+	}
+	if gate != nil {
+		return gate
+	}
+	return d.approverOr()
+}
+
 // resolveWeb computes the effective egress allowlist and search backend from the
 // persisted config (set by `nilcore init`) plus the -allow-egress flag — so web
 // access is configured ONCE and then just works, not a flag the user must remember.
@@ -688,7 +703,11 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			Log:      d.log,
 			Router:   agent.SingleRouter{},
 			Spawner:  agent.NoSpawner{},
-			Approver: d.approverOr(),
+			// The line-REPL uses the SESSION-backed gate approver (in.Gate) instead of a
+			// ConsoleApprover that would race the REPL's single stdin reader: a gate parks
+			// AwaitingGate and is answered by a typed y/n Turn. The TUI keeps its modal
+			// approver (d.approver != nil), so it is used as-is.
+			Approver: gateApproverFor(d, in.Gate),
 			RaceN:    *d.flags.common.raceN,
 		}
 
@@ -838,11 +857,14 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 // tree under the conversation budget, and its outcome folds back into the
 // conversation exactly like a native drive.
 func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFunc {
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		// Attended: wire the supervisor's ask_user to the SAME session ask box the native
+		// loop uses, so a multi-agent chat drive can pose a human question between waves.
+		stack.sup.AskUser = superAskFunc(ask)
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {

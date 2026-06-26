@@ -1,6 +1,7 @@
 package termui
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -88,13 +89,61 @@ func (e *ConsoleEmitter) Emit(ev emit.Event) {
 		e.c.Line("  " + st.Warn("⤺ "+ev.Text))
 		e.spin()
 	case emit.KindAsk:
-		// A question posed to the operator (ask_user): a ? marker, and DON'T resume
-		// the spinner — the drive is parked waiting on the human; the REPL settles and
-		// shows the prompt for the answer.
-		e.c.Line("  " + st.Info("? ") + ev.Text)
+		// A question posed to the operator (ask_user): render a styled box from the
+		// STRUCTURED payload when present (the native REPL widget), else fall back to the
+		// plain "? "+Text line. The spinner is NOT resumed — the drive is parked waiting
+		// on the human; the REPL settles and shows the prompt for the typed answer.
+		if ev.Ask != nil {
+			e.renderAskBox(st, ev.Ask)
+		} else {
+			e.c.Line("  " + st.Info("? ") + ev.Text)
+		}
+	case emit.KindGate:
+		// An irreversible-action approval (the session-backed gate): a bold amber line
+		// with the action and the y/N prompt. The REPL settles its spinner and shows the
+		// prompt; a typed y/n Turn answers it (no stdin race).
+		e.c.Line("  " + st.Warn(st.Bold("⚠ GATE — irreversible:")) + " " + ev.Text)
+		e.c.Line("  " + st.Dim("approve? type ") + st.Success("y") + st.Dim(" or ") + st.Danger("n"))
 	default:
 		e.c.Line("  " + ev.Text)
 	}
+}
+
+// renderAskBox draws a styled bordered prompt for an ask_user question from the
+// structured payload: a header with the batch position, the question, a numbered
+// choice menu (label + dim detail), and a hint line. It is pure presentation over the
+// same payload the answer grammar expects — the user still types a number (or "1,3",
+// or free text), which the REPL's single stdin reader hands to Session.Turn. No raw
+// terminal mode / arrow-keys (the line-REPL is not full-screen — that is the TUI's
+// modal); the box just makes the question legible and distinct from reasoning.
+func (e *ConsoleEmitter) renderAskBox(st Style, a *emit.AskPrompt) {
+	head := "question"
+	if a.Total > 1 {
+		head = fmt.Sprintf("question %d/%d", a.Index, a.Total)
+	}
+	rule := 46 - len(head)
+	if rule < 0 {
+		rule = 0
+	}
+	e.c.Line("  " + st.Info("╭─ "+st.Bold(head)+" "+strings.Repeat("─", rule)))
+	e.c.Line("  " + st.Info("│ ") + st.Bold(strings.TrimSpace(a.Question)))
+	for i, c := range a.Choices {
+		line := "  " + st.Info("│ ") + "  " + st.Warn(fmt.Sprintf("%d", i+1)) + "  " + c.Label
+		if strings.TrimSpace(c.Detail) != "" {
+			line += st.Dim("  · " + strings.TrimSpace(c.Detail))
+		}
+		e.c.Line(line)
+	}
+	var hint string
+	switch {
+	case len(a.Choices) == 0:
+		hint = "type your answer"
+	case a.MultiSelect:
+		hint = "type the numbers (e.g. 1,3), add \"; note\" if you like — or type your own answer"
+	default:
+		hint = "type a number — or type your own answer"
+	}
+	e.c.Line("  " + st.Info("╰ ") + st.Dim(hint))
 }
 
 // spin (re)starts the thinking spinner with a fresh seed so the verb cycles, and

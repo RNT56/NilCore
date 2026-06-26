@@ -26,6 +26,7 @@ const (
 	KindSteerAck = "steer_ack" // a steer message was accepted/folded
 	KindToken    = "token"     // an incremental output-text delta (a streamed token)
 	KindAsk      = "ask"       // a question posed to the human operator (ask_user)
+	KindGate     = "gate"      // an irreversible-action approval posed to the operator
 )
 
 // Event is one surfaced line of the agent's live reasoning. Step is the loop
@@ -35,6 +36,29 @@ type Event struct {
 	Kind string // one of the Kind* constants above
 	Text string // the human-readable body
 	Step int    // loop iteration this event belongs to
+	// Ask, when non-nil (only on a KindAsk event), carries the STRUCTURED question
+	// so a widget surface (the TUI modal, the styled REPL box, Telegram/Slack native
+	// buttons) can render natively instead of parsing Text. nil on every other event,
+	// so non-ask events stay byte-identical. These are emit-LOCAL types on purpose:
+	// emit imports nothing internal (it must stay an import-leaf the frozen backend can
+	// hold), so the question is mirrored from backend.AskQuestion at emit time, never
+	// referenced. Text remains the authoritative PLAIN rendering — a surface that
+	// ignores Ask renders exactly as before.
+	Ask *AskPrompt
+}
+
+// AskPrompt is the structured form of one ask_user question (an emit-local mirror of
+// backend.AskQuestion). Index/Total are 1-based position in the 1–5 batch.
+type AskPrompt struct {
+	Index, Total int
+	Question     string
+	Choices      []AskChoice
+	MultiSelect  bool
+}
+
+// AskChoice is one labelled option (an emit-local mirror of backend.AskChoice).
+type AskChoice struct {
+	Label, Detail string
 }
 
 // Emitter receives live reasoning/intent events. Implementations must tolerate
