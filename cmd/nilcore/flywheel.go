@@ -60,7 +60,7 @@ func flywheelMain(args []string) {
 	if *once {
 		maxIter = 1
 	}
-	orch := buildRunOrchestrator(c, b, log, absDir)
+	orch := buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log))
 	fw := newFlywheelLoop(orch, log, *c.logPath, maxIter, *interval)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)

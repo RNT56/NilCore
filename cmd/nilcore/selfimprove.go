@@ -55,7 +55,7 @@ func proposeEditMain(args []string) {
 	log := openLog(*c.logPath)
 	defer log.Close()
 
-	orch := buildRunOrchestrator(c, b, log, absDir)
+	orch := buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log))
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
 		Run: func(ctx context.Context, g string) (bool, error) {

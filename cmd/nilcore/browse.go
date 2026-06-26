@@ -133,7 +133,7 @@ func browseMain(args []string) {
 		fatal(perr)
 	}
 	emitEgressProfile(log, prof, egressBackendLabel(*bf.sandboxPref))
-	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, prof.Tree.Allowed)
+	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, prof.Tree.Allowed, nil)
 	defer stopProxy()
 
 	box := selectSandbox(*bf.sandboxPref, *bf.runtime, *bf.image, absDir)

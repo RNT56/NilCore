@@ -86,7 +86,7 @@ func tuiMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*cf.common.sandboxPref))
 	warnNamespaceEgress(prof, *cf.common.sandboxPref)
 	allow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, *cf.allowEgress, searchKey)
-	egress, proxyAddr, stopProxy, egressOK := startEgressProxy(ctx, allow)
+	egress, proxyAddr, stopProxy, egressOK := startEgressProxy(ctx, allow, nil)
 	defer stopProxy()
 
 	gates := make(chan gateReq)

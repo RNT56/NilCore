@@ -808,9 +808,15 @@ func runMain(args []string) {
 	}
 	mem, cp := setupPersistence(log, *c.logPath)
 
+	// One shared blast-radius budget for the whole run: the SAME meter fences the
+	// sandbox wall-time + egress hosts (BR-T02/T03) and the auto-approval $/rate/
+	// irreversible axes (BR-T04). nil when -blast-radius is off (the default) ⇒ unfenced,
+	// byte-identical.
+	blast := mintBlastBudget(*c.blastRadius, log)
+
 	orch := &agent.Orchestrator{
 		BaseRepo: absDir,
-		NewEnv:   envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
+		NewEnv:   envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg, blast),
 		Log:      log,
 		Router:   agent.SingleRouter{},
 		Spawner:  agent.NoSpawner{},
@@ -818,14 +824,14 @@ func runMain(args []string) {
 		// envelope configured (cfg.AutoApprove empty) wrapAutoApprove returns the console
 		// approver UNCHANGED, so the default is byte-identical; an envelope lets an
 		// earned-trust boundary auto-proceed within the shared blast-radius fence.
-		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
+		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast),
 		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
 	// Phase 13: when -backends names two or more backends, activate strength-routing
 	// (Backends/NewEnvFor/Selector). EMPTY/single ⇒ no-op (byte-identical single path).
-	wireMultiBackend(orch, c, b, log, mem, absDir)
+	wireMultiBackend(orch, c, b, log, mem, absDir, blast)
 	// Phase 13: when -auto-supervise is set, wire the optional supervised seam so a
 	// complex goal opportunistically scales up to the bounded project loop. DEFAULT
 	// OFF ⇒ Project/ShouldSupervise stay nil ⇒ Execute is byte-identical single-task.
@@ -900,7 +906,9 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 	}
 
 	// The build caps VERBATIM (the same construction `nilcore build` uses), so the
-	// scaled-up run is bounded identically — no new rails.
+	// scaled-up run is bounded identically — no new rails. One shared blast budget
+	// fences the gate + the loop's sandboxes (nil when off ⇒ unfenced).
+	asBlast := mintBlastBudget(*c.blastRadius, log)
 	stack, err := buildStack(buildDeps{
 		goal:        goal, // the project loop bakes this goal; matches the chat supervised path
 		dir:         o.BaseRepo,
@@ -919,9 +927,11 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 		strong:      strong,
 		log:         log,
 		logPath:     *c.logPath,
+		blast:       asBlast,
 		// GAA-T07: the -auto-supervise scale-up honors the same auto-approval envelope as
-		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged.
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
+		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged. The
+		// SAME blast meter fences the gate + the loop's sandboxes (BR-T04).
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, asBlast),
 	})
 	if err != nil {
 		fatal(err)
@@ -971,7 +981,7 @@ func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal stri
 // so a self-started or self-edit task runs through the EXACT same verified path —
 // the verifier remains the sole authority on done (I2), the gate on irreversible
 // actions (I3/policy).
-func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string) *agent.Orchestrator {
+func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget) *agent.Orchestrator {
 	// Resolve `-backend auto` / config backend:auto to a concrete name so the
 	// self-started run paths (propose-edit / watch / scheduler / webhook) honor the
 	// same system-selection seam as `nilcore run`. No "auto" ⇒ no-op (byte-identical).
@@ -985,7 +995,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	mem, cp := setupPersistence(log, *c.logPath)
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg, blast),
 		Log:        log,
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
@@ -996,7 +1006,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	}
 	// Phase 13: -backends (two or more) activates strength-routing for the run-style
 	// commands (propose-edit / watch / self-improve / schedule). EMPTY/single ⇒ no-op.
-	wireMultiBackend(orch, c, b, log, mem, absDir)
+	wireMultiBackend(orch, c, b, log, mem, absDir, blast)
 	return orch
 }
 
@@ -1094,7 +1104,7 @@ func serveMain(args []string) {
 	// inside the goroutine; each tick runs one bounded cycle (verifier + gate own every
 	// ship — I2). It never edits the verifier of record (selfimprove.DefaultScope).
 	if os.Getenv("NILCORE_FLYWHEEL") != "" {
-		fwLoop := newFlywheelLoop(buildRunOrchestrator(c, b, log, absDir), log, *c.logPath, 1, time.Minute)
+		fwLoop := newFlywheelLoop(buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log)), log, *c.logPath, 1, time.Minute)
 		go runFlywheelTicker(ctx, fwLoop)
 	}
 
@@ -1119,7 +1129,12 @@ func serveMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*c.sandboxPref))
 	warnNamespaceEgress(prof, *c.sandboxPref)
 	webAllow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, "", searchKey)
-	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow)
+	// One shared blast-radius budget for the whole serve PROCESS: the SAME meter fences
+	// the egress hosts (BR-T02), the per-thread sandbox wall-time (BR-T03), and the
+	// auto-approval $/rate/irreversible axes (BR-T04/GAA-T07). Minted once here, threaded
+	// to the egress proxy + serveDeps. nil when -blast-radius is off ⇒ unfenced.
+	serveBlast := mintBlastBudget(*c.blastRadius, log)
+	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow, serveBlast)
 	defer stopProxy()
 	if egress.Empty() {
 		fmt.Fprintln(os.Stderr, "nilcore serve: web access off (default-deny)")
@@ -1143,7 +1158,7 @@ func serveMain(args []string) {
 		baseRepo:        absDir,
 		budget:          *budgetCeil,
 		gate:            gate,
-		blast:           mintBlastBudget(*c.blastRadius, log), // one shared fence for the whole serve process (nil when off)
+		blast:           serveBlast, // one shared fence for the whole serve process (nil when off)
 		mem:             mem,
 		checkpoint:      ckpt,
 		wakeReg:         wakeReg,
@@ -1163,7 +1178,7 @@ func serveMain(args []string) {
 	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
 	// names. An empty backlog emits nothing, so this is inert until objectives exist.
 	if os.Getenv("NILCORE_AUTONOMY") != "" {
-		autoOrch := buildRunOrchestrator(c, b, log, absDir)
+		autoOrch := buildRunOrchestrator(c, b, log, absDir, d.blast)
 		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
 		go runAutonomyDaemon(ctx, autoOrch, log)
 	}
@@ -1698,6 +1713,7 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 		strong:   strong,
 		log:      d.log,
 		logPath:  *d.flags.logPath,
+		blast:    d.blast, // share the serve process's blast fence across the supervise/project sandboxes
 		approver: approver,
 		ledger:   ledger,       // pin the per-conversation wall (§6)
 		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
@@ -1898,10 +1914,28 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 	return box
 }
 
-// envFactory builds the per-worktree backend+verifier factory.
-func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config) func(string) agent.Env {
+// attachBlast wires the shared blast-radius budget onto a container sandbox so its
+// cumulative WALL-TIME axis is fenced (BR-T03). It is the single seam the env factories
+// use; a nil budget (no -blast-radius preset, the default) or a non-container backend
+// is returned UNCHANGED, so an unfenced run is byte-identical. The same *blastbudget
+// instance is shared across every worktree of a run, so the wall fence bounds the run,
+// not each box independently.
+func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
+	if b == nil {
+		return box
+	}
+	if c, ok := box.(*sandbox.Container); ok {
+		c.Blast = b
+	}
+	return box
+}
+
+// envFactory builds the per-worktree backend+verifier factory. The optional blast
+// budget fences the sandbox wall-time axis (BR-T04 threading); nil ⇒ unfenced,
+// byte-identical.
+func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config, blast *blastbudget.Budget) func(string) agent.Env {
 	return func(dir string) agent.Env {
-		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := behavioralVerifier(box, *c.checkCmd)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project, cfg)
 		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
@@ -1925,7 +1959,7 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 // resolveAdvisor return today) and its OWN creds via the SecretStore-backed cred
 // resolver — the model never sees a key (I3). The verifier is identical across
 // backends (the project's checks for the worktree), so only the backend is swapped.
-func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) func(dir, name string) agent.Env {
+func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string, blast *blastbudget.Budget) func(dir, name string) agent.Env {
 	return func(dir, name string) agent.Env {
 		// Per-NAME deps: native needs the executor provider + advisor; codex/claude-code
 		// get nil (resolveProvider/resolveAdvisor already special-case them). A provider
@@ -1936,7 +1970,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 			fatal(perr)
 		}
 		adv := resolveAdvisor(name, b, c)
-		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := behavioralVerifier(box, *c.checkCmd)
 		be := buildBackend(name, prov, b.cred, adv, box, v, log, *c.maxSteps, mem, project, b.cfg)
 		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
@@ -1958,7 +1992,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 // Replay error is LOGGED and degrades to a nil Selector (configured order) — it never
 // aborts the run; a clean/missing log yields an empty ledger ⇒ configured order until
 // evidence accrues. The Selector only ORDERS; the verifier still governs "done" (I2).
-func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) {
+func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string, blast *blastbudget.Budget) {
 	// Trust-route (Phase 16, RTE-T08): activate the cost-aware oracle when
 	// NILCORE_TRUST_DEFAULT=1 — independent of -backends, so a single-backend run
 	// also sizes race/escalate by learned per-class data. Fail-soft on a broken
@@ -1979,7 +2013,7 @@ func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlo
 		return // single path — leave Backends/NewEnvFor/Selector unset (byte-identical)
 	}
 	o.Backends = names
-	o.NewEnvFor = multiEnvFactory(c, b, log, mem, project)
+	o.NewEnvFor = multiEnvFactory(c, b, log, mem, project, blast)
 	led, err := trust.Replay(*c.logPath)
 	if err != nil {
 		// Fail-soft on a broken chain: no trustworthy ranking, so fall back to the

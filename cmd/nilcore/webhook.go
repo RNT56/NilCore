@@ -31,7 +31,9 @@ func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boo
 		fmt.Fprintln(os.Stderr, "nilcore serve: --webhook set but NILCORE_WEBHOOK_SECRET is empty; webhook intake disabled (fail-closed)")
 		return
 	}
-	orch := buildRunOrchestrator(c, b, log, dir)
+	// Share the run's blast-radius budget across its sandbox/egress (BR-T02/T03); the
+	// gate stays a hardcoded headless deny (I3). nil when off ⇒ unfenced, byte-identical.
+	orch := buildRunOrchestrator(c, b, log, dir, mintBlastBudget(*c.blastRadius, log))
 	var mu sync.Mutex // serialize self-started runs on the single orchestrator
 	trig := &trigger.Trigger{
 		Enabled: true,

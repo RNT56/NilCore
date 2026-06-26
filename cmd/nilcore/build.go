@@ -44,6 +44,7 @@ import (
 	"nilcore/internal/agent/bus"
 	"nilcore/internal/artifact"
 	"nilcore/internal/backend"
+	"nilcore/internal/blastbudget"
 	"nilcore/internal/budget"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/guard"
@@ -173,6 +174,12 @@ func buildMain(args []string) {
 	// supervisor seeds them with bounded ContextSummary state, never a transcript).
 	_, _ = setupPersistence(log, *bf.logPath)
 
+	// One shared blast-radius budget for the whole build: the SAME meter fences the
+	// loop's sandboxes (wall-time, BR-T03) and the auto-approval gate ($/rate/
+	// irreversible, BR-T04). nil when -blast-radius is off (the default) ⇒ unfenced,
+	// byte-identical.
+	blast := mintBlastBudget(*bf.blastRadius, log)
+
 	stack, err := buildStack(buildDeps{
 		goal:        *bf.goal,
 		dir:         *bf.dir,
@@ -192,11 +199,12 @@ func buildMain(args []string) {
 		strong:      strong,
 		log:         log,
 		logPath:     *bf.logPath,
+		blast:       blast,
 		// The supervised-promote gate (the one human gate of a build, §9/§10) is
 		// wrapped with graduated auto-approval ONLY when an operator envelope is
 		// configured; with none, this returns the console approver unchanged
-		// (byte-identical default-off). The blast meter is wired by BR-T05.
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, mintBlastBudget(*bf.blastRadius, log)),
+		// (byte-identical default-off). The SAME blast meter fences the gate + sandboxes.
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, blast),
 	})
 	if err != nil {
 		fatal(err)
@@ -246,7 +254,8 @@ type buildDeps struct {
 	executor model.Provider // cheap tier (role-workers, supervisor self-code)
 	strong   model.Provider // strong tier (supervisor orchestration, planner/reviewer)
 	log      *eventlog.Log
-	logPath  string // on-disk path of log; feeds the A9 verify cache (LRN-T05). Empty ⇒ vcache off.
+	logPath  string              // on-disk path of log; feeds the A9 verify cache (LRN-T05). Empty ⇒ vcache off.
+	blast    *blastbudget.Budget // shared blast-radius fence for the loop's sandboxes (BR-T04). nil ⇒ unfenced.
 	approver policy.Approver
 
 	// egress is the Pillar-5 research-egress widen-tree (P11-T28): the resolved
@@ -549,7 +558,7 @@ func advisorFor(strong model.Provider) *advisor.Advisor {
 // runs verifyCmd inside that sandbox: the sole done-authority (I2).
 func buildEnvFactory(d buildDeps, verifyCmd string) func(dir string) buildEnv {
 	return func(dir string) buildEnv {
-		box := selectSandbox(d.sandboxPref, d.runtime, d.image, dir)
+		box := attachBlast(selectSandbox(d.sandboxPref, d.runtime, d.image, dir), d.blast)
 		// LRN-T05: skip a redundant re-verify when the EXACT same worktree content +
 		// verifier-id + toolchain already produced a chain-verified pass (the loop
 		// re-verifies the integration tip across requeues/convergence). Default-off
@@ -1336,7 +1345,7 @@ func bootstrapGreenfield(ctx context.Context, d buildDeps, repo string, exec, st
 // verifier auto-detects over the scaffolded tree — the scaffold task's own MaxSteps
 // bounds it. Kept separate so bootstrap does not depend on the final verifyCmd.
 func buildEnvForScaffold(d buildDeps, dir string) buildEnv {
-	box := selectSandbox(d.sandboxPref, d.runtime, d.image, dir)
+	box := attachBlast(selectSandbox(d.sandboxPref, d.runtime, d.image, dir), d.blast)
 	cmd := d.verify
 	if cmd == "" {
 		cmd = verify.Detect(dir)

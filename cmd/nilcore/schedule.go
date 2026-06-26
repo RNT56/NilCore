@@ -51,13 +51,15 @@ func scheduleMain(args []string) {
 	log := openLog(*c.logPath)
 	defer log.Close()
 
-	orch := buildRunOrchestrator(c, b, log, absDir)
+	// One shared blast-radius budget across the sandbox/egress + auto-approval gate.
+	blast := mintBlastBudget(*c.blastRadius, log)
+	orch := buildRunOrchestrator(c, b, log, absDir, blast)
 	if *openPR {
 		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
 	}
 	// Graduated auto-approval when an envelope is configured; else the console
 	// approver unchanged (byte-identical default-off). See watch.go.
-	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log))
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,

@@ -41,7 +41,10 @@ func watchMain(args []string) {
 	log := openLog(*c.logPath)
 	defer log.Close()
 
-	orch := buildRunOrchestrator(c, b, log, absDir)
+	// One shared blast-radius budget: the SAME meter fences the sandbox/egress (BR-T02/
+	// T03) and the auto-approval gate (BR-T04). nil when off ⇒ unfenced, byte-identical.
+	blast := mintBlastBudget(*c.blastRadius, log)
+	orch := buildRunOrchestrator(c, b, log, absDir, blast)
 	if *openPR {
 		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
 	}
@@ -49,7 +52,7 @@ func watchMain(args []string) {
 	// envelope is configured; with none it is the console approver unchanged
 	// (byte-identical default-off). Free-text gates still go to the human; only a
 	// structured OpenPR can auto-approve, within the earned-trust + envelope bar.
-	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log))
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,
