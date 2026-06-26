@@ -914,6 +914,7 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 		executor:    exec,
 		strong:      strong,
 		log:         log,
+		logPath:     *c.logPath,
 		// GAA-T07: the -auto-supervise scale-up honors the same auto-approval envelope as
 		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged.
 		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
@@ -1669,6 +1670,7 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 		executor: d.provider,
 		strong:   strong,
 		log:      d.log,
+		logPath:  *d.flags.logPath,
 		approver: approver,
 		ledger:   ledger,       // pin the per-conversation wall (§6)
 		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)

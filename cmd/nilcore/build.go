@@ -191,6 +191,7 @@ func buildMain(args []string) {
 		executor:    exec,
 		strong:      strong,
 		log:         log,
+		logPath:     *bf.logPath,
 		// The supervised-promote gate (the one human gate of a build, §9/§10) is
 		// wrapped with graduated auto-approval ONLY when an operator envelope is
 		// configured; with none, this returns the console approver unchanged
@@ -245,6 +246,7 @@ type buildDeps struct {
 	executor model.Provider // cheap tier (role-workers, supervisor self-code)
 	strong   model.Provider // strong tier (supervisor orchestration, planner/reviewer)
 	log      *eventlog.Log
+	logPath  string // on-disk path of log; feeds the A9 verify cache (LRN-T05). Empty ⇒ vcache off.
 	approver policy.Approver
 
 	// egress is the Pillar-5 research-egress widen-tree (P11-T28): the resolved
@@ -548,7 +550,12 @@ func advisorFor(strong model.Provider) *advisor.Advisor {
 func buildEnvFactory(d buildDeps, verifyCmd string) func(dir string) buildEnv {
 	return func(dir string) buildEnv {
 		box := selectSandbox(d.sandboxPref, d.runtime, d.image, dir)
-		v := verify.New(box, verifyCmd)
+		// LRN-T05: skip a redundant re-verify when the EXACT same worktree content +
+		// verifier-id + toolchain already produced a chain-verified pass (the loop
+		// re-verifies the integration tip across requeues/convergence). Default-off
+		// (NILCORE_VCACHE) ⇒ verify.New unchanged. The verifier stays the sole authority
+		// on "done" — a hit replays a verdict the verifier itself produced (I2).
+		v := vcacheDecorate(verify.New(box, verifyCmd), box, verifyCmd, d.log, d.logPath)
 		return buildEnv{Box: box, Verifier: v}
 	}
 }

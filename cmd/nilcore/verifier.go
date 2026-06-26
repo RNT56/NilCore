@@ -16,7 +16,34 @@ import (
 	"nilcore/internal/sandbox"
 	"nilcore/internal/secrets"
 	"nilcore/internal/verify"
+	"nilcore/internal/verify/vcache"
 )
+
+// vcacheDecorate wraps base in the A9 content-hash verify cache (Phase 16, LRN-T05)
+// when NILCORE_VCACHE is set and a log + worktree box are available: a chain-verified
+// PASS over the EXACT same worktree content + verifier-id + toolchain is REPLAYED
+// instead of re-run, skipping a redundant (expensive) `make verify` the loop would
+// otherwise repeat on an unchanged integration tip. It is I2-safe by construction —
+// vcache.Lookup re-runs eventlog.Verify and FAILS CLOSED to recompute on any chain
+// error, and only a pass the inner verifier itself produced is ever replayed; the
+// verifier stays the sole authority on "done". DEFAULT-OFF: with the env unset (or no
+// log / log path / box / workdir) Decorate returns base UNCHANGED — byte-identical.
+func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string, log *eventlog.Log, logPath string) verify.Verifier {
+	if os.Getenv("NILCORE_VCACHE") == "" || log == nil || logPath == "" || box == nil || box.Workdir() == "" {
+		return base
+	}
+	return vcache.Decorate(vcache.Config{
+		Inner:   base,
+		Log:     log,
+		LogPath: logPath,
+		Hash: func(ctx context.Context) (string, error) {
+			// Hash everything the verifier reads (the worktree), skipping VCS/agent state.
+			return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
+		},
+		VerifierID: verifierID,
+		Toolchain:  verify.Toolchain(),
+	})
+}
 
 // behavioralVerifier builds the project verifier, optionally composed with a
 // headless-browser behavioral check (P9-T03) and/or an evidence-artifact check

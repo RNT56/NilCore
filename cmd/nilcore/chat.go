@@ -933,6 +933,7 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
 		executor: d.provider,
 		strong:   strong,
 		log:      d.log,
+		logPath:  *d.flags.common.logPath,
 		approver: d.approverOr(),
 		ledger:   ledger,       // pin the conversation wall (§6)
 		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
