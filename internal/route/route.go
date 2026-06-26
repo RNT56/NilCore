@@ -33,6 +33,13 @@ type Candidate struct {
 	Backend  backend.CodingBackend
 	Verifier verify.Verifier
 	Task     backend.Task
+
+	// Class and Cost are optional routing-learning dimensions (Phase 16, RTE):
+	// when set, the race_outcome event carries them so trust.Replay folds the
+	// per-(task-class, backend) cost cell. Empty Class / zero Cost ⇒ the event is
+	// byte-identical to today (the dimensions are simply absent from Detail).
+	Class string
+	Cost  float64
 }
 
 // Race runs all candidates concurrently and returns the result of the first whose
@@ -58,8 +65,14 @@ func Race(ctx context.Context, candidates []Candidate, log *eventlog.Log) (backe
 				}
 			}
 			results[i] = outcome{res, passed}
-			log.Append(eventlog.Event{Task: c.Task.ID, Backend: res.Backend, Kind: "race_outcome",
-				Detail: map[string]any{"passed": passed}})
+			detail := map[string]any{"passed": passed}
+			if c.Class != "" {
+				detail["class"] = c.Class
+			}
+			if c.Cost > 0 {
+				detail["cost"] = c.Cost
+			}
+			log.Append(eventlog.Event{Task: c.Task.ID, Backend: res.Backend, Kind: "race_outcome", Detail: detail})
 		}(i)
 	}
 	wg.Wait()

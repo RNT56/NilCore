@@ -16,6 +16,7 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/project"
 	"nilcore/internal/route"
+	"nilcore/internal/trust"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
@@ -134,6 +135,26 @@ type Orchestrator struct {
 	// Selector only orders WHICH backend to run; the verifier still decides "done"
 	// (I2).
 	Selector Selector
+
+	// Oracle, when set, is the Phase-16 trust-informed routing seam (RTE-T05): it
+	// ORDERS / PRUNES the candidate names per task-class and SIZES the verify-fail
+	// escalation (best-of-N, attempt budget) from earned, verifier-judged evidence.
+	// It is consulted AFTER the Selector, through the nil-safe PlanRoute / OracleRaceN
+	// helpers, so a nil Oracle (the default) is byte-identical to the pre-RTE static
+	// path. Like the Selector it only biases WHAT to attempt and HOW HARD — the
+	// verifier still judges every race (route.Race) and re-runs as the final gate
+	// (I2: the oracle never decides "done" and never picks a race winner). A
+	// degenerate plan (empty candidate list) falls back to the configured set, so the
+	// oracle can never starve the hot path of a runnable backend.
+	Oracle TrustOracle
+
+	// Cost, when set, returns the metered $-cost of attempting this task class with a
+	// given backend (typically a meter.Pricer-derived estimate). It is recorded —
+	// alongside the task class — on the race events so trust.Replay can fold the
+	// per-(class, backend) cost cell that makes cost-aware routing LEARN (RTE-T06). It
+	// is METADATA ONLY (I7) and never gates: nil ⇒ no cost dimension is recorded,
+	// byte-identical to before. The oracle, not the model, ever sees a cost.
+	Cost func(taskClass, backendName string) float64
 }
 
 // multiBackend reports whether the Phase-13 multi-backend path is active: more than
@@ -146,14 +167,25 @@ func (o *Orchestrator) multiBackend() bool {
 
 // orderBackends returns the candidate backend names best-first for this task. When
 // a Selector is wired it orders a COPY of o.Backends (the Trust Ledger biases toward
-// the historically-strongest); otherwise the configured order is kept. o.Backends is
-// never mutated. The result is de-duplicated and empty names are dropped, so a
-// fresh worktree is built once per DISTINCT backend.
+// the historically-strongest); then, when an Oracle is wired, PlanRoute reorders /
+// prunes the result per task-class (RTE-T05). o.Backends is never mutated. The
+// result is de-duplicated and empty names are dropped, so a fresh worktree is built
+// once per DISTINCT backend.
+//
+// Both extra stages are nil-safe and order-preserving when unwired: with Selector
+// and Oracle both nil this is the configured order, byte-identical to before.
 func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []string {
 	src := make([]string, len(o.Backends))
 	copy(src, o.Backends)
 	if o.Selector != nil {
 		src = o.Selector.Select(ctx, t, src)
+	}
+	// Trust-informed routing (RTE-T05): consult the possibly-nil oracle for this
+	// task class. A nil oracle returns src unchanged (PlanRoute reports applied=false),
+	// so the static path is untouched. The oracle only ORDERS / PRUNES — the verifier
+	// still judges every race (I2).
+	if plan, applied := PlanRoute(ctx, o.Oracle, trust.Classify(t.Goal), src); applied {
+		src = plan.Candidates
 	}
 	seen := make(map[string]bool, len(src))
 	out := make([]string, 0, len(src))
@@ -164,12 +196,12 @@ func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []stri
 		seen[n] = true
 		out = append(out, n)
 	}
-	// A Selector is documented as ordering AND filtering, so it may legitimately return
-	// fewer — or, pathologically, zero — names. The multi-backend path needs at least one
-	// runnable backend (executeSingle indexes [0]; raceEscalate needs candidates), and
-	// o.Backends is non-empty by construction (multiBackend requires len>1). So if a
-	// Selector dropped everything, fall back to the configured set (de-duped) rather than
-	// hand the caller an empty slice — defending the hot path in ONE place.
+	// A Selector/Oracle is documented as ordering AND filtering, so it may legitimately
+	// return fewer — or, pathologically, zero — names. The multi-backend path needs at
+	// least one runnable backend (executeSingle indexes [0]; raceEscalate needs
+	// candidates), and o.Backends is non-empty by construction (multiBackend requires
+	// len>1). So if everything was dropped, fall back to the configured set (de-duped)
+	// rather than hand the caller an empty slice — defending the hot path in ONE place.
 	if len(out) == 0 {
 		seen = make(map[string]bool, len(o.Backends))
 		for _, n := range o.Backends {
@@ -302,7 +334,7 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		env = o.NewEnvFor(t.Dir, names[0])
 		be = env.Backend
 		order := "configured"
-		if o.Selector != nil {
+		if o.Selector != nil || o.Oracle != nil {
 			order = "trust"
 		}
 		o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "backend_select",
@@ -349,8 +381,15 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	// DISTINCT configured backends and the gate is multiBackend() itself (more than
 	// one backend is already guaranteed), so an operator gets the cross-backend race
 	// without also having to set RaceN. Easy tasks (passed first try) never reach here.
-	if !rep.Passed && (o.RaceN > 1 || o.multiBackend()) {
-		if rout, ok := o.raceEscalate(ctx, t); ok {
+	//
+	// RTE-T05: a wired Oracle may SIZE the best-of-N for this task class through the
+	// nil-safe OracleRaceN helper (a nil oracle returns o.RaceN unchanged — the static
+	// gate, byte-identical). The oracle only sizes candidacy; the verifier still judges
+	// the race (I2). raceN is recomputed once and passed to raceEscalate so the gate
+	// and the race agree on N.
+	raceN := OracleRaceN(o.Oracle, trust.Classify(t.Goal), o.RaceN)
+	if !rep.Passed && (raceN > 1 || o.multiBackend()) {
+		if rout, ok := o.raceEscalate(ctx, t, raceN); ok {
 			return rout, nil
 		}
 	}
@@ -387,12 +426,24 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 }
 
 // raceEscalate runs a best-of-N race after a single-task verify failure: it cuts
-// RaceN fresh worktrees off the base HEAD, runs a backend in each, and returns the
+// raceN fresh worktrees off the base HEAD, runs a backend in each, and returns the
 // first whose verifier passes (route.Race is the judge — I2). It is ONE-SHOT per
 // task (a race never re-races) and, like the single path, report-only — the
 // winning worktree is disposable. Returns (_, false) when none pass, leaving the
 // caller to return the original failed Outcome.
-func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcome, bool) {
+//
+// raceN is the (possibly oracle-sized) best-of-N for the single path; the multi
+// path always races the DISTINCT configured backends and ignores raceN. With a nil
+// Oracle raceN == o.RaceN, so the single path is byte-identical to before.
+func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN int) (Outcome, bool) {
+	// RTE-T05 learning dimensions. class + cost are recorded on the race_escalate
+	// event ONLY when routing/cost is wired (Oracle or Cost set), so the default-off
+	// path stays byte-identical. They are metadata (I7) the model never sees; the
+	// verifier still judges the race (I2).
+	class := ""
+	if o.Oracle != nil || o.Cost != nil {
+		class = trust.Classify(t.Goal)
+	}
 	var cands []route.Candidate
 	if o.multiBackend() {
 		// Multi path: race the DISTINCT configured backends (one fresh worktree per
@@ -402,7 +453,7 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcom
 		// distinct backends — the signal that closes the Trust Ledger loop.
 		names := o.orderBackends(ctx, t)
 		o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate",
-			Detail: map[string]any{"n": len(names), "backends": names}})
+			Detail: o.raceEscalateDetail(class, map[string]any{"n": len(names), "backends": names}, names)})
 		for i, name := range names {
 			rwt, err := worktree.CreateFrom(ctx, o.BaseRepo,
 				"race/"+t.ID+"-"+strconv.Itoa(i), t.ID+"-race-"+strconv.Itoa(i), "HEAD")
@@ -413,7 +464,11 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcom
 			rt := t
 			rt.Dir = rwt.Path()
 			renv := o.NewEnvFor(rt.Dir, name)
-			cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+			rc := route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class}
+			if o.Cost != nil {
+				rc.Cost = o.Cost(class, name)
+			}
+			cands = append(cands, rc)
 		}
 		if len(cands) == 0 {
 			return Outcome{}, false
@@ -421,9 +476,11 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcom
 		return o.runRace(ctx, t, cands)
 	}
 
-	// Single path — UNCHANGED, byte-identical: RaceN copies of the one backend.
-	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate", Detail: map[string]any{"n": o.RaceN}})
-	for i := 0; i < o.RaceN; i++ {
+	// Single path — byte-identical when the oracle is unwired: raceN copies of the
+	// one backend (raceN == o.RaceN with a nil Oracle).
+	o.Log.Append(eventlog.Event{Task: t.ID, Kind: "race_escalate",
+		Detail: o.raceEscalateDetail(class, map[string]any{"n": raceN}, nil)})
+	for i := 0; i < raceN; i++ {
 		rwt, err := worktree.CreateFrom(ctx, o.BaseRepo,
 			"race/"+t.ID+"-"+strconv.Itoa(i), t.ID+"-race-"+strconv.Itoa(i), "HEAD")
 		if err != nil {
@@ -433,12 +490,38 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task) (Outcom
 		rt := t
 		rt.Dir = rwt.Path()
 		renv := o.NewEnv(rt.Dir)
-		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt})
+		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class})
 	}
 	if len(cands) == 0 {
 		return Outcome{}, false
 	}
 	return o.runRace(ctx, t, cands)
+}
+
+// raceEscalateDetail enriches a race_escalate event's Detail with the RTE-T05
+// learning dimensions — the task class and, when a Cost func is wired, the metered
+// per-candidate $-cost — so the routing evidence is recorded ALONGSIDE the verdict
+// the race produces. It is the in-scope home for class/cost: route.Race owns the
+// per-candidate race_outcome event (out of this task's owned set), so the dimensions
+// ride the orchestrator-owned race_escalate event that frames the same race.
+//
+// DEFAULT-OFF: an empty class (Oracle and Cost both nil) leaves base untouched and
+// returned verbatim — byte-identical to the pre-RTE event. cost is added only when a
+// Cost func is wired AND backend names are known (the multi path). The values are
+// metadata, never instructions (I7), and never gate (I2).
+func (o *Orchestrator) raceEscalateDetail(class string, base map[string]any, names []string) map[string]any {
+	if class == "" {
+		return base
+	}
+	base["class"] = class
+	if o.Cost != nil && len(names) > 0 {
+		costs := make(map[string]float64, len(names))
+		for _, n := range names {
+			costs[n] = o.Cost(class, n)
+		}
+		base["cost"] = costs
+	}
+	return base
 }
 
 // runRace is the shared tail of both raceEscalate paths: judge the candidates by
