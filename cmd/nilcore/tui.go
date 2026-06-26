@@ -254,10 +254,69 @@ type tuiModel struct {
 	tokens  int
 	spin    verb.Spinner
 
-	gate *gateReq // active gate modal (nil = none)
+	gate *gateReq  // active gate modal (nil = none)
+	ask  *askModal // active ask_user modal (nil = none); serialized AFTER the gate
 
 	width, height int
 	ready         bool
+}
+
+// askModal is the interactive ask_user widget — a selectable choice list (single- or
+// multi-select) plus a free-text field, opened from a KindAsk event's structured
+// payload. It is the TUI counterpart of the REPL box / channel buttons: it formats the
+// operator's selection into the SAME line grammar resolveReply parses and delivers it
+// via Session.Turn (AwaitingInput → askBox.Resolve), so the UI holds no answer logic.
+// One modal per sub-question — the next batch question re-opens it (event-driven
+// stepper, matching ask.Box's per-question loop), so no batch state lives in the UI.
+type askModal struct {
+	index, total int
+	question     string
+	choices      []emit.AskChoice
+	multi        bool
+	cursor       int
+	picked       []bool // multi-select toggles (len == len(choices))
+	typing       bool   // free-text field focused
+	text         string // free-text buffer
+}
+
+// line formats the current selection into the resolveReply line grammar (INDICES only,
+// never label text — labels may contain ',' or ';'): a bare index for single-select, a
+// comma list "1,3" (+ "; note") for multi, or the raw free text. Empty ⇒ declined.
+func (a *askModal) line() string {
+	if len(a.choices) == 0 {
+		return a.text // pure free-form question
+	}
+	if !a.multi {
+		if strings.TrimSpace(a.text) != "" {
+			return a.text // a typed answer overrides the cursor → free-form
+		}
+		return fmt.Sprintf("%d", a.cursor+1)
+	}
+	var idx []string
+	for i, p := range a.picked {
+		if p {
+			idx = append(idx, fmt.Sprintf("%d", i+1))
+		}
+	}
+	base := strings.Join(idx, ",")
+	if strings.TrimSpace(a.text) != "" {
+		if base == "" {
+			return a.text // nothing picked, just a note → free-form
+		}
+		return base + " ; " + a.text
+	}
+	return base // "" when nothing picked → declined
+}
+
+func (a *askModal) hint() string {
+	switch {
+	case len(a.choices) == 0:
+		return "type your answer · enter send · esc skip"
+	case a.multi:
+		return "↑↓ move · space toggle · t type your own · enter send · esc let me decide"
+	default:
+		return "↑↓ move · enter select · t type your own · esc let me decide"
+	}
 }
 
 func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq, greeting []string) tuiModel {
@@ -385,6 +444,12 @@ func (m tuiModel) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// An ask_user modal captures keys until answered (lower priority than a gate, so a
+	// gate and an ask never both grab input — same serialization guarantee the gate has).
+	if m.ask != nil {
+		return m.onAskKey(msg)
+	}
+
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
@@ -400,6 +465,82 @@ func (m tuiModel) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.ta, cmd = m.ta.Update(msg)
 	return m, cmd
+}
+
+// onAskKey drives the ask_user modal. Choosing mode: ↑/↓ move, space toggles a
+// multi-select choice, enter selects (single) or submits (multi/free), t focuses the
+// free-text field, esc declines (you-decide). Typing mode: runes edit the text, enter
+// submits, esc returns to choosing (or declines a free-form question). ^C quits the TUI
+// (the drive ctx then cancels and unblocks the parked ask). The answer is formatted into
+// the resolveReply grammar and delivered via Turn — the modal holds no parsing.
+func (m tuiModel) onAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	a := m.ask
+	if a.typing {
+		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
+		case tea.KeyEnter:
+			return m.deliverAsk(a.line())
+		case tea.KeyEsc:
+			if len(a.choices) == 0 {
+				return m.deliverAsk("") // a free-form question has nothing to fall back to → decline
+			}
+			a.typing, a.text = false, ""
+		case tea.KeyBackspace:
+			if n := len(a.text); n > 0 {
+				a.text = a.text[:n-1]
+			}
+		case tea.KeySpace:
+			a.text += " "
+		case tea.KeyRunes:
+			a.text += string(msg.Runes)
+		}
+		m.refresh()
+		return m, nil
+	}
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "k":
+		if a.cursor > 0 {
+			a.cursor--
+		}
+	case "down", "j":
+		if a.cursor < len(a.choices)-1 {
+			a.cursor++
+		}
+	case " ":
+		if a.multi && a.cursor < len(a.picked) {
+			a.picked[a.cursor] = !a.picked[a.cursor]
+		}
+	case "enter":
+		if !a.multi && len(a.choices) > 0 {
+			return m.deliverAsk(fmt.Sprintf("%d", a.cursor+1))
+		}
+		return m.deliverAsk(a.line())
+	case "t", "tab":
+		a.typing = true
+	case "esc":
+		return m.deliverAsk("") // decline → resolveReply's you-decide path
+	}
+	m.refresh()
+	return m, nil
+}
+
+// deliverAsk closes the modal, echoes a compact summary, and hands the formatted line
+// to Session.Turn (AwaitingInput → askBox.Resolve). The next batch question, if any,
+// re-opens the modal via its own KindAsk event.
+func (m tuiModel) deliverAsk(line string) (tea.Model, tea.Cmd) {
+	a := m.ask
+	m.ask = nil
+	shown := strings.TrimSpace(line)
+	if shown == "" {
+		shown = "(let me decide)"
+	}
+	m.append("  " + styleInfo.Render("? ") + styleDim.Render(a.question+" → ") + shown)
+	go func() { _ = m.sess.Turn(m.ctx, line) }()
+	m.refresh()
+	return m, nil
 }
 
 // submit handles a typed line. It dispatches through the SAME session.ParseControl
@@ -626,6 +767,21 @@ func (m *tuiModel) onEvent(ev emit.Event) {
 	case emit.KindSteerAck:
 		m.commitStream()
 		m.append("  " + styleWarn.Render("⤺ "+ev.Text))
+	case emit.KindAsk:
+		// A structured ask_user question opens the modal; a payload-less KindAsk (a
+		// re-prompt nudge) just scrolls as a line. The modal is event-driven: the next
+		// batch question arrives as another KindAsk and re-opens it.
+		m.commitStream()
+		if ev.Ask != nil {
+			a := ev.Ask
+			m.ask = &askModal{
+				index: a.Index, total: a.Total, question: strings.TrimSpace(a.Question),
+				choices: a.Choices, multi: a.MultiSelect, picked: make([]bool, len(a.Choices)),
+				typing: len(a.Choices) == 0, // a free-form question starts in typing mode
+			}
+		} else {
+			m.append("  " + styleInfo.Render("? ") + ev.Text)
+		}
 	default:
 		m.commitStream()
 		m.append("  " + ev.Text)
@@ -676,6 +832,9 @@ func (m tuiModel) View() string {
 	}
 	if m.gate != nil {
 		return m.viewGate()
+	}
+	if m.ask != nil {
+		return m.viewAsk()
 	}
 	return strings.Join([]string{m.header(), m.vp.View(), m.activity(), m.ta.View(), m.status()}, "\n")
 }
@@ -733,6 +892,44 @@ func (m tuiModel) viewGate() string {
 		styleWarn.Render("GATE — irreversible action") + "\n\n" +
 			m.gate.action + "\n\n" +
 			styleOK.Render("[y] approve") + "    " + styleErr.Render("[n] deny"))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewAsk renders the ask_user modal centered on the alt-screen — the batch header,
+// the question, the selectable choice list (cursor highlight + [x] for multi-select
+// picks), the free-text field when typing, and a hint line. Reuses styleGate's border
+// so the ask and the gate read as the same "I need you" modal family.
+func (m tuiModel) viewAsk() string {
+	a := m.ask
+	var b strings.Builder
+	head := "QUESTION"
+	if a.total > 1 {
+		head = fmt.Sprintf("QUESTION %d/%d", a.index, a.total)
+	}
+	b.WriteString(styleInfo.Render(head) + "\n\n" + a.question + "\n")
+	for i, c := range a.choices {
+		cursor, label := "  ", c.Label
+		if i == a.cursor && !a.typing {
+			cursor, label = styleInfo.Render("❯ "), styleInfo.Render(c.Label)
+		}
+		mark := ""
+		if a.multi {
+			mark = "[ ] "
+			if a.picked[i] {
+				mark = styleOK.Render("[x] ")
+			}
+		}
+		row := "\n" + cursor + mark + styleDim.Render(fmt.Sprintf("%d ", i+1)) + label
+		if strings.TrimSpace(c.Detail) != "" {
+			row += styleDim.Render("  · " + strings.TrimSpace(c.Detail))
+		}
+		b.WriteString(row)
+	}
+	if a.typing || len(a.choices) == 0 {
+		b.WriteString("\n\n" + styleYou.Render("› ") + a.text + styleDim.Render("▏"))
+	}
+	b.WriteString("\n\n" + styleDim.Render(a.hint()))
+	box := styleGate.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
