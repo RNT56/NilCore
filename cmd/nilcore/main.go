@@ -117,6 +117,8 @@ func main() {
 		lessonsMain(args[1:])
 	case "flywheel":
 		flywheelMain(args[1:])
+	case "objective":
+		objectiveMain(args[1:])
 	case "capability":
 		capabilityMain(args[1:])
 	case "trace", "why":
@@ -1152,6 +1154,19 @@ func serveMain(args []string) {
 		egressTree:      prof.Tree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 	factory := serveSessionFactory(d, rawCh, ctx)
+
+	// AUTO-T06: the autonomy daemon self-services the operator objective backlog when
+	// idle. DEFAULT-OFF — only when NILCORE_AUTONOMY is set. The orchestrator is built
+	// HERE (at startup) so a missing model key fails loudly at boot rather than in the
+	// goroutine; its gate is HEADLESS (deny irreversible by default, auto only for an
+	// earned boundary inside the operator envelope + the shared blast fence — I3). The
+	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
+	// names. An empty backlog emits nothing, so this is inert until objectives exist.
+	if os.Getenv("NILCORE_AUTONOMY") != "" {
+		autoOrch := buildRunOrchestrator(c, b, log, absDir)
+		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
+		go runAutonomyDaemon(ctx, autoOrch, log)
+	}
 
 	// Durable resume: re-drive any native task a prior process left running or
 	// interrupted, BEFORE accepting new traffic. Each runs in a fresh disposable
