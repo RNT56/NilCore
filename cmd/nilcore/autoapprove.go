@@ -38,3 +38,17 @@ func wrapAutoApprove(human policy.Approver, cfg onboard.Config, logPath string, 
 	}
 	return graapprove.MaybeWrap(human, cfg.AutoApprove, logPath, blast, graapprove.WithSink(autoApproveSink{log}))
 }
+
+// emitBoundaryOutcome records that a verifier-judged boundary (promote-to-base /
+// open-pr / deploy) was reached, so graapprove.TrustView can fold it into earned
+// trust (GAA-T04). `passed` MUST be the verifier verdict on the work, never a
+// backend self-report (I2). It is additive — a metadata-only event alongside the
+// existing promote/open_pr events. A nil log is a no-op (Append is nil-safe).
+func emitBoundaryOutcome(log *eventlog.Log, action, scope string, passed bool) {
+	log.Append(eventlog.Event{Kind: "boundary_outcome", Detail: map[string]any{
+		"action": action,
+		"scope":  scope,
+		"passed": passed,
+		"chain":  true,
+	}})
+}
