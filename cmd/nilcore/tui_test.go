@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +26,21 @@ func drive(t *testing.T, m tuiModel, msg tea.Msg) tuiModel {
 		t.Fatalf("Update returned %T, want tuiModel", out)
 	}
 	return tm
+}
+
+// typeLine simulates the user typing a line and pressing Enter — the path every
+// control verb and message flows through (onKey → submit).
+func typeLine(t *testing.T, m tuiModel, line string) tuiModel {
+	t.Helper()
+	m.ta.SetValue(line)
+	return drive(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+// readyTUI builds a sized, ready TUI model over a real (log-free) Session.
+func readyTUI(t *testing.T, sess *session.Session) tuiModel {
+	t.Helper()
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq))
+	return drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 }
 
 // TestTUIFoldsEvents proves the emit→transcript folding: streamed tokens accumulate
@@ -152,5 +169,86 @@ func TestTUIApproverUnblocksOnCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Approve did not return after ctx cancel — the shutdown hang is not fixed")
+	}
+}
+
+// TestTUIModeVerbs proves the TUI routes the shared mode verbs through
+// session.ParseControl onto the SAME Session — so /ask (the /discuss alias), /plan,
+// /execute, and /auto pin the mode in the TUI exactly as in the REPL.
+func TestTUIModeVerbs(t *testing.T) {
+	sess := session.New("t", "local", t.TempDir(), nil)
+	m := readyTUI(t, sess)
+
+	for _, tc := range []struct {
+		line string
+		want session.Mode
+	}{
+		{"/ask", session.ModeDiscuss},
+		{"/discuss", session.ModeDiscuss},
+		{"/plan", session.ModePlan},
+		{"/execute", session.ModeExecute},
+		{"/auto", session.ModeAuto},
+	} {
+		m = typeLine(t, m, tc.line)
+		if got := sess.CurrentMode(); got != tc.want {
+			t.Errorf("%s ⇒ mode %v, want %v", tc.line, got, tc.want)
+		}
+	}
+}
+
+// TestTUISaveVerb proves /save works in the TUI (a local front door): nothing to
+// save ⇒ no file; after an answer exists ⇒ the last answer is persisted verbatim
+// (the same writeLastAnswer path as the REPL).
+func TestTUISaveVerb(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(t.TempDir()) // cwd deliberately differs from the session repo
+	sess := session.New("t", "local", repo, nil)
+	m := readyTUI(t, sess)
+
+	m = typeLine(t, m, "/save NOTES.md")
+	if _, err := os.Stat(filepath.Join(repo, "NOTES.md")); err == nil {
+		t.Fatal("/save wrote a file with nothing to save")
+	}
+
+	sess.State.LastOutcome = "# Plan\n\n- step one"
+	m = typeLine(t, m, "/save NOTES.md")
+	// /save resolves against the session repo (RepoDir), NOT the process cwd.
+	got, err := os.ReadFile(filepath.Join(repo, "NOTES.md"))
+	if err != nil {
+		t.Fatalf("read saved file from repo: %v", err)
+	}
+	if string(got) != "# Plan\n\n- step one\n" {
+		t.Errorf("saved content = %q", got)
+	}
+	if !strings.Contains(strings.Join(m.lines, "\n"), "saved the last answer") {
+		t.Errorf("no save confirmation in the transcript:\n%s", strings.Join(m.lines, "\n"))
+	}
+}
+
+// TestTUIMiscVerbs covers the remaining shared verbs and the unknown-command guard:
+// /add registers a read-only root, /mode reports, /clear resets, and a bogus slash
+// warns instead of being routed to the model as a turn.
+func TestTUIMiscVerbs(t *testing.T) {
+	dir := t.TempDir()
+	sess := session.New("t", "local", dir, nil)
+	m := readyTUI(t, sess)
+
+	m = typeLine(t, m, "/add "+dir)
+	if len(sess.ReadRootsNow()) != 1 {
+		t.Errorf("/add did not register a read-only root: %v", sess.ReadRootsNow())
+	}
+
+	m = typeLine(t, m, "/mode")
+	m = typeLine(t, m, "/bogus")
+	m = typeLine(t, m, "/clear")
+	joined := strings.Join(m.lines, "\n")
+	if !strings.Contains(joined, "mode:") {
+		t.Error("/mode did not report the current mode")
+	}
+	if !strings.Contains(joined, "unknown command") {
+		t.Error("/bogus did not warn (it must not be routed to the model)")
+	}
+	if !strings.Contains(joined, "context cleared") {
+		t.Error("/clear did not confirm")
 	}
 }

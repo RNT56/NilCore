@@ -17,6 +17,8 @@ func TestParseControl(t *testing.T) {
 	}{
 		// mode verbs (+ trailing-text shorthand)
 		{"/discuss", CtrlMode, ModeDiscuss, "", true},
+		{"/ask", CtrlMode, ModeDiscuss, "", true}, // alias of /discuss
+		{"/ask should we cache it?", CtrlMode, ModeDiscuss, "should we cache it?", true},
 		{"/plan", CtrlMode, ModePlan, "", true},
 		{"/execute", CtrlMode, ModeExecute, "", true},
 		{"/auto", CtrlMode, ModeAuto, "", true},
@@ -26,6 +28,10 @@ func TestParseControl(t *testing.T) {
 		{"/add", CtrlAdd, ModeAuto, "", true},
 		{"/add /tmp/lib", CtrlAdd, ModeAuto, "/tmp/lib", true},
 		{"/add https://x.io/p", CtrlAdd, ModeAuto, "https://x.io/p", true},
+		// save (principal-initiated persist; Arg is the raw path)
+		{"/save", CtrlSave, ModeAuto, "", true},
+		{"/save PLAN.md", CtrlSave, ModeAuto, "PLAN.md", true},
+		{"/save docs/notes.txt", CtrlSave, ModeAuto, "docs/notes.txt", true},
 		// other controls
 		{"/clear", CtrlClear, ModeAuto, "", true},
 		{"/status", CtrlStatus, ModeAuto, "", true},

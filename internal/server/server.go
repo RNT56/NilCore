@@ -172,10 +172,12 @@ func (s *Server) intake(ctx context.Context, req channel.TaskRequest) {
 		return
 	}
 	// Control-verb parse on PRINCIPAL input (post-Permit) — the SAME parser the REPL
-	// uses, so /discuss /plan /execute /auto /add /clear /mode /status /cancel behave
-	// identically over a channel. I7: this is the only place a channel message is
-	// inspected for a control; Turn folds text as data and never parses it, so an
-	// untrusted "/execute" in tool output can never flip a thread's mode.
+	// uses, so /discuss (/ask) /plan /execute /auto /add /clear /mode /status /cancel
+	// behave identically over a channel. /save is the one exception: it is recognized
+	// but refused here (it writes a host file — a local-operator-only action, never a
+	// remote one). I7: this is the only place a channel message is inspected for a
+	// control; Turn folds text as data and never parses it, so an untrusted "/execute"
+	// in tool output can never flip a thread's mode.
 	ctrl, isCtrl := session.ParseControl(req.Goal)
 
 	if created {
@@ -235,6 +237,12 @@ func (s *Server) applyControl(ctx context.Context, th *thread, req channel.TaskR
 		}
 	case session.CtrlAdd:
 		s.applyAdd(ctx, th, req, c.Arg, reply)
+	case session.CtrlSave:
+		// /save writes a file on the HOST. That is a local-operator action only — a
+		// remote principal must never drive a host write — so the serve path refuses
+		// it rather than acting. (The verb is still parsed centrally so both front
+		// doors agree on what it IS; only the terminal ACTS on it.)
+		reply("/save is only available in the local terminal, not over a channel.")
 	case session.CtrlClear:
 		if err := th.sess.Clear(); err != nil {
 			reply(err.Error())

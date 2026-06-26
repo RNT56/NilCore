@@ -2,8 +2,12 @@ package session
 
 // control.go is the SHARED control-verb parser used by BOTH front doors — the
 // terminal REPL (cmd/nilcore/chat.go) and the serve intake (internal/server) — so
-// /discuss /plan /execute /auto /add /clear /mode /status /cancel behave identically
-// over the keyboard and over Telegram/Slack, defined once.
+// /discuss (/ask) /plan /execute /auto /add /save /clear /mode /status /cancel
+// behave identically over the keyboard and over Telegram/Slack, defined once. The
+// one exception is /save (CtrlSave): it is parsed here but ACTED ON only by the
+// terminal front door (it writes a host file for the local operator); the serve
+// path recognizes it and refuses, rather than letting a remote principal write to
+// the host filesystem.
 //
 // THE TRUST BOUNDARY (I7): ParseControl is pure string classification with no IO,
 // and it is called ONLY on PRINCIPAL top-level input — a REPL line, or a serve
@@ -39,6 +43,11 @@ const (
 	CtrlContext
 	// CtrlCancel: abort the in-flight run, stay in the conversation.
 	CtrlCancel
+	// CtrlSave: write the agent's last answer/plan to a file. Arg is the raw path
+	// (resolution/containment/write is the front door's job — session stays pure).
+	// Empty Arg ⇒ show usage. Terminal-only in practice: the serve path refuses it
+	// rather than letting a remote principal write to the host filesystem.
+	CtrlSave
 )
 
 // Control is the parsed result of a control line.
@@ -48,9 +57,12 @@ type Control struct {
 	Arg  string // set for CtrlMode (trailing request) and CtrlAdd (path/url)
 }
 
-// controlModeVerbs maps each mode control verb to the Mode it pins.
+// controlModeVerbs maps each mode control verb to the Mode it pins. "/ask" is an
+// alias for "/discuss" — the same read-only converse-and-research mode under a more
+// intuitive name.
 var controlModeVerbs = map[string]Mode{
 	"/discuss": ModeDiscuss,
+	"/ask":     ModeDiscuss, // alias of /discuss
 	"/plan":    ModePlan,
 	"/execute": ModeExecute,
 	"/auto":    ModeAuto,
@@ -84,6 +96,8 @@ func ParseControl(line string) (Control, bool) {
 		return Control{Kind: CtrlModeShow}, true
 	case "/add":
 		return Control{Kind: CtrlAdd, Arg: rest}, true
+	case "/save":
+		return Control{Kind: CtrlSave, Arg: rest}, true
 	}
 	if m, ok := controlModeVerbs[first]; ok {
 		return Control{Kind: CtrlMode, Mode: m, Arg: rest}, true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -393,6 +394,93 @@ func TestApplyAddVerbAddsRoot(t *testing.T) {
 	resolved, _ := filepath.EvalSymlinks(dir)
 	if roots[0] != resolved {
 		t.Errorf("registered root = %q, want %q", roots[0], resolved)
+	}
+}
+
+// TestResolveSavePath proves the four containment rules of the /save target
+// resolver: relative-only, text-extension-only, within-working-dir (no `..`/symlink
+// escape), and no-clobber. Together they bound a principal-typed /save to creating a
+// NEW planning doc — it can never escape the dir, overwrite source, or write a
+// .go/.sh source file.
+func TestResolveSavePath(t *testing.T) {
+	base := t.TempDir()
+	if err := os.Mkdir(filepath.Join(base, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "exists.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Accepted: a new .md at the root and a new .txt in an existing subdir.
+	if p, err := resolveSavePath(base, "PLAN.md"); err != nil || !strings.HasSuffix(p, string(filepath.Separator)+"PLAN.md") {
+		t.Errorf("PLAN.md: p=%q err=%v, want an accepted root-level target", p, err)
+	}
+	if _, err := resolveSavePath(base, "docs/notes.txt"); err != nil {
+		t.Errorf("docs/notes.txt: unexpected error %v", err)
+	}
+
+	// Rejected — each would otherwise be a way out of "create a new doc here".
+	bad := map[string]string{
+		"/etc/passwd":          "absolute path",
+		"../escape.md":         "parent escape",
+		"docs/../../escape.md": "escape via traversal",
+		"main.go":              "source extension",
+		"deploy.sh":            "script extension",
+		"noext":                "no extension",
+		"exists.md":            "clobber of an existing file",
+		"missing/x.md":         "nonexistent parent dir",
+	}
+	for arg, why := range bad {
+		if _, err := resolveSavePath(base, arg); err == nil {
+			t.Errorf("resolveSavePath(%q) = nil error, want rejection (%s)", arg, why)
+		}
+	}
+}
+
+// TestApplySaveVerb drives the full /save control path against a real Session: with
+// nothing produced yet it writes no file; after a drive has set LastOutcome it
+// persists that verbatim text to the named doc. It confirms the model is never
+// involved — the front door reads LastAnswer and writes the file directly (I7).
+func TestApplySaveVerb(t *testing.T) {
+	dir := t.TempDir()
+	sess := session.New("c", "local", dir, newMemLog(t)) // repo == dir; /save resolves against it
+	con := termui.New(io.Discard)
+
+	// Nothing to save yet ⇒ no file created.
+	applySaveVerb(sess, con, "NOPE.md")
+	if _, err := os.Stat(filepath.Join(dir, "NOPE.md")); err == nil {
+		t.Fatal("/save wrote a file with no prior answer to save")
+	}
+
+	// After a drive set the last answer, /save persists it verbatim (+ trailing \n).
+	sess.State.LastOutcome = "# Plan\n\n1. do the thing"
+	applySaveVerb(sess, con, "PLAN.md")
+	got, err := os.ReadFile(filepath.Join(dir, "PLAN.md"))
+	if err != nil {
+		t.Fatalf("read saved plan: %v", err)
+	}
+	if string(got) != "# Plan\n\n1. do the thing\n" {
+		t.Errorf("saved content = %q", got)
+	}
+}
+
+// TestApplySaveVerbUsesRepoNotCwd proves /save resolves against the session's repo
+// (-dir), not the process cwd — so a saved plan lands where the agent works.
+func TestApplySaveVerbUsesRepoNotCwd(t *testing.T) {
+	repo := t.TempDir()
+	other := t.TempDir()
+	t.Chdir(other) // cwd deliberately differs from the session repo
+	sess := session.New("c", "local", repo, newMemLog(t))
+	sess.State.LastOutcome = "plan body"
+	con := termui.New(io.Discard)
+
+	applySaveVerb(sess, con, "P.md")
+
+	if _, err := os.Stat(filepath.Join(repo, "P.md")); err != nil {
+		t.Errorf("/save must write to the session repo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "P.md")); err == nil {
+		t.Error("/save must NOT write to the process cwd")
 	}
 }
 

@@ -332,36 +332,187 @@ func (m tuiModel) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// submit handles a typed line: local controls, or a Turn (queue/steer).
+// submit handles a typed line. It dispatches through the SAME session.ParseControl
+// the REPL and serve front doors use, so every shared control verb — the modes
+// (/discuss, /ask, /plan, /execute, /auto), /add, /save, /clear, /mode, /status,
+// /context, /cancel — behaves identically in the TUI. /quit and /help stay
+// TUI-local (terminal-only, like the REPL). Anything else is a message → Turn
+// (queue/steer). The alt-screen resets the input on Enter, so every line is echoed
+// into the transcript to leave a record of what was typed.
 func (m tuiModel) submit(line string) (tea.Model, tea.Cmd) {
 	switch strings.TrimSpace(line) {
 	case "/quit", "/exit":
 		return m, tea.Quit
-	case "/cancel", "/stop":
-		if m.sess.PhaseNow() == session.Working {
-			m.append(styleDim.Render("  cancelling current run…"))
-			go m.sess.Cancel()
-		} else {
-			m.append(styleDim.Render("  nothing running."))
-		}
-		m.refresh()
-		return m, nil
+	}
+
+	m.append(styleYou.Render("❯ ") + line)
+
+	switch strings.TrimSpace(line) {
 	case "/help", "/?":
 		m.append(styleDim.Render(tuiHelp))
 		m.refresh()
 		return m, nil
 	}
 
-	// Echo the principal's turn and its mode, then dispatch (Turn returns at once).
-	m.append(styleYou.Render("❯ ") + line)
+	// A shared control verb — the SAME parser the REPL + serve paths use, acting on
+	// the same Session, so the three front doors agree by construction (I7: parsed
+	// only on this principal front-door line, never on tool/inbox text).
+	if c, ok := session.ParseControl(line); ok {
+		return m.applyControl(c)
+	}
+
+	// A leading "/" that matched no verb (and is not a steer): warn rather than send
+	// the typo to the model as a chat turn — mirrors the REPL's unknown-command guard.
+	if isUnknownSlash(line) {
+		m.append(styleWarn.Render("  unknown command: " + firstToken(line) + " — try /help"))
+		m.refresh()
+		return m, nil
+	}
+
+	// An ordinary message or a steer → Turn (returns at once; output streams in).
+	// "queued" only when a drive is in flight (Phase != Idle — exactly when Turn
+	// folds the message in rather than launching a fresh drive).
 	if chatIsSteer(line) {
 		m.append(styleWarn.Render("  steering — interrupting the current step…"))
-	} else if m.sess.PhaseNow() == session.Working {
+	} else if m.sess.PhaseNow() != session.Idle {
 		m.append(styleDim.Render("  queued (delivered after this step)"))
 	}
 	go func() { _ = m.sess.Turn(m.ctx, line) }()
 	m.refresh()
 	return m, nil
+}
+
+// applyControl renders a parsed session.Control on the TUI transcript — the TUI's
+// half of the SHARED control verbs (the REPL's is chat.go's applyControl over a
+// termui.Console, serve's is server.go's over a channel reply; all three call the
+// same ParseControl and act on the same Session). Rendering differs per front door;
+// the parser and the session ops are shared, so behaviour agrees by construction.
+func (m tuiModel) applyControl(c session.Control) (tea.Model, tea.Cmd) {
+	switch c.Kind {
+	case session.CtrlMode:
+		m.modeVerb(c.Mode, c.Arg)
+	case session.CtrlAdd:
+		m.addVerb(c.Arg)
+	case session.CtrlSave:
+		m.saveVerb(c.Arg)
+	case session.CtrlClear:
+		if err := m.sess.Clear(); err != nil {
+			m.append(styleWarn.Render("  " + err.Error()))
+		} else {
+			m.append(styleInfo.Render("  context cleared — fresh conversation (mode and attached roots kept)"))
+		}
+	case session.CtrlModeShow:
+		md := m.sess.CurrentMode()
+		m.append(styleInfo.Render("  mode: " + md.String() + modeBlurb(md)))
+	case session.CtrlStatus:
+		pct, _, _ := m.sess.ContextUsage()
+		m.append(styleDim.Render(fmt.Sprintf("  status: %s · mode: %s · context roots: %d · context %d%%",
+			strings.ToLower(m.sess.PhaseNow().String()), m.sess.CurrentMode(), len(m.sess.ReadRootsNow()), pct)))
+	case session.CtrlContext:
+		pct, used, window := m.sess.ContextUsage()
+		if window == 0 {
+			m.append(styleDim.Render("  context: not measured yet (no model call this conversation)"))
+		} else {
+			m.append(styleDim.Render(fmt.Sprintf("  context %d%% — %d / %d tokens", pct, used, window)))
+			if pct >= 80 {
+				m.append(styleWarn.Render("  context is filling — it will auto-compact soon, or /clear to reset now"))
+			}
+		}
+	case session.CtrlCancel:
+		// Cancel any in-flight drive, INCLUDING the transient Routing window (a
+		// classifier/summarizer call before Working) — Session.Cancel succeeds there
+		// too. Gating on != Working would falsely report "nothing running" mid-routing,
+		// diverging from the REPL/serve doors.
+		if m.sess.PhaseNow() == session.Idle {
+			m.append(styleDim.Render("  nothing running."))
+		} else {
+			m.append(styleWarn.Render("  cancelling current run…"))
+			go m.sess.Cancel()
+		}
+	}
+	m.refresh()
+	return m, nil
+}
+
+// modeVerb pins the mode, acks it, and — if the verb carried trailing text —
+// submits that text as a turn under the new mode (the "/plan add a limiter"
+// shorthand). A switch while a drive is Working applies only to the NEXT turn (the
+// running drive's capability is fixed at launch).
+func (m *tuiModel) modeVerb(mode session.Mode, rest string) {
+	working := m.sess.PhaseNow() != session.Idle
+	m.sess.SetMode(mode)
+	note := ""
+	if working && rest == "" {
+		note = " (applies to your next turn; the current run keeps its capability)"
+	}
+	m.append(styleInfo.Render("  mode → "+mode.String()) + styleDim.Render(modeBlurb(mode)+note))
+	if rest != "" {
+		// Ack the trailing text by what Turn will actually do with it — steer vs queue —
+		// mirroring the REPL's ackChatMode, so a "/plan !urgent" is never mislabeled.
+		if chatIsSteer(rest) {
+			m.append(styleWarn.Render("  steering — interrupting the current step…"))
+		} else if working {
+			m.append(styleDim.Render("  queued (delivered after this step)"))
+		}
+		sess, ctx := m.sess, m.ctx
+		go func() { _ = sess.Turn(ctx, rest) }()
+	}
+}
+
+// addVerb attaches a read-only context root: a path becomes a root the read/search
+// tools may consult (validated + symlink-resolved in cmd, so the session stays
+// pure), applied to the NEXT drive. Reuses the same resolveReadRoot helper as the
+// REPL's applyAddVerb. NOTE: unlike the REPL, `nilcore tui` does not (yet) wire the
+// egress proxy, so the web_fetch tool is never advertised here — /add <url> would be
+// a no-op, so it is refused honestly rather than announcing a fetch that can't run.
+// (Wiring egress/persistence/MCP into the TUI boot is a tracked follow-on.)
+func (m *tuiModel) addVerb(arg string) {
+	if arg == "" {
+		m.append(styleDim.Render("  usage: /add <path>   — a file or folder as read-only context"))
+		if roots := m.sess.ReadRootsNow(); len(roots) > 0 {
+			m.append(styleDim.Render(fmt.Sprintf("  attached roots (%d):", len(roots))))
+			for _, r := range roots {
+				m.append(styleDim.Render("    " + r))
+			}
+		}
+		return
+	}
+	if isURLArg(arg) {
+		m.append(styleWarn.Render("  URL fetch isn't available in the TUI yet (no egress wired) — use nilcore chat with -allow-egress"))
+		return
+	}
+	resolved, err := resolveReadRoot(arg)
+	if err != nil {
+		m.append(styleWarn.Render("  cannot add context: " + err.Error()))
+		return
+	}
+	m.sess.AddReadRoot(resolved)
+	m.append(styleInfo.Render("  added read-only context root: " + resolved))
+	m.append(styleDim.Render("  the agent can read files there by absolute path (and search spans it)"))
+}
+
+// saveVerb writes the agent's last answer/plan to a file — the principal-initiated
+// persist. It reuses writeLastAnswer (and therefore resolveSavePath's four
+// containment rules), so the TUI's /save is byte-for-byte the same operation as the
+// REPL's: the model is never handed a write tool (I7). The TUI runs locally, so —
+// unlike serve — /save is fully available here.
+func (m *tuiModel) saveVerb(arg string) {
+	if strings.TrimSpace(arg) == "" {
+		m.append(styleDim.Render("  usage: /save <file.md>   — write the agent's last answer/plan to a file"))
+		m.append(styleDim.Render("         relative to the working repo; .md/.markdown/.txt only; never overwrites"))
+		return
+	}
+	content := m.sess.LastAnswer()
+	if strings.TrimSpace(content) == "" {
+		m.append(styleWarn.Render("  nothing to save yet — ask for a plan or an answer first"))
+		return
+	}
+	path, err := writeLastAnswer(m.sess.RepoDir(), arg, content)
+	if err != nil {
+		m.append(styleWarn.Render("  cannot save: " + err.Error()))
+		return
+	}
+	m.append(styleInfo.Render("  saved the last answer to " + path))
 }
 
 // onEvent folds one emit event into the transcript: tokens stream into the live
@@ -476,7 +627,7 @@ func (m tuiModel) activity() string {
 func (m tuiModel) status() string {
 	phase := strings.ToLower(m.sess.PhaseNow().String())
 	tag := styleTag.Render(" " + strings.ToUpper(phase) + " ")
-	hints := styleDim.Render("enter send · ! steer · /cancel · /quit · ^C exit")
+	hints := styleDim.Render("enter send · ! steer · /help · /cancel · /quit")
 	gap := m.width - lipgloss.Width(tag) - lipgloss.Width(hints) - 1
 	if gap < 1 {
 		gap = 1
@@ -506,10 +657,17 @@ func isVerifyFailure(s string) bool {
 }
 
 const tuiHelp = `  talk to route a quick fix, a feature, or a whole project — it decides.
-  plain text          queue (folds in at the next step)
-  !text  /steer       steer (interrupt the current step, fold your feedback)
-  /cancel  /stop      abort the current run, stay in the conversation
-  /quit   ^C          leave`
+  plain text           queue (folds in at the next step)
+  !text  /steer        steer (interrupt the current step, fold your feedback)
+  /discuss /ask /plan  read-only modes: research & talk (/ask=/discuss) / plan
+  /execute /auto       full capability / let the agent infer scope (default)
+  /add <path>          attach a file/folder as read-only context
+  /save <file.md>      write the agent's last answer/plan to a file (.md/.txt)
+  /mode  /status       show the current mode / what's running
+  /context             show context-window usage (auto-compacts near full)
+  /clear               reset the conversation (keeps mode + attached context)
+  /cancel  /stop       abort the current run, stay in the conversation
+  /quit   ^C           leave`
 
 // --- styles ---
 
