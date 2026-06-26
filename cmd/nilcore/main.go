@@ -1903,6 +1903,18 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 // aborts the run; a clean/missing log yields an empty ledger ⇒ configured order until
 // evidence accrues. The Selector only ORDERS; the verifier still governs "done" (I2).
 func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) {
+	// Trust-route (Phase 16, RTE-T08): activate the cost-aware oracle when
+	// NILCORE_TRUST_DEFAULT=1 — independent of -backends, so a single-backend run
+	// also sizes race/escalate by learned per-class data. Fail-soft on a broken
+	// chain (no oracle ⇒ the static path); byte-identical default-off when the env
+	// is unset (o.Oracle stays nil). The verifier still judges every race (I2).
+	if os.Getenv("NILCORE_TRUST_DEFAULT") == "1" {
+		if led, err := trust.Replay(*c.logPath); err == nil {
+			o.Oracle = agent.NewTrustRouteOracle(led, nil)
+		} else {
+			fmt.Fprintf(os.Stderr, "trust-route: ledger unavailable (%v); using static routing\n", err)
+		}
+	}
 	// Expand the "auto" token to the host's available backends BEFORE the len<=1
 	// check, so `-backends auto` competes every available backend (ledger-ordered)
 	// and `-backends auto` on a single-backend host collapses to the single path.
