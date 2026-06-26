@@ -992,7 +992,7 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 				con.Line(con.Style().Warn("  unknown command: " + firstToken(line) + " — try /help"))
 			} else if strings.TrimSpace(line) != "" {
 				// Ack the mode BEFORE Turn dispatches (it may launch a streaming drive).
-				ackChatMode(con, line)
+				ackChatMode(con, line, sess.PhaseNow() != session.Idle)
 				if err := sess.Turn(ctx, line); err != nil {
 					con.Line(con.Style().Dim("  (routing failed: " + err.Error() + ")"))
 				}
@@ -1016,6 +1016,7 @@ type chatSession interface {
 	Clear() error
 	ContextUsage() (pct, used, window int)
 	LastAnswer() string
+	RepoDir() string
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).
@@ -1097,7 +1098,7 @@ func applyModeVerb(ctx context.Context, sess chatSession, con *termui.Console, m
 	_, paint := modeGlyph(mode, st)
 	con.Line(paint("  mode → "+mode.String()) + st.Dim(modeBlurb(mode)+note))
 	if rest != "" {
-		ackChatMode(con, rest)
+		ackChatMode(con, rest, working)
 		if err := sess.Turn(ctx, rest); err != nil {
 			con.Line(st.Dim("  (routing failed: " + err.Error() + ")"))
 		}
@@ -1124,7 +1125,7 @@ func applyAddVerb(ctx context.Context, sess chatSession, con *termui.Console, ar
 	}
 	if isURLArg(arg) {
 		con.Line(st.Info("  fetching URL as context: " + arg))
-		ackChatMode(con, arg)
+		ackChatMode(con, arg, sess.PhaseNow() != session.Idle)
 		// Ask the agent to fetch with the sandboxed web_fetch tool and treat the body
 		// as reference DATA, not instructions (the tool also fences it, I7).
 		prompt := "Fetch this URL with the web_fetch tool and use its contents as reference context " +
@@ -1172,13 +1173,15 @@ func isURLArg(s string) bool {
 // handing the read-only modes a write tool — the human types the command and the
 // path, so the model never gains a write surface and the Discuss/Plan structural
 // no-write guarantee is untouched (I7). resolveSavePath confines the target so the
-// verb can only ever create a NEW text doc inside the working directory: it can
-// neither escape the dir, overwrite source, nor write executable/source files.
+// verb can only ever create a NEW text doc inside the working repo: it can neither
+// escape the dir, overwrite source, nor write executable/source files. The base is
+// the session's repo (-dir), not the process cwd, so a saved plan lands where the
+// agent actually works.
 func applySaveVerb(sess chatSession, con *termui.Console, arg string) {
 	st := con.Style()
 	if strings.TrimSpace(arg) == "" {
 		con.Line(st.Dim("  usage: /save <file.md>   — write the agent's last answer/plan to a file"))
-		con.Line(st.Dim("         relative to the working dir; .md/.markdown/.txt only; never overwrites"))
+		con.Line(st.Dim("         relative to the working repo; .md/.markdown/.txt only; never overwrites"))
 		return
 	}
 	content := sess.LastAnswer()
@@ -1186,12 +1189,7 @@ func applySaveVerb(sess chatSession, con *termui.Console, arg string) {
 		con.Line(st.Warn("  nothing to save yet — ask for a plan or an answer first"))
 		return
 	}
-	base, err := os.Getwd()
-	if err != nil {
-		con.Line(st.Warn("  cannot save: " + err.Error()))
-		return
-	}
-	path, err := writeLastAnswer(base, arg, content)
+	path, err := writeLastAnswer(sess.RepoDir(), arg, content)
 	if err != nil {
 		con.Line(st.Warn("  cannot save: " + err.Error()))
 		return
@@ -1212,7 +1210,19 @@ func writeLastAnswer(base, arg, content string) (string, error) {
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	// O_EXCL makes the no-clobber atomic (race-free with resolveSavePath's Stat) and
+	// O_NOFOLLOW refuses a leaf that is itself a symlink — so a pre-planted symlink in
+	// the final component cannot redirect the write outside base (resolveSavePath
+	// only symlink-resolves the parent). Defence-in-depth for the local-operator verb.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -1279,16 +1289,21 @@ func runChatCommand(_ context.Context, sess chatSession, cmd string, con *termui
 }
 
 // ackChatMode prints the queue/steer acknowledgement for a message line BEFORE it
-// is dispatched, so the user always knows which mode was understood (§5.3). It
-// reuses the session's own queue-vs-steer rule via chatIsSteer so the ack can never
-// drift from what Turn actually does.
-func ackChatMode(con *termui.Console, line string) {
+// is dispatched, so the user always knows how the message was understood. It reuses
+// the session's own queue-vs-steer rule via chatIsSteer so the ack can never drift
+// from what Turn actually does. The "queued" line is shown ONLY when a drive is in
+// flight (inFlight = Phase != Idle, exactly when Turn folds the message in at the
+// next step); when Idle the message starts a fresh drive immediately, so claiming it
+// is "queued" would be a lie — print nothing.
+func ackChatMode(con *termui.Console, line string, inFlight bool) {
 	st := con.Style()
 	if chatIsSteer(line) {
 		con.Line(st.Warn("  steering — interrupting the current step…"))
 		return
 	}
-	con.Line(st.Dim("  queued (delivered after this step)"))
+	if inFlight {
+		con.Line(st.Dim("  queued (delivered after this step)"))
+	}
 }
 
 // chatIsSteer mirrors session.classifyInterrupt's prefix rule (a leading '!' or a

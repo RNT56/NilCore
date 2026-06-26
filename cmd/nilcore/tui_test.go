@@ -200,21 +200,22 @@ func TestTUIModeVerbs(t *testing.T) {
 // save ⇒ no file; after an answer exists ⇒ the last answer is persisted verbatim
 // (the same writeLastAnswer path as the REPL).
 func TestTUISaveVerb(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir) // resolveSavePath resolves relative to the working directory
-	sess := session.New("t", "local", dir, nil)
+	repo := t.TempDir()
+	t.Chdir(t.TempDir()) // cwd deliberately differs from the session repo
+	sess := session.New("t", "local", repo, nil)
 	m := readyTUI(t, sess)
 
 	m = typeLine(t, m, "/save NOTES.md")
-	if _, err := os.Stat(filepath.Join(dir, "NOTES.md")); err == nil {
+	if _, err := os.Stat(filepath.Join(repo, "NOTES.md")); err == nil {
 		t.Fatal("/save wrote a file with nothing to save")
 	}
 
 	sess.State.LastOutcome = "# Plan\n\n- step one"
 	m = typeLine(t, m, "/save NOTES.md")
-	got, err := os.ReadFile(filepath.Join(dir, "NOTES.md"))
+	// /save resolves against the session repo (RepoDir), NOT the process cwd.
+	got, err := os.ReadFile(filepath.Join(repo, "NOTES.md"))
 	if err != nil {
-		t.Fatalf("read saved file: %v", err)
+		t.Fatalf("read saved file from repo: %v", err)
 	}
 	if string(got) != "# Plan\n\n- step one\n" {
 		t.Errorf("saved content = %q", got)

@@ -509,6 +509,13 @@ func (s *Session) CurrentMode() Mode {
 	return s.State.Mode
 }
 
+// RepoDir returns the conversation's working repository path (the absolute, already
+// symlink-resolvable `-dir`). The front door's /save verb resolves its target
+// against it, so a saved plan lands where the agent actually works — consistent with
+// read roots, steering, and the drive worktrees — rather than against the process
+// cwd. It is immutable after New, so no lock is needed.
+func (s *Session) RepoDir() string { return s.Repo }
+
 // LastAnswer returns the verbatim text of the agent's last terminal answer/plan
 // (WorkState.LastOutcome) under s.mu — for a Discuss/Plan drive that is the finish
 // summary (the plan/recap), for a chat reply it is the reply text. The front door's

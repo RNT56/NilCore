@@ -443,8 +443,7 @@ func TestResolveSavePath(t *testing.T) {
 // involved — the front door reads LastAnswer and writes the file directly (I7).
 func TestApplySaveVerb(t *testing.T) {
 	dir := t.TempDir()
-	t.Chdir(dir) // resolveSavePath resolves relative to the working directory
-	sess := session.New("c", "local", dir, newMemLog(t))
+	sess := session.New("c", "local", dir, newMemLog(t)) // repo == dir; /save resolves against it
 	con := termui.New(io.Discard)
 
 	// Nothing to save yet ⇒ no file created.
@@ -462,6 +461,26 @@ func TestApplySaveVerb(t *testing.T) {
 	}
 	if string(got) != "# Plan\n\n1. do the thing\n" {
 		t.Errorf("saved content = %q", got)
+	}
+}
+
+// TestApplySaveVerbUsesRepoNotCwd proves /save resolves against the session's repo
+// (-dir), not the process cwd — so a saved plan lands where the agent works.
+func TestApplySaveVerbUsesRepoNotCwd(t *testing.T) {
+	repo := t.TempDir()
+	other := t.TempDir()
+	t.Chdir(other) // cwd deliberately differs from the session repo
+	sess := session.New("c", "local", repo, newMemLog(t))
+	sess.State.LastOutcome = "plan body"
+	con := termui.New(io.Discard)
+
+	applySaveVerb(sess, con, "P.md")
+
+	if _, err := os.Stat(filepath.Join(repo, "P.md")); err != nil {
+		t.Errorf("/save must write to the session repo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(other, "P.md")); err == nil {
+		t.Error("/save must NOT write to the process cwd")
 	}
 }
 
