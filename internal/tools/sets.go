@@ -31,5 +31,16 @@ func ReadOnly() *Registry {
 // keeps the write-free structural guarantee intact. It is the right set for
 // Discuss/Plan, which must navigate an unfamiliar codebase to converse or plan.
 func ReadOnlyWithCodeintel() *Registry {
-	return NewRegistry(ReadTool{}, SearchTool{}, CodeintelTool{})
+	// The host-side navigation/analysis tools below are all READ-ONLY AND
+	// EXECUTION-FREE (pure go/ast + file reads + an in-memory graph; no writes, no
+	// subprocess), so adding them keeps both the write-free AND the no-execution
+	// guarantee of a Discuss/Plan drive intact while giving it the precise lenses to
+	// navigate an unfamiliar codebase: outline (file/dir shape), read_symbol (surgical
+	// reads), dead_code + import_graph (hygiene/architecture). NOTE: affected_tests is
+	// deliberately EXCLUDED — it shells out to `git status`, and a read-only drive must
+	// stay execution-free (DisableShell); it remains available on the full primary loop.
+	return NewRegistry(
+		ReadTool{}, SearchTool{}, CodeintelTool{},
+		OutlineTool{}, ReadSymbolTool{}, DeadCodeTool{}, ImportGraphTool{},
+	)
 }
