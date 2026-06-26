@@ -69,3 +69,20 @@ CREATE TABLE IF NOT EXISTS exp_meta (
     chain_ok   INTEGER NOT NULL DEFAULT 0,          -- 1 if the event hash chain verified at rebuild
     rebuilt_at TEXT    NOT NULL DEFAULT ''
 );
+
+-- Standing-objectives backlog (AUTO-T01, Pillar 7). The durable backing for the
+-- autonomy daemon's idle self-service queue: each row is one operator-authored
+-- standing intent the agent pulls from when it has no foreground work. Additive
+-- and default-empty — with no objective enqueued, every existing query above is
+-- byte-identical and the backlog source stays off (the default-off contract).
+-- Goal is operator-authored, inert data; the store never interprets it (I7).
+-- min_period_ns stores time.Duration as nanoseconds; last_run is RFC3339Nano UTC
+-- (or '' for the zero time, matching formatTS/parseTS); enabled is 0/1.
+CREATE TABLE IF NOT EXISTS objectives (
+    id            TEXT PRIMARY KEY,
+    goal          TEXT    NOT NULL DEFAULT '',
+    priority      INTEGER NOT NULL DEFAULT 0,
+    enabled       INTEGER NOT NULL DEFAULT 1,   -- 1 enabled, 0 paused (inert, retained)
+    min_period_ns INTEGER NOT NULL DEFAULT 0,   -- minimum spacing between runs (time.Duration ns)
+    last_run      TEXT    NOT NULL DEFAULT ''    -- RFC3339Nano UTC, '' = never run
+);
