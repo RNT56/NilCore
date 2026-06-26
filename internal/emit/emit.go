@@ -25,6 +25,7 @@ const (
 	KindVerify   = "verify"    // the verifier's verdict
 	KindSteerAck = "steer_ack" // a steer message was accepted/folded
 	KindToken    = "token"     // an incremental output-text delta (a streamed token)
+	KindAsk      = "ask"       // a question posed to the human operator (ask_user)
 )
 
 // Event is one surfaced line of the agent's live reasoning. Step is the loop
@@ -116,6 +117,8 @@ func glyph(kind string) string {
 		return "✓"
 	case KindSteerAck:
 		return "!"
+	case KindAsk:
+		return "?"
 	default:
 		return "-"
 	}

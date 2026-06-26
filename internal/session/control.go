@@ -48,6 +48,10 @@ const (
 	// Empty Arg ⇒ show usage. Terminal-only in practice: the serve path refuses it
 	// rather than letting a remote principal write to the host filesystem.
 	CtrlSave
+	// CtrlQuestions: dial how often the agent may ask clarifying questions. Arg is the
+	// spec ("less"/"more"/"off"/"normal"/a level); empty Arg ⇒ show the current level.
+	// The deterministic sibling of telling the agent "ask me fewer questions" in prose.
+	CtrlQuestions
 )
 
 // Control is the parsed result of a control line.
@@ -98,6 +102,16 @@ func ParseControl(line string) (Control, bool) {
 		return Control{Kind: CtrlAdd, Arg: rest}, true
 	case "/save":
 		return Control{Kind: CtrlSave, Arg: rest}, true
+	case "/questions", "/ask-less", "/ask-more":
+		// /questions <spec> dials the ask budget; the two dashed aliases are sugar that
+		// fold straight to one notch in either direction.
+		switch first {
+		case "/ask-less":
+			rest = "less"
+		case "/ask-more":
+			rest = "more"
+		}
+		return Control{Kind: CtrlQuestions, Arg: rest}, true
 	}
 	if m, ok := controlModeVerbs[first]; ok {
 		return Control{Kind: CtrlMode, Mode: m, Arg: rest}, true

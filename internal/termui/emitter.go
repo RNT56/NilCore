@@ -87,6 +87,11 @@ func (e *ConsoleEmitter) Emit(ev emit.Event) {
 		// Acknowledge the steer, then resume the spinner — the loop is re-thinking.
 		e.c.Line("  " + st.Warn("⤺ "+ev.Text))
 		e.spin()
+	case emit.KindAsk:
+		// A question posed to the operator (ask_user): a ? marker, and DON'T resume
+		// the spinner — the drive is parked waiting on the human; the REPL settles and
+		// shows the prompt for the answer.
+		e.c.Line("  " + st.Info("? ") + ev.Text)
 	default:
 		e.c.Line("  " + ev.Text)
 	}

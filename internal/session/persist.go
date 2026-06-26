@@ -62,6 +62,10 @@ type persistedState struct {
 	// same mode rather than silently defaulting to full-capability ModeAuto. An
 	// unknown name decodes to ModeAuto (router decides), never an unexpected pin.
 	Mode string `json:"mode,omitempty"`
+	// AskLevel is the user-set ask-aggressiveness (1..6); like Mode it is a posture the
+	// operator dialed, so it must round-trip a restart. Zero (an old snapshot) is
+	// normalized to the default ("normal") at use, never silently off.
+	AskLevel int `json:"ask_level,omitempty"`
 }
 
 // encodeState maps the bounded WorkState onto its wire shape. It is total and
@@ -77,6 +81,7 @@ func encodeState(st WorkState) persistedState {
 		Branch:      st.Branch,
 		LastOutcome: st.LastOutcome,
 		Mode:        st.Mode.String(),
+		AskLevel:    st.AskLevel,
 	}
 }
 
@@ -90,6 +95,7 @@ func (p persistedState) decode() WorkState {
 		Branch:      p.Branch,
 		LastOutcome: p.LastOutcome,
 		Mode:        ModeFromString(p.Mode),
+		AskLevel:    p.AskLevel,
 	}
 	st.Summary.Goal = p.Goal
 	st.Summary.Constraints = p.Constraints

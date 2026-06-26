@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"nilcore/internal/ask"
 	"nilcore/internal/backend"
 	"nilcore/internal/budget"
 	"nilcore/internal/emit"
@@ -68,6 +69,13 @@ type Session struct {
 	// Inbox is the user→agent seam a running drive drains. It is created at New
 	// and reused across drives so a mid-work Turn always has somewhere to push.
 	Inbox *inbox.Box
+
+	// askBox is the outbound (loop→user) clarification seam — non-nil ONLY when an
+	// interactive front door enabled attended asking (EnableAskUser). It is the mirror
+	// of Inbox: a parked ask_user drive collects answers through it, and a Turn arriving
+	// while Phase==AwaitingInput resolves the current question with it. Headless
+	// sessions leave it nil, so ask_user is never wired and never blocks.
+	askBox *ask.Box
 
 	// Sizer is the native-vs-supervise sizing heuristic used ONLY when the user has
 	// pinned ModeExecute (which bypasses the auto-router): a complex goal routes to
@@ -154,12 +162,26 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 
 	s.mu.Lock()
 	if s.Phase != Idle {
-		// In-flight: fold the follow-up into History and the running loop's Inbox.
-		mode := classifyInterrupt(text)
-		s.History = append(s.History, userMsg)
 		phase := s.Phase
+		askBox := s.askBox
+		s.History = append(s.History, userMsg)
 		s.mu.Unlock()
 
+		// AwaitingInput: the drive is parked on an ask_user question, so this typed
+		// line IS the answer — route it to the ask box, NOT the queue/steer inbox
+		// (classifyInterrupt is bypassed, so an answer that begins with '!' is never
+		// mis-read as a steer). To redirect instead of answering, the operator uses
+		// /cancel (a control verb the front door peels off before Turn). If the batch
+		// just ended between the phase read and Resolve, the line falls through to the
+		// normal follow-up path below so it is never lost.
+		if phase == AwaitingInput && askBox != nil && askBox.Resolve(text) {
+			s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_answer",
+				Detail: map[string]any{"phase": phase.String()}})
+			return nil
+		}
+
+		// In-flight: fold the follow-up into the running loop's Inbox (queue/steer).
+		mode := classifyInterrupt(text)
 		s.Log.Append(eventlog.Event{
 			Task: s.ID,
 			Kind: "session_followup",
@@ -316,6 +338,14 @@ func (s *Session) launch(ctx context.Context, r Route, text string, st WorkState
 		Out:       s.Out,
 		Mode:      st.Mode, // capability captured at launch (fixed for the drive's life)
 		ReadRoots: roots,   // read-only context roots captured at launch
+	}
+	// Attended ask seam (ask_user / set_ask_level): wired ONLY when an interactive
+	// front door enabled it (askBox != nil). Captured at launch like the inbox; the
+	// session-owned adapter flips Phase=AwaitingInput around the parked ask and dials
+	// the per-drive budget from the conversation's ask level. Headless ⇒ nil ⇒ the
+	// tools are never advertised (the structural never-block guarantee).
+	if s.askBox != nil {
+		in.AskUser = &askAdapter{s: s, box: s.askBox}
 	}
 
 	// Claim Working and launch. The drive goroutine is the single owner of the

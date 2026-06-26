@@ -236,9 +236,11 @@ const chatBanner = `nilcore chat — talk to the agent; it picks the machine and
   /save <file.md>   write the agent's last answer/plan to a file (.md/.txt; no overwrite)
   /context          show context-window usage (auto-compacts near full)
   /clear            reset the conversation (keeps mode + attached context)
+  /questions <less|more|off|normal>   dial how often the agent asks you questions
   /cancel  /stop    abort the current run (and stay in the conversation)
   /status           show what the agent is working on
-  /quit  (Ctrl-D)   leave`
+  /quit  (Ctrl-D)   leave
+when the agent asks you something, just type the choice number or your own answer.`
 
 // chatDeps is the resolved input to buildChatSession: everything the wiring needs
 // after flags + boot resolve. Keeping it a plain struct lets the hermetic test
@@ -489,6 +491,13 @@ func buildChatSession(d chatDeps) (*session.Session, error) {
 	// byte-identical, so the hermetic test wires no sink.
 	if d.emitter != nil {
 		sess.Out = d.emitter
+		// ATTENDED: the interactive chat has a human at the keyboard, so enable
+		// ask_user — the native loop may pose a sharp question (or a short batch) on a
+		// genuine fork and block for the answer, rendered through this same sink. Only
+		// the interactive front door calls this; headless front doors (serve resume,
+		// watch, …) build their session without it, so ask_user stays unwired and never
+		// blocks there (the structural never-block guarantee, I3/I4).
+		sess.EnableAskUser(d.emitter)
 	}
 	sess.Budget = ledger
 
@@ -780,6 +789,14 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if in.Emitter != nil {
 		n.Emitter = in.Emitter
 	}
+	// Attended ask seam (ask_user / set_ask_level): wired only when the session
+	// enabled attended asking (interactive chat). The session-owned adapter parks the
+	// drive in AwaitingInput and dials the per-drive budget; nil here (headless /
+	// supervised) leaves the loop byte-identical. NativeRun.AskUser is a session
+	// interface whose method set matches backend.AskHandle, so it assigns directly.
+	if in.AskUser != nil {
+		n.AskUser = in.AskUser
+	}
 	if adv.prov != nil {
 		// A fresh advisor per drive so its per-drive consult ceiling is honored,
 		// exactly as the run path's buildBackend does.
@@ -971,9 +988,18 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 			con.Line("")
 			return err // nil on clean EOF (Ctrl-D)
 		case <-tick.C:
-			if working && sess.PhaseNow() == session.Idle {
+			// Catch async phase changes the REPL is not otherwise woken for: a drive
+			// that finished (→Idle) or parked on an ask_user question (→AwaitingInput)
+			// settles the spinner and shows the prompt (for a new instruction or the
+			// answer); a drive that RESUMED after an answer (→Working) restarts the
+			// spinner. Only transitions act, so an idle prompt never flickers.
+			switch p := sess.PhaseNow(); {
+			case working && p != session.Working:
 				settle()
 				prompt()
+			case !working && p == session.Working:
+				working = true
+				em.Begin(verb.General)
 			}
 		case line := <-lines:
 			if c, ok := session.ParseControl(line); ok {
@@ -1017,6 +1043,8 @@ type chatSession interface {
 	ContextUsage() (pct, used, window int)
 	LastAnswer() string
 	RepoDir() string
+	SetAskLevelSpec(spec string) (string, error)
+	AskLevelName() string
 }
 
 // parseChatLine recognizes the local REPL control verbs (/status, /quit, /help).
@@ -1048,6 +1076,16 @@ func applyControl(ctx context.Context, sess chatSession, con *termui.Console, c 
 		applyAddVerb(ctx, sess, con, c.Arg)
 	case session.CtrlSave:
 		applySaveVerb(sess, con, c.Arg)
+	case session.CtrlQuestions:
+		// Dial how often the agent asks clarifying questions. Empty Arg ⇒ show the
+		// current level; otherwise move it (less/more/off/normal/a number). The
+		// deterministic sibling of telling the agent "ask me fewer questions" in prose.
+		ack, err := sess.SetAskLevelSpec(c.Arg)
+		if err != nil {
+			con.Line(st.Warn("  " + err.Error()))
+			return
+		}
+		con.Line(st.Info("  " + ack))
 	case session.CtrlClear:
 		if err := sess.Clear(); err != nil {
 			con.Line(st.Warn("  " + err.Error()))
@@ -1059,8 +1097,8 @@ func applyControl(ctx context.Context, sess chatSession, con *termui.Console, c 
 		con.Line(st.Info("  mode: " + m.String() + modeBlurb(m)))
 	case session.CtrlStatus:
 		pct, _, _ := sess.ContextUsage()
-		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · context roots: %d · %s",
-			sess.PhaseNow(), sess.CurrentMode(), len(sess.ReadRootsNow()), con.Gauge(pct))))
+		con.Line(st.Dim(fmt.Sprintf("  status: %s · mode: %s · questions: %s · context roots: %d · %s",
+			sess.PhaseNow(), sess.CurrentMode(), sess.AskLevelName(), len(sess.ReadRootsNow()), con.Gauge(pct))))
 	case session.CtrlContext:
 		pct, used, window := sess.ContextUsage()
 		if window == 0 {
