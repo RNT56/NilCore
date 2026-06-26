@@ -41,13 +41,37 @@ type ctx struct {
 // field, it never reaches a Step (defence in depth for I7). Values are
 // stringified positionally; the renderer fences them, so a stray newline cannot
 // reshape the tree.
+//
+// A small, fixed set of evidence wrappers (the graduated-auto-approval
+// auto_approve event nests its trust bar / rate / dollar ceilings under the
+// "bar", "rate", and "dollars" objects) is flattened ONE level deep: only their
+// inner scalar keys that are themselves on the allowlist are surfaced, under
+// their inner names. Everything else inside a wrapper — and any other nested
+// object — is dropped. The recursion never goes deeper than one level, so a
+// body can never hide in a nested structure (I7).
 func safeDetail(d map[string]any) map[string]string {
 	if len(d) == 0 {
 		return nil
 	}
 	out := map[string]string{}
 	for k, v := range d {
+		// An evidence wrapper that actually carries an object is flattened one
+		// level. The SAME key can arrive as a plain scalar on a different event
+		// (auto_deny's rate_exceeded writes "rate" as an int), so a non-object
+		// value falls through to the scalar allowlist below rather than being
+		// dropped.
+		if evidenceWrappers[k] {
+			if inner, ok := v.(map[string]any); ok {
+				flattenEvidence(inner, out)
+				continue
+			}
+		}
 		if !safeKeys[k] {
+			continue
+		}
+		// A nested object under a non-wrapper key is never surfaced as a blob —
+		// only flat scalars reach Detail.
+		if _, nested := v.(map[string]any); nested {
 			continue
 		}
 		out[k] = stringify(v)
@@ -56,6 +80,29 @@ func safeDetail(d map[string]any) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// flattenEvidence surfaces the allowlisted scalar fields of one evidence wrapper
+// object (auto_approve's "bar"/"rate"/"dollars") into out under their inner
+// names. Anything not on the allowlist, and anything that is itself an object,
+// is dropped — the one-level flatten is the whole story (I7).
+func flattenEvidence(inner map[string]any, out map[string]string) {
+	for k, v := range inner {
+		if !safeKeys[k] {
+			continue
+		}
+		if _, nested := v.(map[string]any); nested {
+			continue
+		}
+		out[k] = stringify(v)
+	}
+}
+
+// evidenceWrappers names the auto_approve evidence sub-objects whose allowlisted
+// scalar fields are flattened one level into Detail. They are metadata wrappers
+// (counts, thresholds, ceilings) — never bodies.
+var evidenceWrappers = map[string]bool{
+	"bar": true, "rate": true, "dollars": true,
 }
 
 // safeKeys is the allowlist of Detail fields the trace is permitted to surface.
@@ -75,6 +122,18 @@ var safeKeys = map[string]bool{
 	"pass": true, "checked": true, "failed": true, "remaining": true,
 	"escalate": true, "proposed": true, "added": true, "dropped": true,
 	"total": true, "count": true,
+	// Graduated-auto-approval audit (GAA): the scope/reason of an
+	// auto_approve / auto_deny / boundary_outcome plus the numeric trust
+	// evidence and envelope bars. Every one is a harness-written scalar (a
+	// count, a threshold, a $/day ceiling, a pass flag) — never a body, never a
+	// secret, never the human prompt string (I7). "rate" appears here for the
+	// scalar form auto_deny writes; the object form on auto_approve is flattened
+	// to "count"/"max_per_day" via evidenceWrappers.
+	"scope": true, "reason": true, "chain": true, "chain_ok": true,
+	"green": true, "min_successes": true, "min_sample": true,
+	"recency_days": true, "recent_ok": true, "last_green": true,
+	"rate": true, "max_per_day": true, "charged": true, "max_dollars_day": true,
+	"protected": true, "environment": true,
 }
 
 // stringify renders a metadata scalar deterministically. Booleans and integers
@@ -184,6 +243,47 @@ func annotate(kind string, d map[string]any, c *ctx) (title, why string) {
 		title = "human gate: " + verdict
 		why = fmt.Sprintf("%s is irreversible (class %s), so it required human sign-off",
 			act, fallback(detailStr(d, "class"), "irreversible"))
+
+	// --- graduated auto-approval: the gate the agent cleared on earned trust ---
+	// auto_approve / auto_deny are the GradedApprover's decision; boundary_outcome
+	// is the verifier verdict that FEEDS earned trust. All three are projected from
+	// harness-written metadata only (action/scope/reason + numeric evidence) — never
+	// the human prompt string, a secret, or a model body (I7).
+	case kind == "auto_approve":
+		act := fallback(detailStr(d, "action"), "an action")
+		scope := detailStr(d, "scope")
+		title = "auto-approved " + act
+		if scope != "" {
+			title += " on " + scope
+		}
+		why = "earned trust met the operator envelope bar, so this cleared without a human"
+
+	case kind == "auto_deny":
+		act := fallback(detailStr(d, "action"), "an action")
+		title = act + " fell to the human"
+		if r := detailStr(d, "reason"); r != "" {
+			why = "auto-approval declined (" + r + ") — the human gate decides this one"
+		} else {
+			why = "auto-approval declined — the human gate decides this one"
+		}
+
+	case kind == "boundary_outcome":
+		act := fallback(detailStr(d, "action"), "an action")
+		scope := detailStr(d, "scope")
+		passed, _ := detailBool(d, "passed")
+		if passed {
+			title = "verifier-green " + act + " boundary"
+			if scope != "" {
+				title += " on " + scope
+			}
+			why = "the verifier passed this boundary — it earns trust toward future auto-approval (never a self-report)"
+		} else {
+			title = act + " boundary did not pass the verifier"
+			if scope != "" {
+				title += " on " + scope
+			}
+			why = "the verifier rejected this boundary — it earns no trust"
+		}
 
 	// --- advisor consult: the recovery escalation -----------------------------
 	case kind == "advisor_consult", kind == "advisor":
