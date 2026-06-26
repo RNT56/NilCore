@@ -1191,19 +1191,31 @@ func applySaveVerb(sess chatSession, con *termui.Console, arg string) {
 		con.Line(st.Warn("  cannot save: " + err.Error()))
 		return
 	}
-	path, err := resolveSavePath(base, arg)
+	path, err := writeLastAnswer(base, arg, content)
 	if err != nil {
 		con.Line(st.Warn("  cannot save: " + err.Error()))
 		return
+	}
+	con.Line(st.Info("  saved the last answer to " + path))
+}
+
+// writeLastAnswer resolves arg against base via resolveSavePath's four containment
+// rules, then writes content (with a trailing newline) to the resolved path and
+// returns it. It is the shared core of the /save verb so the REPL and the TUI front
+// doors persist the agent's last answer identically — the security-critical path
+// confinement lives once, in resolveSavePath.
+func writeLastAnswer(base, arg, content string) (string, error) {
+	path, err := resolveSavePath(base, arg)
+	if err != nil {
+		return "", err
 	}
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		con.Line(st.Warn("  cannot save: " + err.Error()))
-		return
+		return "", err
 	}
-	con.Line(st.Info("  saved the last answer to " + path))
+	return path, nil
 }
 
 // resolveSavePath validates and resolves a /save target against base (the working
