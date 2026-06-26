@@ -69,9 +69,14 @@ func (e *askEntry) blocks(token string) []map[string]any {
 			"value": "ask:" + token + ":done", "action_id": "ask_done", "style": "primary",
 		})
 	}
+	hint := "tap a choice, or just type your answer"
+	if e.multi {
+		hint = "toggle choices then tap Done, or just type your answer"
+	}
 	return []map[string]any{
 		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*❓ " + e.question + "*"}},
 		{"type": "actions", "elements": elems},
+		{"type": "context", "elements": []map[string]any{{"type": "mrkdwn", "text": hint}}},
 	}
 }
 
@@ -96,30 +101,21 @@ func (b *Bot) PostChoices(ctx context.Context, threadID, question string, choice
 	return nil
 }
 
-// askActionPayload is the decoded interesting fields of a Block Kit block_actions event.
+// askActionPayload is the decoded interesting fields of a Block Kit block_actions event:
+// the action value and the clicking user. (The prompt's channel + message ts come from
+// the registered askEntry, not the payload, so they are not decoded here.)
 type askActionPayload struct {
-	value, user, channel, ts string
+	value, user string
 }
 
-// askAction extracts the ask-button action from an interactive (block_actions) payload:
-// the value, the clicking user, and the channel + message ts (for an in-place toggle
-// re-render).
+// askAction extracts the ask-button action (value + clicking user) from an interactive
+// (block_actions) payload.
 func askAction(payload json.RawMessage) (askActionPayload, bool) {
 	var p struct {
 		Type string `json:"type"`
 		User struct {
 			ID string `json:"id"`
 		} `json:"user"`
-		Channel struct {
-			ID string `json:"id"`
-		} `json:"channel"`
-		Container struct {
-			ChannelID string `json:"channel_id"`
-			MessageTS string `json:"message_ts"`
-		} `json:"container"`
-		Message struct {
-			TS string `json:"ts"`
-		} `json:"message"`
 		Actions []struct {
 			Value string `json:"value"`
 		} `json:"actions"`
@@ -127,15 +123,7 @@ func askAction(payload json.RawMessage) (askActionPayload, bool) {
 	if json.Unmarshal(payload, &p) != nil || p.Type != "block_actions" || len(p.Actions) == 0 {
 		return askActionPayload{}, false
 	}
-	ch := p.Channel.ID
-	if ch == "" {
-		ch = p.Container.ChannelID
-	}
-	ts := p.Message.TS
-	if ts == "" {
-		ts = p.Container.MessageTS
-	}
-	return askActionPayload{value: p.Actions[0].Value, user: p.User.ID, channel: ch, ts: ts}, true
+	return askActionPayload{value: p.Actions[0].Value, user: p.User.ID}, true
 }
 
 // handleAskAction turns an "ask:<token>:<action>" click into the authorized answer task,
@@ -191,10 +179,7 @@ func (b *Bot) consume(token string) {
 // updateBlocks re-renders the prompt's buttons in place (chat.update) after a toggle so
 // the operator sees the ☑ checkmarks accumulate.
 func (b *Bot) updateBlocks(ctx context.Context, ent *askEntry, token string) {
-	var r struct {
-		OK bool `json:"ok"`
-	}
 	_ = b.apiPost(ctx, "chat.update", b.botToken, map[string]any{
 		"channel": ent.channel, "ts": ent.ts, "text": "❓ " + ent.question, "blocks": ent.blocks(token),
-	}, &r)
+	}, nil)
 }

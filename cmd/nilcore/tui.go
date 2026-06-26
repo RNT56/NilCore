@@ -514,9 +514,8 @@ func (m tuiModel) onAskKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.picked[a.cursor] = !a.picked[a.cursor]
 		}
 	case "enter":
-		if !a.multi && len(a.choices) > 0 {
-			return m.deliverAsk(fmt.Sprintf("%d", a.cursor+1))
-		}
+		// a.line() already returns the cursor's index for a single-select with no typed
+		// text (the only choosing-mode state), the picks for multi, or the free text.
 		return m.deliverAsk(a.line())
 	case "t", "tab":
 		a.typing = true

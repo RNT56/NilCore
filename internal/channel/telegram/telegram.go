@@ -81,8 +81,7 @@ type tgCallback struct {
 		ID int64 `json:"id"`
 	} `json:"from"`
 	Message struct {
-		MessageID int64 `json:"message_id"`
-		Chat      struct {
+		Chat struct {
 			ID int64 `json:"id"`
 		} `json:"chat"`
 	} `json:"message"`
