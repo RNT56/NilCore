@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,11 +33,14 @@ type Bot struct {
 	http    *http.Client
 
 	offset  int                   // last seen update_id
-	askSeq  atomic.Int64          // unique gate-callback ids
-	pending []channel.TaskRequest // task messages seen while awaiting a gate answer
+	askSeq  atomic.Int64          // unique gate/ask-callback ids
+	pending []channel.TaskRequest // task messages (and resolved ask taps) seen while awaiting a gate answer
 
-	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
-	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
+	amu  sync.Mutex           // guards asks
+	asks map[string]*askEntry // ask_user choice prompts awaiting a tap, by correlation token
+
+	authorize func(string) bool // who may answer a gate / ask (nil = anyone; serve sets it)
+	log       *eventlog.Log     // for recording rejected gate/ask clicks (may be nil)
 }
 
 var _ channel.Channel = (*Bot)(nil)
@@ -46,6 +50,7 @@ func New(token string) *Bot {
 	return &Bot{
 		token:   token,
 		baseURL: defaultAPIBase,
+		asks:    map[string]*askEntry{},
 		// Slightly longer than the long-poll timeout below.
 		http: &http.Client{Timeout: 70 * time.Second},
 	}
@@ -76,7 +81,8 @@ type tgCallback struct {
 		ID int64 `json:"id"`
 	} `json:"from"`
 	Message struct {
-		Chat struct {
+		MessageID int64 `json:"message_id"`
+		Chat      struct {
 			ID int64 `json:"id"`
 		} `json:"chat"`
 	} `json:"message"`
@@ -115,6 +121,20 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 		}
 		var got *channel.TaskRequest
 		for _, u := range ups {
+			// An ask_user button tap (callback) becomes an ORDINARY authorized task
+			// request carrying the formatted answer line — it then flows through the
+			// same intake→Permit→Turn→Resolve path a typed message does (I7: no new
+			// trust promotion). A toggle/unauthorized/stale tap yields nil.
+			if u.CallbackQuery != nil {
+				if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
+					if got == nil {
+						got = tr
+					} else {
+						b.pending = append(b.pending, *tr)
+					}
+				}
+				continue
+			}
 			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
 				continue
 			}
@@ -287,6 +307,16 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 				}
 				_ = b.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": u.CallbackQuery.ID}, nil)
 				return strings.HasPrefix(u.CallbackQuery.Data, "yes:"), nil
+			}
+			// An ask_user button tap that lands in THIS gate's poll loop (the gate and
+			// Receive can race the shared offset) must not be dropped: resolve it and
+			// buffer the resulting answer task so Receive delivers it. A toggle/stale/
+			// unauthorized tap yields nil.
+			if u.CallbackQuery != nil && strings.HasPrefix(u.CallbackQuery.Data, "ask:") {
+				if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
+					b.pending = append(b.pending, *tr)
+				}
+				continue
 			}
 			if u.Message != nil && strings.TrimSpace(u.Message.Text) != "" {
 				b.pending = append(b.pending, toRequest(u.Message)) // buffer, don't drop

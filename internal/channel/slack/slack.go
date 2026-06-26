@@ -52,8 +52,9 @@ type Bot struct {
 	askSeq  atomic.Int64
 	pending []channel.TaskRequest
 
-	mu     sync.Mutex             // guards drafts
+	mu     sync.Mutex             // guards drafts + asks
 	drafts map[string]*slackDraft // per-thread in-place streaming message (chat.update)
+	asks   map[string]*askEntry   // ask_user choice prompts awaiting a tap, by token
 
 	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
 	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
@@ -76,7 +77,7 @@ var (
 // New returns a bot for the given SLACK_APP_TOKEN (socket) and SLACK_BOT_TOKEN.
 func New(appToken, botToken string) *Bot {
 	b := &Bot{appToken: appToken, botToken: botToken, apiBase: defaultAPIBase,
-		http: &http.Client{Timeout: 30 * time.Second}, drafts: map[string]*slackDraft{}}
+		http: &http.Client{Timeout: 30 * time.Second}, drafts: map[string]*slackDraft{}, asks: map[string]*askEntry{}}
 	b.connect = b.dialSocket
 	return b
 }
@@ -115,6 +116,18 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 		}
 		if ev.EnvelopeID != "" {
 			_ = b.src.Ack(ctx, ev.EnvelopeID)
+		}
+		if ev.Type == "interactive" {
+			// An ask_user button tap becomes an ORDINARY authorized task request (the
+			// answer line, Sender=clicker) — it flows through the same intake→Permit→
+			// Turn→Resolve path a typed message does (I7). A toggle/unauthorized/stale
+			// action yields nil.
+			if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
+				if tr := b.handleAskAction(ctx, a); tr != nil {
+					return *tr, nil
+				}
+				continue
+			}
 		}
 		if ev.Type == "events_api" {
 			if tr, ok := messageRequest(ev.Payload); ok {
@@ -247,6 +260,13 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 					continue // ignore; keep waiting for an authorized responder
 				}
 				return strings.HasPrefix(val, "yes:"), nil
+			}
+			// An ask_user tap landing in THIS gate's loop must not be dropped: resolve
+			// it and buffer the answer task so Receive delivers it.
+			if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
+				if tr := b.handleAskAction(ctx, a); tr != nil {
+					b.pending = append(b.pending, *tr)
+				}
 			}
 		case "events_api":
 			if tr, ok := messageRequest(ev.Payload); ok {
