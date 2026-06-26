@@ -59,6 +59,14 @@ func mintBlastBudget(preset string, log *eventlog.Log) *blastbudget.Budget {
 // event's `dollars.charged` whose Time is today and pre-charges that total. Best-effort
 // and READ-ONLY: a missing/unreadable log or a malformed line just contributes nothing
 // (a fresh install has no prior spend). A nil budget or empty path is a no-op.
+//
+// CONSERVATIVE BY DESIGN: it counts EVERY auto-approval that occurred today, including
+// any taken while a prior run was unfenced (`-blast-radius off`, so no budget was
+// charged at the time). The log records `dollars.charged` regardless of whether a budget
+// was attached, and the spend genuinely happened, so a newly-fenced run accounts for the
+// day's full auto-approval $ rather than under-counting it — the fail-safe direction for
+// a ceiling. (There is no over-count within a process: the live charge happens for NEW
+// decisions, the rebuild only re-establishes PAST ones at mint time.)
 func rebuildBlastDay(b *blastbudget.Budget, logPath string) {
 	if b == nil || logPath == "" {
 		return

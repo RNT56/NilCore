@@ -67,9 +67,15 @@ func logKey() []byte {
 // its hash chain) is also written to the store, while the JSONL file remains
 // available as an export. Append's signature and all callers are unchanged.
 func (l *Log) UseStore(s *store.Store) {
-	if l != nil {
-		l.store = s
+	if l == nil {
+		return
 	}
+	// Set under the lock so the write is properly synchronized with a concurrent
+	// Append that reads l.store under the same lock (these are normally set once at
+	// startup, before any Append, but the lock makes that race-free regardless).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.store = s
 }
 
 // OnAppend registers an optional hook called with each event AFTER it is durably
@@ -80,9 +86,14 @@ func (l *Log) UseStore(s *store.Store) {
 // the authoritative append-only log (I5). nil (the default) installs nothing, so an
 // unwired log is byte-identical. Set it once, before traffic.
 func (l *Log) OnAppend(fn func(e Event)) {
-	if l != nil {
-		l.onAppend = fn
+	if l == nil {
+		return
 	}
+	// Set under the lock so the write is synchronized with a concurrent Append that
+	// reads l.onAppend under the same lock (set once at startup in practice).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onAppend = fn
 }
 
 // Open opens (creating if needed) the log at path, continuing the hash chain and

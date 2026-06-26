@@ -1941,6 +1941,13 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 // is returned UNCHANGED, so an unfenced run is byte-identical. The same *blastbudget
 // instance is shared across every worktree of a run, so the wall fence bounds the run,
 // not each box independently.
+//
+// KNOWN LIMITATION: the wall-time fence is wired into the container backend only (the
+// Blast field lives on *sandbox.Container). The host-native Linux namespace backend
+// (sandbox.Namespace, Phase 7) carries no wall fence, so under it the wall axis of
+// -blast-radius is not enforced (the host/irreversible/$ axes still apply, at the egress
+// proxy and the gate). The container backend is the default; this is a documented gap,
+// not a silent failure.
 func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
 	if b == nil {
 		return box
