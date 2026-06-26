@@ -102,6 +102,7 @@ type buildFlags struct {
 	budget      *float64
 	deadline    *time.Duration
 	maxSteps    *int
+	blastRadius *string
 }
 
 func registerBuildFlags(fs *flag.FlagSet) buildFlags {
@@ -123,6 +124,7 @@ func registerBuildFlags(fs *flag.FlagSet) buildFlags {
 		budget:      fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
 		deadline:    fs.Duration("deadline", 2*time.Hour, "wall-clock ceiling for the whole run"),
 		maxSteps:    fs.Int("max-steps", 80, "tool-call budget for each role-worker and the supervisor's own coding pass"),
+		blastRadius: fs.String("blast-radius", "off", "blast-radius envelope for auto-approval runs: off | tight | standard (bounds auto-approval count, sandbox wall-time, and per-UTC-day auto-approval $); off = unfenced, byte-identical"),
 	}
 }
 
@@ -193,7 +195,7 @@ func buildMain(args []string) {
 		// wrapped with graduated auto-approval ONLY when an operator envelope is
 		// configured; with none, this returns the console approver unchanged
 		// (byte-identical default-off). The blast meter is wired by BR-T05.
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, nil),
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, mintBlastBudget(*bf.blastRadius, log)),
 	})
 	if err != nil {
 		fatal(err)

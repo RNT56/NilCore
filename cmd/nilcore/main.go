@@ -493,6 +493,7 @@ type commonFlags struct {
 	dir, backendName, backends, preferBackend, runtime, image, checkCmd, logPath, config, sandboxPref *string
 	maxSteps, advisorMaxCalls, escalateAfter, raceN                                                   *int
 	autoSupervise                                                                                     *bool
+	blastRadius                                                                                       *string
 }
 
 func registerCommon(fs *flag.FlagSet) commonFlags {
@@ -521,6 +522,7 @@ func registerCommon(fs *flag.FlagSet) commonFlags {
 		escalateAfter:   fs.Int("escalate-after", 2, "auto-consult the advisor after N consecutive verifier failures (0 = off)"),
 		raceN:           fs.Int("race-n", 1, "on a verify failure, race N parallel attempts and keep a verifier-green one (1 = off; adaptive — only fires after the single attempt fails)"),
 		autoSupervise:   fs.Bool("auto-supervise", false, "let a complex goal opportunistically scale up to the supervised project loop (bounded by the same caps as `nilcore build`); off = single-task, byte-identical"),
+		blastRadius:     fs.String("blast-radius", "off", "blast-radius envelope for unattended / auto-approval runs: off | tight | standard (bounds distinct egress hosts, auto-approval count, sandbox wall-time, and per-UTC-day auto-approval $); off = unfenced, byte-identical"),
 	}
 }
 
