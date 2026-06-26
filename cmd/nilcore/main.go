@@ -115,6 +115,8 @@ func main() {
 		experienceMain(args[1:])
 	case "lessons":
 		lessonsMain(args[1:])
+	case "flywheel":
+		flywheelMain(args[1:])
 	case "capability":
 		capabilityMain(args[1:])
 	case "trace", "why":
@@ -1083,6 +1085,16 @@ func serveMain(args []string) {
 	// already open here, so rotating its path mid-serve would not affect the live
 	// inode; rotation-while-open needs eventlog support and is out of scope.)
 	go runMaintenanceTicker(ctx, absDir, log)
+
+	// SIF-T08: the optional self-improvement flywheel as a bounded serve-background
+	// cadence. DEFAULT-OFF — only when NILCORE_FLYWHEEL is set. The orchestrator is
+	// built HERE (at startup) so a missing model key fails loudly at boot rather than
+	// inside the goroutine; each tick runs one bounded cycle (verifier + gate own every
+	// ship — I2). It never edits the verifier of record (selfimprove.DefaultScope).
+	if os.Getenv("NILCORE_FLYWHEEL") != "" {
+		fwLoop := newFlywheelLoop(buildRunOrchestrator(c, b, log, absDir), log, *c.logPath, 1, time.Minute)
+		go runFlywheelTicker(ctx, fwLoop)
+	}
 
 	// One shared concurrency gate caps how many drives run at once across ALL
 	// threads, so a burst of conversations queues rather than overrunning the host's

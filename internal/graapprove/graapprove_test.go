@@ -533,6 +533,40 @@ func TestApproveStructuredOverDollarCeiling(t *testing.T) {
 	assertDenyReason(t, sink, "over_ceiling")
 }
 
+// SIF-T07: the self-improve auto-approval CLASS is its OWN double opt-in.
+func TestSelfImproveGate(t *testing.T) {
+	humanAsked := false
+	human := func(string) bool { humanAsked = true; return false }
+	sink := &recSink{}
+	g := SelfImproveGate(human, sink)
+
+	// Default-off: env unset ⇒ delegate to the human (and return the human's verdict).
+	t.Setenv(EnvSelfImproveAutoApprove, "")
+	if g("self-edit: docs/PERSONA.md") {
+		t.Fatal("default-off must return the human's verdict (deny here)")
+	}
+	if !humanAsked {
+		t.Fatal("default-off must consult the human")
+	}
+	if len(sink.events) != 0 {
+		t.Fatal("default-off must emit no auto-approval event")
+	}
+
+	// Opted in: auto-approve WITHOUT consulting the human, and audit it.
+	humanAsked = false
+	t.Setenv(EnvSelfImproveAutoApprove, "1")
+	if !g("self-edit: docs/PERSONA.md") {
+		t.Fatal("opted-in must auto-approve the earned self-edit")
+	}
+	if humanAsked {
+		t.Fatal("opted-in must NOT consult the human")
+	}
+	ev, ok := sink.last()
+	if !ok || ev.kind != "auto_approve_selfimprove" {
+		t.Fatalf("opted-in must emit an audited auto_approve_selfimprove event, got %+v", sink.events)
+	}
+}
+
 // BR-T04: every auto-approval consumes one slot of the SHARED blast meter's
 // irreversible axis (composition law min(P5, blast)); a breach falls through to the
 // human, regardless of how much earned trust the clause has.
