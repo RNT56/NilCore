@@ -39,15 +39,33 @@ func typeLine(t *testing.T, m tuiModel, line string) tuiModel {
 // readyTUI builds a sized, ready TUI model over a real (log-free) Session.
 func readyTUI(t *testing.T, sess *session.Session) tuiModel {
 	t.Helper()
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq))
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
 	return drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+}
+
+// TestTUIGreetingAndModeIndicator proves the boot greeting is seeded into the
+// transcript (the alt-screen no longer launches blank) and that the pinned mode is
+// shown in the always-visible status bar (parity with the REPL's mode-colored prompt).
+func TestTUIGreetingAndModeIndicator(t *testing.T) {
+	sess := session.New("t", "local", t.TempDir(), nil)
+	sess.SetMode(session.ModePlan)
+	greeting := []string{"↻ resumed the previous conversation", "nilcore tui — talk to the agent"}
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), greeting)
+	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	if joined := strings.Join(m.lines, "\n"); !strings.Contains(joined, "resumed the previous conversation") {
+		t.Errorf("boot greeting not seeded into the transcript:\n%s", joined)
+	}
+	if v := m.View(); !strings.Contains(v, "plan") {
+		t.Errorf("status bar missing the pinned mode indicator:\n%s", v)
+	}
 }
 
 // TestTUIFoldsEvents proves the emit→transcript folding: streamed tokens accumulate
 // into one line, and a framed event commits that line and appends its own.
 func TestTUIFoldsEvents(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "anthropic:claude-x", newTUIEmitter(), make(chan gateReq))
+	m := newTUIModel(context.Background(), sess, "anthropic:claude-x", newTUIEmitter(), make(chan gateReq), nil)
 
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	if !m.ready {
@@ -74,7 +92,7 @@ func TestTUIFoldsEvents(t *testing.T) {
 // back to the blocked Approve call.
 func TestTUIGateModal(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq))
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	reply := make(chan bool, 1)
@@ -131,7 +149,7 @@ func TestTUIEmitterKeepsFramesNonBlocking(t *testing.T) {
 // (the defensive split that stops two turns merging into one transcript line).
 func TestTUIBatchFoldsAndSplitsTurns(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq))
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	m = drive(t, m, emitBatchMsg([]emit.Event{

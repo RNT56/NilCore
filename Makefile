@@ -1,4 +1,4 @@
-.PHONY: build vet test verify run tidy tui tui-verify desktop-e2e desktop-image desktop-mac desktop-mac-smoke desktop-mac-probe
+.PHONY: build vet test verify test-race run tidy tui tui-verify desktop-e2e desktop-image desktop-mac desktop-mac-smoke desktop-mac-probe
 
 build:
 	go build ./...
@@ -12,6 +12,13 @@ test:
 # The default check command the agent runs to decide "done". Point nilcore at
 # its own repo with -verify "make verify" to have it dogfood this gate.
 verify: build vet test
+
+# Race-detector pass over the concurrency-bearing packages (the conversational
+# session lifecycle). NOT folded into `verify` (the race build is slower and the
+# detector needs CGO), but the canonical gate for changes to session/Cancel/Turn —
+# run it after touching the drive lifecycle. See cancel_race_test.go.
+test-race:
+	go test -race ./internal/session/...
 
 run:
 	go run ./cmd/nilcore $(ARGS)
