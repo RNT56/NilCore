@@ -36,6 +36,41 @@ func TestWrapAutoApprove_WrapsWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestEmitBoundaryOutcome_FoldsToEarnedTrust(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "e.jsonl")
+	log, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	// A verifier-green promote boundary (the shape swarm.run / project.converge emit).
+	emitBoundaryOutcome(log, policy.PromoteToBase.String(), "feature/x", true)
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// The event must keep the hash chain intact (I5)...
+	if err := eventlog.Verify(path); err != nil {
+		t.Fatalf("emitBoundaryOutcome broke the event-log chain: %v", err)
+	}
+	// ...and fold into earned trust as one verifier-green sample (the GAA-T04 → GAA-T05
+	// hand-off that makes graduated auto-approval able to fire).
+	view, err := graapprove.BuildTrust(path)
+	if err != nil {
+		t.Fatalf("BuildTrust: %v", err)
+	}
+	if !view.ChainOK {
+		t.Fatal("a clean chain must report ChainOK=true")
+	}
+	got := view.Tally(graapprove.ScopeKey{Type: policy.PromoteToBase.String(), Scope: "feature/x"})
+	if got.Green != 1 || got.Total != 1 {
+		t.Fatalf("boundary_outcome must fold to 1 green / 1 total, got %+v", got)
+	}
+	// A self-report (passed=false) must NOT count as a green (I2: only verifier verdicts).
+	other := view.Tally(graapprove.ScopeKey{Type: policy.PromoteToBase.String(), Scope: "feature/never"})
+	if other.Green != 0 || other.Total != 0 {
+		t.Fatalf("an un-emitted scope must be empty, got %+v", other)
+	}
+}
+
 func TestAutoApproveSink_AppendsToChain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "e.jsonl")
 	log, err := eventlog.Open(path)

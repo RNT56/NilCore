@@ -29,9 +29,10 @@ func (s autoApproveSink) Emit(kind string, detail map[string]any) {
 // WHEN an operator envelope is configured (cfg.AutoApprove non-empty); otherwise
 // it returns the human approver UNCHANGED — the byte-identical default-off path.
 // logPath feeds the earned-trust replay (fail-closed over a broken chain); blast
-// is the shared blast-radius meter (nil until BR-T05 wires it). A nil human (e.g.
-// the swarm approver, which never auto-approves) is returned as-is so we never
-// construct a graded approver around a missing human.
+// is the shared blast-radius meter minted from -blast-radius (nil when "off" — the
+// default — so the run is unfenced). A nil human (e.g. the swarm approver, which
+// never auto-approves) is returned as-is so we never construct a graded approver
+// around a missing human.
 func wrapAutoApprove(human policy.Approver, cfg onboard.Config, logPath string, log *eventlog.Log, blast *blastbudget.Budget) policy.Approver {
 	if human == nil || cfg.AutoApprove.Empty() {
 		return human
