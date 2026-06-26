@@ -19,6 +19,7 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/summarize"
 )
 
@@ -231,6 +232,12 @@ type DriveInput struct {
 	// every headless drive and for supervised/project sub-drives (a worker asks its
 	// supervisor, not the human). Captured at launch like Inbox/Mode.
 	AskUser AskerHandle
+	// Gate is the session-backed irreversible-action approver bound to this drive's ctx
+	// — it parks AwaitingGate and resolves via a typed Turn instead of reading os.Stdin.
+	// Set only for an attended session; the chat REPL wiring uses it in place of
+	// ConsoleApprover (the TUI/serve keep their own modal/channel approver). nil ⇒ the
+	// closure falls back to its own approver.
+	Gate policy.Approver
 }
 
 // AskerHandle is the minimal handle the native loop needs onto the attended ask

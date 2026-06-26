@@ -39,6 +39,7 @@ import (
 
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/summarize"
 )
 
@@ -88,6 +89,10 @@ type NativeRun struct {
 	// (ask_user / set_ask_level). nil for every headless drive ⇒ the tools are never
 	// advertised (the structural never-block guarantee, I3/I4).
 	AskUser AskerHandle
+	// Gate is the session-backed irreversible-action approver (parks AwaitingGate,
+	// resolves via a typed Turn). The chat REPL native closure uses it in place of
+	// ConsoleApprover; nil ⇒ the closure keeps its own approver.
+	Gate policy.Approver
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
@@ -144,6 +149,7 @@ func (d *nativeDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 		Mode:      in.Mode,      // capability captured at launch (read-only vs full)
 		ReadRoots: in.ReadRoots, // read-only context roots captured at launch
 		AskUser:   in.AskUser,   // attended ask seam (nil for headless / supervised)
+		Gate:      in.Gate,      // session-backed gate approver (chat REPL; nil otherwise)
 	})
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("native drive: %w", err)

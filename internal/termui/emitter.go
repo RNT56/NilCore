@@ -98,6 +98,12 @@ func (e *ConsoleEmitter) Emit(ev emit.Event) {
 		} else {
 			e.c.Line("  " + st.Info("? ") + ev.Text)
 		}
+	case emit.KindGate:
+		// An irreversible-action approval (the session-backed gate): a bold amber line
+		// with the action and the y/N prompt. The REPL settles its spinner and shows the
+		// prompt; a typed y/n Turn answers it (no stdin race).
+		e.c.Line("  " + st.Warn(st.Bold("⚠ GATE — irreversible:")) + " " + ev.Text)
+		e.c.Line("  " + st.Dim("approve? type ") + st.Success("y") + st.Dim(" or ") + st.Danger("n"))
 	default:
 		e.c.Line("  " + ev.Text)
 	}

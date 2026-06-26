@@ -302,6 +302,21 @@ func (d chatDeps) approverOr() policy.Approver {
 	return policy.NewConsoleApprover(os.Stdin, os.Stdout)
 }
 
+// gateApproverFor picks a chat drive's irreversible-action approver: the TUI's injected
+// modal approver if present (d.approver); otherwise the SESSION-backed gate approver
+// (the line-REPL — it parks AwaitingGate and is answered by a typed y/n Turn, so the
+// REPL keeps its single stdin reader instead of a ConsoleApprover racing it); falling
+// back to a ConsoleApprover only when neither is wired (a non-interactive/test build).
+func gateApproverFor(d chatDeps, gate policy.Approver) policy.Approver {
+	if d.approver != nil {
+		return d.approver
+	}
+	if gate != nil {
+		return gate
+	}
+	return d.approverOr()
+}
+
 // resolveWeb computes the effective egress allowlist and search backend from the
 // persisted config (set by `nilcore init`) plus the -allow-egress flag — so web
 // access is configured ONCE and then just works, not a flag the user must remember.
@@ -688,7 +703,11 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			Log:      d.log,
 			Router:   agent.SingleRouter{},
 			Spawner:  agent.NoSpawner{},
-			Approver: d.approverOr(),
+			// The line-REPL uses the SESSION-backed gate approver (in.Gate) instead of a
+			// ConsoleApprover that would race the REPL's single stdin reader: a gate parks
+			// AwaitingGate and is answered by a typed y/n Turn. The TUI keeps its modal
+			// approver (d.approver != nil), so it is used as-is.
+			Approver: gateApproverFor(d, in.Gate),
 			RaceN:    *d.flags.common.raceN,
 		}
 
