@@ -54,6 +54,7 @@ import (
 	"nilcore/internal/project"
 	"nilcore/internal/roster"
 	"nilcore/internal/sandbox"
+	"nilcore/internal/session"
 	"nilcore/internal/spawn"
 	"nilcore/internal/strongcap"
 	"nilcore/internal/summarize"
@@ -1386,4 +1387,35 @@ func truncate(s string, n int) string {
 // naming, never a security boundary (stdlib-arithmetic only, I6).
 func shortID() string {
 	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), buildSeq.Add(1))
+}
+
+// superAskFunc adapts the session's ask handle into the supervisor's AskUser seam,
+// converting the super-local question/answer value types to the backend ones the
+// session ask box speaks. A nil handle yields nil (so the supervisor's ask_user tool
+// stays unadvertised on a headless run). The supervisor's question thus renders through
+// every per-surface UI and its answer routes back through the one authorized path —
+// the same machinery the native loop uses.
+func superAskFunc(h session.AskerHandle) super.AskFunc {
+	if h == nil {
+		return nil
+	}
+	return func(ctx context.Context, qs []super.AskQuestion) ([]super.AskAnswer, error) {
+		bq := make([]backend.AskQuestion, len(qs))
+		for i, q := range qs {
+			bc := make([]backend.AskChoice, len(q.Choices))
+			for j, c := range q.Choices {
+				bc[j] = backend.AskChoice{Label: c.Label, Detail: c.Detail}
+			}
+			bq[i] = backend.AskQuestion{Prompt: q.Prompt, Choices: bc, MultiSelect: q.MultiSelect}
+		}
+		ba, err := h.Ask(ctx, bq)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]super.AskAnswer, len(ba))
+		for i, a := range ba {
+			out[i] = super.AskAnswer{Selected: a.Selected, Custom: a.Custom}
+		}
+		return out, nil
+	}
 }

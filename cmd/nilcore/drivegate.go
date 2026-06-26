@@ -85,8 +85,8 @@ func gateSupervise(g *driveGate, run session.RunSuperviseFunc) session.RunSuperv
 	if g == nil {
 		return run
 	}
-	return func(ctx context.Context, goal string, seed []model.Message, in session.InboxHandle, out emit.Emitter) (session.DriveOutcome, error) {
-		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, in, out) })
+	return func(ctx context.Context, goal string, seed []model.Message, in session.InboxHandle, out emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
+		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, in, out, ask) })
 	}
 }
 

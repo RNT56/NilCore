@@ -1578,11 +1578,15 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 // conversation wall, and its outcome folds back exactly like a native drive.
 func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunSuperviseFunc {
 	taskID := superviseTaskID(threadID)
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		// Attended over the channel: a live serve thread can answer, so wire the
+		// supervisor's ask_user to this thread's ask box (headless resume builds no
+		// Session, so ask stays nil there).
+		stack.sup.AskUser = superAskFunc(ask)
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := stack.loop.Run(ctx)
 		if err != nil {

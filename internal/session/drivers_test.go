@@ -148,7 +148,7 @@ func TestSuperviseDriverWiresInboxAndOut(t *testing.T) {
 	var gotGoal string
 	var gotInbox InboxHandle
 	var gotOut emit.Emitter
-	run := func(_ context.Context, goal string, _ []model.Message, in InboxHandle, out emit.Emitter) (DriveOutcome, error) {
+	run := func(_ context.Context, goal string, _ []model.Message, in InboxHandle, out emit.Emitter, _ AskerHandle) (DriveOutcome, error) {
 		gotGoal, gotInbox, gotOut = goal, in, out
 		return DriveOutcome{Summary: "shipped feature", Branch: "integ-3", Verified: true}, nil
 	}
@@ -362,7 +362,7 @@ func TestSessionContinueReentersActiveDriver(t *testing.T) {
 	// (the Native/Project/Chat fields are nil), never reach this closure, and leave
 	// seedLen at 0.
 	ran := make(chan struct{}, 1)
-	run := func(_ context.Context, _ string, seed []model.Message, _ InboxHandle, _ emit.Emitter) (DriveOutcome, error) {
+	run := func(_ context.Context, _ string, seed []model.Message, _ InboxHandle, _ emit.Emitter, _ AskerHandle) (DriveOutcome, error) {
 		seedLen = len(seed)
 		ran <- struct{}{}
 		return DriveOutcome{Summary: "more done", Verified: true}, nil

@@ -91,10 +91,12 @@ type NativeRun struct {
 }
 
 // RunSuperviseFunc runs one supervised drive: it constructs/uses a
-// super.Supervisor with the session's Inbox + Out WIRED IN and calls Run(ctx,
-// goal). The user Inbox is the second concurrent source the supervisor folds at
-// the round boundary beside its subagent findings. The wiring site supplies it.
-type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter) (DriveOutcome, error)
+// super.Supervisor with the session's Inbox + Out + AskUser WIRED IN and calls
+// Run(ctx, goal). The user Inbox is the second concurrent source the supervisor
+// folds at the round boundary beside its subagent findings; AskUser lets the
+// supervisor pose a human question between waves (nil ⇒ no ask tool). The wiring
+// site supplies them.
+type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter, ask AskerHandle) (DriveOutcome, error)
 
 // RunProjectFunc runs one whole-project drive: project.Loop.Run(ctx), seeding the
 // loop's initial ContextSummary from the carried WorkState so a follow-up
@@ -194,7 +196,7 @@ func (d *superviseDriver) Drive(ctx context.Context, in DriveInput) (DriveResult
 	if d.run == nil {
 		return DriveResult{}, fmt.Errorf("session: supervise driver has no run closure")
 	}
-	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out)
+	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out, in.AskUser)
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("supervise drive: %w", err)
 	}
