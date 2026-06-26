@@ -1,0 +1,286 @@
+package autosrc
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"nilcore/internal/trigger"
+)
+
+// errUnexpectedItem flags a Source that returned ok=true when the test expected it to
+// unpark on cancellation with no item.
+var errUnexpectedItem = errors.New("unexpected item from blocked source")
+
+// TestPriorityBandsOrdered locks the structural ladder: webhook outranks wake outranks
+// cron outranks file. A refactor that reorders the bands (and so changes which funnel
+// drains first under contention) is caught here, not silently in production.
+func TestPriorityBandsOrdered(t *testing.T) {
+	if PriorityWebhook <= PriorityWake || PriorityWake <= PriorityCron || PriorityCron <= PriorityFile {
+		t.Fatalf("priority bands out of order: file=%d cron=%d wake=%d webhook=%d",
+			PriorityFile, PriorityCron, PriorityWake, PriorityWebhook)
+	}
+	if PriorityFile != 0 {
+		t.Fatalf("PriorityFile must be the zero/default band, got %d", PriorityFile)
+	}
+}
+
+// TestFileSourceMapsSignals proves FileSource turns each read FileSignal into a
+// PriorityFile QueuedSignal with the "file:<name>" Source label and the file's goal,
+// then reports DONE when the channel closes.
+func TestFileSourceMapsSignals(t *testing.T) {
+	ch := make(chan FileSignal, 2)
+	ch <- FileSignal{Name: "ci.txt", Goal: "fix the failing build"}
+	ch <- FileSignal{Name: "todo", Goal: "rename the package"}
+	close(ch)
+
+	src := FileSource{Signals: ch}
+	ctx := context.Background()
+
+	want := []struct {
+		source, goal string
+	}{
+		{"file:ci.txt", "fix the failing build"},
+		{"file:todo", "rename the package"},
+	}
+	for i, w := range want {
+		qs, ok, err := src.Next(ctx)
+		if err != nil || !ok {
+			t.Fatalf("Next[%d]: ok=%v err=%v", i, ok, err)
+		}
+		if qs.Priority != PriorityFile {
+			t.Fatalf("Next[%d] priority = %d, want PriorityFile(%d)", i, qs.Priority, PriorityFile)
+		}
+		if qs.Signal.Source != w.source || qs.Signal.Goal != w.goal {
+			t.Fatalf("Next[%d] = {%q,%q}, want {%q,%q}", i, qs.Signal.Source, qs.Signal.Goal, w.source, w.goal)
+		}
+	}
+
+	// Channel closed ⇒ source DONE: (zero, false, nil), never an error.
+	qs, ok, err := src.Next(ctx)
+	if ok || err != nil {
+		t.Fatalf("exhausted FileSource: got ok=%v err=%v qs=%+v, want false,nil", ok, err, qs)
+	}
+}
+
+// TestFileSourceFromTempDir is the directory-driven analogue: a temp signals dir is
+// read exactly as cmd/nilcore/watch.go does, each entry fed through the adapter, and
+// the resulting QueuedSignals match the dropped files. Hermetic (t.TempDir) and
+// deterministic (sorted compare).
+func TestFileSourceFromTempDir(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.signal": "  goal a  ", // leading/trailing space the caller trims
+		"b.signal": "goal b",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+	}
+
+	// Caller-side poll: read the dir, trim contents, feed the adapter's channel —
+	// mirroring watch.go's pollSignals without importing it.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	ch := make(chan FileSignal, len(entries))
+	for _, e := range entries {
+		body, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %q: %v", e.Name(), err)
+		}
+		ch <- FileSignal{Name: e.Name(), Goal: strings.TrimSpace(string(body))}
+	}
+	close(ch)
+
+	src := FileSource{Signals: ch}
+	var got []string
+	for {
+		qs, ok, err := src.Next(context.Background())
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if qs.Priority != PriorityFile {
+			t.Fatalf("priority = %d, want PriorityFile", qs.Priority)
+		}
+		got = append(got, qs.Signal.Source+"="+qs.Signal.Goal)
+	}
+
+	want := []string{"file:a.signal=goal a", "file:b.signal=goal b"}
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("mismatch at %d: got %v, want %v", i, got, want)
+		}
+	}
+}
+
+// TestCronSourceMapsFire proves a fired cron job (a trigger.Signal the scheduler emits)
+// becomes a PriorityCron QueuedSignal, preserving the scheduler's Source label, and
+// that the source reports DONE on channel close.
+func TestCronSourceMapsFire(t *testing.T) {
+	ch := make(chan trigger.Signal, 1)
+	ch <- trigger.Signal{Source: "cron", Goal: "nightly dependency audit"}
+	close(ch)
+
+	src := CronSource{Fires: ch}
+	qs, ok, err := src.Next(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	if qs.Priority != PriorityCron {
+		t.Fatalf("priority = %d, want PriorityCron(%d)", qs.Priority, PriorityCron)
+	}
+	if qs.Signal.Source != "cron" || qs.Signal.Goal != "nightly dependency audit" {
+		t.Fatalf("signal = %+v, want {cron, nightly dependency audit}", qs.Signal)
+	}
+
+	if _, ok, err := src.Next(context.Background()); ok || err != nil {
+		t.Fatalf("exhausted CronSource: ok=%v err=%v, want false,nil", ok, err)
+	}
+}
+
+// TestWakeSourceMapsFire proves a fired durable wake becomes a PriorityWake
+// QueuedSignal whose Source ties to the thread and whose Goal is the self-note.
+func TestWakeSourceMapsFire(t *testing.T) {
+	ch := make(chan Wake, 1)
+	ch <- Wake{ThreadID: "thread-7", Note: "check whether the flaky test still fails"}
+	close(ch)
+
+	src := WakeSource{Fires: ch}
+	qs, ok, err := src.Next(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+	if qs.Priority != PriorityWake {
+		t.Fatalf("priority = %d, want PriorityWake(%d)", qs.Priority, PriorityWake)
+	}
+	if qs.Signal.Source != "wake:thread-7" || qs.Signal.Goal != "check whether the flaky test still fails" {
+		t.Fatalf("signal = %+v, want {wake:thread-7, check whether the flaky test still fails}", qs.Signal)
+	}
+
+	if _, ok, err := src.Next(context.Background()); ok || err != nil {
+		t.Fatalf("exhausted WakeSource: ok=%v err=%v, want false,nil", ok, err)
+	}
+}
+
+// TestWebhookSignalQueued proves the push-path mapping: an in-hand scmhook signal maps
+// to a PriorityWebhook QueuedSignal preserving the handler's Source and framed Goal.
+func TestWebhookSignalQueued(t *testing.T) {
+	in := trigger.Signal{Source: "issue", Goal: `Address GitHub issue #42 ("flaky login"): read, reproduce, fix.`}
+	qs := WebhookSignal(in).Queued()
+	if qs.Priority != PriorityWebhook {
+		t.Fatalf("priority = %d, want PriorityWebhook(%d)", qs.Priority, PriorityWebhook)
+	}
+	if qs.Signal != in {
+		t.Fatalf("signal = %+v, want %+v (Goal passed through verbatim — I7 data)", qs.Signal, in)
+	}
+}
+
+// TestWebhookSignalEnqueue proves the in-hand webhook signal lands on the daemon's
+// queue via the sanctioned push entry, and that the band is preserved through the
+// queue (the webhook drains ahead of a lower-band file signal).
+func TestWebhookSignalEnqueue(t *testing.T) {
+	d := New(nil, Config{})
+
+	// Push a low-band file signal first, then a webhook: the webhook must drain first.
+	if err := d.Enqueue(QueuedSignal{Signal: trigger.Signal{Source: "file:x", Goal: "low"}, Priority: PriorityFile}); err != nil {
+		t.Fatalf("seed file enqueue: %v", err)
+	}
+	hook := WebhookSignal{Source: "ci", Goal: "CI failed: diagnose and fix."}
+	if err := hook.Enqueue(d); err != nil {
+		t.Fatalf("webhook Enqueue: %v", err)
+	}
+	if d.Backlog() != 2 {
+		t.Fatalf("backlog = %d, want 2", d.Backlog())
+	}
+
+	first, ok, err := d.q.dequeue(context.Background())
+	if err != nil || !ok {
+		t.Fatalf("dequeue: ok=%v err=%v", ok, err)
+	}
+	if first.Signal.Source != "ci" || first.Priority != PriorityWebhook {
+		t.Fatalf("first drained = %+v, want the PriorityWebhook ci signal", first)
+	}
+}
+
+// TestWebhookEnqueueNilDaemonSafe proves the push path is nil-safe exactly like the
+// underlying Daemon.Enqueue: a nil daemon returns ErrQueueClosed, never panics.
+func TestWebhookEnqueueNilDaemonSafe(t *testing.T) {
+	var d *Daemon
+	if err := (WebhookSignal{Source: "ci", Goal: "x"}).Enqueue(d); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("nil-daemon webhook Enqueue: got %v, want ErrQueueClosed", err)
+	}
+}
+
+// TestSourcesHonorCancel proves every pull adapter unparks and returns the context
+// error when its (empty, never-closed) input blocks and ctx is cancelled — the
+// daemon's shutdown contract for a Source.
+func TestSourcesHonorCancel(t *testing.T) {
+	cases := map[string]Source{
+		"file": FileSource{Signals: make(chan FileSignal)},
+		"cron": CronSource{Fires: make(chan trigger.Signal)},
+		"wake": WakeSource{Fires: make(chan Wake)},
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				_, ok, err := src.Next(ctx)
+				if ok {
+					done <- errUnexpectedItem
+					return
+				}
+				done <- err
+			}()
+			time.Sleep(20 * time.Millisecond)
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("%s.Next after cancel: got %v, want context.Canceled", name, err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s.Next did not unpark on cancel", name)
+			}
+		})
+	}
+}
+
+// TestNilChannelSourceBlocksThenCancels proves the default-off posture: a Source over a
+// nil channel produces nothing and exits cleanly on ctx cancel (never a busy-spin, never
+// a panic) — wiring a source with no input is harmless.
+func TestNilChannelSourceBlocksThenCancels(t *testing.T) {
+	src := FileSource{Signals: nil}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := src.Next(ctx)
+		done <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("nil-channel Next: got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("nil-channel Next did not return on cancel")
+	}
+}

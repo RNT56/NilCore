@@ -10,6 +10,8 @@ The single sharpest structural finding driving this scan:
 
 > **NilCore measures everything and learns from almost none of it.** `route.Race` writes a `race_outcome` event for every contest (`internal/route/route.go:61`) and the eval harness emits a structured `Report` with per-config pass-rate/cost/latency (`eval/eval.go:29`) — but **nothing reads either back**. Routing is static (`SingleRouter`; `RaceN` fires identically every run — `cmd/nilcore/main.go:497`), self-improvement is operator-triggered only (`cmd/nilcore/selfimprove.go:43`), and the package doc literally calls routing "adaptive … the data that later earns strength-routing" (`internal/route/route.go:1-5`) — a promise the code has never kept. Principle #9 ("earn improvement from evidence, not vibes") is **architecturally staged but unfulfilled.** This is the richest vein in the codebase.
 
+> **→ Phase 16 — [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) is the consolidated program that closes this loop.** It promotes A6 (cost routing), A8 (lessons-memory), C6 (self-eval flywheel), and C7 (capability budget) below — plus a new headline capability, **graduated auto-approval** (opt-in, fail-closed, earned-trust + operator-envelope) — into one invariant-preserving, default-off, eight-pillar plan (~64 tasks, five waves), designed per-pillar against the real seams and adversarially reviewed against all seven invariants.
+
 ---
 
 ## Method

@@ -37,3 +37,52 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- before P5-T03 the CREATE above is a no-op (IF NOT EXISTS), so an additive
 -- migration adds the column in Go (Store.migrate) — guarded by pragma_table_info
 -- because SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS form.
+
+-- Experience-layer projection (EXP-T02). These three tables are the persistent
+-- backing for the closed-loop experience layer: a *derived* read model rebuilt
+-- from the append-only event log, never a source of truth. They are additive and
+-- default-empty — with no projection written, every existing events/memory/tasks
+-- query is byte-identical. exp_meta tracks the rebuild watermark (last event seq
+-- folded in, whether the hash chain verified, when) so a projection can be torn
+-- down and replayed from the log without mutating history (I5).
+CREATE TABLE IF NOT EXISTS exp_backend_standing (
+    class      TEXT NOT NULL,   -- task class / bucket the standing is scoped to
+    backend    TEXT NOT NULL,   -- native | codex | claude-code | ...
+    races      INTEGER NOT NULL DEFAULT 0,
+    passes     INTEGER NOT NULL DEFAULT 0,
+    cost_usd   REAL    NOT NULL DEFAULT 0,
+    latency_ns INTEGER NOT NULL DEFAULT 0,
+    last_seen  TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (class, backend)
+);
+
+CREATE TABLE IF NOT EXISTS exp_config_standing (
+    config     TEXT PRIMARY KEY,
+    pass_rate  REAL    NOT NULL DEFAULT 0,
+    total_cost REAL    NOT NULL DEFAULT 0,
+    cases      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS exp_meta (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),  -- singleton row
+    source_seq INTEGER NOT NULL DEFAULT 0,          -- last event seq folded into the projection
+    chain_ok   INTEGER NOT NULL DEFAULT 0,          -- 1 if the event hash chain verified at rebuild
+    rebuilt_at TEXT    NOT NULL DEFAULT ''
+);
+
+-- Standing-objectives backlog (AUTO-T01, Pillar 7). The durable backing for the
+-- autonomy daemon's idle self-service queue: each row is one operator-authored
+-- standing intent the agent pulls from when it has no foreground work. Additive
+-- and default-empty — with no objective enqueued, every existing query above is
+-- byte-identical and the backlog source stays off (the default-off contract).
+-- Goal is operator-authored, inert data; the store never interprets it (I7).
+-- min_period_ns stores time.Duration as nanoseconds; last_run is RFC3339Nano UTC
+-- (or '' for the zero time, matching formatTS/parseTS); enabled is 0/1.
+CREATE TABLE IF NOT EXISTS objectives (
+    id            TEXT PRIMARY KEY,
+    goal          TEXT    NOT NULL DEFAULT '',
+    priority      INTEGER NOT NULL DEFAULT 0,
+    enabled       INTEGER NOT NULL DEFAULT 1,   -- 1 enabled, 0 paused (inert, retained)
+    min_period_ns INTEGER NOT NULL DEFAULT 0,   -- minimum spacing between runs (time.Duration ns)
+    last_run      TEXT    NOT NULL DEFAULT ''    -- RFC3339Nano UTC, '' = never run
+);

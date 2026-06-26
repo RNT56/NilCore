@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"nilcore/internal/blastbudget"
 )
 
 // EgressProxy is a forward HTTP/HTTPS proxy that permits only hosts the Egress
@@ -23,6 +25,14 @@ import (
 // network (SSRF defense, audit L1).
 type EgressProxy struct {
 	Egress Egress
+
+	// Blast optionally fences the distinct-egress-host axis of the blast-radius
+	// budget (Phase 16, BR-T02). When non-nil, ServeHTTP charges the destination
+	// host AFTER the allowlist passes but BEFORE any dial/tunnel/forward, so an
+	// unattended run can never reach more than the budgeted number of distinct
+	// hosts. nil = today's behaviour exactly (the leaf is a no-op on a nil
+	// receiver, and an already-charged host is idempotent).
+	Blast *blastbudget.Budget
 
 	// blockIP optionally overrides the destination-IP guard (default
 	// privateOrLocal). Left nil in production; tests relax it to exercise the
@@ -105,6 +115,16 @@ func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostOnly(r)
 	if !p.Egress.Allow(host) {
 		http.Error(w, "egress denied: "+host, http.StatusForbidden)
+		return
+	}
+	// Blast-radius fence: once the host is allowlisted, charge the distinct-host
+	// axis BEFORE any connection. A breach refuses with the same 403 shape as the
+	// allowlist, so no dial/tunnel/forward happens. nil Blast and an
+	// already-charged host are both no-ops (leaf-handled), so this is byte-
+	// identical to today when unwired and idempotent for a repeated host. We read
+	// only the already-parsed host — never the path/query/body (I7).
+	if err := p.Blast.ChargeHost(r.Context(), host); err != nil {
+		http.Error(w, "blast-radius: egress host budget exhausted", http.StatusForbidden)
 		return
 	}
 	if r.Method == http.MethodConnect {

@@ -45,7 +45,11 @@ func watchMain(args []string) {
 	if *openPR {
 		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
 	}
-	gate := policy.NewConsoleApprover(os.Stdin, os.Stdout)
+	// The PR gate is wrapped with graduated auto-approval ONLY when an operator
+	// envelope is configured; with none it is the console approver unchanged
+	// (byte-identical default-off). Free-text gates still go to the human; only a
+	// structured OpenPR can auto-approve, within the earned-trust + envelope bar.
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, nil)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,
@@ -58,6 +62,9 @@ func watchMain(args []string) {
 			}
 			fmt.Printf("self-started: verified=%v — %s\n", out.Verified, out.Summary)
 			if *openPR && out.Verified && out.Branch != "" {
+				// Record the verifier-green boundary so earned trust can accrue for
+				// this (open-pr, branch) before the gate decides who presses the button.
+				emitBoundaryOutcome(log, "open-pr", out.Branch, out.Verified)
 				openGatedPR(ctx, absDir, out.Branch, goal, gate, b.cred, log)
 				// Reclaim the now-redundant LOCAL branch: an approved PR references the
 				// pushed REMOTE branch, a denial pushed nothing — either way the local

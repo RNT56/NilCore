@@ -70,6 +70,22 @@ type Flow struct {
 	Run   func(ctx context.Context, goal string) (verified bool, err error) // run as a task (worktree + verify)
 	Gate  func(action string) bool                                          // human gate before merge
 	Log   *eventlog.Log
+
+	// Measure is an OPTIONAL measured-delta fence (Phase 16, Pillar 4, SIF-T05).
+	// When non-nil, an in-scope, verifier-green candidate must additionally prove
+	// it MEASURABLY improves the agent before it is accepted: the caller supplies
+	// a hook (the flywheel's regression fence over before/after eval reports —
+	// see internal/flywheel/measure) that returns improved=true only when the
+	// candidate cleared its margin. A "not improved" verdict blocks acceptance;
+	// an error aborts the proposal. This fence is purely ADDITIONAL — it never
+	// replaces the scope check, the verifier (I2), or the human gate, each of
+	// which still runs. When Measure is nil the flow is byte-identical to the
+	// operator-triggered propose-edit path: this hook is wholly inert.
+	//
+	// selfimprove stays a lower leaf than the flywheel, so this is a small func
+	// the flywheel satisfies (e.g. a closure over measure.Fence.Improved); this
+	// package never imports internal/flywheel.
+	Measure func(ctx context.Context, p Proposal) (improved bool, err error)
 }
 
 // Propose runs the pipeline: scope-check → run as a verified task → human gate →
@@ -88,6 +104,21 @@ func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error)
 	if !verified {
 		f.Log.Append(eventlog.Event{Kind: "self_edit_unverified"})
 		return false, nil // the checks must pass — green is non-negotiable
+	}
+
+	// Optional measured-delta fence (SIF-T05): when wired, a verifier-green
+	// candidate must ALSO measurably improve the agent before it is kept. This
+	// is additional to — never a replacement for — the verifier above and the
+	// human gate below. Nil Measure leaves the legacy path untouched.
+	if f.Measure != nil {
+		improved, err := f.Measure(ctx, p)
+		if err != nil {
+			return false, fmt.Errorf("self-edit measure: %w", err)
+		}
+		if !improved {
+			f.Log.Append(eventlog.Event{Kind: "self_edit_not_improved", Detail: map[string]any{"goal": p.Goal}})
+			return false, nil // no measured improvement — the candidate is dropped
+		}
 	}
 
 	// Merge is irreversible: always the human gate, no exceptions.

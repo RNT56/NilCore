@@ -12,10 +12,19 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
+
+	"nilcore/internal/blastbudget"
 )
+
+// defaultPerExecWall bounds a single exec when the caller's context carries no
+// deadline. It only matters when a *blastbudget.Budget is attached (the field is
+// nil by default), so an unwired sandbox is unaffected by this constant.
+const defaultPerExecWall = 30 * time.Minute
 
 // Result is the outcome of one command. A non-zero ExitCode is a normal result,
 // not a Go error — the agent is expected to react to failing commands.
@@ -61,6 +70,19 @@ type Container struct {
 	// podman (--userns=keep-id) a root owned by another user reads as empty inside the
 	// box (a uid-mapping limitation, not an error); we do not chown.
 	ExtraReadRoots []string
+
+	// Blast is the optional blast-radius budget (Phase 16, BR-T03). When set, every
+	// exec is fenced on the cumulative sandbox WALL-TIME axis: the per-exec bound is
+	// pre-charged before the command runs (and the run is hard-bounded to that budget
+	// via context.WithTimeout), then reconciled to the actual elapsed time after.
+	// nil (the default) means no fence — behaviour and run args are byte-identical to
+	// a sandbox without a budget.
+	Blast *blastbudget.Budget
+
+	// run is the exec seam, injected only in tests so the wall-time fence's
+	// charge/reconcile path is exercisable without launching a real container. nil
+	// (the default) uses runReal, so production behaviour is unchanged.
+	run func(ctx context.Context, args []string) (Result, error)
 }
 
 // NewContainer returns a hardened container executor for the given worktree.
@@ -157,9 +179,82 @@ func (c *Container) Exec(ctx context.Context, cmd string) (Result, error) {
 }
 
 // ExecWithEnv runs cmd, injecting env into the container for this invocation only.
+//
+// When a blast-radius budget is attached (c.Blast != nil), the run is fenced on
+// the cumulative sandbox wall-time axis: a per-exec bound (the context's remaining
+// deadline, or defaultPerExecWall) is pre-charged via ChargeWall BEFORE the
+// command runs. If that charge is refused the real command NEVER runs and we
+// return a non-zero Result (a budget-refused command is a result, not a Go error,
+// matching the package's exit-code convention). The bound also hard-caps the
+// in-flight run via context.WithTimeout, so the fence bounds wall-time rather than
+// only accounting for it. After the run, accounting is reconciled to the actual
+// elapsed time (charge the real elapsed, credit the unused remainder), keeping the
+// cumulative wall total honest. With c.Blast == nil this whole block is skipped and
+// the run is byte-identical to today.
 func (c *Container) ExecWithEnv(ctx context.Context, cmd string, env map[string]string) (Result, error) {
+	args := c.runArgs(cmd, env)
+
+	if c.Blast != nil {
+		bound := execWallBound(ctx)
+		// Cap the pre-charge at the REMAINING wall budget: a single exec is then
+		// hard-bounded to what's left (the adversarial-review fix — the fence
+		// bounds, it does not merely account), and the pre-charge never spuriously
+		// refuses while budget remains (without this, a no-deadline ctx would
+		// pre-charge the full defaultPerExecWall and refuse the first exec under any
+		// smaller ceiling). An already-exhausted budget refuses before the command runs.
+		if u := c.Blast.Used(""); u.WallCeiling > 0 {
+			rem := u.WallCeiling - u.Wall
+			if rem <= 0 {
+				return Result{Stderr: "blast-radius: sandbox wall-time budget exhausted", ExitCode: 1}, nil
+			}
+			if rem < bound {
+				bound = rem
+			}
+		}
+		if err := c.Blast.ChargeWall(ctx, bound); err != nil {
+			if errors.Is(err, blastbudget.ErrWallCeiling) {
+				return Result{
+					Stderr:   "blast-radius: sandbox wall-time budget exhausted",
+					ExitCode: 1,
+				}, nil
+			}
+			return Result{}, fmt.Errorf("blast wall pre-charge: %w", err)
+		}
+
+		// The pre-charged bound also bounds the in-flight exec, so a runaway command
+		// cannot outlive the wall budget it was charged for.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, bound)
+		defer cancel()
+
+		start := time.Now()
+		res, err := c.runOnce(ctx, args)
+		// Reconcile: keep only the actual elapsed on the wall axis and return the
+		// unused remainder, so the cumulative total never over-counts a fast exec.
+		actual := time.Since(start)
+		if actual > bound {
+			actual = bound
+		}
+		c.Blast.CreditWall(bound - actual)
+		return res, err
+	}
+
+	return c.runOnce(ctx, args)
+}
+
+// runOnce dispatches to the injected exec seam (tests) or the real container exec.
+func (c *Container) runOnce(ctx context.Context, args []string) (Result, error) {
+	if c.run != nil {
+		return c.run(ctx, args)
+	}
+	return c.runReal(ctx, args)
+}
+
+// runReal launches the container runtime with args. It is the production exec path;
+// behaviour is identical to the pre-fence ExecWithEnv body.
+func (c *Container) runReal(ctx context.Context, args []string) (Result, error) {
 	var stdout, stderr bytes.Buffer
-	ec := exec.CommandContext(ctx, c.Runtime, c.runArgs(cmd, env)...)
+	ec := exec.CommandContext(ctx, c.Runtime, args...)
 	ec.Stdout = &stdout
 	ec.Stderr = &stderr
 	err := ec.Run()
@@ -173,4 +268,16 @@ func (c *Container) ExecWithEnv(ctx context.Context, cmd string, env map[string]
 		return res, fmt.Errorf("%s run: %w", c.Runtime, err)
 	}
 	return res, nil
+}
+
+// execWallBound derives the wall-time bound to pre-charge for a single exec: the
+// context's remaining deadline when one is set, otherwise a sensible per-exec cap.
+func execWallBound(ctx context.Context) time.Duration {
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining > 0 {
+			return remaining
+		}
+		return 0
+	}
+	return defaultPerExecWall
 }

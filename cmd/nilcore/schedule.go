@@ -55,7 +55,9 @@ func scheduleMain(args []string) {
 	if *openPR {
 		orch.KeepBranch = true // preserve the verified branch so a gated PR can push it (D4)
 	}
-	gate := policy.NewConsoleApprover(os.Stdin, os.Stdout)
+	// Graduated auto-approval when an envelope is configured; else the console
+	// approver unchanged (byte-identical default-off). See watch.go.
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, nil)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,
@@ -67,6 +69,7 @@ func scheduleMain(args []string) {
 			}
 			fmt.Printf("scheduled run: verified=%v — %s\n", out.Verified, out.Summary)
 			if *openPR && out.Verified && out.Branch != "" {
+				emitBoundaryOutcome(log, "open-pr", out.Branch, out.Verified)
 				openGatedPR(ctx, absDir, out.Branch, goal, gate, b.cred, log)
 				// Reclaim the now-redundant local task/<id> branch (see watch.go).
 				worktree.DeleteBranch(ctx, absDir, out.Branch)

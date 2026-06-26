@@ -98,5 +98,25 @@ func GateStructured(a GateAction, ask Approver) bool {
 	if ask == nil {
 		return false
 	}
+	// An approver may OPT IN to receiving the structured action (so a graduated
+	// auto-approval policy can decide by Type+scope rather than a flattened
+	// string) by implementing StructuredApprover. This branch is additive and
+	// sits ABOVE the existing free-text return: an approver that does NOT
+	// implement it (e.g. ConsoleApprover) falls through to exactly the prior
+	// behaviour, so the default path is byte-identical (proven by a golden test).
+	if sa, ok := ask.(StructuredApprover); ok {
+		return sa.ApproveStructured(a)
+	}
 	return ask.Approve(a.describe())
+}
+
+// StructuredApprover is the OPTIONAL extension an approver implements to receive
+// the full GateAction (its Type, Branch, and Detail) instead of the flattened
+// description string. It exists so the Phase-16 graduated-auto-approval policy
+// (internal/graapprove, docs/ROADMAP-CLOSED-LOOP.md Pillar 5) can decide by the
+// structured action — the frozen Approver interface and the closed GateActionType
+// set are unchanged. An approver that does not implement it keeps today's
+// free-text Approve behaviour exactly.
+type StructuredApprover interface {
+	ApproveStructured(a GateAction) bool
 }

@@ -300,7 +300,7 @@ flowchart TD
     AGENT --> FORGE[forge<br/>gated draft PR]
 ```
 
-Dependencies point inward; leaf packages never import the orchestrator. The full design and rationale live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md).
+Dependencies point inward; leaf packages never import the orchestrator. The full design and rationale live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/PRINCIPLES.md`](docs/PRINCIPLES.md). For one end-to-end map of the whole system — chat behaviour, every command, the engine, and the safety core, with a front-door index to all the in-depth docs — see [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 ---
 

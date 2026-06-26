@@ -331,6 +331,24 @@ func (l *Loop) converge(ctx context.Context, st State) Outcome {
 				}
 			}
 		}
+		// Earned-trust signal (GAA-T04): right BEFORE the supervised promote gate is
+		// consulted, record a dedicated boundary_outcome carrying the VERIFIER's
+		// verdict on this integration tip — never a backend self-report (I2). We are
+		// in converge only because JudgeProject returned done=true (the project
+		// verifier AND every criterion exited 0), so passed is that verdict, sourced
+		// from the same flag the gate already relies on. action/scope mirror exactly
+		// what the GradedApprover keys trust on (PromoteToBase.String() + the target
+		// branch), so graapprove.BuildTrust folds this into the right (Type,scope)
+		// bucket. This is purely ADDITIVE — a new event alongside the existing promote
+		// events — and changes no control flow and no existing event.
+		l.Log.Append(eventlog.Event{Task: projectTask, Kind: "boundary_outcome",
+			Detail: map[string]any{
+				"action": policy.PromoteToBase.String(), // "promote-to-base"
+				"scope":  st.Branch,                     // the target branch the gate matches on
+				"passed": true,                          // the verifier verdict (done==true); never a self-report
+				"chain":  true,
+			}})
+
 		action := policy.GateAction{Type: policy.PromoteToBase, Branch: st.Branch,
 			Detail: "promote converged, verifier-green integration tip"}
 		if l.Gate(action) {
