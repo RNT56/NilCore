@@ -1394,6 +1394,14 @@ func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.
 
 		sess := session.New(threadID, sender, d.baseRepo, d.log)
 		sess.Out = out // reasoning/intent streams back to this thread (Channel.Update)
+		// ATTENDED over the channel: a live serve thread has a reachable, authorized
+		// principal (the Receive loop is running and the sender is pinned + allowlisted),
+		// so enable ask_user — the drive may pose a question, which streams out as a
+		// channel message and is answered by the operator's next thread reply (routed by
+		// intake → Turn → the ask box). The wall-clock backstop bounds an absent operator,
+		// and `/questions off` lets them silence it. The headless durable-resume path
+		// (resumeInflight) builds NO Session, so ask_user is structurally absent there.
+		sess.EnableAskUser(out)
 		// Terminal-outcome push so a DETACHED principal learns a work drive finished
 		// without re-attaching. Uses the SERVE BASE ctx (not the per-request ctx, which
 		// is dead once the principal detaches) with a short timeout, so the push fires
@@ -1537,6 +1545,15 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	}
 	if in.Emitter != nil {
 		n.Emitter = in.Emitter
+	}
+	// Attended ask seam (ask_user / set_ask_level) over the channel: wired only when the
+	// serve session enabled attended asking (a live thread). The session-owned adapter
+	// parks the drive in AwaitingInput; the question streams out via the channel emitter
+	// and the human's reply arrives as an ordinary authorized thread message, routed by
+	// Session.Turn to the ask box (intake → Turn → Resolve). Headless resume builds its
+	// backend without a Session, so this is nil there (the never-block guarantee).
+	if in.AskUser != nil {
+		n.AskUser = in.AskUser
 	}
 	if adv.prov != nil {
 		n.Advisor = advisor.New(adv.prov, adv.maxCalls)

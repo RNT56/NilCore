@@ -243,6 +243,14 @@ func (s *Server) applyControl(ctx context.Context, th *thread, req channel.TaskR
 		// it rather than acting. (The verb is still parsed centrally so both front
 		// doors agree on what it IS; only the terminal ACTS on it.)
 		reply("/save is only available in the local terminal, not over a channel.")
+	case session.CtrlQuestions:
+		// Dial how often the agent asks clarifying questions over this thread — the
+		// deterministic sibling of telling it "ask me fewer questions" in prose.
+		if ack, err := th.sess.SetAskLevelSpec(c.Arg); err != nil {
+			reply(err.Error())
+		} else {
+			reply(ack)
+		}
 	case session.CtrlClear:
 		if err := th.sess.Clear(); err != nil {
 			reply(err.Error())
@@ -257,8 +265,8 @@ func (s *Server) applyControl(ctx context.Context, th *thread, req channel.TaskR
 		if window > 0 {
 			ctxMsg = fmt.Sprintf("context %d%%", pct)
 		}
-		reply(fmt.Sprintf("status: %s · mode: %s · context roots: %d · %s",
-			th.sess.PhaseNow(), th.sess.CurrentMode(), len(th.sess.ReadRootsNow()), ctxMsg))
+		reply(fmt.Sprintf("status: %s · mode: %s · questions: %s · context roots: %d · %s",
+			th.sess.PhaseNow(), th.sess.CurrentMode(), th.sess.AskLevelName(), len(th.sess.ReadRootsNow()), ctxMsg))
 	case session.CtrlContext:
 		pct, used, window := th.sess.ContextUsage()
 		if window == 0 {
@@ -712,6 +720,10 @@ func surfaceLine(e emit.Event) string {
 		return "✓ " + e.Text
 	case emit.KindSteerAck:
 		return "! " + e.Text
+	case emit.KindAsk:
+		// A question to the operator (ask_user): a ? marker so it stands out as a
+		// prompt to reply to. The drive is parked until they answer on this thread.
+		return "❓ " + e.Text
 	default:
 		if e.Text == "" {
 			return e.Kind
