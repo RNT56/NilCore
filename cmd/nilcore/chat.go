@@ -42,6 +42,7 @@ import (
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/budget"
+	"nilcore/internal/capability"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/memory"
@@ -566,10 +567,20 @@ func chatShouldSupervise(goal string) bool {
 // and the shell OFF, so a read-only drive has no registered path to mutate the tree
 // regardless of what the model attempts — capability via wiring, not via prompt (I7).
 func capabilityForMode(m session.Mode) (reg *tools.Registry, guard func(string) (bool, string), disableShell bool) {
-	if m.ReadOnly() {
+	// Derive the read-only / command-policy / shell decision from the unified
+	// capability descriptor (Phase 16, EXP-T06) so a drive's capability has ONE
+	// source of truth; the registry selection stays local (capability is a leaf
+	// that does not import internal/tools). Byte-identical to the prior inline
+	// logic — internal/capability golden-tests For() against it. A resolution error
+	// fails CLOSED to read-only, never widening capability.
+	d, err := capability.For(capability.Request{Mode: m.String()})
+	if err != nil {
 		return readOnlyLoopTools(), policy.ReadOnlyCommandPolicy().Check, true
 	}
-	return loopTools(), policy.DefaultCommandPolicy().Check, false
+	if d.Tools.ReadOnly {
+		return readOnlyLoopTools(), d.CommandPolicy.Check, !d.ShellEnabled
+	}
+	return loopTools(), d.CommandPolicy.Check, !d.ShellEnabled
 }
 
 // readOnlyLoopTools is the read-only counterpart of loopTools: the shared
