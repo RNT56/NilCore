@@ -77,8 +77,35 @@ func loopTools() *tools.Registry {
 	// belongs on every primary loop, not only the build understander — "understand
 	// before you change" applies to run/chat/serve too.
 	r.Register(tools.CodeintelTool{})
+	// Host-side structural tools (worktree-confined, deterministic, stdlib-only, no
+	// execution — I4/I6). They sharpen the inner loop: precise navigation (outline,
+	// read_symbol), hygiene/architecture lenses (dead_code, import_graph), safer
+	// edits (edit_checked, format_file, patch), and durable working memory (plan).
+	for _, t := range hostStructuralTools() {
+		r.Register(t)
+	}
 	for _, t := range skillTools() {
 		r.Register(t)
 	}
 	return r
+}
+
+// hostStructuralTools is the set of additional host-side structured tools the
+// primary loop registers (run/chat/serve/build). Listed in one place so the
+// surface is auditable. The read-only members are also exposed to the Discuss/Plan
+// modes via tools.ReadOnlyWithCodeintel.
+func hostStructuralTools() []tools.Tool {
+	return []tools.Tool{
+		tools.OutlineTool{},
+		tools.ReadSymbolTool{},
+		tools.DeadCodeTool{},
+		tools.ImportGraphTool{},
+		tools.FormatTool{},
+		tools.EditCheckedTool{},
+		tools.PatchTool{},
+		tools.PlanTool{},
+		tools.AffectedTestsTool{},
+		tools.RenameSymbolTool{},
+		tools.StructuralReplaceTool{},
+	}
 }
