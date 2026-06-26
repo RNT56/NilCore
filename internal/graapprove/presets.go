@@ -1,0 +1,98 @@
+package graapprove
+
+import "fmt"
+
+// commonDeny is the floor every preset enforces: the protected branches that NO
+// preset may ever admit. main/master/release/* are denied structurally; deny
+// always wins over an allowlist (see graded.go scope checks). prod is denied for
+// Deploy by a dedicated structural rule plus an explicit prod* deny here.
+var commonDeny = []string{"main", "master", "release/*", "release", "prod", "prod*"}
+
+// Preset returns a conservative/standard/trusted starter envelope by name. An
+// unknown or blank name returns a zero Envelope and an error — the feature is off
+// unless a recognized preset (or an explicit envelope) is configured. By
+// construction NO preset's clause admits main/master/release/prod for any class
+// (asserted by a test): the operator opts into auto-approval on safe scopes only.
+func Preset(name string) (Envelope, error) {
+	switch name {
+	case "conservative":
+		// OpenPR only — opening a draft PR is the most reversible boundary action
+		// (close the draft; no merge ever happens).
+		return Envelope{Classes: []ClassClause{
+			{
+				Type:          "open-pr",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  5,
+				MinSample:     5,
+				RecencyDays:   14,
+				MaxPerDay:     3,
+				MaxDollarsDay: 0,
+			},
+		}}, nil
+	case "standard":
+		// + PromoteToBase on non-main branches (reset/delete the non-main branch to
+		// undo). main/master/release stay denied.
+		return Envelope{Classes: []ClassClause{
+			{
+				Type:          "open-pr",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  10,
+				MinSample:     10,
+				RecencyDays:   14,
+				MaxPerDay:     2,
+				MaxDollarsDay: 0,
+			},
+			{
+				Type:          "promote-to-base",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  10,
+				MinSample:     10,
+				RecencyDays:   14,
+				MaxPerDay:     2,
+				MaxDollarsDay: 0,
+			},
+		}}, nil
+	case "trusted":
+		// + Deploy to staging (redeploy previous to undo), bounded by a $/day cap.
+		// prod* is always denied — both via Environments allowlisting staging only
+		// and the structural prod* deny in the graded scope check.
+		return Envelope{Classes: []ClassClause{
+			{
+				Type:          "open-pr",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  20,
+				MinSample:     20,
+				RecencyDays:   7,
+				MaxPerDay:     2,
+				MaxDollarsDay: 0,
+			},
+			{
+				Type:          "promote-to-base",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  20,
+				MinSample:     20,
+				RecencyDays:   7,
+				MaxPerDay:     2,
+				MaxDollarsDay: 0,
+			},
+			{
+				Type:          "deploy",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				Environments:  []string{"staging"},
+				MinSuccesses:  20,
+				MinSample:     20,
+				RecencyDays:   7,
+				MaxPerDay:     2,
+				MaxDollarsDay: 25,
+			},
+		}}, nil
+	default:
+		return Envelope{}, fmt.Errorf("graapprove: unknown preset %q (want conservative|standard|trusted)", name)
+	}
+}
