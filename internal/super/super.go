@@ -86,6 +86,16 @@ type Supervisor struct {
 	Verify    func(ctx context.Context) (verify.Report, error)
 	Gate      func(a policy.GateAction) bool
 
+	// AskUser, if set, lets the SUPERVISOR (the multi-agent run's root) pose a sharp
+	// question to the HUMAN operator between waves and block for the answer — the
+	// ask_user tool, the multi-agent analogue of the native loop's. nil ⇒ the tool is
+	// not advertised (byte-identical), so a headless run never asks. It uses super-LOCAL
+	// value types (super does not import backend — the same leaf discipline as
+	// Answer/Inbox) and is wired to the SAME session ask box the native loop uses. The
+	// supervisor asks at a round boundary — no sibling wave is in flight then (a prior
+	// wave has already folded) — so a sibling stop/pause scope is moot and omitted.
+	AskUser AskFunc
+
 	// SaveState, if set, durably records the integration snapshot each time the tip
 	// advances (every doIntegrate that merges), so a crashed multi-agent run resumes
 	// from the last VERIFIED tip — replaying merged nodes and re-releasing only the
@@ -388,6 +398,11 @@ func (s *Supervisor) Run(ctx context.Context, goal string) (Outcome, error) {
 	s.publishRunContext(s.buildRunContext(st))
 
 	toolset := append(toolDefs(), s.readToolDefs()...)
+	// The human-ask tool is advertised only when a session ask box is wired (an
+	// attended multi-agent run); a headless run leaves AskUser nil and never sees it.
+	if s.AskUser != nil {
+		toolset = append(toolset, askUserToolDef())
+	}
 
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_start",
 		Detail: map[string]any{"max_rounds": rounds, "max_depth": s.depthCap(),
@@ -1031,6 +1046,12 @@ func (s *Supervisor) dispatchOne(ctx context.Context, round int, st *runState, b
 
 	case toolCode:
 		return s.doCode(ctx, round, st, b), false, ""
+
+	case toolAskUser:
+		// Pose the supervisor's question(s) to the human and block for the answer. The
+		// reply is TRUSTED principal input (un-fenced, like the goal), not subagent/tool
+		// data — the same I7 exception the native loop's ask answer uses.
+		return s.doAskUser(ctx, b), false, ""
 
 	default:
 		// Read/search tools dispatch through the read registry over the
