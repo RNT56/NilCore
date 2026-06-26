@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"nilcore/internal/egressprofile"
+	"nilcore/internal/graapprove"
 	"nilcore/internal/pool"
 )
 
@@ -47,7 +48,13 @@ const (
 // ReasoningEffort, and a small Routing sub-struct). Every new field is omitempty
 // and blank/absent ⇒ skipped, so a v1 config migrated to v2 is byte-identical in
 // behavior — the bump is purely so the strict decoder recognizes the new keys.
-const CurrentConfigVersion = 2
+//
+// v3 (Phase 16, GAA-T02) adds the additive AutoApprove block — the operator-authored
+// graduated-auto-approval envelope (graapprove.Envelope). The field is a nil-able
+// pointer with omitempty: nil ⇒ absent, exactly like the Pool block, so a v2 config
+// migrated to v3 is byte-identical in behavior. The bump is purely so the strict
+// decoder recognizes the new "auto_approve" key; the v2→v3 migration is a no-op.
+const CurrentConfigVersion = 3
 
 // ProviderConfig records a provider and the SecretStore name under which its key
 // is stored — not the key.
@@ -85,6 +92,16 @@ type Config struct {
 	Codex            DelegatedConfig  `json:"codex,omitempty"`             // optional config for the Codex delegated CLI (R1)
 	Claude           DelegatedConfig  `json:"claude,omitempty"`            // optional config for the Claude Code delegated CLI (R1)
 	Pool             *pool.PoolConfig `json:"pool,omitempty"`              // optional swarm provider-pool tiers/caps (P12); nil ⇒ today's single-worker wiring, so an existing config is byte-identical
+
+	// AutoApprove is the operator-authored graduated-auto-approval envelope (Phase
+	// 16, GAA-T02). nil ⇒ absent (the default-off state: no auto-approval, every
+	// boundary gate falls through to the human), exactly like the Pool block — so an
+	// existing config without it is byte-identical. It is host-side policy DATA the
+	// wiring layer hands to graapprove.MaybeWrap; it holds no secret and never enters
+	// a prompt or a model tool (I3). When present it is fail-closed: Load runs its
+	// graapprove.(*Envelope).Validate(), so an unparseable/invalid envelope is a load
+	// error, never silently ignored.
+	AutoApprove *graapprove.Envelope `json:"auto_approve,omitempty"`
 
 	// Provider knobs (P15, schema v2). Every field is additive + omitempty: blank
 	// or absent ⇒ the field is skipped and behavior is byte-identical to a v1
@@ -279,6 +296,17 @@ func (c Config) Validate() error {
 			return fmt.Errorf("pool config: %w", err)
 		}
 	}
+	// The optional graduated-auto-approval envelope (Phase 16) is fail-closed: when
+	// present it must be a well-formed graapprove.Envelope (every clause names a
+	// known action class and states an explicit, non-trivial trust bar). An
+	// unparseable/invalid envelope errors here rather than being silently dropped —
+	// turning auto-approval on requires a valid policy. nil AutoApprove ⇒ no clause
+	// runs, so every pre-Phase-16 config is unchanged (default-off, human-gated).
+	if c.AutoApprove != nil {
+		if err := c.AutoApprove.Validate(); err != nil {
+			return fmt.Errorf("auto_approve config: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -344,11 +372,12 @@ func parse(b []byte) (Config, error) {
 			v, CurrentConfigVersion)
 	}
 	// Field migrations, applied one version at a time, lowest-first, before the
-	// strict decode. v1 → v2 (P15) is purely additive: every v2 field is omitempty
-	// and absent ⇒ default behavior, so a v1 body needs no rewriting — it parses
-	// cleanly under DisallowUnknownFields once its version is stamped current below.
-	// When a future bump adds a field that needs a value carried forward, rewrite b
-	// here for that step.
+	// strict decode. v1 → v2 (P15) and v2 → v3 (Phase 16, the additive auto_approve
+	// block) are both purely additive: every new field is omitempty and absent ⇒
+	// default behavior, so an older body needs no rewriting — it parses cleanly under
+	// DisallowUnknownFields once its version is stamped current below. When a future
+	// bump adds a field that needs a value carried forward, rewrite b here for that
+	// step.
 
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
