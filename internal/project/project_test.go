@@ -1,7 +1,9 @@
 package project
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -536,5 +538,180 @@ func TestRun_PromoteDenied(t *testing.T) {
 	}
 	if !out.Done || out.Promoted {
 		t.Fatalf("denied promote: done=%t promoted=%t, want true/false", out.Done, out.Promoted)
+	}
+}
+
+// --- boundary_outcome earned-trust signal (GAA-T04) --------------------------
+
+// readEvents reads the JSONL audit log at path back into decoded events. It is the
+// test-side read-only replay graapprove.BuildTrust performs in production.
+func readEvents(t *testing.T, path string) []eventlog.Event {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open log file %q: %v", path, err)
+	}
+	defer f.Close()
+	var evs []eventlog.Event
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var e eventlog.Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Fatalf("decode event %q: %v", line, err)
+		}
+		evs = append(evs, e)
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan log: %v", err)
+	}
+	return evs
+}
+
+// boundaryLoop builds a loop whose log lives at a known path (so the test can replay
+// the JSONL) and whose verifier flips green when the slice lands — the realistic
+// converge-then-gate path. The returned path is the audit log on disk.
+func boundaryLoop(t *testing.T, gate func(policy.GateAction) bool) (*Loop, string) {
+	t.Helper()
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "README"), []byte("x"), 0o644)
+	logPath := filepath.Join(t.TempDir(), "events.log")
+	lg, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	t.Cleanup(func() { _ = lg.Close() })
+
+	var green atomic.Bool
+	l := &Loop{
+		Goal: "build a thing",
+		Repo: dir,
+		Log:  lg,
+		Plan: func(_ context.Context, _ string, _ State) (Slice, error) {
+			return Slice{Goal: "do work"}, nil
+		},
+		RunSlice: func(_ context.Context, _ Slice, _ State) (SliceResult, error) {
+			green.Store(true)
+			return SliceResult{Branch: "task/super.t1", Verified: true}, nil
+		},
+		Verifier:      func(string) verify.Verifier { return &togglePass{&green} },
+		MaxIterations: 5,
+		MaxNoProgress: 99,
+		Gate:          gate,
+	}
+	l.SeedCriteria([]Criterion{{Command: "c1", Verifier: &togglePass{&green}}})
+	return l, logPath
+}
+
+// onBoundary returns the single boundary_outcome event in evs (failing the test if
+// there is not exactly one).
+func onlyBoundary(t *testing.T, evs []eventlog.Event) eventlog.Event {
+	t.Helper()
+	var found []eventlog.Event
+	for _, e := range evs {
+		if e.Kind == "boundary_outcome" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("got %d boundary_outcome events, want exactly 1", len(found))
+	}
+	return found[0]
+}
+
+// A verifier-green converge emits exactly one boundary_outcome at the supervised
+// promote gate, with action=promote-to-base, scope = the integration tip, and
+// passed=true sourced from the verifier verdict (the same flag the gate relies on).
+func TestRun_BoundaryOutcome_GreenPromote(t *testing.T) {
+	l, logPath := boundaryLoop(t, func(policy.GateAction) bool { return true })
+
+	out, err := l.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done || !out.Promoted {
+		t.Fatalf("converge: done=%t promoted=%t, want true/true", out.Done, out.Promoted)
+	}
+
+	e := onlyBoundary(t, readEvents(t, logPath))
+	if got := e.Detail["action"]; got != policy.PromoteToBase.String() {
+		t.Errorf("action = %v, want %q", got, policy.PromoteToBase.String())
+	}
+	if got := e.Detail["scope"]; got != "task/super.t1" {
+		t.Errorf("scope = %v, want the integration tip %q", got, "task/super.t1")
+	}
+	// passed must be the verifier verdict (true here), carried as a JSON bool so
+	// graapprove.BuildTrust folds it as a green sample.
+	if passed, ok := e.Detail["passed"].(bool); !ok || !passed {
+		t.Errorf("passed = %v (%T), want bool true sourced from the verifier verdict", e.Detail["passed"], e.Detail["passed"])
+	}
+	if got := e.Detail["chain"]; got != true {
+		t.Errorf("chain = %v, want true", got)
+	}
+	if e.Task != projectTask {
+		t.Errorf("boundary_outcome task = %q, want %q", e.Task, projectTask)
+	}
+
+	// The action/scope pair must equal exactly what GradedApprover keys trust on for
+	// this promote (PromoteToBase.String() + the GateAction.Branch it gates), so
+	// graapprove.BuildTrust folds this win into the right (Type,scope) bucket. We
+	// assert against the gate action the converge path constructs rather than
+	// importing graapprove here (keeping the project test a leaf).
+	wantAction := policy.GateAction{Type: policy.PromoteToBase, Branch: "task/super.t1"}
+	if e.Detail["action"] != wantAction.Type.String() || e.Detail["scope"] != wantAction.Branch {
+		t.Errorf("boundary key (%v,%v) does not match the gate's (%q,%q)",
+			e.Detail["action"], e.Detail["scope"], wantAction.Type.String(), wantAction.Branch)
+	}
+}
+
+// A boundary_outcome is NEVER a self-claim and NEVER emitted with passed=true when
+// the tip is not verifier-green: a run that never converges (the verifier stays red)
+// reaches no promote gate, so it emits no boundary_outcome at all — earned trust can
+// only accrue from a real verifier verdict, never a stall.
+func TestRun_BoundaryOutcome_RedTipNeverEmits(t *testing.T) {
+	l, logPath := boundaryLoop(t, func(policy.GateAction) bool { return true })
+	// Force the verifier to stay red regardless of the slice: the loop exhausts its
+	// iterations and never reaches converge / the promote gate.
+	l.Verifier = func(string) verify.Verifier { return &fixedVerifier{pass: false} }
+	l.RunSlice = func(_ context.Context, _ Slice, _ State) (SliceResult, error) {
+		return SliceResult{Branch: "task/super.t1", Verified: true}, nil
+	}
+
+	out, err := l.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Done {
+		t.Fatalf("red tip reported Done=%t, want false", out.Done)
+	}
+	for _, e := range readEvents(t, logPath) {
+		if e.Kind == "boundary_outcome" {
+			t.Fatalf("a never-converged (verifier-red) run emitted a boundary_outcome: %+v", e.Detail)
+		}
+	}
+}
+
+// GOLDEN / default-off path: with NO Gate seam wired, converge takes its existing
+// byte-identical path — it never reaches the gate site, so it emits NO
+// boundary_outcome. The earned-trust signal is strictly additive and only appears at
+// a real supervised promote gate; the unwired path is unchanged.
+func TestRun_BoundaryOutcome_NoGateIsByteIdentical(t *testing.T) {
+	l, logPath := boundaryLoop(t, nil) // no Gate wired
+
+	out, err := l.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done {
+		t.Fatalf("converge without a gate: done=%t, want true", out.Done)
+	}
+	for _, e := range readEvents(t, logPath) {
+		if e.Kind == "boundary_outcome" {
+			t.Fatalf("default (no-gate) path emitted a boundary_outcome: %+v", e.Detail)
+		}
 	}
 }
