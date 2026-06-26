@@ -1,6 +1,6 @@
 # Roadmap — Phase 16: closing the loop on the agent's own evidence
 
-> **Status:** planned, not started. Default-off, opt-in, invariant-preserving. The headline capability — **graduated auto-approval** — is a second, explicitly-recorded relaxation of the human-gate default and requires a §0 operator decision before any code (see §10). Eight pillars, ~64 tasks, five waves. The final wave (the unified orchestration kernel) is separately §0-gated.
+> **Status:** Pillars 1–7 SHIPPED (default-off, opt-in, invariant-preserving), across Waves A–E. The headline — **graduated auto-approval** — is functional, fenced (the shared `internal/blastbudget` meter, all four axes live), audited (`nilcore trace` + `nilcore auto-approvals`), and inspectable (`nilcore experience`/`capability`); dynamic routing is activatable (`NILCORE_TRUST_DEFAULT=1`); the experience layer, lessons + verify-cache, the self-improvement flywheel (`nilcore flywheel`), and the autonomy daemon + objectives backlog (`nilcore objective`, `NILCORE_AUTONOMY`) are all wired. The §0 relaxation decisions (#1 graduated auto-approval + the exact preset blast-radius values; #2 the separate self-improve auto-merge opt-in) are RECORDED in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) §"Closed-loop autonomy". The cross-cutting guarantees (XC-T01..T06) are asserted in code. **Pillar 8 (the unified orchestration kernel) remains §0-deferred** — the cutover re-homes all entrypoints + edits contract files and is taken only after a separate human-signed decision. Eight pillars, ~64 tasks, five waves.
 >
 > **Read with:** [`CLAUDE.md`](../CLAUDE.md) (invariants), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (the frozen contract + the execution model), [`docs/HORIZON.md`](HORIZON.md) (the candidate scan this program promotes), [`docs/PRINCIPLES.md`](PRINCIPLES.md) (#1 feedback loop, #9 earn improvement from evidence, #10 safety enables autonomy).
 
@@ -352,14 +352,14 @@ Format: `ID — goal · depends · owns · verify`. Acceptance criteria for the 
 
 ## §10 §0 gate decisions (recorded before code)
 
-Per the project's thesis-gate discipline (like `CU-T00`/the EXT tier), these are **recorded operator decisions**, taken before the relevant wave is written, each documented in `docs/ARCHITECTURE.md`:
+Per the project's thesis-gate discipline (like `CU-T00`/the EXT tier), these are **recorded operator decisions**, each documented in `docs/ARCHITECTURE.md` §"Closed-loop autonomy":
 
-1. **Graduated auto-approval is a second human-gate relaxation** (parallel to the `--mac-host` I4 relaxation in `CLAUDE.md §2`). The decision must state the exact granted blast-radius of each preset and the rule that **no preset ever admits main/master/release/prod**. *(Gates Wave C.)*
-2. **The self-improve auto-approval class** (`NILCORE_SELFIMPROVE_AUTOAPPROVE`) — the agent merging edits to its own prompts/skills without a human — is a **separate** double-opt-in from enabling the flywheel. *(Gates Wave D's last task.)*
-3. **Letting the flywheel edit verifiers** (currently denied by `selfimprove.DefaultScope`) is a distinct decision to widen the self-edit allow-list past the frozen `verify` package — never an implicit scope widen.
-4. **The blast-radius preset values** (`standard` = hosts 8 / irreversible 5-per-run / wall 20m / $5-per-day, etc.) are operator-approved policy, not developer defaults.
-5. **The composition rule** that **no single flag transitively enables auto-approval** — each powerful relaxation needs its own recorded gate (`XC-T02` enforces it in code).
-6. **The kernel cutover (`UOK-T10`)** — re-homing run/build/swarm/chat onto one kernel and editing `CLAUDE.md`/`ARCHITECTURE.md`/`TASKS.md` — is a human-signed §0 decision taken only after Pillars 1–7 prove the substrate.
+1. **RECORDED — Graduated auto-approval is a second human-gate relaxation** (parallel to the `--mac-host` I4 relaxation in `CLAUDE.md §2`). The exact granted blast-radius of each preset and the rule that **no preset ever admits main/master/release/prod** are recorded in the ARCHITECTURE preset table. *(Wave C — shipped.)*
+2. **RECORDED — The self-improve auto-approval class** (`NILCORE_SELFIMPROVE_AUTOAPPROVE`) — the agent merging edits to its own prompts/skills without a human — is a **separate** double-opt-in from enabling the flywheel (`graapprove.SelfImproveGate`; XC-T02 enforces no transitive opt-in). *(Wave D — shipped, default-off.)*
+3. **STILL DEFERRED — Letting the flywheel edit verifiers** (denied by `selfimprove.DefaultScope`) is a distinct decision to widen the self-edit allow-list past the frozen `verify` package — never an implicit scope widen. Not taken; the flywheel cannot author or edit the verifier of record.
+4. **RECORDED — The blast-radius preset values** (`tight` = hosts 4 / irreversible 2 / wall 10m / $1-per-day; `standard` = hosts 8 / irreversible 5 / wall 20m / $5-per-day) are operator-approved policy, recorded in the ARCHITECTURE preset table.
+5. **RECORDED + enforced in code — The composition rule** that **no single flag transitively enables auto-approval** — each powerful relaxation needs its own recorded gate (`XC-T02`).
+6. **STILL DEFERRED — The kernel cutover (`UOK-T10`)** — re-homing run/build/swarm/chat onto one kernel and editing `CLAUDE.md`/`ARCHITECTURE.md`/`TASKS.md` — is a human-signed §0 decision taken only after Pillars 1–7 prove the substrate (now shipped, so the kernel is the remaining gated wave).
 
 ---
 

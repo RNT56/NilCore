@@ -1,6 +1,8 @@
-# Handoff — Phase 16 "closing the loop" (in progress)
+# Handoff — Phase 16 "closing the loop" (Pillars 1–7 SHIPPED)
 
-Self-contained handover for the next agent. **The hard, novel logic is built, tested, and committed; what remains is activation wiring across shared files + the cross-cutting tests + contract docs.**
+> **Status update:** Pillars 1–7 are now SHIPPED end-to-end — the activation wiring, the cross-cutting tests (XC-T01..T06), and the contract docs are all done (default-off, opt-in, invariant-preserving; `make verify` + `make tui-verify` green). The authoritative status is the [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) header + §10, the [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) §"Closed-loop autonomy" relaxation record, and the `CHANGELOG.md` entries. **The only remaining wave is Pillar 8 (the unified orchestration kernel — `UOK`), which stays §0-deferred** (a human-signed cutover that re-homes all entrypoints + edits contract files). The historical "what remains" lists below are kept for provenance but are superseded by the shipped state.
+
+Self-contained handover (historical, from the #71 era). **The hard, novel logic is built, tested, and committed; what remains is activation wiring across shared files + the cross-cutting tests + contract docs.**
 
 ## 0. Where the work lives
 

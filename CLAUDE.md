@@ -174,6 +174,12 @@ internal/
   capguard/            ← Rule-of-Two gate (untrusted ∧ private ∧ open-egress)
   browse*·cdp/         ← Phase 14 browser agency (browsersession · browseragent · cdp set-of-marks)
   desktop*·som/        ← Phase CU computer use (desktopwire · desktopsession · desktopagent · som · desktop CV+ladder)
+  experience/          ← Phase 16 the closed-loop spine: one derived, rebuildable projection over the log (Reader · OverLog · OverStore · Projector)
+  capability/          ← Phase 16 one pure For(Request)→Descriptor — the legible "what may this drive do" surface
+  graapprove/          ← Phase 16 GRADUATED AUTO-APPROVAL (Pillar 5): GradedApprover wraps the human gate; earned trust + operator envelope (a SECOND human-gate relaxation — see ARCHITECTURE §0)
+  blastbudget/         ← Phase 16 the hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads
+  flywheel/            ← Phase 16 self-improvement flywheel (selfeval · distiller · measure · loop) — verified, human-gated, never edits the verifier of record
+  autosrc·objective/   ← Phase 16 autonomy daemon (bounded source queue) + operator-only standing-objectives backlog
 ```
 
 New packages introduced by later phases are listed as **extension points** in `docs/ARCHITECTURE.md` and owned by specific tasks in `docs/TASKS.md`.
