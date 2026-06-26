@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"os"
 	"time"
 
 	"nilcore/internal/blastbudget"
@@ -40,8 +44,56 @@ func mintBlastBudget(preset string, log *eventlog.Log) *blastbudget.Budget {
 	b.SetIrreversibleCeiling(env.irrev)
 	b.SetWallCeiling(env.wall)
 	b.SetAutoApprovalDollarCeiling(env.dollarsDay)
+	// XC-T04 rebuild-on-boot: re-establish TODAY's prior auto-approval $ from the
+	// durable log BEFORE the sink is attached (so the pre-charge emits no event), so a
+	// restart cannot reset the per-UTC-day $ ceiling (no fail-open on restart — I5).
+	rebuildBlastDay(b, log.Path())
 	b.SetSink(blastSink{log})
 	return b
+}
+
+// rebuildBlastDay re-loads the current UTC day's already-spent auto-approval dollars
+// from the append-only log into a fresh budget, so the per-day $ ceiling survives a
+// process restart (the rate window and trust view already rebuild from the log per
+// decision; this closes the same gap for the $ axis). It sums every `auto_approve`
+// event's `dollars.charged` whose Time is today and pre-charges that total. Best-effort
+// and READ-ONLY: a missing/unreadable log or a malformed line just contributes nothing
+// (a fresh install has no prior spend). A nil budget or empty path is a no-op.
+func rebuildBlastDay(b *blastbudget.Budget, logPath string) {
+	if b == nil || logPath == "" {
+		return
+	}
+	f, err := os.Open(logPath)
+	if err != nil {
+		return // no log yet ⇒ nothing to rebuild
+	}
+	defer f.Close()
+
+	today := time.Now().UTC().Format("2006-01-02")
+	var sum float64
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var e struct {
+			Time   time.Time      `json:"time"`
+			Kind   string         `json:"kind"`
+			Detail map[string]any `json:"detail"`
+		}
+		if json.Unmarshal(sc.Bytes(), &e) != nil || e.Kind != "auto_approve" {
+			continue
+		}
+		if e.Time.UTC().Format("2006-01-02") != today {
+			continue
+		}
+		if d, ok := e.Detail["dollars"].(map[string]any); ok {
+			if charged, ok := d["charged"].(float64); ok {
+				sum += charged
+			}
+		}
+	}
+	if sum > 0 {
+		_ = b.ChargeAutoApprovalDollars(context.Background(), today, sum)
+	}
 }
 
 // blastSink adapts the run's append-only log to blastbudget.Sink: metadata-only

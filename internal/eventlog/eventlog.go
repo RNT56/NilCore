@@ -40,6 +40,7 @@ type Event struct {
 type Log struct {
 	mu    sync.Mutex
 	f     *os.File
+	path  string       // on-disk path (for read-back rebuilds; see Path)
 	prev  string       // hash of the last *durably written* event
 	seq   uint64       // sequence number for the next event
 	key   []byte       // optional HMAC key (NILCORE_LOG_HMAC_KEY); nil = plain SHA-256
@@ -91,7 +92,7 @@ func Open(path string) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{f: f, key: logKey()}
+	l := &Log{f: f, key: logKey(), path: path}
 	if last, ok := lastEvent(path); ok {
 		l.prev = last.Hash
 		l.seq = last.Seq + 1
@@ -190,6 +191,16 @@ func (l *Log) Err() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.err
+}
+
+// Path reports the on-disk path of the log (empty for a nil log). It lets a wiring
+// layer rebuild a derived window (e.g. the blast per-UTC-day $ meter) from the durable
+// log on boot without threading the path separately — the rebuild-on-boot discipline.
+func (l *Log) Path() string {
+	if l == nil {
+		return ""
+	}
+	return l.path
 }
 
 // Close closes the underlying file.

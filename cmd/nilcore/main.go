@@ -119,6 +119,8 @@ func main() {
 		flywheelMain(args[1:])
 	case "objective":
 		objectiveMain(args[1:])
+	case "auto-approvals":
+		autoApprovalsMain(args[1:])
 	case "capability":
 		capabilityMain(args[1:])
 	case "trace", "why":
