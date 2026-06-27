@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"nilcore/internal/kernel"
 	"nilcore/internal/worktree"
 )
 
@@ -149,4 +150,67 @@ func integrateBranches(ctx context.Context, baseRepo, integLeaf string, children
 	}
 	res.verified = final
 	return wt, res, nil
+}
+
+// childRunner runs ONE sub-goal as a full single-task run that KEEPS its verified branch,
+// returning the branch name + verifier verdict. Injected so the cmd entry supplies the
+// real KeepBranch orchestrator and the envelope flow stays hermetically testable.
+type childRunner func(ctx context.Context, subGoal, taskID string) (branch string, verified bool, err error)
+
+// decomposeState carries the integration worktree out of the (pure-data) kernel Outcome
+// so the caller can keep its branch on success or Cleanup otherwise.
+type decomposeState struct {
+	wt  *worktree.Worktree
+	res integrateResult
+}
+
+// decomposeEnvelope assembles the recursive `decompose` preset over kernel.Recursive
+// (UOK V2 K2-1): Plan = decomposePlan, each child runs via runChild (a KeepBranch
+// single-task run), Integrate = integrateBranches (merge the verified child branches into
+// one re-verified tip — I2). It is bounded by maxChildren (fail-closed) and depth 1, and
+// obs records the recursion tree to the log. The returned decomposeState exposes the
+// integration worktree for the caller's keep/clean decision after kernel.Run returns.
+func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify verifyFunc, maxChildren int, obs kernel.Observer) (kernel.Envelope, *decomposeState) {
+	st := &decomposeState{}
+	env := kernel.Envelope{
+		Name:        "decompose",
+		Granularity: kernel.AlwaysDecompose,
+		MaxDepth:    1, // one level: a goal → its sub-goals (each a flat run)
+		MaxChildren: maxChildren,
+		Observer:    obs,
+		// A child sub-goal runs as a full single-task run that keeps its verified branch.
+		Flat: func(ctx context.Context, n kernel.Node) (kernel.Outcome, error) {
+			branch, verified, err := runChild(ctx, n.Goal, n.ID)
+			if err != nil {
+				return kernel.Outcome{}, err
+			}
+			return kernel.Outcome{Summary: n.Goal, Branch: branch, Verified: verified}, nil
+		},
+	}
+	plan := func(_ context.Context, n kernel.Node) ([]kernel.Node, error) {
+		subs := decomposePlan(n.Goal)
+		nodes := make([]kernel.Node, len(subs))
+		for i, s := range subs {
+			nodes[i] = kernel.Node{ID: fmt.Sprintf("%s-%d", rootID, i+1), Goal: s}
+		}
+		return nodes, nil
+	}
+	integrate := func(ctx context.Context, n kernel.Node, outs []kernel.Outcome) (kernel.Outcome, error) {
+		children := make([]childResult, len(outs))
+		for i, o := range outs {
+			children[i] = childResult{subGoal: o.Summary, branch: o.Branch, verified: o.Verified}
+		}
+		wt, res, err := integrateBranches(ctx, baseRepo, n.ID+"-integ", children, verify)
+		if err != nil {
+			return kernel.Outcome{}, err
+		}
+		st.wt, st.res = wt, res
+		return kernel.Outcome{
+			Summary:  fmt.Sprintf("decomposed into %d sub-goals; merged %d, dropped %d", len(outs), res.merged, res.dropped),
+			Branch:   res.branch,
+			Verified: res.verified,
+		}, nil
+	}
+	env.Decompose = kernel.Recursive(&env, plan, integrate)
+	return env, st
 }

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"nilcore/internal/kernel"
 )
 
 func TestDecomposePlan(t *testing.T) {
@@ -169,5 +171,39 @@ func TestIntegrateBranchesSkipsUnverifiedChildren(t *testing.T) {
 	defer wt.Cleanup()
 	if res.merged != 1 || res.dropped != 1 {
 		t.Fatalf("res = %+v, want merged=1 dropped=1 (unverified child skipped)", res)
+	}
+}
+
+// TestDecomposeEnvelopeEndToEnd drives the whole recursive preset through kernel.Run with
+// a fake child runner (creates a real branch per sub-goal) + a fake verifier: it proves
+// plan → run each child → integrate composes, the integrated tip carries every merged
+// child, and the kernel Outcome reflects the integrator's verdict (I2).
+func TestDecomposeEnvelopeEndToEnd(t *testing.T) {
+	repo := initEquivGitRepo(t)
+	base := baseBranch(t, repo)
+	runChild := func(_ context.Context, subGoal, taskID string) (string, bool, error) {
+		br := "child-" + taskID
+		addChildBranch(t, repo, base, br, taskID+".txt", subGoal+"\n")
+		return br, true, nil
+	}
+	alwaysGreen := func(context.Context, string) (bool, error) { return true, nil }
+
+	env, st := decomposeEnvelope("root", repo, runChild, alwaysGreen, 8, nil)
+	out, err := kernel.Run(context.Background(), env,
+		kernel.Node{ID: "root", Goal: "add a model and add a handler and add a test"})
+	if err != nil {
+		t.Fatalf("decompose Run: %v", err)
+	}
+	if !out.Verified {
+		t.Fatalf("decompose outcome not verified: %+v", out)
+	}
+	if st.res.merged != 3 {
+		t.Fatalf("merged %d, want 3 sub-goals", st.res.merged)
+	}
+	defer st.wt.Cleanup()
+	for _, f := range []string{"root-1.txt", "root-2.txt", "root-3.txt"} {
+		if _, err := os.Stat(filepath.Join(st.wt.Path(), f)); err != nil {
+			t.Errorf("integrated tip missing %s: %v", f, err)
+		}
 	}
 }
