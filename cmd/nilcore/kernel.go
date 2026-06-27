@@ -6,19 +6,21 @@ package main
 // `build`, and `swarm` become kernel Envelopes, so every entrypoint routes through ONE
 // `kernel.Run` instead of calling a bespoke machine.
 //
-// DEFAULT-OFF (NILCORE_KERNEL unset): each *ViaKernel helper calls the legacy machine
-// DIRECTLY, so the binary is byte-identical and the kernel is never constructed. When
-// set, the helper wraps the SAME machine call as the envelope's Flat runner and routes
-// it through kernel.Run — the machine's internal structure (orch's single-vs-supervised
-// dispatch, the project loop's fan-out, the swarm's multi-pass) stays opaque to the
-// kernel, so the event sequence is identical (proven by the equivalence harness,
-// kernel_equiv_test.go). The kernel adds the unified entry + the granularity/recursion
-// engine (available for MaxDepth>1); it never re-verifies or re-gates (I2/I3) — the
-// wrapped machine owns all of that, and the native outcome flows back unchanged.
+// DEFAULT-ON (see kernelEnabled): each *ViaKernel helper wraps the SAME machine call as
+// the envelope's Flat runner and routes it through kernel.Run — the machine's internal
+// structure (orch's single-vs-supervised dispatch, the project loop's fan-out, the
+// swarm's multi-pass) stays opaque to the kernel, so the event sequence is identical
+// (proven by the equivalence harness, kernel_equiv_test.go). The legacy machine path is
+// retained as an instant escape hatch: with NILCORE_KERNEL=0|off|false|no the helper
+// calls the machine DIRECTLY, byte-identical, and the kernel is never constructed. Either
+// way the native outcome flows back unchanged; the kernel adds the unified entry + the
+// granularity/recursion engine (available for MaxDepth>1); it never re-verifies or
+// re-gates (I2/I3) — the wrapped machine owns all of that.
 
 import (
 	"context"
 	"os"
+	"strings"
 
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
@@ -28,8 +30,18 @@ import (
 )
 
 // kernelEnabled reports whether orchestration routes through the unified kernel. It is
-// the single default-off gate; unset ⇒ the legacy machine path, byte-identical.
-func kernelEnabled() bool { return os.Getenv("NILCORE_KERNEL") != "" }
+// DEFAULT-ON (Pillar 8 is the engine): the kernel transparently wraps the proven machines
+// and is equivalence-proven, so routing through it is the norm. The legacy machine path is
+// retained as an instant escape hatch — set NILCORE_KERNEL to 0/off/false/no to call the
+// machine DIRECTLY (byte-identical), for revert if the kernel path ever misbehaves.
+func kernelEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NILCORE_KERNEL"))) {
+	case "0", "off", "false", "no":
+		return false
+	default:
+		return true
+	}
+}
 
 // agentToKernel / projectToKernel / swarmToKernel map a machine's native outcome onto the
 // kernel's uniform Outcome. Verified is the machine's verifier verdict (I2) — never a

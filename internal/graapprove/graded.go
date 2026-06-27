@@ -96,15 +96,12 @@ func describe(a policy.GateAction) string {
 	return d
 }
 
-// scopeFor derives the scope string a clause is matched against: for Deploy the
-// environment (Detail-carried, falling back to Branch), otherwise the target
-// Branch. The value is pure DATA (I7) — matched by glob/equality, never executed.
+// scopeFor derives the scope string a clause is matched against. Today every action
+// scopes on Branch: for Deploy that Branch carries the target environment name (the
+// structured action has no Environment field), for every other type it is the git
+// branch. The value is pure DATA (I7) — matched by glob/equality, never executed. (If a
+// type ever needs a different scope source, special-case it here.)
 func scopeFor(a policy.GateAction) string {
-	if a.Type == policy.Deploy {
-		// Deploy targets are carried in Branch by the gate site (the structured
-		// action has no Environment field); treat it as the environment name.
-		return a.Branch
-	}
 	return a.Branch
 }
 

@@ -39,6 +39,27 @@ func (v equivVerifier) Check(context.Context) (verify.Report, error) {
 	return verify.Report{Passed: v.pass}, nil
 }
 
+// TestKernelEnabledDefaultOnWithEscapeHatch proves the flip: the kernel is the DEFAULT
+// engine (unset ⇒ on), with an opt-out escape hatch to the legacy machine path.
+func TestKernelEnabledDefaultOnWithEscapeHatch(t *testing.T) {
+	t.Setenv("NILCORE_KERNEL", "")
+	if !kernelEnabled() {
+		t.Fatal("unset NILCORE_KERNEL must default ON (the unified kernel is the engine)")
+	}
+	for _, off := range []string{"0", "off", "OFF", "false", "no", " no "} {
+		t.Setenv("NILCORE_KERNEL", off)
+		if kernelEnabled() {
+			t.Errorf("NILCORE_KERNEL=%q must route to the legacy machine (escape hatch)", off)
+		}
+	}
+	for _, on := range []string{"1", "yes", "true", "on"} {
+		t.Setenv("NILCORE_KERNEL", on)
+		if !kernelEnabled() {
+			t.Errorf("NILCORE_KERNEL=%q must keep the kernel on", on)
+		}
+	}
+}
+
 func initEquivGitRepo(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
@@ -98,7 +119,7 @@ func runOrchOnce(t *testing.T, kernelOn bool) ([]string, agent.Outcome) {
 	if kernelOn {
 		t.Setenv("NILCORE_KERNEL", "1")
 	} else {
-		t.Setenv("NILCORE_KERNEL", "")
+		t.Setenv("NILCORE_KERNEL", "0") // the escape hatch — route directly to the legacy machine
 	}
 	out, err := runViaKernel(context.Background(), orch, backend.Task{ID: "equiv-1", Goal: "do a thing"})
 	if err != nil {
