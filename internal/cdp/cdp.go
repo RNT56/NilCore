@@ -22,6 +22,10 @@ type Conn struct {
 	mu sync.Mutex
 	ws *wsConn
 	id int64
+	// actionWait bounds how long the selector-targeting commands poll for their
+	// target to become actionable before giving up (see evalUntil). Zero means use
+	// defaultActionWait; tests set a small value to keep the no-match path fast.
+	actionWait time.Duration
 }
 
 // rpcRequest is the CDP command envelope. params is omitted when nil so commands

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -316,17 +317,56 @@ func TestElementCenterDecodes(t *testing.T) {
 	})
 	t.Run("no match", func(t *testing.T) {
 		clientWS, server := newPipePair(t)
-		c := &Conn{ws: clientWS}
+		// A sub-tick budget makes the auto-wait poll exactly once (any real round-trip
+		// exceeds 1ns), so the single-null server below suffices and the genuine
+		// no-match path still returns the precise domain error fast.
+		c := &Conn{ws: clientWS, actionWait: time.Nanosecond}
 		go func() {
 			req := decodeClientRequest(t, bufio.NewReader(server))
 			writeServerResult(t, server, req.ID, map[string]any{
 				"result": map[string]any{"value": nil},
 			})
 		}()
-		if _, err := c.ElementCenter(context.Background(), "#missing"); err == nil {
+		_, err := c.ElementCenter(context.Background(), "#missing")
+		if err == nil {
 			t.Fatal("ElementCenter on no-match = nil, want error")
 		}
+		if !strings.Contains(err.Error(), "matched no visible element") {
+			t.Fatalf("error = %v, want a 'matched no visible element' domain error", err)
+		}
 	})
+}
+
+// TestElementCenterAutoWaitsForElement proves the auto-wait: when the element is not
+// present on the first DOM queries (the page is still settling) but appears on a later
+// poll, ElementCenter waits for it and returns its center rather than failing on the
+// first miss — the settle race the live-flow CI exercised.
+func TestElementCenterAutoWaitsForElement(t *testing.T) {
+	clientWS, server := newPipePair(t)
+	c := &Conn{ws: clientWS} // default budget; the element appears well within it
+	go func() {
+		br := bufio.NewReader(server)
+		// First two polls see nothing (null); the third sees the laid-out element.
+		for i := 0; i < 3; i++ {
+			req := decodeClientRequest(t, br)
+			if i < 2 {
+				writeServerResult(t, server, req.ID, map[string]any{
+					"result": map[string]any{"value": nil},
+				})
+				continue
+			}
+			writeServerResult(t, server, req.ID, map[string]any{
+				"result": map[string]any{"value": map[string]any{"x": 10.5, "y": 20.0}},
+			})
+		}
+	}()
+	pt, err := c.ElementCenter(context.Background(), "#late")
+	if err != nil {
+		t.Fatalf("ElementCenter with a late element: %v", err)
+	}
+	if pt.X != 10.5 || pt.Y != 20.0 {
+		t.Fatalf("center = %+v, want {10.5 20} after the auto-wait", pt)
+	}
 }
 
 // TestClickDispatchesPressAndRelease confirms a Click sends exactly two
