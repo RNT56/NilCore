@@ -45,6 +45,16 @@ func TestSelfAccLeafDependencyClosure(t *testing.T) {
 		if d == "" || strings.HasPrefix(d, "nilcore/") {
 			continue
 		}
+		// golang.org/x/sys is the SANCTIONED §6/I6 exception (the namespace sandbox's
+		// Landlock / no_new_privs / seccomp syscalls). selfacc legitimately imports
+		// internal/sandbox (a sanctioned read — see wantPresent below, the I4 fix that
+		// lets a self-authored verifier run ONLY sandboxed), and on Linux that sandbox
+		// transitively pulls x/sys. It is therefore inherited, NOT a new module this
+		// leaf adds — so allow it (mirrors internal/verify/vcache's deps_test). On
+		// macOS the linux-only namespace backend isn't compiled, so x/sys is absent.
+		if strings.HasPrefix(d, "golang.org/x/sys") {
+			continue
+		}
 		if first := strings.SplitN(d, "/", 2)[0]; strings.Contains(first, ".") {
 			t.Errorf("selfacc leaf must add no module dependency, found external module %q", d)
 		}
