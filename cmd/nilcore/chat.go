@@ -41,6 +41,7 @@ import (
 	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
+	"nilcore/internal/blastbudget"
 	"nilcore/internal/budget"
 	"nilcore/internal/capability"
 	"nilcore/internal/emit"
@@ -120,7 +121,7 @@ func chatMain(args []string) {
 	// that lets the conversation survive a restart (set as the Session.Store below)
 	// and durable event-log mirroring. Nils keep the conversation in-memory only and
 	// the live tool off.
-	mem, ckpt := setupPersistence(log)
+	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
@@ -386,7 +387,7 @@ func resolveWeb(cfg onboard.Config, profileHosts []string, flagAllow, searchKey 
 // allowlisted hosts and refuses private/loopback destinations (the SSRF guard), so
 // it is never an open relay.
 func startEgress(ctx context.Context, hosts []string, con *termui.Console) (policy.Egress, string, func()) {
-	egress, addr, stop, ok := startEgressProxy(ctx, hosts)
+	egress, addr, stop, ok := startEgressProxy(ctx, hosts, nil)
 	switch {
 	case len(hosts) == 0:
 		// default-deny; nothing to announce.
@@ -406,12 +407,14 @@ func startEgress(ctx context.Context, hosts []string, con *termui.Console) (poli
 // proxy cannot bind — fail-closed: a bind failure runs with no egress, not an open
 // sandbox. It binds 0.0.0.0 so a bridged container can reach it; the proxy only ever
 // forwards to the allowlisted hosts and refuses private/loopback (the SSRF guard).
-func startEgressProxy(ctx context.Context, hosts []string) (policy.Egress, string, func(), bool) {
+func startEgressProxy(ctx context.Context, hosts []string, blast *blastbudget.Budget) (policy.Egress, string, func(), bool) {
 	if len(hosts) == 0 {
 		return policy.Egress{}, "", func() {}, false
 	}
 	egress := policy.Egress{Allowed: hosts}
-	proxy := &policy.EgressProxy{Egress: egress}
+	// BR-T02: the optional blast-radius budget fences the distinct-egress-host axis at
+	// the proxy. nil (no -blast-radius preset, the default) ⇒ unfenced, byte-identical.
+	proxy := &policy.EgressProxy{Egress: egress, Blast: blast}
 	addr, stop, err := proxy.Start(ctx, "0.0.0.0:0")
 	if err != nil {
 		return policy.Egress{}, "", func() {}, false
@@ -933,6 +936,8 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
 		executor: d.provider,
 		strong:   strong,
 		log:      d.log,
+		logPath:  *d.flags.common.logPath,
+		blast:    mintBlastBudget(*d.flags.common.blastRadius, d.log), // -blast-radius fence for the chat supervise/project sandboxes (nil when off)
 		approver: d.approverOr(),
 		ledger:   ledger,       // pin the conversation wall (§6)
 		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)

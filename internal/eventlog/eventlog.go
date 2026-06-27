@@ -40,11 +40,18 @@ type Event struct {
 type Log struct {
 	mu    sync.Mutex
 	f     *os.File
+	path  string       // on-disk path (for read-back rebuilds; see Path)
 	prev  string       // hash of the last *durably written* event
 	seq   uint64       // sequence number for the next event
 	key   []byte       // optional HMAC key (NILCORE_LOG_HMAC_KEY); nil = plain SHA-256
 	store *store.Store // optional second backing (P4-T02); JSONL stays the export
-	err   error        // first write failure, if any (a broken audit trail is loud)
+	// onAppend is an optional hook invoked with each event AFTER it is durably written
+	// (and mirrored to the store). It is the Phase-16 experience seam (EXP-T03): the
+	// projector folds a verifier-judged race_outcome into its DERIVED projection as the
+	// event lands, so OverStore stays warm without a full replay. nil (the default) is a
+	// no-op, so an unwired log is byte-identical.
+	onAppend func(e Event)
+	err      error // first write failure, if any (a broken audit trail is loud)
 }
 
 // logKey reads the optional chain HMAC key from the environment (invariant I3:
@@ -60,9 +67,33 @@ func logKey() []byte {
 // its hash chain) is also written to the store, while the JSONL file remains
 // available as an export. Append's signature and all callers are unchanged.
 func (l *Log) UseStore(s *store.Store) {
-	if l != nil {
-		l.store = s
+	if l == nil {
+		return
 	}
+	// Set under the lock so the write is properly synchronized with a concurrent
+	// Append that reads l.store under the same lock (these are normally set once at
+	// startup, before any Append, but the lock makes that race-free regardless).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.store = s
+}
+
+// OnAppend registers an optional hook called with each event AFTER it is durably
+// appended and mirrored to the store. It is the seam the Phase-16 experience
+// projector uses to fold a verifier-judged race_outcome into its derived projection
+// as it lands (EXP-T03). The hook runs under the log lock (appends stay serialized)
+// and its result is IGNORED: a derived projection failing must never break or stall
+// the authoritative append-only log (I5). nil (the default) installs nothing, so an
+// unwired log is byte-identical. Set it once, before traffic.
+func (l *Log) OnAppend(fn func(e Event)) {
+	if l == nil {
+		return
+	}
+	// Set under the lock so the write is synchronized with a concurrent Append that
+	// reads l.onAppend under the same lock (set once at startup in practice).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onAppend = fn
 }
 
 // Open opens (creating if needed) the log at path, continuing the hash chain and
@@ -72,7 +103,7 @@ func Open(path string) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Log{f: f, key: logKey()}
+	l := &Log{f: f, key: logKey(), path: path}
 	if last, ok := lastEvent(path); ok {
 		l.prev = last.Hash
 		l.seq = last.Seq + 1
@@ -132,6 +163,23 @@ func (l *Log) Append(e Event) {
 			l.fail(fmt.Errorf("mirror event to store: %w", serr))
 		}
 	}
+
+	// Phase-16 experience seam: fold the now-durable event into the derived projection
+	// (EXP-T03). Best-effort and after the authoritative write — the projection is
+	// rebuildable from the log, so a fold failure degrades only the warm cache, never
+	// the audit trail. A panic in a buggy projector is RECOVERED (and surfaced) rather
+	// than allowed to take down the audit-log writer; the event is already durable.
+	// nil hook ⇒ no-op (byte-identical).
+	if l.onAppend != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "nilcore: experience fold hook panicked: %v\n", r)
+				}
+			}()
+			l.onAppend(e)
+		}()
+	}
 }
 
 // fail records the first write failure and emits a one-line diagnostic. A
@@ -154,6 +202,16 @@ func (l *Log) Err() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.err
+}
+
+// Path reports the on-disk path of the log (empty for a nil log). It lets a wiring
+// layer rebuild a derived window (e.g. the blast per-UTC-day $ meter) from the durable
+// log on boot without threading the path separately — the rebuild-on-boot discipline.
+func (l *Log) Path() string {
+	if l == nil {
+		return ""
+	}
+	return l.path
 }
 
 // Close closes the underlying file.

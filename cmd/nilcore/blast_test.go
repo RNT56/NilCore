@@ -1,9 +1,55 @@
 package main
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"nilcore/internal/blastbudget"
+	"nilcore/internal/eventlog"
 )
+
+// TestXC04_BlastDayWindowRebuildsFromLog proves the per-UTC-day auto-approval $ ceiling
+// REBUILDS from the durable log on boot, so a process restart cannot reset the fence
+// (no fail-open on restart — the I5 rebuild-on-boot discipline).
+func TestXC04_BlastDayWindowRebuildsFromLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "e.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A prior auto_approve TODAY charged $20 (the exact shape graapprove emits).
+	log.Append(eventlog.Event{Kind: "auto_approve", Detail: map[string]any{
+		"action":  "deploy",
+		"scope":   "staging",
+		"dollars": map[string]any{"charged": 20.0, "max_dollars_day": 25.0},
+	}})
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A FRESH budget (simulating a restart) must rebuild the day window so the $25/day
+	// ceiling already reflects the prior $20.
+	reopened, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	b := blastbudget.New()
+	b.SetAutoApprovalDollarCeiling(25)
+	rebuildBlastDay(b, reopened.Path())
+
+	today := time.Now().UTC().Format("2006-01-02")
+	if u := b.Used(today); u.Dollars != 20 {
+		t.Fatalf("rebuilt day window = $%.2f, want $20 from the log", u.Dollars)
+	}
+	// Only $5 remains: a further $6 must breach (the restart did NOT reset the fence).
+	if err := b.ChargeAutoApprovalDollars(context.Background(), today, 6); err == nil {
+		t.Fatal("restart must not reset the $ window — $20 prior + $6 must breach $25")
+	}
+}
 
 func TestMintBlastBudget_OffIsNil(t *testing.T) {
 	// "off" / empty / unknown ⇒ no budget (unfenced, byte-identical default-off).

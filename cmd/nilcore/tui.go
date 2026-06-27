@@ -58,7 +58,7 @@ func tuiMain(args []string) {
 	// Persistence backbone (best-effort): cross-project memory + the checkpointer that
 	// lets the conversation survive a restart (set as Session.Store below). Nils keep
 	// it in-memory only — parity with chatMain.
-	mem, ckpt := setupPersistence(log)
+	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
@@ -86,7 +86,7 @@ func tuiMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*cf.common.sandboxPref))
 	warnNamespaceEgress(prof, *cf.common.sandboxPref)
 	allow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, *cf.allowEgress, searchKey)
-	egress, proxyAddr, stopProxy, egressOK := startEgressProxy(ctx, allow)
+	egress, proxyAddr, stopProxy, egressOK := startEgressProxy(ctx, allow, nil)
 	defer stopProxy()
 
 	gates := make(chan gateReq)

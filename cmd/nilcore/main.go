@@ -40,6 +40,7 @@ import (
 	"nilcore/internal/channel/telegram"
 	"nilcore/internal/emit"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/experience"
 	"nilcore/internal/maint"
 	"nilcore/internal/memory"
 	"nilcore/internal/meter"
@@ -112,6 +113,14 @@ func main() {
 		trustMain(args[1:])
 	case "experience":
 		experienceMain(args[1:])
+	case "lessons":
+		lessonsMain(args[1:])
+	case "flywheel":
+		flywheelMain(args[1:])
+	case "objective":
+		objectiveMain(args[1:])
+	case "auto-approvals":
+		autoApprovalsMain(args[1:])
 	case "capability":
 		capabilityMain(args[1:])
 	case "trace", "why":
@@ -799,11 +808,17 @@ func runMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log)
+	mem, cp, _ := setupPersistence(log, *c.logPath)
+
+	// One shared blast-radius budget for the whole run: the SAME meter fences the
+	// sandbox wall-time + egress hosts (BR-T02/T03) and the auto-approval $/rate/
+	// irreversible axes (BR-T04). nil when -blast-radius is off (the default) ⇒ unfenced,
+	// byte-identical.
+	blast := mintBlastBudget(*c.blastRadius, log)
 
 	orch := &agent.Orchestrator{
 		BaseRepo: absDir,
-		NewEnv:   envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
+		NewEnv:   envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg, blast),
 		Log:      log,
 		Router:   agent.SingleRouter{},
 		Spawner:  agent.NoSpawner{},
@@ -811,14 +826,14 @@ func runMain(args []string) {
 		// envelope configured (cfg.AutoApprove empty) wrapAutoApprove returns the console
 		// approver UNCHANGED, so the default is byte-identical; an envelope lets an
 		// earned-trust boundary auto-proceed within the shared blast-radius fence.
-		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
+		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast),
 		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
 	}
 	// Phase 13: when -backends names two or more backends, activate strength-routing
 	// (Backends/NewEnvFor/Selector). EMPTY/single ⇒ no-op (byte-identical single path).
-	wireMultiBackend(orch, c, b, log, mem, absDir)
+	wireMultiBackend(orch, c, b, log, mem, absDir, blast)
 	// Phase 13: when -auto-supervise is set, wire the optional supervised seam so a
 	// complex goal opportunistically scales up to the bounded project loop. DEFAULT
 	// OFF ⇒ Project/ShouldSupervise stay nil ⇒ Execute is byte-identical single-task.
@@ -893,7 +908,9 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 	}
 
 	// The build caps VERBATIM (the same construction `nilcore build` uses), so the
-	// scaled-up run is bounded identically — no new rails.
+	// scaled-up run is bounded identically — no new rails. One shared blast budget
+	// fences the gate + the loop's sandboxes (nil when off ⇒ unfenced).
+	asBlast := mintBlastBudget(*c.blastRadius, log)
 	stack, err := buildStack(buildDeps{
 		goal:        goal, // the project loop bakes this goal; matches the chat supervised path
 		dir:         o.BaseRepo,
@@ -911,9 +928,12 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 		executor:    exec,
 		strong:      strong,
 		log:         log,
+		logPath:     *c.logPath,
+		blast:       asBlast,
 		// GAA-T07: the -auto-supervise scale-up honors the same auto-approval envelope as
-		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged.
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, mintBlastBudget(*c.blastRadius, log)),
+		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged. The
+		// SAME blast meter fences the gate + the loop's sandboxes (BR-T04).
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, asBlast),
 	})
 	if err != nil {
 		fatal(err)
@@ -963,10 +983,25 @@ func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal stri
 // so a self-started or self-edit task runs through the EXACT same verified path —
 // the verifier remains the sole authority on done (I2), the gate on irreversible
 // actions (I3/policy).
-func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string) *agent.Orchestrator {
+func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget) *agent.Orchestrator {
+	// Open the persistence backbone, then build the orchestrator over it. A one-shot
+	// command (propose-edit / watch / scheduler / webhook / `nilcore flywheel`) owns its
+	// own store for the process lifetime. A long-running serve must NOT call this for its
+	// folds — it would open a SECOND single-writer handle to the same DB; serve uses
+	// buildRunOrchestratorWith with the store it already opened (see serveMain).
+	mem, cp, _ := setupPersistence(log, *c.logPath)
+	return buildRunOrchestratorWith(c, b, log, absDir, blast, mem, cp)
+}
+
+// buildRunOrchestratorWith builds the single-task run orchestrator over an
+// ALREADY-OPENED memory + checkpointer, so a process that has already set up persistence
+// (serve) can share its one *sql.DB rather than opening competing handles. It mirrors
+// runMain's wiring: the native backend via envFactory, the console gate, memory
+// write-back, and the optional multi-backend / blast seams. The verifier stays the sole
+// authority on done (I2); the gate governs irreversible actions (I3).
+func buildRunOrchestratorWith(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget, mem *memory.Memory, cp *agent.Checkpoint) *agent.Orchestrator {
 	// Resolve `-backend auto` / config backend:auto to a concrete name so the
-	// self-started run paths (propose-edit / watch / scheduler / webhook) honor the
-	// same system-selection seam as `nilcore run`. No "auto" ⇒ no-op (byte-identical).
+	// self-started run paths honor the same system-selection seam as `nilcore run`.
 	if *c.backendName == "auto" {
 		*c.backendName = resolveAutoBackend(c, b, log)
 	}
@@ -974,10 +1009,9 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	if err != nil {
 		fatal(err)
 	}
-	mem, cp := setupPersistence(log)
 	orch := &agent.Orchestrator{
 		BaseRepo:   absDir,
-		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg),
+		NewEnv:     envFactory(c, prov, b.cred, resolveAdvisor(*c.backendName, b, c), log, mem, absDir, b.cfg, blast),
 		Log:        log,
 		Router:     agent.SingleRouter{},
 		Spawner:    agent.NoSpawner{},
@@ -988,7 +1022,7 @@ func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir strin
 	}
 	// Phase 13: -backends (two or more) activates strength-routing for the run-style
 	// commands (propose-edit / watch / self-improve / schedule). EMPTY/single ⇒ no-op.
-	wireMultiBackend(orch, c, b, log, mem, absDir)
+	wireMultiBackend(orch, c, b, log, mem, absDir, blast)
 	return orch
 }
 
@@ -1022,7 +1056,7 @@ func serveMain(args []string) {
 	// Persistence backbone (best-effort): durable event-log mirroring + cross-project
 	// memory (the opt-in live tool) + the checkpointer that gives serve threads
 	// conversation persistence and leftover-task resume across a restart.
-	mem, ckpt := setupPersistence(log)
+	mem, ckpt, serveStore := setupPersistence(log, *c.logPath)
 	// Reclaim worktree admin entries left by a crashed prior process. SAFE: only
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.
@@ -1080,6 +1114,18 @@ func serveMain(args []string) {
 	// inode; rotation-while-open needs eventlog support and is out of scope.)
 	go runMaintenanceTicker(ctx, absDir, log)
 
+	// SIF-T08: the optional self-improvement flywheel as a bounded serve-background
+	// cadence. DEFAULT-OFF — only when NILCORE_FLYWHEEL is set. The orchestrator is
+	// built HERE (at startup) so a missing model key fails loudly at boot rather than
+	// inside the goroutine; each tick runs one bounded cycle (verifier + gate own every
+	// ship — I2). It never edits the verifier of record (selfimprove.DefaultScope).
+	if os.Getenv("NILCORE_FLYWHEEL") != "" {
+		// Reuse serve's already-opened persistence (mem/ckpt) — never re-open the store
+		// (one *sql.DB for the whole serve process; no competing single-writer handles).
+		fwLoop := newFlywheelLoop(buildRunOrchestratorWith(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log), mem, ckpt), log, *c.logPath, 1, time.Minute)
+		go runFlywheelTicker(ctx, fwLoop)
+	}
+
 	// One shared concurrency gate caps how many drives run at once across ALL
 	// threads, so a burst of conversations queues rather than overrunning the host's
 	// sandbox/model capacity. Drained and stopped after the serve loop returns.
@@ -1101,7 +1147,12 @@ func serveMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*c.sandboxPref))
 	warnNamespaceEgress(prof, *c.sandboxPref)
 	webAllow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, "", searchKey)
-	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow)
+	// One shared blast-radius budget for the whole serve PROCESS: the SAME meter fences
+	// the egress hosts (BR-T02), the per-thread sandbox wall-time (BR-T03), and the
+	// auto-approval $/rate/irreversible axes (BR-T04/GAA-T07). Minted once here, threaded
+	// to the egress proxy + serveDeps. nil when -blast-radius is off ⇒ unfenced.
+	serveBlast := mintBlastBudget(*c.blastRadius, log)
+	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow, serveBlast)
 	defer stopProxy()
 	if egress.Empty() {
 		fmt.Fprintln(os.Stderr, "nilcore serve: web access off (default-deny)")
@@ -1125,7 +1176,7 @@ func serveMain(args []string) {
 		baseRepo:        absDir,
 		budget:          *budgetCeil,
 		gate:            gate,
-		blast:           mintBlastBudget(*c.blastRadius, log), // one shared fence for the whole serve process (nil when off)
+		blast:           serveBlast, // one shared fence for the whole serve process (nil when off)
 		mem:             mem,
 		checkpoint:      ckpt,
 		wakeReg:         wakeReg,
@@ -1136,6 +1187,22 @@ func serveMain(args []string) {
 		egressTree:      prof.Tree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 	factory := serveSessionFactory(d, rawCh, ctx)
+
+	// AUTO-T06: the autonomy daemon self-services the operator objective backlog when
+	// idle. DEFAULT-OFF — only when NILCORE_AUTONOMY is set. The orchestrator is built
+	// HERE (at startup) so a missing model key fails loudly at boot rather than in the
+	// goroutine; its gate is HEADLESS (deny irreversible by default, auto only for an
+	// earned boundary inside the operator envelope + the shared blast fence — I3). The
+	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
+	// names. An empty backlog emits nothing, so this is inert until objectives exist.
+	if os.Getenv("NILCORE_AUTONOMY") != "" && serveStore != nil {
+		// Reuse serve's already-opened persistence (mem/ckpt + serveStore) — the daemon
+		// shares the one *sql.DB for both its orchestrator and the objective backlog, so
+		// it never opens a competing single-writer handle to the same file.
+		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
+		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
+		go runAutonomyDaemon(ctx, autoOrch, log, serveStore)
+	}
 
 	// Durable resume: re-drive any native task a prior process left running or
 	// interrupted, BEFORE accepting new traffic. Each runs in a fresh disposable
@@ -1666,6 +1733,8 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 		executor: d.provider,
 		strong:   strong,
 		log:      d.log,
+		logPath:  *d.flags.logPath,
+		blast:    d.blast, // share the serve process's blast fence across the supervise/project sandboxes
 		approver: approver,
 		ledger:   ledger,       // pin the per-conversation wall (§6)
 		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
@@ -1866,10 +1935,35 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 	return box
 }
 
-// envFactory builds the per-worktree backend+verifier factory.
-func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config) func(string) agent.Env {
+// attachBlast wires the shared blast-radius budget onto a container sandbox so its
+// cumulative WALL-TIME axis is fenced (BR-T03). It is the single seam the env factories
+// use; a nil budget (no -blast-radius preset, the default) or a non-container backend
+// is returned UNCHANGED, so an unfenced run is byte-identical. The same *blastbudget
+// instance is shared across every worktree of a run, so the wall fence bounds the run,
+// not each box independently.
+//
+// KNOWN LIMITATION: the wall-time fence is wired into the container backend only (the
+// Blast field lives on *sandbox.Container). The host-native Linux namespace backend
+// (sandbox.Namespace, Phase 7) carries no wall fence, so under it the wall axis of
+// -blast-radius is not enforced (the host/irreversible/$ axes still apply, at the egress
+// proxy and the gate). The container backend is the default; this is a documented gap,
+// not a silent failure.
+func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
+	if b == nil {
+		return box
+	}
+	if c, ok := box.(*sandbox.Container); ok {
+		c.Blast = b
+	}
+	return box
+}
+
+// envFactory builds the per-worktree backend+verifier factory. The optional blast
+// budget fences the sandbox wall-time axis (BR-T04 threading); nil ⇒ unfenced,
+// byte-identical.
+func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config, blast *blastbudget.Budget) func(string) agent.Env {
 	return func(dir string) agent.Env {
-		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := behavioralVerifier(box, *c.checkCmd)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project, cfg)
 		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
@@ -1893,7 +1987,7 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 // resolveAdvisor return today) and its OWN creds via the SecretStore-backed cred
 // resolver — the model never sees a key (I3). The verifier is identical across
 // backends (the project's checks for the worktree), so only the backend is swapped.
-func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) func(dir, name string) agent.Env {
+func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string, blast *blastbudget.Budget) func(dir, name string) agent.Env {
 	return func(dir, name string) agent.Env {
 		// Per-NAME deps: native needs the executor provider + advisor; codex/claude-code
 		// get nil (resolveProvider/resolveAdvisor already special-case them). A provider
@@ -1904,7 +1998,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 			fatal(perr)
 		}
 		adv := resolveAdvisor(name, b, c)
-		box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := behavioralVerifier(box, *c.checkCmd)
 		be := buildBackend(name, prov, b.cred, adv, box, v, log, *c.maxSteps, mem, project, b.cfg)
 		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
@@ -1926,7 +2020,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 // Replay error is LOGGED and degrades to a nil Selector (configured order) — it never
 // aborts the run; a clean/missing log yields an empty ledger ⇒ configured order until
 // evidence accrues. The Selector only ORDERS; the verifier still governs "done" (I2).
-func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string) {
+func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlog.Log, mem *memory.Memory, project string, blast *blastbudget.Budget) {
 	// Trust-route (Phase 16, RTE-T08): activate the cost-aware oracle when
 	// NILCORE_TRUST_DEFAULT=1 — independent of -backends, so a single-backend run
 	// also sizes race/escalate by learned per-class data. Fail-soft on a broken
@@ -1947,7 +2041,7 @@ func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlo
 		return // single path — leave Backends/NewEnvFor/Selector unset (byte-identical)
 	}
 	o.Backends = names
-	o.NewEnvFor = multiEnvFactory(c, b, log, mem, project)
+	o.NewEnvFor = multiEnvFactory(c, b, log, mem, project, blast)
 	led, err := trust.Replay(*c.logPath)
 	if err != nil {
 		// Fail-soft on a broken chain: no trustworthy ranking, so fall back to the
@@ -2021,17 +2115,42 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 // setupPersistence opens the persistent store (best-effort), wires it as a second
 // backing for the event log, and returns the memory API and the task checkpointer
 // (both nil if the store is unavailable — persistence is optional, never blocking).
-func setupPersistence(log *eventlog.Log) (*memory.Memory, *agent.Checkpoint) {
+func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent.Checkpoint, *store.Store) {
 	dir, err := paths.EnsureDir(paths.DataDir())
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	s, err := store.Open(filepath.Join(dir, "nilcore.db"))
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	log.UseStore(s)
-	return memory.New(s), agent.NewCheckpoint(s)
+	wireExperience(log, s)
+	mem := memory.New(s)
+	// LRN-T03: fold distilled verifier-failure scars into memory so the next same-class
+	// task sees them as context. Default-off (NILCORE_LESSONS unset ⇒ no-op).
+	wireLessons(logPath, mem)
+	// The store is returned so a long-running process (serve) can SHARE this single
+	// *sql.DB across its folds (flywheel/autonomy orchestrators + the objective backlog)
+	// rather than opening competing single-writer handles to the same file — see
+	// buildRunOrchestratorWith / runAutonomyDaemon. One-shot commands ignore it.
+	return mem, agent.NewCheckpoint(s), s
+}
+
+// wireExperience activates the Phase-16 experience projection (EXP-T03). When
+// NILCORE_EXPERIENCE is set, every appended event is folded into the store-backed
+// projection as it lands — only verifier-judged race_outcome events change state
+// (I2) — so the OverStore reader stays warm for consumers without a full log replay.
+// The fold is best-effort behind the authoritative append (a derived projection is
+// rebuildable from the log, so a fold error never breaks the log). DEFAULT-OFF: with
+// the env unset no hook is installed and Append is byte-identical. The projection is
+// also (re)derivable on demand via `nilcore experience --rebuild`.
+func wireExperience(log *eventlog.Log, s *store.Store) {
+	if os.Getenv("NILCORE_EXPERIENCE") == "" {
+		return
+	}
+	proj := experience.NewProjector(s)
+	log.OnAppend(func(e eventlog.Event) { _ = proj.Fold(context.Background(), e) })
 }
 
 // memWriteBack persists a durable record after a verified task (P4-T05).

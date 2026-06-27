@@ -39,6 +39,42 @@ func (b *fakeVerifierBox) ExecWithEnv(_ context.Context, cmd string, env map[str
 
 func (b *fakeVerifierBox) Workdir() string { return b.dir }
 
+// TestVcacheDecorateGating proves the LRN-T05 verify-cache wiring is default-off
+// byte-identical and only wraps when fully opted in. The cache MECHANICS are tested in
+// internal/verify/vcache; here we only assert the gate the cmd layer owns.
+func TestVcacheDecorateGating(t *testing.T) {
+	dir := t.TempDir()
+	box := &fakeVerifierBox{dir: dir}
+	base := verify.New(box, "true")
+	logPath := filepath.Join(dir, "e.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	// Default-off: NILCORE_VCACHE unset ⇒ the base verifier is returned UNCHANGED.
+	t.Setenv("NILCORE_VCACHE", "")
+	if got := vcacheDecorate(base, box, "true", log, logPath); got != verify.Verifier(base) {
+		t.Fatal("NILCORE_VCACHE unset must return the base verifier unchanged (byte-identical)")
+	}
+	t.Setenv("NILCORE_VCACHE", "1")
+	// Opted in but missing a required input ⇒ still unchanged (cannot record/verify safely).
+	if got := vcacheDecorate(base, box, "true", nil, logPath); got != verify.Verifier(base) {
+		t.Fatal("a nil log must return base unchanged")
+	}
+	if got := vcacheDecorate(base, box, "true", log, ""); got != verify.Verifier(base) {
+		t.Fatal("an empty log path must return base unchanged")
+	}
+	if got := vcacheDecorate(base, &fakeVerifierBox{dir: ""}, "true", log, logPath); got != verify.Verifier(base) {
+		t.Fatal("an empty workdir must return base unchanged")
+	}
+	// Fully opted in ⇒ a WRAPPED cache verifier, not the bare base.
+	if got := vcacheDecorate(base, box, "true", log, logPath); got == verify.Verifier(base) {
+		t.Fatal("NILCORE_VCACHE on with a full config must wrap the verifier")
+	}
+}
+
 // writeURLArtifact writes an artifact whose single claim uses the generic
 // web.url_resolves verifier (the only id evverify.Default registers), so the wired
 // verifier exercises the real default registry path. Returns the artifact id.

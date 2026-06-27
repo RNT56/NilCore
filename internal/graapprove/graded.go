@@ -181,12 +181,26 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		return g.human.Approve(describe(a))
 	}
 
-	// (5b) Dollars — when a clause carries a $/day ceiling, charge it through the
-	// SHARED blastbudget meter (never a second counter). A breach is final: deny and
-	// delegate. A zero ceiling charges nothing.
+	// (5b) Blast irreversible fence — every auto-approval consumes one slot of the
+	// SHARED blast-radius meter's irreversible axis. This is the composition law in
+	// code (min(P5, blast)): a P5 grant proceeds ONLY within the remaining blast
+	// envelope, and a breach is FINAL — fall through to the human. A nil g.blast (no
+	// -blast-radius preset) is a no-op, so an unfenced run is byte-identical (the
+	// irreversible axis bites only when an operator sets a ceiling).
+	ctx := context.Background()
+	if cerr := g.blast.ChargeIrreversible(ctx, 1); cerr != nil {
+		g.emitDeny("blast_radius", typ, scope, map[string]any{"axis": "irreversible"})
+		return g.human.Approve(describe(a))
+	}
+
+	// (5c) Dollars — when a clause carries a $/day ceiling, charge it through the SAME
+	// shared meter (never a second counter). On a breach, roll back the irreversible
+	// slot we just took (CreditIrreversible) so a denied action consumes nothing, then
+	// deny and delegate. A zero ceiling charges nothing.
 	dollars := clause.MaxDollarsDay
 	if dollars > 0 && g.blast != nil {
-		if cerr := g.blast.ChargeAutoApprovalDollars(context.Background(), today, dollars); cerr != nil {
+		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, dollars); cerr != nil {
+			g.blast.CreditIrreversible(1) // this action did not proceed — release its slot
 			g.emitDeny("over_ceiling", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})

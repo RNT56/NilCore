@@ -113,11 +113,16 @@ func (p *Projector) Fold(ctx context.Context, e eventlog.Event) error {
 	if e.Kind != "race_outcome" {
 		return nil
 	}
-	meta, _, err := p.s.ExpMeta(ctx)
+	meta, ok, err := p.s.ExpMeta(ctx)
 	if err != nil {
 		return err
 	}
-	if int64(e.Seq) <= meta.SourceSeq {
+	// A fresh projection (no meta row yet) has folded NOTHING — not even seq 0. Only
+	// once a meta row exists is SourceSeq a real high-water mark, so an event at or
+	// below it is already folded (idempotent). Distinguishing the two lets a
+	// race_outcome that is the literal first log event (seq 0) fold under live
+	// activation instead of being dropped by a spurious 0 <= 0 test.
+	if ok && int64(e.Seq) <= meta.SourceSeq {
 		return nil // already folded (idempotent)
 	}
 

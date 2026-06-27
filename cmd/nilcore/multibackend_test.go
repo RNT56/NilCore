@@ -84,7 +84,7 @@ func TestWireMultiBackendDefaultOff(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := buildCommon(t, append(args, "-log", logPath))
 			o := &agent.Orchestrator{}
-			wireMultiBackend(o, c, b, logAt(t, logPath), nil, dir)
+			wireMultiBackend(o, c, b, logAt(t, logPath), nil, dir, nil)
 			if o.Backends != nil {
 				t.Errorf("Backends should be nil on the single path, got %v", o.Backends)
 			}
@@ -112,7 +112,7 @@ func TestWireMultiBackendActivates(t *testing.T) {
 
 	c := buildCommon(t, []string{"-backends", "native,codex,claude-code", "-log", logPath})
 	o := &agent.Orchestrator{}
-	wireMultiBackend(o, c, b, logAt(t, logPath), nil, dir)
+	wireMultiBackend(o, c, b, logAt(t, logPath), nil, dir, nil)
 
 	if want := []string{"native", "codex", "claude-code"}; !reflect.DeepEqual(o.Backends, want) {
 		t.Errorf("Backends = %v, want %v", o.Backends, want)
@@ -133,7 +133,7 @@ func TestMultiEnvFactorySwapsBackendByName(t *testing.T) {
 	logPath := filepath.Join(dir, "events.jsonl")
 	b := fakeBoot()
 	c := buildCommon(t, []string{"-log", logPath})
-	newEnvFor := multiEnvFactory(c, b, logAt(t, logPath), nil, dir)
+	newEnvFor := multiEnvFactory(c, b, logAt(t, logPath), nil, dir, nil)
 
 	for _, name := range []string{"native", "codex", "claude-code"} {
 		env := newEnvFor(dir, name)
