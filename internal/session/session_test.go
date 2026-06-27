@@ -80,13 +80,20 @@ func (f *fakeDriver) input() DriveInput {
 	return f.in
 }
 
+// testWaitBudget bounds the package's test-sync helpers (waitClosed, waitFor). It is
+// deliberately generous: the helpers return the instant their condition holds, so the
+// bound only ever bites a genuine hang — a tighter value flaked under CI load.
+const testWaitBudget = 10 * time.Second
+
 // waitClosed blocks until ch closes or the deadline elapses (test sync without
-// arbitrary sleeps).
+// arbitrary sleeps). The bound is generous (returns the instant ch closes, so it only
+// bites a genuine hang) to tolerate scheduling jitter on a loaded CI runner — a 2s bound
+// flaked there even though the channel closes in milliseconds locally.
 func waitClosed(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testWaitBudget):
 		t.Fatal("timed out waiting for channel close")
 	}
 }

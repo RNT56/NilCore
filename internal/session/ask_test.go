@@ -36,7 +36,7 @@ func (d *askingDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, e
 
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
