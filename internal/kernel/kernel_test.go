@@ -197,3 +197,60 @@ func TestRunPassesContextToRunner(t *testing.T) {
 		t.Fatalf("the kernel must not short-circuit a ctx-ignoring runner, got %+v err=%v", out, err)
 	}
 }
+
+// recordingObserver captures the node-boundary events Recursive emits (K2-2).
+type recordingObserver struct{ events []NodeEvent }
+
+func (o *recordingObserver) OnNode(_ context.Context, ev NodeEvent) { o.events = append(o.events, ev) }
+
+// TestRecursiveMaxChildrenFailsClosed: a plan exceeding the width bound aborts the
+// decompose rather than spawning an unbounded fan-out.
+func TestRecursiveMaxChildrenFailsClosed(t *testing.T) {
+	env := Envelope{Name: "d", Flat: flatRunner("f"), Granularity: AlwaysDecompose, MaxDepth: 2, MaxChildren: 2}
+	plan := func(_ context.Context, n Node) ([]Node, error) {
+		if n.Depth == 0 {
+			return []Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}, nil // 3 > MaxChildren=2
+		}
+		return nil, nil
+	}
+	integrate := func(_ context.Context, _ Node, _ []Outcome) (Outcome, error) { return Outcome{Verified: true}, nil }
+	env.Decompose = Recursive(&env, plan, integrate)
+	if _, err := Run(context.Background(), env, Node{ID: "root"}); err == nil {
+		t.Fatal("plan exceeding MaxChildren must fail the decompose (fail-closed)")
+	}
+	// Within the bound is fine.
+	env2 := Envelope{Name: "d", Flat: flatRunner("f"), Granularity: AlwaysDecompose, MaxDepth: 1, MaxChildren: 3}
+	env2.Decompose = Recursive(&env2, plan, integrate)
+	if _, err := Run(context.Background(), env2, Node{ID: "root"}); err != nil {
+		t.Fatalf("3 children within MaxChildren=3 must run, got %v", err)
+	}
+}
+
+// TestRecursiveEmitsObserverEvents: the engine emits a start+done per child for audit.
+func TestRecursiveEmitsObserverEvents(t *testing.T) {
+	rec := &recordingObserver{}
+	env := Envelope{Name: "d", Flat: flatRunner("f"), Granularity: AlwaysDecompose, MaxDepth: 1, Observer: rec}
+	plan := func(_ context.Context, _ Node) ([]Node, error) { return []Node{{ID: "a"}, {ID: "b"}}, nil }
+	integrate := func(_ context.Context, _ Node, _ []Outcome) (Outcome, error) { return Outcome{Verified: true}, nil }
+	env.Decompose = Recursive(&env, plan, integrate)
+	if _, err := Run(context.Background(), env, Node{ID: "root"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(rec.events) != 4 { // 2 children × (start, done)
+		t.Fatalf("got %d node events, want 4 (start+done per child); %+v", len(rec.events), rec.events)
+	}
+	want := []struct {
+		phase, id string
+	}{{"start", "a"}, {"done", "a"}, {"start", "b"}, {"done", "b"}}
+	for i, w := range want {
+		if rec.events[i].Phase != w.phase || rec.events[i].Node.ID != w.id {
+			t.Fatalf("event %d = (%s,%s), want (%s,%s)", i, rec.events[i].Phase, rec.events[i].Node.ID, w.phase, w.id)
+		}
+	}
+	// A nil Observer is silent (no panic).
+	env.Observer = nil
+	env.Decompose = Recursive(&env, plan, integrate)
+	if _, err := Run(context.Background(), env, Node{ID: "root2"}); err != nil {
+		t.Fatalf("nil Observer must be silent: %v", err)
+	}
+}
