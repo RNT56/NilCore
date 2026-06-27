@@ -843,7 +843,7 @@ func runMain(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
-	out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("t-%d", time.Now().Unix()), Goal: *goal})
+	out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("t-%d", time.Now().Unix()), Goal: *goal})
 	if err != nil {
 		fatal(err)
 	}
@@ -1387,7 +1387,7 @@ func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) 
 			Approver:   approver,
 			Checkpoint: d.checkpoint,
 		}
-		out, err := orch.Execute(ctx, t)
+		out, err := runViaKernel(ctx, orch, t)
 		return out.Verified, err
 	}
 	if err := d.checkpoint.Resume(ctx, run); err != nil {
@@ -1583,7 +1583,7 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			RaceN:      *d.flags.raceN, // escalate a verify failure to a best-of-N race
 			Checkpoint: d.checkpoint,   // records running/done so a restart can resume a leftover drive
 		}
-		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
+		out, err := runViaKernel(ctx, orch, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -1679,7 +1679,7 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 		// Session, so ask stays nil there).
 		stack.sup.AskUser = superAskFunc(ask)
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -1699,7 +1699,7 @@ func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approve
 			return session.DriveOutcome{}, err
 		}
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}

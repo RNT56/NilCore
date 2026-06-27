@@ -880,7 +880,7 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 		// loop uses, so a multi-agent chat drive can pose a human question between waves.
 		stack.sup.AskUser = superAskFunc(ask)
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -902,7 +902,7 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 			return session.DriveOutcome{}, err
 		}
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}

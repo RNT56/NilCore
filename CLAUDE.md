@@ -180,6 +180,7 @@ internal/
   blastbudget/         ← Phase 16 the hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads
   flywheel/            ← Phase 16 self-improvement flywheel (selfeval · distiller · measure · loop) — verified, human-gated, never edits the verifier of record
   autosrc·objective/   ← Phase 16 autonomy daemon (bounded source queue) + operator-only standing-objectives backlog
+  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; opt-in via NILCORE_KERNEL, equivalence-proven)
 ```
 
 New packages introduced by later phases are listed as **extension points** in `docs/ARCHITECTURE.md` and owned by specific tasks in `docs/TASKS.md`.
