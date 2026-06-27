@@ -6,15 +6,16 @@ package main
 // `build`, and `swarm` become kernel Envelopes, so every entrypoint routes through ONE
 // `kernel.Run` instead of calling a bespoke machine.
 //
-// DEFAULT-OFF (NILCORE_KERNEL unset): each *ViaKernel helper calls the legacy machine
-// DIRECTLY, so the binary is byte-identical and the kernel is never constructed. When
-// set, the helper wraps the SAME machine call as the envelope's Flat runner and routes
-// it through kernel.Run — the machine's internal structure (orch's single-vs-supervised
-// dispatch, the project loop's fan-out, the swarm's multi-pass) stays opaque to the
-// kernel, so the event sequence is identical (proven by the equivalence harness,
-// kernel_equiv_test.go). The kernel adds the unified entry + the granularity/recursion
-// engine (available for MaxDepth>1); it never re-verifies or re-gates (I2/I3) — the
-// wrapped machine owns all of that, and the native outcome flows back unchanged.
+// DEFAULT-ON (see kernelEnabled): each *ViaKernel helper wraps the SAME machine call as
+// the envelope's Flat runner and routes it through kernel.Run — the machine's internal
+// structure (orch's single-vs-supervised dispatch, the project loop's fan-out, the
+// swarm's multi-pass) stays opaque to the kernel, so the event sequence is identical
+// (proven by the equivalence harness, kernel_equiv_test.go). The legacy machine path is
+// retained as an instant escape hatch: with NILCORE_KERNEL=0|off|false|no the helper
+// calls the machine DIRECTLY, byte-identical, and the kernel is never constructed. Either
+// way the native outcome flows back unchanged; the kernel adds the unified entry + the
+// granularity/recursion engine (available for MaxDepth>1); it never re-verifies or
+// re-gates (I2/I3) — the wrapped machine owns all of that.
 
 import (
 	"context"
