@@ -179,11 +179,21 @@ func TestRecursiveNeedsPlanAndIntegrate(t *testing.T) {
 	}
 }
 
-// TestRunHonorsContextCancel: a cancelled context stops before running.
-func TestRunHonorsContextCancel(t *testing.T) {
+// TestRunPassesContextToRunner: the kernel does NOT short-circuit on a cancelled context
+// (that would diverge from the legacy machines, which emit their opening event before
+// honoring cancellation — the equivalence the cutover rests on). Instead it passes ctx
+// straight to the runner, which owns cancellation. A ctx-aware runner therefore still
+// observes the cancellation.
+func TestRunPassesContextToRunner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Run(ctx, Envelope{Name: "run", Flat: flatRunner("f")}, Node{ID: "a"}); err == nil {
-		t.Fatal("a cancelled context must stop Run")
+	ctxAware := RunFunc(func(c context.Context, _ Node) (Outcome, error) { return Outcome{}, c.Err() })
+	if _, err := Run(ctx, Envelope{Name: "run", Flat: ctxAware}, Node{ID: "a"}); err == nil {
+		t.Fatal("the kernel must pass ctx to the runner, which observes the cancellation")
+	}
+	// A ctx-IGNORING runner is NOT pre-empted by the kernel (the runner owns ctx) —
+	// proving the kernel adds no ctx behaviour of its own.
+	if out, err := Run(ctx, Envelope{Name: "run", Flat: flatRunner("f")}, Node{ID: "a"}); err != nil || out.Summary != "flat:a" {
+		t.Fatalf("the kernel must not short-circuit a ctx-ignoring runner, got %+v err=%v", out, err)
 	}
 }

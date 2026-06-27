@@ -175,9 +175,13 @@ func Run(ctx context.Context, env Envelope, n Node) (Outcome, error) {
 	if env.Flat == nil {
 		return Outcome{}, ErrNoFlat
 	}
-	if err := ctx.Err(); err != nil {
-		return Outcome{}, err
-	}
+	// Deliberately NO ctx.Err() short-circuit here: the injected runner (the wrapped
+	// machine) owns context handling, and the legacy machines emit their opening event
+	// (task_start / project_start / a finish outcome) BEFORE honoring a cancelled ctx —
+	// so short-circuiting here would diverge from the legacy run on a pre-cancelled
+	// context (the equivalence the cutover rests on). The kernel passes ctx straight
+	// through; the per-child ctx check in Recursive is the kernel's OWN loop guard
+	// (a new code path with no legacy equivalent).
 	if env.branchFor(ctx, n) == Decompose {
 		return env.Decompose(ctx, n)
 	}

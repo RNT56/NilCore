@@ -54,7 +54,7 @@ func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *event
 		// Run the operator-authored objective goal through the verified orchestrator:
 		// reversible by construction (a disposable worktree), with every irreversible
 		// step hitting the headless gate the caller wired onto orch.Approver.
-		_, err := orch.Execute(ctx, backend.Task{
+		_, err := runViaKernel(ctx, orch, backend.Task{
 			ID:   fmt.Sprintf("auto-%d", time.Now().UnixNano()),
 			Goal: sig.Goal,
 		})

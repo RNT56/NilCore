@@ -83,7 +83,7 @@ func flywheelMain(args []string) {
 func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string, maxIter int, interval time.Duration) *loop.Loop {
 	runSuite := func(ctx context.Context, cases []eval.Case) (eval.Report, error) {
 		return eval.Run(ctx, cases, "flywheel", func(ctx context.Context, cse eval.Case) (bool, float64) {
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("flywheel-eval-%d", time.Now().UnixNano()), Goal: cse.Goal})
+			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("flywheel-eval-%d", time.Now().UnixNano()), Goal: cse.Goal})
 			if err != nil {
 				return false, 0
 			}
@@ -93,7 +93,7 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
 		Run: func(ctx context.Context, g string) (bool, error) {
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("flywheel-edit-%d", time.Now().UnixNano()), Goal: g})
+			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("flywheel-edit-%d", time.Now().UnixNano()), Goal: g})
 			if err != nil {
 				return false, err
 			}

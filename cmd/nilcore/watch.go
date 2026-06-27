@@ -59,7 +59,7 @@ func watchMain(args []string) {
 		Start: func(ctx context.Context, goal string) error {
 			// UnixNano (not Unix-second) so two ticks in the same second never collide
 			// on the kept task/<id> branch under --open-pr.
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("trig-%d", time.Now().UnixNano()), Goal: goal})
+			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("trig-%d", time.Now().UnixNano()), Goal: goal})
 			if err != nil {
 				return err
 			}

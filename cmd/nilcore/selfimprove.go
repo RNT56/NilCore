@@ -59,7 +59,7 @@ func proposeEditMain(args []string) {
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
 		Run: func(ctx context.Context, g string) (bool, error) {
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("self-%d", time.Now().Unix()), Goal: g})
+			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("self-%d", time.Now().Unix()), Goal: g})
 			if err != nil {
 				return false, err
 			}

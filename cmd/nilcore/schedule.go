@@ -65,7 +65,7 @@ func scheduleMain(args []string) {
 		Gate:    gate.Approve,
 		Start: func(ctx context.Context, goal string) error {
 			// UnixNano so two ticks in the same second never collide on the kept branch.
-			out, err := orch.Execute(ctx, backend.Task{ID: fmt.Sprintf("cron-%d", time.Now().UnixNano()), Goal: goal})
+			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("cron-%d", time.Now().UnixNano()), Goal: goal})
 			if err != nil {
 				return err
 			}
