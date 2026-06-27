@@ -196,6 +196,24 @@ func (w *Worktree) Checkout(ctx context.Context, ref string) error {
 	return nil
 }
 
+// Reset hard-resets this worktree's branch to sha (discarding the working tree + index).
+// It is how an integrator UNDOES a merge whose integrated tip failed verification —
+// restoring the last verified tip so the next child merges onto a green tree (I2). Unlike
+// Checkout it stays ON the branch (no detach), so subsequent merges advance the branch.
+// Hardened git (I4): no repo-authored hook/config runs on the host.
+func (w *Worktree) Reset(ctx context.Context, sha string) error {
+	if w == nil {
+		return fmt.Errorf("worktree reset: nil worktree")
+	}
+	if sha == "" {
+		return fmt.Errorf("worktree reset: empty sha")
+	}
+	if out, err := git(ctx, w.path, "reset", "--hard", sha); err != nil {
+		return fmt.Errorf("worktree reset %s: %w (%s)", sha, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // ListFiles returns the worktree's tracked file paths (git ls-files) — a cheap,
 // bounded view of the tree's STRUCTURE (not contents) for grounding the supervisor's
 // answer in "where things are". The result is byte-capped to maxBytes (on a line
