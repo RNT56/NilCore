@@ -89,6 +89,8 @@ func main() {
 		fmt.Println(versionString())
 	case "chat":
 		chatMain(args[1:])
+	case "do":
+		doMain(args[1:])
 	case "tui":
 		tuiMain(args[1:])
 	case "serve":
@@ -159,6 +161,7 @@ swarm, a backend — when the job calls for it. The harness is small; the model 
 TALK TO IT — this is the product:
   nilcore                               start the conversation; it decides how to work and works while you type
   nilcore chat [-dir ./repo]            the same conversation, explicitly (-dir picks the repo)
+  nilcore do -goal "<task>"             one task; the agent ROUTES it to run/build/swarm and dispatches (-dry-run to preview)
   nilcore tui                           the conversation in a full-screen UI
   nilcore serve -channel telegram       run the agent as a chat bot (Telegram/Slack/…)
   nilcore -goal "<task>" [-dir ./repo]  one-shot: run a single task to completion, no conversation
