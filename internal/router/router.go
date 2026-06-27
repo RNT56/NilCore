@@ -40,12 +40,18 @@ const (
 	// Swarm is the verified swarm (a DECOMPOSE machine): fan a breadth objective out into
 	// typed, independently-verified shards, requeued until clean.
 	Swarm Preset = "swarm"
+	// Decompose is the kernel's native recursive preset (UOK V2): split a goal into
+	// independent sub-goals, run each as a full task, then merge-and-re-verify the verified
+	// branches into one tip. It is OPT-IN — Classify never auto-selects it (it is not in
+	// All()), so it is reached only by an explicit choice (`do -as decompose` /
+	// `nilcore decompose`); a future learned Oracle may select it for clearly-forking goals.
+	Decompose Preset = "decompose"
 )
 
 // Valid reports whether p is one of the known presets.
 func (p Preset) Valid() bool {
 	switch p {
-	case Run, Build, Swarm:
+	case Run, Build, Swarm, Decompose:
 		return true
 	default:
 		return false

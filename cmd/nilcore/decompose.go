@@ -2,11 +2,19 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
+	"time"
 
+	"nilcore/internal/backend"
+	"nilcore/internal/eventlog"
 	"nilcore/internal/kernel"
+	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
 )
 
@@ -213,4 +221,93 @@ func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify ver
 	}
 	env.Decompose = kernel.Recursive(&env, plan, integrate)
 	return env, st
+}
+
+// logObserver records the recursive engine's node-boundary events to the append-only log
+// (I5) so a decompose run's tree is auditable + replayable.
+type logObserver struct{ log *eventlog.Log }
+
+func (o logObserver) OnNode(_ context.Context, ev kernel.NodeEvent) {
+	if o.log == nil {
+		return
+	}
+	o.log.Append(eventlog.Event{Task: ev.Node.ID, Kind: "decompose_node", Detail: map[string]any{
+		"phase": ev.Phase, "goal": ev.Node.Goal, "verified": ev.Outcome.Verified, "err": ev.Err,
+	}})
+}
+
+// decomposeMain implements `nilcore decompose` — the recursive decompose preset's entry.
+// It plans the goal into independent sub-goals, runs each as a full single-task run that
+// keeps its verified branch, and integrates the verified branches into one re-verified
+// tip (merge → re-verify → drop conflicts/red). It reuses the run orchestrator + the
+// project verifier, so the only new behaviour is the kernel-driven fan-out + integration.
+func decomposeMain(args []string) {
+	fs := flag.NewFlagSet("decompose", flag.ExitOnError)
+	goal := fs.String("goal", "", "the goal to split into independent sub-goals (required)")
+	maxChildren := fs.Int("max-children", 8, "maximum sub-goals to fan out (fail-closed bound)")
+	c := registerCommon(fs)
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `nilcore decompose — split a goal into independent sub-goals, run each, integrate.
+
+Each sub-goal runs as a full verified single-task run in its own worktree; the verified
+branches are merged into one integration tip, re-verifying after each merge and dropping
+any sub-goal that conflicts or turns the tree red (the verifier decides "done", not the
+sub-goals).
+
+Usage:
+  nilcore decompose -goal "<a> and <b> and <c>" [-dir ./repo] [-max-children N]
+`)
+	}
+	_ = fs.Parse(args)
+	if strings.TrimSpace(*goal) == "" {
+		fmt.Fprintln(os.Stderr, "error: --goal is required\nrun 'nilcore decompose -h' for usage")
+		os.Exit(2)
+	}
+
+	b := loadBoot(*c.config)
+	applyConfigDefaults(c, b.cfg, flagsSet(fs))
+	absDir := mustAbs(*c.dir)
+	log := openLog(*c.logPath)
+	defer log.Close()
+	blast := mintBlastBudget(*c.blastRadius, log)
+	verifyCmd := verify.DetectOrOverride(absDir, *c.checkCmd)
+
+	// Each sub-goal runs as a full single-task run that KEEPS its verified branch so the
+	// integrator can merge it.
+	runChild := func(ctx context.Context, subGoal, taskID string) (string, bool, error) {
+		orch := buildRunOrchestrator(c, b, log, absDir, blast)
+		orch.KeepBranch = true
+		out, err := runViaKernel(ctx, orch, backend.Task{ID: taskID, Goal: subGoal})
+		if err != nil {
+			return "", false, err
+		}
+		return out.Branch, out.Verified, nil
+	}
+	// Re-verify the merged integration tip with the project verifier (I2): a fresh sandbox
+	// bound to the integration worktree runs the project's check command.
+	verifyTip := func(ctx context.Context, dir string) (bool, error) {
+		rep, err := verify.New(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), verifyCmd).Check(ctx)
+		if err != nil {
+			return false, err
+		}
+		return rep.Passed, nil
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	rootID := fmt.Sprintf("decompose-%d", time.Now().UnixNano())
+	env, st := decomposeEnvelope(rootID, absDir, runChild, verifyTip, *maxChildren, logObserver{log})
+	out, err := kernel.Run(ctx, env, kernel.Node{ID: rootID, Goal: *goal})
+	if err != nil {
+		fatal(fmt.Errorf("decompose: %w", err))
+	}
+	fmt.Printf("decompose: verified=%v — %s\n", out.Verified, out.Summary)
+	if st.wt != nil {
+		if out.Verified && out.Branch != "" {
+			fmt.Printf("decompose: integrated tip on branch %s (merged %d, dropped %d)\n", out.Branch, st.res.merged, st.res.dropped)
+		} else {
+			_ = st.wt.Cleanup() // discard the unverified integration worktree
+		}
+	}
 }

@@ -71,6 +71,8 @@ For flags beyond these, call the chosen command directly (e.g. nilcore build -ne
 		buildMain(presetArgs(router.Build, *goal, *dir, ""))
 	case router.Swarm:
 		swarmMain(presetArgs(router.Swarm, *goal, *dir, *swarmPreset))
+	case router.Decompose:
+		decomposeMain(presetArgs(router.Decompose, *goal, *dir, "")) // opt-in via -as decompose
 	default:
 		// Unreachable: resolvePreset only returns valid presets.
 		fmt.Fprintf(os.Stderr, "error: unroutable preset %q\n", preset)

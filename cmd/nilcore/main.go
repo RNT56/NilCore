@@ -99,6 +99,8 @@ func main() {
 		buildMain(args[1:])
 	case "swarm":
 		swarmMain(args[1:])
+	case "decompose":
+		decomposeMain(args[1:])
 	case "init":
 		initMain(args[1:])
 	case "doctor":
@@ -169,6 +171,7 @@ TALK TO IT — this is the product:
 WHAT IT CAN DO — capabilities the agent reaches for on demand (or invoke directly):
   nilcore build -goal "<project>" -new ./svc          drive a whole project to a verifier-green tree (multi-agent)
   nilcore swarm -goal "<objective>" -preset research  fan out a verified agent swarm (typed artifacts, requeue-until-clean)
+  nilcore decompose -goal "<a> and <b>"  split a goal into independent sub-goals, run each, merge-and-re-verify into one tip (kernel recursion)
   nilcore browse -goal "..."            drive a persistent in-sandbox browser (observe→plan→act→verify; findings re-verified)
   nilcore desktop -goal "..."           drive a contained virtual desktop (Set-of-Marks; --mac-host drives a real Mac, gated)
   nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
