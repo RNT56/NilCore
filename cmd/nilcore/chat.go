@@ -871,8 +871,8 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 // tree under the conversation budget, and its outcome folds back into the
 // conversation exactly like a native drive.
 func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFunc {
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
-		stack, err := buildStack(chatBuildDeps(d, ledger, goal))
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle, gate policy.Approver) (session.DriveOutcome, error) {
+		stack, err := buildStack(chatBuildDeps(d, ledger, goal, gate))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -896,8 +896,8 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 // planner's Inbox/Out wiring is a documented follow-on; the drive itself runs
 // bounded, verifier-gated, and charged against the conversation wall.
 func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter) (session.DriveOutcome, error) {
-		stack, err := buildStack(chatBuildDeps(d, ledger, goal))
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
+		stack, err := buildStack(chatBuildDeps(d, ledger, goal, gate))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -915,7 +915,7 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 // shared conversation ledger so the supervised/project drive charges the SAME
 // ceiling (§6). It mirrors buildMain's defaults for the multi-agent rails sized for
 // an interactive drive.
-func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
+func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string, gate policy.Approver) buildDeps {
 	adv := resolveAdvisor("native", d.boot, d.flags.common)
 	strong := adv.prov
 	if strong == nil {
@@ -938,9 +938,9 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string) buildDeps {
 		log:      d.log,
 		logPath:  *d.flags.common.logPath,
 		blast:    mintBlastBudget(*d.flags.common.blastRadius, d.log), // -blast-radius fence for the chat supervise/project sandboxes (nil when off)
-		approver: d.approverOr(),
-		ledger:   ledger,       // pin the conversation wall (§6)
-		egress:   d.egressTree, // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
+		approver: gateApproverFor(d, gate),                            // AU-T05b: line-REPL drives use the session AwaitingGate approver, not a stdin-racing ConsoleApprover
+		ledger:   ledger,                                              // pin the conversation wall (§6)
+		egress:   d.egressTree,                                        // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 }
 

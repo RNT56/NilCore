@@ -1689,7 +1689,11 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 // conversation wall, and its outcome folds back exactly like a native drive.
 func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunSuperviseFunc {
 	taskID := superviseTaskID(threadID)
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
+	// The session gate (last param) is intentionally unused here: serve already passes
+	// its CHANNEL approver (parks AwaitingGate and routes the prompt over the transport),
+	// which is the proven path — there is no stdin to race, so AU-T05b's REPL fix does not
+	// apply. Keeping serve on its channel approver leaves the serve gate byte-identical.
+	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter, ask session.AskerHandle, _ policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -1713,7 +1717,7 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 
 func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunProjectFunc {
 	taskID := superviseTaskID(threadID)
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter, _ policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err

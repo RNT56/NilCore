@@ -100,16 +100,22 @@ type NativeRun struct {
 // Run(ctx, goal). The user Inbox is the second concurrent source the supervisor
 // folds at the round boundary beside its subagent findings; AskUser lets the
 // supervisor pose a human question between waves (nil ⇒ no ask tool). The wiring
-// site supplies them.
-type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter, ask AskerHandle) (DriveOutcome, error)
+// site supplies them. gate is the session-backed irreversible-action approver (the
+// same one the native driver receives): in a line-REPL chat drive it parks
+// AwaitingGate so the single REPL reader answers the supervisor's promote gate instead
+// of a second ConsoleApprover racing stdin (AU-T05b). nil ⇒ the closure keeps its own
+// approver (serve passes its channel approver; tests pass nil).
+type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter, ask AskerHandle, gate policy.Approver) (DriveOutcome, error)
 
 // RunProjectFunc runs one whole-project drive: project.Loop.Run(ctx), seeding the
 // loop's initial ContextSummary from the carried WorkState so a follow-up
 // continues the project rather than restarting it. The project loop has no inbox
 // seam of its own (its agentic work happens inside the supervisor it drives, which
 // carries the Inbox); the Emitter surfaces the loop's progress. The wiring site
-// supplies it.
-type RunProjectFunc func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter) (DriveOutcome, error)
+// supplies it. gate is the session-backed approver for the project loop's single
+// human promote gate — in a line-REPL chat drive it parks AwaitingGate so the REPL
+// reader answers it (AU-T05b); nil ⇒ the closure keeps its own approver.
+type RunProjectFunc func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter, gate policy.Approver) (DriveOutcome, error)
 
 // nativeDriver maps RouteNative onto the orchestrator's single-task path. It holds
 // only the run closure + the metered chat/summarize provider used to distil the
@@ -202,7 +208,7 @@ func (d *superviseDriver) Drive(ctx context.Context, in DriveInput) (DriveResult
 	if d.run == nil {
 		return DriveResult{}, fmt.Errorf("session: supervise driver has no run closure")
 	}
-	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out, in.AskUser)
+	out, err := d.run(ctx, in.Goal, in.History, in.Inbox, in.Out, in.AskUser, in.Gate)
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("supervise drive: %w", err)
 	}
@@ -230,7 +236,7 @@ func (d *projectDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, 
 	if d.run == nil {
 		return DriveResult{}, fmt.Errorf("session: project driver has no run closure")
 	}
-	out, err := d.run(ctx, in.Goal, in.State.Summary, in.Out)
+	out, err := d.run(ctx, in.Goal, in.State.Summary, in.Out, in.Gate)
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("project drive: %w", err)
 	}
