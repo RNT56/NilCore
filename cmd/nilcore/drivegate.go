@@ -5,6 +5,7 @@ import (
 
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/scheduler"
 	"nilcore/internal/session"
 	"nilcore/internal/summarize"
@@ -85,8 +86,8 @@ func gateSupervise(g *driveGate, run session.RunSuperviseFunc) session.RunSuperv
 	if g == nil {
 		return run
 	}
-	return func(ctx context.Context, goal string, seed []model.Message, in session.InboxHandle, out emit.Emitter, ask session.AskerHandle) (session.DriveOutcome, error) {
-		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, in, out, ask) })
+	return func(ctx context.Context, goal string, seed []model.Message, in session.InboxHandle, out emit.Emitter, ask session.AskerHandle, gate policy.Approver) (session.DriveOutcome, error) {
+		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, in, out, ask, gate) })
 	}
 }
 
@@ -94,7 +95,7 @@ func gateProject(g *driveGate, run session.RunProjectFunc) session.RunProjectFun
 	if g == nil {
 		return run
 	}
-	return func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter) (session.DriveOutcome, error) {
-		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, out) })
+	return func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
+		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, out, gate) })
 	}
 }

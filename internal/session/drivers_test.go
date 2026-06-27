@@ -10,6 +10,7 @@ import (
 	"nilcore/internal/emit"
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
+	"nilcore/internal/policy"
 	"nilcore/internal/summarize"
 )
 
@@ -148,7 +149,7 @@ func TestSuperviseDriverWiresInboxAndOut(t *testing.T) {
 	var gotGoal string
 	var gotInbox InboxHandle
 	var gotOut emit.Emitter
-	run := func(_ context.Context, goal string, _ []model.Message, in InboxHandle, out emit.Emitter, _ AskerHandle) (DriveOutcome, error) {
+	run := func(_ context.Context, goal string, _ []model.Message, in InboxHandle, out emit.Emitter, _ AskerHandle, _ policy.Approver) (DriveOutcome, error) {
 		gotGoal, gotInbox, gotOut = goal, in, out
 		return DriveOutcome{Summary: "shipped feature", Branch: "integ-3", Verified: true}, nil
 	}
@@ -183,7 +184,7 @@ func TestSuperviseDriverWiresInboxAndOut(t *testing.T) {
 
 func TestProjectDriverSeedsSummary(t *testing.T) {
 	var gotSeed summarize.ContextSummary
-	run := func(_ context.Context, _ string, seed summarize.ContextSummary, out emit.Emitter) (DriveOutcome, error) {
+	run := func(_ context.Context, _ string, seed summarize.ContextSummary, out emit.Emitter, _ policy.Approver) (DriveOutcome, error) {
 		gotSeed = seed
 		if out == nil {
 			t.Error("project Out not wired")
@@ -362,7 +363,7 @@ func TestSessionContinueReentersActiveDriver(t *testing.T) {
 	// (the Native/Project/Chat fields are nil), never reach this closure, and leave
 	// seedLen at 0.
 	ran := make(chan struct{}, 1)
-	run := func(_ context.Context, _ string, seed []model.Message, _ InboxHandle, _ emit.Emitter, _ AskerHandle) (DriveOutcome, error) {
+	run := func(_ context.Context, _ string, seed []model.Message, _ InboxHandle, _ emit.Emitter, _ AskerHandle, _ policy.Approver) (DriveOutcome, error) {
 		seedLen = len(seed)
 		ran <- struct{}{}
 		return DriveOutcome{Summary: "more done", Verified: true}, nil
@@ -459,4 +460,42 @@ func hasKind(events []emit.Event, kind string) bool {
 		}
 	}
 	return false
+}
+
+// TestSuperviseProjectDriversReceiveGate proves the AU-T05b fix: the session-backed
+// gate approver (DriveInput.Gate) now reaches the supervise AND project run closures,
+// so a line-REPL chat drive that escalates to a gating drive uses the AwaitingGate
+// approver (single REPL reader) instead of a second ConsoleApprover racing stdin.
+// Before the fix the supervise driver passed only AskUser and the project driver passed
+// neither, so Gate was silently dropped.
+func TestSuperviseProjectDriversReceiveGate(t *testing.T) {
+	sentinel := policy.NewConsoleApprover(nil, nil) // a distinct approver, identity-compared
+
+	t.Run("supervise", func(t *testing.T) {
+		var got policy.Approver
+		run := func(_ context.Context, _ string, _ []model.Message, _ InboxHandle, _ emit.Emitter, _ AskerHandle, gate policy.Approver) (DriveOutcome, error) {
+			got = gate
+			return DriveOutcome{Summary: "ok", Verified: true}, nil
+		}
+		if _, err := NewSuperviseDriver(run, nil).Drive(context.Background(), DriveInput{Goal: "g", Gate: sentinel}); err != nil {
+			t.Fatalf("Drive: %v", err)
+		}
+		if got != sentinel {
+			t.Fatal("supervise driver did not pass DriveInput.Gate to its run closure")
+		}
+	})
+
+	t.Run("project", func(t *testing.T) {
+		var got policy.Approver
+		run := func(_ context.Context, _ string, _ summarize.ContextSummary, _ emit.Emitter, gate policy.Approver) (DriveOutcome, error) {
+			got = gate
+			return DriveOutcome{Summary: "ok", Verified: true}, nil
+		}
+		if _, err := NewProjectDriver(run, nil).Drive(context.Background(), DriveInput{Goal: "g", Gate: sentinel}); err != nil {
+			t.Fatalf("Drive: %v", err)
+		}
+		if got != sentinel {
+			t.Fatal("project driver did not pass DriveInput.Gate to its run closure")
+		}
+	})
 }
