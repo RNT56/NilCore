@@ -571,7 +571,7 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 // final clean tip as a single gated PromoteToBase candidate. It NEVER auto-lands: the
 // gate's nil approver default-denies, so a converged run stops at the promote gate.
 func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
-	out, err := a.controller.Run(ctx, a.state, a.initial)
+	out, err := swarmViaKernel(ctx, a.controller, a.state, a.initial)
 	if err != nil {
 		return out, err
 	}

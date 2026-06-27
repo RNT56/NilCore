@@ -729,7 +729,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 		// to the goal so a read-only Discuss/Plan drive knows it is researching (and
 		// must finish with a plan/answer rather than expecting to write). It is empty
 		// for Execute/Auto, so those goals are byte-identical.
-		out, err := orch.Execute(ctx, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
+		out, err := runViaKernel(ctx, orch, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -880,7 +880,7 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 		// loop uses, so a multi-agent chat drive can pose a human question between waves.
 		stack.sup.AskUser = superAskFunc(ask)
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
@@ -902,7 +902,7 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 			return session.DriveOutcome{}, err
 		}
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
-		o, err := stack.loop.Run(ctx)
+		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}

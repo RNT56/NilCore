@@ -199,7 +199,7 @@ func runResumedSupervise(ctx context.Context, d serveDeps, goal, taskID, baseRef
 		return false, err
 	}
 	defer stack.cleanup()
-	o, err := stack.loop.Run(ctx)
+	o, err := buildViaKernel(ctx, stack.loop)
 	if err != nil {
 		return false, err
 	}

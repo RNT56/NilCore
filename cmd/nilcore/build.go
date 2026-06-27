@@ -219,7 +219,7 @@ func buildMain(args []string) {
 	// All of it lives in stack.cleanup so every entry path reclaims it uniformly.
 	defer stack.cleanup()
 
-	out, err := stack.loop.Run(ctx)
+	out, err := buildViaKernel(ctx, stack.loop)
 	if err != nil {
 		fatal(err)
 	}

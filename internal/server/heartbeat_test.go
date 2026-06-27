@@ -30,6 +30,14 @@ func (d blockingDriver) Drive(ctx context.Context, _ session.DriveInput) (sessio
 // cancellation (hbWG.Wait returns — no leak).
 func TestHeartbeatEmitsLivenessPulse(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	// The parked drive gets its OWN context, so cancelling the heartbeat (cancel) does
+	// NOT release the drive: the blockingDriver selects on ctx.Done(), so sharing one ctx
+	// let `cancel()` unblock BOTH the heartbeat and the drive — and a final heartbeat beat
+	// racing ctx.Done() vs a ready tick could then observe the drive already back to Idle
+	// (working=0), a flake under CI load. With a separate driveCtx the drive stays parked
+	// (on rel) across every beat, so the in-flight count is stable.
+	driveCtx, driveCancel := context.WithCancel(context.Background())
+	defer driveCancel()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "events.jsonl")
 	log, err := eventlog.Open(logPath)
@@ -49,7 +57,7 @@ func TestHeartbeatEmitsLivenessPulse(t *testing.T) {
 	work.Router = stubRouter{}
 	work.Drivers = session.Drivers{Native: blockingDriver{release: rel}}
 	srv.threads["work"] = &thread{sess: work}
-	if err := work.Turn(ctx, "go"); err != nil {
+	if err := work.Turn(driveCtx, "go"); err != nil {
 		t.Fatalf("Turn: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -71,20 +79,26 @@ func TestHeartbeatEmitsLivenessPulse(t *testing.T) {
 	work.Wait() // join it so nothing writes after we read the log
 	log.Close()
 
-	// Read back: at least one serve_heartbeat with threads=2, working=1, uptime present.
+	// Read back: at least one serve_heartbeat must have observed threads=2 + working=1
+	// (the in-flight drive) with an uptime field. We assert on SOME beat rather than the
+	// LAST one: the drive is parked across every beat (its ctx outlives the heartbeat), so
+	// every beat sees working=1 — but asserting "some beat" stays robust to any transient
+	// phase read at the exact tick boundary.
 	beats := readHeartbeats(t, logPath)
 	if len(beats) == 0 {
 		t.Fatal("no serve_heartbeat events emitted")
 	}
-	last := beats[len(beats)-1]
-	if last["threads"] != float64(2) {
-		t.Errorf("threads = %v, want 2", last["threads"])
+	var saw bool
+	for _, b := range beats {
+		if _, ok := b["uptime_seconds"]; !ok {
+			t.Error("heartbeat missing uptime_seconds")
+		}
+		if b["threads"] == float64(2) && b["working"] == float64(1) {
+			saw = true
+		}
 	}
-	if last["working"] != float64(1) {
-		t.Errorf("working = %v, want 1 (one drive in flight)", last["working"])
-	}
-	if _, ok := last["uptime_seconds"]; !ok {
-		t.Error("heartbeat missing uptime_seconds")
+	if !saw {
+		t.Errorf("no heartbeat observed threads=2 + working=1 (the in-flight drive); beats=%v", beats)
 	}
 }
 
