@@ -89,7 +89,7 @@ func TestIntegrateBranchesMergesVerified(t *testing.T) {
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 	if res.merged != 2 || !res.verified || res.dropped != 0 {
 		t.Fatalf("res = %+v, want merged=2 verified=true dropped=0", res)
 	}
@@ -120,7 +120,7 @@ func TestIntegrateBranchesDropsRedMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 	if res.merged != 1 || res.dropped != 1 || !res.verified {
 		t.Fatalf("res = %+v, want merged=1 dropped=1 verified=true (bad child reverted)", res)
 	}
@@ -148,7 +148,7 @@ func TestIntegrateBranchesDropsConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 	if res.merged != 1 || res.dropped != 1 {
 		t.Fatalf("res = %+v, want merged=1 dropped=1 (the conflicting child dropped)", res)
 	}
@@ -168,7 +168,7 @@ func TestIntegrateBranchesSkipsUnverifiedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
-	defer wt.Cleanup()
+	defer func() { _ = wt.Cleanup() }()
 	if res.merged != 1 || res.dropped != 1 {
 		t.Fatalf("res = %+v, want merged=1 dropped=1 (unverified child skipped)", res)
 	}
@@ -200,7 +200,7 @@ func TestDecomposeEnvelopeEndToEnd(t *testing.T) {
 	if st.res.merged != 3 {
 		t.Fatalf("merged %d, want 3 sub-goals", st.res.merged)
 	}
-	defer st.wt.Cleanup()
+	defer func() { _ = st.wt.Cleanup() }()
 	for _, f := range []string{"root-1.txt", "root-2.txt", "root-3.txt"} {
 		if _, err := os.Stat(filepath.Join(st.wt.Path(), f)); err != nil {
 			t.Errorf("integrated tip missing %s: %v", f, err)
