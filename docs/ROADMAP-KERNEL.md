@@ -1,6 +1,6 @@
 # Roadmap — Pillar 8: the Unified Orchestration Kernel (UOK)
 
-> **Status:** building (Phase 16, Pillar 8). The §0 cutover decision is recorded: the operator has authorized routing `run`/`build`/`swarm`/`chat` through one kernel. Built **additively behind `NILCORE_KERNEL`** (default-off, byte-identical), proven against the legacy machines by an equivalence harness, then cut over.
+> **Status:** SHIPPED + **default-ON** (Phase 16, Pillar 8; flipped to default-on in PR #78 after the equivalence harness stayed green — escape hatch `NILCORE_KERNEL=0|off|false|no` reverts to the legacy machine path, byte-identical). The §0 cutover routed `run`/`build`/`swarm`/`chat` through one kernel, proven against the legacy machines by an equivalence harness. **For the routing design this roadmap is superseded by [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md)** — which builds the preset router (`nilcore do`) the kernel was designed for and records that the native recursive engine (`MaxDepth>1`) is built + tested but **dormant in production** (every production envelope sets `Flat` only; the iterative project loop does not fit the one-shot recursion — see V2 for the full reasoning).
 >
 > **Read with:** [`CLAUDE.md`](../CLAUDE.md) §1/§2/§8, [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (the execution model + the frozen contract), [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) §4 Pillar 8.
 
@@ -71,5 +71,5 @@ The chat router maps its `Route` (native/supervise/project) onto these envelopes
 
 ## §6 Honest caveats
 
-- The cutover ships the **monolithic-wrap** envelopes (equivalent + safe). **Native recursion** (`MaxDepth>1`, re-expressing the project loop / swarm as `Plan`/`Integrate`) is built + tested in the engine but is opt-in, not the default — re-expressing each machine to exploit it is a follow-on that does not touch the entrypoints again.
-- `NILCORE_KERNEL` is default-OFF through the cutover: the legacy `Route`→machine path is unchanged when unset, so the binary is byte-identical until an operator opts in. Flipping the default to the kernel is the final step, gated on the equivalence harness staying green.
+- The cutover ships the **monolithic-wrap** envelopes (equivalent + safe). **Native recursion** (`MaxDepth>1`, re-expressing the project loop / swarm as `Plan`/`Integrate`) is built + tested in the engine but is **dormant in production** — NO production envelope uses it (every envelope sets `Flat` only). [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md) records why the *iterative* project loop does not fit the *one-shot* recursion, and what a real recursive `decompose` preset would require before the engine has a live consumer.
+- `NILCORE_KERNEL` is now **default-ON** (flipped in PR #78 after the equivalence harness stayed green): the kernel routes every entrypoint when unset; set `NILCORE_KERNEL=0|off|false|no` to revert to the legacy `Route`→machine path, byte-identical (the escape hatch retained for instant revert).
