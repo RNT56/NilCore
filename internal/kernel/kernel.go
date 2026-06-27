@@ -104,6 +104,35 @@ type Plan func(ctx context.Context, n Node) ([]Node, error)
 // every child passed. Injected.
 type Integrate func(ctx context.Context, n Node, children []Outcome) (Outcome, error)
 
+// NodeEvent is one node-boundary signal the recursive engine emits to an Observer. It is
+// pure structural data (I7) for AUDIT/RESUME only — never a control signal.
+type NodeEvent struct {
+	// Phase is "start" (a child is about to run) or "done" (a child finished).
+	Phase string
+	// Node is the child node the event is about.
+	Node Node
+	// Outcome is the child's result, populated on a successful "done".
+	Outcome Outcome
+	// Err is non-empty on a "done" whose child run errored.
+	Err string
+}
+
+// Observer receives node-boundary events from Recursive (a child starting, a child
+// finishing) so the cmd layer can record the recursion tree to the append-only log
+// (I5) for audit + resume. It is OPTIONAL (nil ⇒ silent) and injected on the Envelope
+// so the kernel stays a pure leaf (it never imports eventlog). It NEVER influences
+// control flow — the kernel emits and moves on, ignoring any side effect.
+type Observer interface {
+	OnNode(ctx context.Context, ev NodeEvent)
+}
+
+// emitNode delivers a node event to a possibly-nil Observer (the one nil-guard site).
+func emitNode(ctx context.Context, obs Observer, ev NodeEvent) {
+	if obs != nil {
+		obs.OnNode(ctx, ev)
+	}
+}
+
 // Granularity decides whether a Node runs Flat or Decomposes for a given Envelope. It
 // generalizes the conversational router's machine-pick into one extensible policy: the
 // router picks an ENVELOPE, the envelope's Granularity picks the BRANCH.
@@ -143,6 +172,14 @@ type Envelope struct {
 	// MaxDepth bounds recursion. <=0 ⇒ DefaultMaxDepth. At depth >= MaxDepth a node runs
 	// Flat regardless of Granularity, so recursion can never run away.
 	MaxDepth int
+	// MaxChildren bounds the fan-out WIDTH: a Plan returning more than this many children
+	// fails the decompose (fail-closed), so a runaway plan can never spawn an unbounded
+	// fan-out. <=0 ⇒ unbounded (the prior behaviour). Together with MaxDepth this caps the
+	// total recursive work at MaxChildren^MaxDepth.
+	MaxChildren int
+	// Observer receives node-boundary events (start/done) from Recursive for audit +
+	// resume (I5). nil ⇒ silent. It never influences control flow.
+	Observer Observer
 }
 
 // maxDepth resolves the effective recursion bound.
@@ -209,16 +246,23 @@ func Recursive(env *Envelope, plan Plan, integrate Integrate) RunFunc {
 		if err != nil {
 			return Outcome{}, fmt.Errorf("kernel: planning %q: %w", n.ID, err)
 		}
+		// Fail-closed width bound: a runaway plan can never spawn an unbounded fan-out.
+		if env.MaxChildren > 0 && len(children) > env.MaxChildren {
+			return Outcome{}, fmt.Errorf("kernel: plan for %q returned %d children, exceeds MaxChildren=%d", n.ID, len(children), env.MaxChildren)
+		}
 		outs := make([]Outcome, 0, len(children))
 		for _, c := range children {
 			if err := ctx.Err(); err != nil {
 				return Outcome{}, err
 			}
 			c.Depth = n.Depth + 1 // descend — bounded by env.MaxDepth inside Run
+			emitNode(ctx, env.Observer, NodeEvent{Phase: "start", Node: c})
 			o, err := Run(ctx, *env, c)
 			if err != nil {
+				emitNode(ctx, env.Observer, NodeEvent{Phase: "done", Node: c, Err: err.Error()})
 				return Outcome{}, fmt.Errorf("kernel: running child %q of %q: %w", c.ID, n.ID, err)
 			}
+			emitNode(ctx, env.Observer, NodeEvent{Phase: "done", Node: c, Outcome: o})
 			outs = append(outs, o)
 		}
 		// Integrate re-verifies the tip (I2): a parent is verified only if the merged

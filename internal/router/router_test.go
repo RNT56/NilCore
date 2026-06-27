@@ -105,3 +105,22 @@ func TestPresetValid(t *testing.T) {
 		t.Error("unknown preset reported Valid")
 	}
 }
+
+// TestDecomposePresetIsOptIn: the decompose preset is valid + reachable via an explicit
+// pick, but Classify never auto-selects it (it is not in All()), so it stays opt-in.
+func TestDecomposePresetIsOptIn(t *testing.T) {
+	if !Decompose.Valid() {
+		t.Fatal("Decompose must be a valid preset")
+	}
+	for _, p := range All() {
+		if p == Decompose {
+			t.Fatal("Decompose must NOT be in All() — it is opt-in, never auto-routed")
+		}
+	}
+	// No heuristic goal should classify to decompose.
+	for _, g := range []string{"build a new app and add tests", "audit every package", "fix a bug"} {
+		if Classify(g) == Decompose {
+			t.Fatalf("Classify(%q) auto-selected decompose; it must stay opt-in", g)
+		}
+	}
+}

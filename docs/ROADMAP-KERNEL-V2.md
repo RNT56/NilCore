@@ -1,6 +1,6 @@
 # ROADMAP — Kernel V2 (completing the UOK)
 
-Status: **router shipped**; recursive build-out **specced, deliberately deferred**.
+Status: **router shipped**; **recursive `decompose` preset SHIPPED (K2-1 + K2-2, opt-in)** — the recursive engine now has a real production consumer. The learned router Oracle (K2-3) remains future. §4 / §5 / §6 below are kept as the original record; the "deferred" framing they describe was superseded when `decompose` was built — see §5 for the as-shipped state.
 Prereq: `docs/ROADMAP-KERNEL.md` (the original UOK / Pillar 8). Read that first.
 
 This document is the honest answer to "should we upgrade the kernel, and how?" It records
@@ -108,23 +108,30 @@ These are specced here so they are a *choice*, not an oversight:
 
 ---
 
-## 5. The path if/when we cash the recursion IOU
+## 5. Cashing the recursion IOU — as shipped
 
-Demand-driven order, each step equivalence/property-tested and behind a flag:
+- **K2-1 — SHIPPED (opt-in).** The `decompose` envelope wires `kernel.Recursive`: `Plan` =
+  `decomposePlan` (a deterministic goal-splitter — newlines/list items, then top-level
+  ` and `/`;`; a model splitter is the future seam), child `RunFunc` = a KeepBranch
+  single-task run (via `buildRunOrchestrator` + `runViaKernel`), `Integrate` =
+  `integrateBranches` — the cross-worktree merge-and-re-verify integrator (merge each
+  verified child branch into a fresh integration worktree, re-verify after EVERY merge, and
+  DROP any child that conflicts [`worktree.Merge` auto-aborts] or turns the tree red [new
+  `worktree.Reset` undoes to the last green tip]). The integrated tip is the verifier's
+  verdict, never the children's (I2). Reachable as `nilcore decompose`, `do -as decompose`,
+  and a `router.Decompose` preset (OPT-IN — `Classify` never auto-selects it). The
+  integrator's logic is hermetically tested against a real temp git repo (merge,
+  drop-red-with-revert, drop-conflict, skip-unverified) + an end-to-end flow test through
+  `kernel.Run`; the real multi-backend run is the field-validation step.
+- **K2-2 — SHIPPED.** `Envelope.MaxChildren` (fail-closed width bound) + the `kernel.Observer`
+  seam (node start/done events; the cmd `logObserver` records `decompose_node` to the log
+  for audit/resume — I5), both pure-leaf. Bounded-concurrency fan-out (`MaxParallel`)
+  remains future — `decompose` runs children sequentially today.
+- **K2-3 — future.** The learned `router.Oracle`: route on experience/lessons/trust signals +
+  a model estimate, replacing the heuristic when confident (heuristic stays the fail-closed
+  floor), and selecting `decompose` for clearly-forking goals.
 
-- **K2-1** — a `decompose` envelope wiring `kernel.Recursive`: `Plan` = a model goal-splitter
-  (seam + deterministic fallback), child `RunFunc` = `runViaKernel`, `Integrate` = the new
-  cross-worktree merge-and-re-verify integrator. The router gains `decompose` as a fourth
-  preset the oracle can choose.
-- **K2-2** — engine hardening the decompose preset forces: `Envelope.MaxChildren` (structural
-  width bound, fail-closed), a `kernel.Observer` seam (node-start/done events for audit +
-  resume, injected so the leaf stays pure), and bounded-concurrency fan-out
-  (`Envelope.MaxParallel`, default 1 = today's sequential).
-- **K2-3** — the learned `router.Oracle`: route on experience/lessons/trust signals + a model
-  estimate, replacing the heuristic when confident (heuristic stays the fail-closed floor).
-
-Until K2-1 has a real consumer, the recursive engine remains available, tested, and
-dormant — and that is an acceptable resting state, not a bug.
+The recursive engine is no longer dormant — `decompose` is its production consumer.
 
 ---
 
