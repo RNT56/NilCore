@@ -5,7 +5,60 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
+
+// Selector-targeting actions (click, type) can fire before the page has settled —
+// a fresh navigation or an async render means the element they name may not exist,
+// or may not yet be actionable (laid out / focusable), on the very first DOM query.
+// Rather than fail on that first miss, the resolving helpers POLL the page for a
+// short, bounded window. This mirrors the auto-wait every mature browser-automation
+// tool performs; once the element is present the first poll succeeds, so behavior is
+// unchanged in the common case — only the settle race is removed.
+const (
+	defaultActionWait  = 3 * time.Second
+	actionPollInterval = 50 * time.Millisecond
+)
+
+// evalUntil evaluates expr repeatedly until ready(result) holds or the action-wait
+// budget / context expires, returning the last evaluated value. A transient evaluate
+// error (e.g. an execution context torn down mid-navigation) is tolerated and retried;
+// an error is returned only if the context is cancelled or every attempt within the
+// budget failed. When the budget expires with a value in hand but ready never held, the
+// last value is returned with a nil error so the caller's own check renders the precise
+// domain error ("matched no visible/focusable element").
+func (c *Conn) evalUntil(ctx context.Context, expr string, ready func(json.RawMessage) bool) (json.RawMessage, error) {
+	budget := c.actionWait
+	if budget <= 0 {
+		budget = defaultActionWait
+	}
+	deadline := time.Now().Add(budget)
+	var last json.RawMessage
+	var lastErr error
+	gotValue := false
+	for {
+		v, err := c.Eval(ctx, expr)
+		if err != nil {
+			lastErr = err // transient during page settle — keep polling within the budget
+		} else {
+			last, lastErr, gotValue = v, nil, true
+			if ready(v) {
+				return v, nil
+			}
+		}
+		if !time.Now().Before(deadline) {
+			if gotValue {
+				return last, nil // budget spent; let the caller produce the domain error
+			}
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(actionPollInterval):
+		}
+	}
+}
 
 // This file is the typed, intention-revealing layer the browser driver calls.
 // Each method wraps one or two raw CDP commands and decodes the UNTRUSTED (I7)
@@ -152,7 +205,12 @@ func (c *Conn) ElementCenter(ctx context.Context, selector string) (point, error
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 })()`, string(sel))
 
-	v, err := c.Eval(ctx, expr)
+	// Poll until the element exists AND has a non-zero layout box (the expr returns
+	// null until both hold), so a click that targets a not-yet-rendered element waits
+	// for it instead of failing on the first miss.
+	v, err := c.evalUntil(ctx, expr, func(v json.RawMessage) bool {
+		return len(v) > 0 && string(v) != "null"
+	})
 	if err != nil {
 		return point{}, err
 	}
@@ -270,7 +328,12 @@ func (c *Conn) TypeIntoSelector(ctx context.Context, selector, text string) erro
   if (typeof el.focus === 'function') el.focus();
   return true;
 })()`, string(sel))
-	v, err := c.Eval(ctx, expr)
+	// Poll until the element exists and is focusable (the expr returns false until
+	// then), so typing into a not-yet-rendered field waits for it rather than failing
+	// on the first miss — the settle race the live-flow CI exercised.
+	v, err := c.evalUntil(ctx, expr, func(v json.RawMessage) bool {
+		return strings.TrimSpace(string(v)) == "true"
+	})
 	if err != nil {
 		return err
 	}
