@@ -385,12 +385,20 @@ func TestTurnWhileWorkingPushesToInbox(t *testing.T) {
 				t.Fatalf("router calls = %d, want 1 (follow-up must not re-route)", rt.calls)
 			}
 
-			// Steer mode fires the steer signal; queue mode must not.
+			// Steer mode fires the steer signal; queue mode must not. The wait is
+			// mode-aware: Steer is a POSITIVE wait for a signal fired asynchronously by
+			// the drive goroutine, so it gets a generous budget (a 50ms bound flaked
+			// under CI load); Queue is an ABSENCE check, which a short window confirms
+			// (a not-sent signal never appears, so a longer wait would only slow the test).
 			fired := false
+			steerWait := 50 * time.Millisecond
+			if tc.wantMode == inbox.Steer {
+				steerWait = testWaitBudget
+			}
 			select {
 			case <-steered:
 				fired = true
-			case <-time.After(50 * time.Millisecond):
+			case <-time.After(steerWait):
 			}
 			if tc.wantMode == inbox.Steer && !fired {
 				t.Fatal("steer follow-up did not fire the steer signal")

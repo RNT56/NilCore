@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -366,6 +367,23 @@ func TestElementCenterAutoWaitsForElement(t *testing.T) {
 	}
 	if pt.X != 10.5 || pt.Y != 20.0 {
 		t.Fatalf("center = %+v, want {10.5 20} after the auto-wait", pt)
+	}
+}
+
+// TestElementCenterHonorsContextCancel proves the auto-wait poll aborts on a cancelled
+// context rather than spinning until its budget: a selector command run under a cancelled
+// ctx returns the context error (not a selector-not-found domain error), so a parent that
+// cancels (deadline, kill-switch) stops the poll at once. This exercises evalUntil's
+// ctx-cancellation path, which the other cdp tests do not.
+func TestElementCenterHonorsContextCancel(t *testing.T) {
+	clientWS, _ := newPipePair(t)
+	c := &Conn{ws: clientWS}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the call
+
+	_, err := c.ElementCenter(ctx, "#anything")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ElementCenter under a cancelled ctx = %v, want context.Canceled", err)
 	}
 }
 
