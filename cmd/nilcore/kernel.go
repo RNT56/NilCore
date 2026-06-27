@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
@@ -28,8 +29,18 @@ import (
 )
 
 // kernelEnabled reports whether orchestration routes through the unified kernel. It is
-// the single default-off gate; unset ⇒ the legacy machine path, byte-identical.
-func kernelEnabled() bool { return os.Getenv("NILCORE_KERNEL") != "" }
+// DEFAULT-ON (Pillar 8 is the engine): the kernel transparently wraps the proven machines
+// and is equivalence-proven, so routing through it is the norm. The legacy machine path is
+// retained as an instant escape hatch — set NILCORE_KERNEL to 0/off/false/no to call the
+// machine DIRECTLY (byte-identical), for revert if the kernel path ever misbehaves.
+func kernelEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("NILCORE_KERNEL"))) {
+	case "0", "off", "false", "no":
+		return false
+	default:
+		return true
+	}
+}
 
 // agentToKernel / projectToKernel / swarmToKernel map a machine's native outcome onto the
 // kernel's uniform Outcome. Verified is the machine's verifier verdict (I2) — never a

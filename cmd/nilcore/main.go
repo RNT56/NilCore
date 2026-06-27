@@ -152,32 +152,49 @@ func main() {
 // usageText is the top-level help: what NilCore is, then the command list, then
 // the first-time on-ramp. Hand-written so the front door reads like a product,
 // not a flag dump.
-const usageText = `NilCore — a tiny, robust coding agent. The harness is small; the model is the engine.
+const usageText = `NilCore — ONE coding agent you talk to. It writes the code, runs and verifies it
+works (in a real browser/app when needed), and reaches for more power — delegation, a
+swarm, a backend — when the job calls for it. The harness is small; the model is the engine.
 
-Usage:
-  nilcore                               start the interactive chat front door (same as 'nilcore chat')
-  nilcore chat [-dir ./repo]            talk to the agent: it picks the machine and works while you type
-  nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
-  nilcore -goal "<task>" [-dir ./repo]  run one task to completion in a disposable worktree
-  nilcore build -goal "<project>" -new ./svc   drive a whole project to a verifier-green tree (multi-agent)
-  nilcore swarm -goal "<objective>" -preset research   fan out a verified agent swarm (typed artifacts, requeue-until-clean)
-  nilcore serve -channel telegram       listen on a chat channel and dispatch tasks
-  nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
+TALK TO IT — this is the product:
+  nilcore                               start the conversation; it decides how to work and works while you type
+  nilcore chat [-dir ./repo]            the same conversation, explicitly (-dir picks the repo)
+  nilcore tui                           the conversation in a full-screen UI
+  nilcore serve -channel telegram       run the agent as a chat bot (Telegram/Slack/…)
+  nilcore -goal "<task>" [-dir ./repo]  one-shot: run a single task to completion, no conversation
+
+WHAT IT CAN DO — capabilities the agent reaches for on demand (or invoke directly):
+  nilcore build -goal "<project>" -new ./svc          drive a whole project to a verifier-green tree (multi-agent)
+  nilcore swarm -goal "<objective>" -preset research  fan out a verified agent swarm (typed artifacts, requeue-until-clean)
   nilcore browse -goal "..."            drive a persistent in-sandbox browser (observe→plan→act→verify; findings re-verified)
-  nilcore desktop -goal "..."           drive a contained virtual desktop (Set-of-Marks ladder; --mac-host drives a real Mac, gated)
-  nilcore propose-edit -goal "..." -paths ...  gated self-edit of the agent's own prompts/skills/tools
+  nilcore desktop -goal "..."           drive a contained virtual desktop (Set-of-Marks; --mac-host drives a real Mac, gated)
+  nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
+  nilcore schedule -goal "..." -every 1h   self-start on a cron cadence
+  nilcore flywheel [--once]             run the self-improvement loop (eval → mine failures → propose a gated fix)
+  nilcore propose-edit -goal "..." -paths ...   gated self-edit of the agent's own prompts/skills/tools
+  (run/build/swarm run on ONE engine — the kernel; the conversation picks which preset. Set NILCORE_KERNEL=0 to opt out.)
+
+THE COCKPIT — read-only / operator surfaces to inspect, audit, and steer:
+  nilcore trace <task> | nilcore why <task>   explain why the agent did what it did (event log, read-only)
+  nilcore report [-format text|matrix]  the verification report (the I2 trust gate)
+  nilcore trust [-format text|json]     the Trust Ledger scoreboard (verifier-judged routing; the verifier still decides)
+  nilcore experience | nilcore capability     the learned-state scoreboard / a drive's exact capability descriptor
+  nilcore lessons                       recurring verifier-failure patterns the agent has learned from
+  nilcore auto-approvals [-denied]      account of past graduated auto-approvals + the per-class undo story
+  nilcore objective <list|add|disable|enable>   manage the standing-objectives backlog (operator-only)
+  nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
+  nilcore registry list|install <m>     manage local skills / MCP-server specs
+
+SETUP & MAINTENANCE:
+  nilcore init                          guided setup: keys, runtime, backend, channel, allowlist
   nilcore doctor                        check whether this host is ready to run/serve
   nilcore config show                   print the active configuration (secret-free)
   nilcore secret set <name>             store or rotate a single secret in the secret store
-  nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
-  nilcore report [-format text|matrix]  render the verification report from the event log (the I2 trust gate)
-  nilcore trust [-format text|json]     show the Trust Ledger scoreboard (verifier-judged strength routing; the verifier still decides)
-  nilcore trace <task> | nilcore why <task>   explain why the agent did what it did, from the event log (read-only)
   nilcore mcp-call <server> <tool> ...  invoke a configured MCP tool (the runtime bridge for generated wrappers)
   nilcore version                       print the build version
 
 Run 'nilcore <command> -h' for a command's flags.
-First time? Start with: nilcore init
+First time? Run 'nilcore init', then just run 'nilcore' and talk to it.
 `
 
 func usage(w io.Writer) { fmt.Fprint(w, usageText) }
