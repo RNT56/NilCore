@@ -137,8 +137,10 @@ The recursive engine is no longer dormant — `decompose` is its production cons
 
 ## 6. Decision
 
-Ship the router (done). Keep the recursive engine dormant-but-tested. Revisit §5 only when a
-concrete static-decompose workload justifies the integrator. If that never comes, the
-honest end-state is to **delete `Recursive`/`Granularity`/`MaxDepth`** and let the kernel be
-the unified-entry + router layer it actually is — carrying a dormant engine indefinitely is
-the one outcome to avoid.
+Router shipped + in use. **The recursive engine is no longer dormant** — the `decompose`
+preset (§5, K2-1/K2-2) is its production consumer, opt-in and hermetically tested. What
+remains future: the learned `router.Oracle` (K2-3) and bounded-concurrency fan-out
+(`MaxParallel`); the *iterative* project loop stays deliberately un-re-expressed (it is not
+the one-shot shape the engine fits). The "delete `Recursive` if it never gets a consumer"
+escape hatch is now moot — it has one. (§4 below is kept as the original pre-decompose
+record; its "deferred / not built" framing was superseded when `decompose` shipped.)

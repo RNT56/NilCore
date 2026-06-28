@@ -1,6 +1,6 @@
 # ROADMAP — `ask_user`: attended-only interactive clarification
 
-**Status:** proposed (design approved, unimplemented). Namespace `AU-T##`. Slots after Phase 15 as **proposed Phase 16**.
+**Status:** SHIPPED. Namespace `AU-T##`. Phase 1 + Phase 2 merged (#67, #70); **AU-T05b** (escalated supervise/project gate unification) merged (#82); **AU-T06b** (native inline-button choices) + **AU-T08a** (supervisor ask seam) merged (#70). The only deferred piece is the full **AU-T08** §0.1 concurrency-scope field (`scope: let_run|pause|stop`) — infeasible until the scheduler/dispatch/peer-bus pause-resume-stop machinery exists. See §6b for the per-task implementation account.
 **Revision:** v2 — adds **batched questions** (1–5 per ask, each with multi-select choices + always-available free-form), reviewed by a second adversarial panel. The batch is a presentation loop over the v1 single-flight primitive; no new session park state.
 **Read order:** `CLAUDE.md` → `docs/ARCHITECTURE.md` (§Execution model, §Security) → `docs/PERSONA.md` §2 → this file.
 
