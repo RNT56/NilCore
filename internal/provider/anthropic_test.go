@@ -54,6 +54,45 @@ const cannedSSE = "event: message_start\n" +
 // TestAnthropicStream parses a canned SSE byte stream served over httptest and
 // asserts the assembled Response (text + tool_use + usage + stop_reason) matches
 // what Complete would return, with onChunk receiving each text delta in order.
+// TestAnthropicCompleteWebSearchResult proves the non-streaming decode no longer
+// crashes on a web_search_tool_result block (whose "content" is an ARRAY) — the
+// exact shape native web search returns. Before the tolerant decode this failed the
+// whole turn with "cannot unmarshal array ... into ... string". The server-tool
+// blocks are dropped; the model's text answer survives.
+func TestAnthropicCompleteWebSearchResult(t *testing.T) {
+	const body = `{
+	  "content": [
+	    {"type":"text","text":"Go 1.25 is out."},
+	    {"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"go release"}},
+	    {"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[
+	       {"type":"web_search_result","title":"Go","url":"https://go.dev","encrypted_content":"abc"}
+	    ]}
+	  ],
+	  "stop_reason":"end_turn",
+	  "usage":{"input_tokens":12,"output_tokens":7}
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	a := NewAnthropic("k", "claude-x")
+	a.baseURL = srv.URL
+
+	resp, err := a.Complete(context.Background(), "sys",
+		[]model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "go"}}}}, nil, 100)
+	if err != nil {
+		t.Fatalf("Complete on a web-search response must not error: %v", err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != "text" || resp.Content[0].Text != "Go 1.25 is out." {
+		t.Fatalf("expected the single text block to survive, got %+v", resp.Content)
+	}
+	if resp.StopReason != "end_turn" || resp.Usage.InputTokens != 12 || resp.Usage.OutputTokens != 7 {
+		t.Errorf("stop/usage = %q %+v", resp.StopReason, resp.Usage)
+	}
+}
+
 func TestAnthropicStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") != "k" {

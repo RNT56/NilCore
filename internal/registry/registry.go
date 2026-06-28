@@ -98,6 +98,11 @@ func InstallSkill(e Entry, skillsDir string) error {
 		return fmt.Errorf("registry: mkdir %s: %w", destDir, err)
 	}
 	dest := filepath.Join(destDir, "SKILL.md")
+	// Preserve any prior-good skill at this name: a bad re-install (overwrite) must
+	// NOT destroy the working skill it was replacing. If a SKILL.md already exists we
+	// snapshot it and restore it on rollback; only a genuinely fresh install removes
+	// the dir it created.
+	prev, hadPrev := os.ReadFile(dest)
 	if err := os.WriteFile(dest, src, 0o644); err != nil {
 		return fmt.Errorf("registry: write %s: %w", dest, err)
 	}
@@ -106,7 +111,11 @@ func InstallSkill(e Entry, skillsDir string) error {
 	// discovery dir never holds an unparseable skill.
 	loaded, err := skills.LoadDir(destDir)
 	if err != nil || len(loaded) == 0 {
-		_ = os.RemoveAll(destDir)
+		if hadPrev == nil {
+			_ = os.WriteFile(dest, prev, 0o644) // restore the prior-good skill
+		} else {
+			_ = os.RemoveAll(destDir) // fresh bad install — remove what we created
+		}
 		if err != nil {
 			return fmt.Errorf("registry: installed skill %q does not load: %w", e.Name, err)
 		}

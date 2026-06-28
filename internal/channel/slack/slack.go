@@ -52,7 +52,7 @@ type Bot struct {
 	askSeq  atomic.Int64
 	pending []channel.TaskRequest
 
-	mu     sync.Mutex             // guards drafts + asks
+	mu     sync.Mutex             // guards drafts + asks + pending
 	drafts map[string]*slackDraft // per-thread in-place streaming message (chat.update)
 	asks   map[string]*askEntry   // ask_user choice prompts awaiting a tap, by token
 
@@ -92,11 +92,30 @@ func (b *Bot) SetAuthorizer(allow func(string) bool, log *eventlog.Log) {
 }
 
 // Receive blocks until the next user message, returning it as a task request.
+// popPending removes and returns the head of the buffered request queue. The serve
+// Receive loop and a backgrounded drive's gate Ask loop can both touch pending, so
+// it is mu-guarded (see pushPending).
+func (b *Bot) popPending() (channel.TaskRequest, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.pending) == 0 {
+		return channel.TaskRequest{}, false
+	}
+	tr := b.pending[0]
+	b.pending = b.pending[1:]
+	return tr, true
+}
+
+// pushPending appends a request to the buffered queue (mu-guarded).
+func (b *Bot) pushPending(tr channel.TaskRequest) {
+	b.mu.Lock()
+	b.pending = append(b.pending, tr)
+	b.mu.Unlock()
+}
+
 func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 	for {
-		if len(b.pending) > 0 {
-			tr := b.pending[0]
-			b.pending = b.pending[1:]
+		if tr, ok := b.popPending(); ok {
 			return tr, nil
 		}
 		if err := b.ensure(ctx); err != nil {
@@ -265,12 +284,12 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 			// it and buffer the answer task so Receive delivers it.
 			if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
 				if tr := b.handleAskAction(ctx, a); tr != nil {
-					b.pending = append(b.pending, *tr)
+					b.pushPending(*tr)
 				}
 			}
 		case "events_api":
 			if tr, ok := messageRequest(ev.Payload); ok {
-				b.pending = append(b.pending, tr) // don't drop tasks during a gate
+				b.pushPending(tr) // don't drop tasks during a gate
 			}
 		}
 	}

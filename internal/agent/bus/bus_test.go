@@ -63,6 +63,53 @@ func kinds(events []eventlog.Event) map[string]int {
 // Ask resolves by correlation id: the supervisor answers a subagent's question
 // and the blocked Ask returns the correlated reply. The reply is delivered
 // straight to the parked Ask (not via a mailbox the asker is not draining).
+// TestConcurrentSendDeregisterNoPanic stresses the deliverOne/Deregister TOCTOU:
+// many goroutines Send to a recipient while another concurrently Deregisters and
+// re-Registers it. Before deliverOne held the read lock across the send, a close()
+// landing between the lookup and the send panicked on send-to-closed-channel. The
+// test passes iff no panic occurs over many iterations.
+func TestConcurrentSendDeregisterNoPanic(t *testing.T) {
+	b := New(nil, 1, 0) // depth 1 so mailboxes fill and sends wait (widening the window)
+	ctx := context.Background()
+
+	const target = AgentID("worker")
+	if _, err := b.Register(target); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Senders.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = b.Send(ctx, Message{Sender: "peer", To: []AgentID{target}, Kind: KindFinding, TTL: 4, Payload: "x"})
+			}
+		}()
+	}
+
+	// Churn: deregister + re-register the target repeatedly.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			b.Deregister(target)
+			_, _ = b.Register(target)
+		}
+		close(stop)
+	}()
+
+	wg.Wait() // a panic in any goroutine fails the test
+}
+
 func TestAskResolvesByCorrelationID(t *testing.T) {
 	b := New(nil, 4, 0)
 	superMbox := mustRegister(t, b, Supervisor)

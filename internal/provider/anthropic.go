@@ -105,11 +105,54 @@ func (a *Anthropic) Complete(ctx context.Context, system string, msgs []model.Me
 		return model.Response{}, fmt.Errorf("anthropic api: %s: %s", resp.Status, tail(string(raw), 1000))
 	}
 
-	var out model.Response
-	if err := json.Unmarshal(raw, &out); err != nil {
+	var ar anthropicResponse
+	if err := json.Unmarshal(raw, &ar); err != nil {
 		return model.Response{}, fmt.Errorf("decode response: %w", err)
 	}
-	return out, nil
+	return ar.toModel(), nil
+}
+
+// anthropicResponse is the non-streaming Messages response, decoded TOLERANTLY.
+// Decoding straight into model.Response used to crash the whole turn whenever native
+// web search ran: an Anthropic web_search_tool_result block carries an ARRAY under
+// "content", but model.Block.Content is a string, so json.Unmarshal returned
+// "cannot unmarshal array ... into ... string". Here the per-block struct simply
+// does not declare a "content" field, so a server-tool block's array content is an
+// ignored unknown field. We then keep only the blocks the loop consumes — text and
+// tool_use — exactly as the streaming assembler's finish() does, dropping
+// server_tool_use / web_search_tool_result (the model's text answer already folds in
+// the search results; the loop has no handler for server-side tool blocks).
+type anthropicResponse struct {
+	Content []struct {
+		Type  string          `json:"type"`
+		Text  string          `json:"text"`
+		ID    string          `json:"id"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	} `json:"content"`
+	StopReason string         `json:"stop_reason"`
+	Usage      anthropicUsage `json:"usage"`
+}
+
+func (ar anthropicResponse) toModel() model.Response {
+	out := model.Response{
+		StopReason: ar.StopReason,
+		Usage:      model.Usage{InputTokens: ar.Usage.InputTokens, OutputTokens: ar.Usage.OutputTokens},
+	}
+	for _, b := range ar.Content {
+		switch b.Type {
+		case "text":
+			out.Content = append(out.Content, model.Block{Type: "text", Text: b.Text})
+		case "tool_use":
+			out.Content = append(out.Content, model.Block{
+				Type:  "tool_use",
+				ID:    b.ID,
+				Name:  b.Name,
+				Input: json.RawMessage(orEmptyObj(string(b.Input))),
+			})
+		}
+	}
+	return out
 }
 
 // streamEvent is one Messages-API server-sent event frame. Only the fields the

@@ -433,12 +433,24 @@ func (b *Board) snapshotLocked() Snapshot {
 // so the event is safe to append verbatim and eventlog.Verify stays green. A nil log
 // is a no-op (returns false).
 func (b *Board) EmitSnapshot(log *eventlog.Log) bool {
+	return b.emitSnapshot(log, false)
+}
+
+// EmitSnapshotForce emits a snapshot UNCONDITIONALLY (bypassing the minInterval
+// coalescing). It is used for the guaranteed FINAL snapshot at run end so the
+// replayed report always reflects the same terminal scoreboard the live render
+// printed, even when the last pass completed within the coalescing window.
+func (b *Board) EmitSnapshotForce(log *eventlog.Log) bool {
+	return b.emitSnapshot(log, true)
+}
+
+func (b *Board) emitSnapshot(log *eventlog.Log, force bool) bool {
 	if log == nil {
 		return false
 	}
 	b.mu.Lock()
 	now := time.Now()
-	if b.minInterval > 0 && !b.lastEmit.IsZero() && now.Sub(b.lastEmit) < b.minInterval {
+	if !force && b.minInterval > 0 && !b.lastEmit.IsZero() && now.Sub(b.lastEmit) < b.minInterval {
 		b.mu.Unlock()
 		return false // coalesced: too soon since the last emit
 	}

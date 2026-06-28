@@ -11,6 +11,55 @@ import (
 	"nilcore/internal/store"
 )
 
+// TestResumeAfterTornFinalLine proves a crash that leaves a torn final line does
+// not (a) concatenate the next record into the partial line, nor (b) reset the
+// sequence to 0. After reopening, the new record resumes from the last GOOD event's
+// Seq+1 and lands on its own line.
+func TestResumeAfterTornFinalLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Append(Event{Kind: "a"}) // seq 0
+	log.Append(Event{Kind: "b"}) // seq 1
+	_ = log.Close()
+
+	// Simulate a crash mid-write: a partial line with no trailing newline.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"time":"2020`); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	// Reopen and append: must resume at seq 2 (last good was seq 1), not 0.
+	log2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log2.Append(Event{Kind: "c"})
+	_ = log2.Close()
+
+	data, _ := os.ReadFile(path)
+	// The new record must be on its own line (not spliced into the torn one).
+	if strings.Contains(string(data), `{"time":"2020{`) {
+		t.Fatalf("new record was spliced into the torn line:\n%s", data)
+	}
+	var lastGood Event
+	for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		var e Event
+		if json.Unmarshal([]byte(ln), &e) == nil && e.Kind == "c" {
+			lastGood = e
+		}
+	}
+	if lastGood.Kind != "c" || lastGood.Seq != 2 {
+		t.Fatalf("resumed event must be kind=c seq=2, got kind=%q seq=%d", lastGood.Kind, lastGood.Seq)
+	}
+}
+
 func TestOnAppendHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hook.jsonl")
 	log, err := Open(path)

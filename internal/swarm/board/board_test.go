@@ -298,6 +298,37 @@ func TestEmitSnapshotCoalesced(t *testing.T) {
 	assertMetadataOnly(t, lines[0])
 }
 
+// TestEmitSnapshotForceBypassesCoalescing asserts the forced terminal emit always
+// writes, even within the coalescing window — so a replayed report never loses the
+// final scoreboard just because the last pass landed quickly after the prior emit.
+func TestEmitSnapshotForceBypassesCoalescing(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "swarm.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	b := New(budget.New(), meter.NewTable(), time.Hour) // long window
+	b.SetTotal(1)
+	b.Record(ShardOutcome{ID: "x", Pass: 1, Passed: true})
+
+	if !b.EmitSnapshot(log) {
+		t.Fatal("first EmitSnapshot returned false, want a write")
+	}
+	if b.EmitSnapshot(log) {
+		t.Fatal("coalesced emit unexpectedly wrote")
+	}
+	if !b.EmitSnapshotForce(log) {
+		t.Fatal("forced emit must write even within the coalescing window")
+	}
+	if err := log.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if lines := readLines(t, logPath); len(lines) != 2 {
+		t.Fatalf("log has %d lines, want 2 (first + forced)", len(lines))
+	}
+}
+
 // TestEmitSnapshotNoCoalesce asserts a non-positive interval disables coalescing — every
 // EmitSnapshot writes.
 func TestEmitSnapshotNoCoalesce(t *testing.T) {

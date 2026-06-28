@@ -99,6 +99,20 @@ func (l *Log) OnAppend(fn func(e Event)) {
 // Open opens (creating if needed) the log at path, continuing the hash chain and
 // the sequence counter from any existing content.
 func Open(path string) (*Log, error) {
+	// Heal a torn final line before opening for append. If the file is non-empty and
+	// does not end in '\n', a prior process crashed mid-write (or a short write
+	// occurred). Append a single newline so the NEXT record starts on its own line
+	// rather than being concatenated INTO the partial one (which would corrupt the
+	// next event too and, via lastEvent failing, silently reset the sequence to 0).
+	// This only ADDS a byte — still append-only (I5); the partial line itself stays
+	// as an honest corruption signal that Verify will surface.
+	if data, rerr := os.ReadFile(path); rerr == nil && len(data) > 0 && data[len(data)-1] != '\n' {
+		if hf, herr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644); herr == nil {
+			_, _ = hf.Write([]byte{'\n'})
+			_ = hf.Close()
+		}
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
@@ -244,11 +258,16 @@ func lastEvent(path string) (Event, bool) {
 		return Event{}, false
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	var e Event
-	if json.Unmarshal([]byte(lines[len(lines)-1]), &e) != nil {
-		return Event{}, false
+	// Scan backward to the last PARSEABLE event. A crash can leave a torn final line;
+	// the chain must still resume from the last event that fully reached disk (with
+	// its real Seq), never reset to 0 because only the tail is corrupt.
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e Event
+		if json.Unmarshal([]byte(lines[i]), &e) == nil {
+			return e, true
+		}
 	}
-	return e, true
+	return Event{}, false
 }
 
 // Verify re-reads the log at path and checks the chain end to end — sequence
