@@ -63,6 +63,15 @@ jobs:
   tui:
     name: tui-verify (-tags tui)
     runs-on: ubuntu-latest
+    # tui-verify runs `go test -tags tui ./cmd/nilcore`, whose tests exercise real git
+    # merges (integrate/worktree) under HardenedEnv (which blanks the global git config),
+    # so the committer identity must come from these env vars — same as the `verify` and
+    # `race` jobs. Without them git fails with "Committer identity unknown".
+    env:
+      GIT_AUTHOR_NAME: nilcore-ci
+      GIT_AUTHOR_EMAIL: ci@nilcore.local
+      GIT_COMMITTER_NAME: nilcore-ci
+      GIT_COMMITTER_EMAIL: ci@nilcore.local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

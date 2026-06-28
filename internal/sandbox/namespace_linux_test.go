@@ -119,9 +119,43 @@ func TestNamespaceDevNullWritable(t *testing.T) {
 
 func TestNamespaceTmpWritable(t *testing.T) {
 	box := requireNamespace(t)
-	res := runSandbox(t, box, "echo scratch > /tmp/nilcore-x && cat /tmp/nilcore-x")
+	// The writable scratch is $TMPDIR (== HOME), set to a run-private dir. A tool that
+	// needs scratch writes there; this holds whether the worktree is under /tmp (a
+	// run-private subdir) or not (a private tmpfs at /tmp). We no longer grant write to
+	// all of shared host /tmp (the B3 isolation fix), so a tool must use $TMPDIR — which
+	// the namespace backend sets for exactly this reason.
+	res := runSandbox(t, box, `echo scratch > "$TMPDIR/nilcore-x" && cat "$TMPDIR/nilcore-x"`)
 	if res.ExitCode != 0 || !strings.Contains(res.Stdout, "scratch") {
-		t.Fatalf("/tmp should be writable scratch: exit %d out %q stderr %q", res.ExitCode, res.Stdout, res.Stderr)
+		t.Fatalf("$TMPDIR should be writable scratch: exit %d out %q stderr %q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+// TestNamespaceDoesNotShareHostTmp proves the B3 isolation: when the worktree lives
+// under /tmp (the production layout — worktrees are os.MkdirTemp("")), the sandbox does
+// NOT get write access to all of shared host /tmp, only its run-private scratch
+// ($TMPDIR). So a concurrent run cannot scribble into another run's /tmp space. A write
+// to a /tmp path OUTSIDE the scratch must be denied. The workdir is rooted explicitly
+// under /tmp so this holds regardless of the host's $TMPDIR.
+func TestNamespaceDoesNotShareHostTmp(t *testing.T) {
+	if ok, reason := detectNamespace(); !ok {
+		if os.Getenv("NILCORE_SANDBOX_MUST_RUN") == "1" {
+			t.Fatalf("namespace backend required (NILCORE_SANDBOX_MUST_RUN=1) but unavailable: %s", reason)
+		}
+		t.Skipf("namespace backend unavailable on this host: %s", reason)
+	}
+	dir, err := os.MkdirTemp("/tmp", "nilcore-b3-")
+	if err != nil {
+		t.Skipf("cannot create a /tmp-rooted workdir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	box, err := newNamespace(dir)
+	if err != nil {
+		t.Fatalf("newNamespace: %v", err)
+	}
+	res := runSandbox(t, box.(*Namespace),
+		`if echo x > /tmp/nilcore-shared-probe 2>/dev/null; then echo WROTE; else echo denied; fi`)
+	if !strings.Contains(res.Stdout, "denied") {
+		t.Fatalf("a write to shared host /tmp must be DENIED (B3 isolation), got out=%q stderr=%q", res.Stdout, res.Stderr)
 	}
 }
 

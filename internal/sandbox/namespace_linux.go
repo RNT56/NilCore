@@ -251,6 +251,14 @@ func sandboxEnv(home string) []string {
 	}
 	env = defaultEnv(env, "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	env = setEnv(env, "HOME", home)
+	// TMPDIR points at the writable scratch (== home). REQUIRED since the namespace
+	// backend no longer grants RW to all of shared host /tmp when the worktree lives
+	// under /tmp (the B3 isolation fix): a tool that writes scratch must reach the
+	// run-private dir, not /tmp-at-large. In the non-/tmp case home IS the private
+	// tmpfs /tmp, so this is a no-op there. TMP/TEMP set too for portability.
+	env = setEnv(env, "TMPDIR", home)
+	env = setEnv(env, "TMP", home)
+	env = setEnv(env, "TEMP", home)
 	env = setEnv(env, "GOCACHE", filepath.Join(home, ".gocache"))
 	env = setEnv(env, "GOPATH", filepath.Join(home, ".gopath"))
 	return env
