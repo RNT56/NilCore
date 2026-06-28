@@ -137,7 +137,7 @@ func MaybeRunInit() {
 		os.Exit(126)
 	}
 	argv := []string{"/bin/sh", "-c", os.Getenv(envCmd)}
-	if err := unix.Exec("/bin/sh", argv, sandboxEnv("/tmp")); err != nil {
+	if err := unix.Exec("/bin/sh", argv, sandboxEnv(sandboxScratch(os.Getenv(envWorkdir)))); err != nil {
 		fmt.Fprintf(os.Stderr, "nilcore sandbox exec: %v\n", err)
 		os.Exit(127)
 	}
@@ -156,12 +156,23 @@ func sandboxInit(workdir string) error {
 	// A /proc reflecting our PID namespace (best-effort; not a security boundary).
 	_ = unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
 
-	// A private tmpfs at /tmp gives writable scratch that's invisible to the host,
-	// mirroring the container's tmpfs — EXCEPT when the worktree itself lives under
-	// /tmp (tests, some CI), where mounting over /tmp would shadow it. There we
-	// share the host /tmp. Either way /tmp is the writable scratch, granted below.
+	// Writable scratch. When the worktree does NOT live under /tmp we mount a private
+	// tmpfs over /tmp — invisible to the host, mirroring the container's tmpfs — and
+	// grant RW on all of it (it is this namespace's own /tmp). When the worktree DOES
+	// live under /tmp (production: worktrees are os.MkdirTemp("","nilcore-wt-") →
+	// /tmp/nilcore-wt-XXXX/<leaf>), mounting over /tmp would shadow the worktree, so
+	// we cannot. There we must NOT grant RW to the shared host /tmp — that would let a
+	// sandboxed command write into a SIBLING run's worktree/scratch under /tmp during
+	// concurrent multi-agent runs (an I4 cross-run isolation hole). Instead we carve a
+	// run-private scratch dir under the worktree's own run-scoped parent (removed by
+	// worktree.Release) and grant RW to exactly that.
+	scratch := sandboxScratch(workdir)
 	if !underTmp(workdir) {
 		_ = unix.Mount("tmpfs", "/tmp", "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "")
+	} else {
+		// Best-effort create; if it fails the command simply has no extra scratch
+		// beyond its worktree (fail-closed: less writable surface, never more).
+		_ = os.MkdirAll(scratch, 0o700)
 	}
 
 	if err := unix.Chdir(workdir); err != nil {
@@ -179,7 +190,7 @@ func sandboxInit(workdir string) error {
 	rules := []landlockRule{
 		{"/", landlockReadExec()},
 		{workdir, landlockReadWrite()},
-		{"/tmp", landlockReadWrite()},
+		{scratch, landlockReadWrite()},
 		{"/dev/null", landlockDevRW()},
 		{"/dev/zero", landlockDevRW()},
 		{"/dev/full", landlockDevRW()},
@@ -205,6 +216,24 @@ func sandboxInit(workdir string) error {
 // shadow the worktree.
 func underTmp(p string) bool {
 	return p == "/tmp" || strings.HasPrefix(p, "/tmp/")
+}
+
+// sandboxScratch is the single writable scratch path granted to the command beyond
+// its worktree (and used as HOME / TMPDIR). When the worktree is not under /tmp the
+// scratch is the private tmpfs at /tmp. When it IS under /tmp we cannot mount over
+// /tmp, so the scratch is a run-private subdir of the worktree's parent — never the
+// shared host /tmp — so concurrent runs cannot write into each other's space.
+func sandboxScratch(workdir string) string {
+	if !underTmp(workdir) {
+		return "/tmp"
+	}
+	parent := filepath.Dir(workdir)
+	// Guard against a degenerate workdir like "/tmp" or "/tmp/x" whose parent is "/"
+	// or "/tmp": fall back to a dir beside the worktree rather than widening scope.
+	if parent == "/" || parent == "/tmp" || parent == "." {
+		return filepath.Join(workdir, ".nilcore-scratch")
+	}
+	return filepath.Join(parent, ".nilcore-scratch")
 }
 
 // sandboxEnv is the command's environment: the inherited env minus our control

@@ -252,6 +252,34 @@ func TestRedactionShapesAndNesting(t *testing.T) {
 	}
 }
 
+// TestRedactionInlineSecrets covers the broadened free-text masking: a credential
+// assigned to a named field inside a model-authored shell command (stored under
+// "cmd") that no prefixed-token pattern would catch. The key name is kept; only the
+// value is masked. Without inlineSecretRe/flagSecretRe these would leak (audit I3).
+func TestRedactionInlineSecrets(t *testing.T) {
+	d := map[string]any{
+		"export":  "export DB_PASSWORD=hunter2longvalue && run",
+		"flag":    "mysql -p s3cr3tpw -h db",
+		"longopt": "deploy --token=abc123def456 --env prod",
+		"auth":    "curl -H 'Authorization: Bearer zzzTOPSECRETzzz' https://x",
+		"keep":    "the password is set elsewhere",
+	}
+	redact(d)
+	blob, _ := json.Marshal(d)
+	s := string(blob)
+	for _, leak := range []string{"hunter2longvalue", "s3cr3tpw", "abc123def456", "zzzTOPSECRETzzz"} {
+		if strings.Contains(s, leak) {
+			t.Errorf("inline secret leaked through redaction: %q present in %s", leak, s)
+		}
+	}
+	// The field names / structure must survive so the audit line stays meaningful.
+	for _, keep := range []string{"DB_PASSWORD", "--token", "Authorization"} {
+		if !strings.Contains(s, keep) {
+			t.Errorf("redaction destroyed structure: %q missing from %s", keep, s)
+		}
+	}
+}
+
 // TestHMACKeyedChain proves a keyed chain verifies under its key but not without
 // it or under a different key — so an attacker who cannot read NILCORE_LOG_HMAC_KEY
 // cannot forge a chain that passes Verify (audit L6).

@@ -73,6 +73,30 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+// TestSearchDoesNotFollowSymlinks proves an in-tree symlink pointing OUT of the
+// worktree does not leak the target's contents to the model (I4). filepath.WalkDir
+// yields the symlink as a non-dir entry; os.ReadFile would follow it, so searchRoot
+// must skip symlinks (matching ReadTool's OpenNoFollow hardening).
+func TestSearchDoesNotFollowSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	// A secret living OUTSIDE the worktree.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("SECRET_NEEDLE_VALUE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An in-tree symlink pointing at it.
+	if err := os.Symlink(outside, filepath.Join(dir, "link.txt")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	got, err := run(t, SearchTool{}, dir, `{"pattern":"SECRET_NEEDLE_VALUE"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "SECRET_NEEDLE_VALUE") {
+		t.Errorf("search followed an in-tree symlink and leaked out-of-worktree content: %q", got)
+	}
+}
+
 func TestPathEscape(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := run(t, ReadTool{}, dir, `{"path":"../etc/passwd"}`); err == nil {

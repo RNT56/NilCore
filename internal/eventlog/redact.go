@@ -17,6 +17,23 @@ var secretRe = regexp.MustCompile(strings.Join([]string{
 	`-----BEGIN[ A-Z]*PRIVATE KEY-----`, // PEM private-key header
 }, "|"))
 
+// inlineSecretRe catches a credential assigned to a named field INSIDE a free-form
+// string — most importantly a model-authored shell command stored under "cmd"
+// (e.g. `export DB_PASSWORD=hunter2`, `--token=ghs_...`, `Authorization: Bearer x`).
+// A pattern-only allowlist (secretRe) cannot know every provider shape; this is the
+// belt-and-suspenders for the highest-risk free-text path (I3: no secrets in the log,
+// ever). It keeps the key name and masks the value. Conservative by design — over-
+// redaction in the audit trail is preferred to a leaked credential.
+// The optional scheme group ((?:bearer|basic|token) ) keeps an auth scheme word
+// visible while masking only the credential after it, so `Authorization: Bearer XYZ`
+// becomes `Authorization: Bearer [redacted]` (not `Authorization: [redacted] XYZ`).
+var inlineSecretRe = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|authorization|auth[_-]?token|bearer)([ \t]*[=:][ \t]*|[ \t]+)((?:bearer|basic|token)[ \t]+)?("?)([^\s"']{4,})`)
+
+// flagSecretRe catches a credential passed as a CLI flag value (e.g. `mysql -p s3cr3t`,
+// `curl --header 'Authorization: x'` is covered above; this covers `-p`, `--password`,
+// `--token`, `--secret`, `--api-key`, `--access-key`).
+var flagSecretRe = regexp.MustCompile(`(?i)((?:^|\s)(?:-p|--password|--passwd|--token|--secret|--api-key|--access-key|--auth-token)(?:[= ]))(\S{4,})`)
+
 // redact removes secret-looking values from a Detail map in place, before the
 // event is written. Values under secret-named keys are dropped entirely; secret
 // patterns embedded in any string value are masked. It recurses into nested maps
@@ -38,7 +55,10 @@ func redactMap(m map[string]any) {
 func redactValue(v any) any {
 	switch t := v.(type) {
 	case string:
-		return secretRe.ReplaceAllString(t, "[redacted]")
+		s := secretRe.ReplaceAllString(t, "[redacted]")
+		s = inlineSecretRe.ReplaceAllString(s, "${1}${2}${3}${4}[redacted]")
+		s = flagSecretRe.ReplaceAllString(s, "${1}[redacted]")
+		return s
 	case map[string]any:
 		redactMap(t)
 		return t

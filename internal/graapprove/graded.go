@@ -129,9 +129,12 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		return g.human.Approve(describe(a))
 	}
 
-	// (3) Blast radius — DenyBranches and prod* ALWAYS win; AllowBranches must admit
-	// the scope; for Deploy the Environments allowlist must admit it too.
-	if isProd(scope) || matchAny(scope, clause.DenyBranches) {
+	// (3) Blast radius — protected bases (prod*, main/master/release*), DenyBranches
+	// ALWAYS win; AllowBranches must admit the scope; for Deploy the Environments
+	// allowlist must admit it too. isProtectedBase is the STRUCTURAL floor that holds
+	// even if a custom envelope's DenyBranches omits main/master/release (charter:
+	// graduated auto-approval never auto-approves main/prod).
+	if isProd(scope) || isProtectedBase(scope) || matchAny(scope, clause.DenyBranches) {
 		g.emitDeny("out_of_scope", typ, scope, map[string]any{"protected": true})
 		return g.human.Approve(describe(a))
 	}
