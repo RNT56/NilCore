@@ -177,8 +177,15 @@ func (it *Integrator) mergeOne(ctx context.Context, dir string, env Env, item Me
 
 	// --no-ff keeps a distinct merge commit per branch so a later rollback is one
 	// reset; --no-commit lets us re-verify before the merge is recorded. (We do
-	// commit clean merges below; verify-then-reset gives per-branch granularity.)
-	out, mergeErr := git(ctx, dir, "merge", "--no-ff", "--no-commit", item.Branch)
+	// commit clean merges below; verify-then-reset gives per-branch granularity.) The
+	// inline -c identity is set on the MERGE too (not just the commit below): git
+	// validates the committer up-front even with --no-commit, so without it a host with
+	// no git identity (HardenedEnv blanks the global config) fails the merge with
+	// "Committer identity unknown". This makes the integrator self-sufficient, matching
+	// worktree.Merge — it never depends on ambient GIT_*/config identity.
+	out, mergeErr := git(ctx, dir,
+		"-c", "user.email=agent@nilcore.local", "-c", "user.name=nilcore",
+		"merge", "--no-ff", "--no-commit", item.Branch)
 	if mergeErr != nil {
 		// A merge that does not apply cleanly leaves the tree mid-merge. Abort to
 		// restore the pre-merge tip exactly, then escalate — the conflicting branch
