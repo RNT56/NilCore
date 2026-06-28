@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"nilcore/internal/channel"
 	"nilcore/internal/eventlog"
@@ -23,12 +24,15 @@ const maxAsks = 128
 type askEntry struct {
 	choices []channel.AskChoice
 	multi   bool
+	mu      sync.Mutex // guards picked (concurrent taps can land in either poll loop)
 	picked  []bool
 	chatID  int64
 	msgID   int64
 }
 
 func (e *askEntry) toggle(i int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if i >= 0 && i < len(e.picked) {
 		e.picked[i] = !e.picked[i]
 	}
@@ -38,6 +42,8 @@ func (e *askEntry) toggle(i int) {
 // (never label text, which may contain ',' or ';'), so the answer parser stays the sole
 // authority. Empty when nothing is picked (→ resolveReply's you-decide path).
 func (e *askEntry) line() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	var idx []string
 	for i, p := range e.picked {
 		if p {
@@ -52,6 +58,8 @@ func (e *askEntry) line() string {
 // plus a Done button that finalizes the accumulated picks. The callback_data carries the
 // correlation token so a tap maps back to this prompt regardless of which poll loop sees it.
 func (e *askEntry) keyboard(token string) map[string]any {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	var rows [][]map[string]any
 	for i, c := range e.choices {
 		label, data := c.Label, "ask:"+token+":"+strconv.Itoa(i)

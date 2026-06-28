@@ -147,5 +147,21 @@ func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage
 	for _, b := range res.Content {
 		out += b.Text
 	}
+	// Per the MCP spec a tool-level failure is reported with isError=true and the
+	// error detail in content (NOT as a JSON-RPC error). Surface it as a Go error so
+	// the executor treats it as a failed tool call rather than a successful result —
+	// otherwise a failing MCP tool reads as success. The content carries the detail.
+	if res.IsError {
+		return "", fmt.Errorf("mcp tool %s/%s failed: %s", c.Server, name, tailText(out, 500))
+	}
 	return out, nil
+}
+
+// tailText returns at most n characters of s (the trailing part when longer), so a
+// surfaced tool error stays bounded.
+func tailText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
 }

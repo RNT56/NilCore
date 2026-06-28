@@ -41,14 +41,18 @@ import (
 // loudly at boot, not inside this goroutine, and so the whole serve process shares ONE
 // *sql.DB rather than opening a competing single-writer handle here (the store is NOT
 // closed here — serve owns its lifetime).
-func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *eventlog.Log, s *store.Store) {
+func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *eventlog.Log, s *store.Store, idle func() bool) {
 	if s == nil {
 		fmt.Fprintln(os.Stderr, "nilcore: autonomy daemon disabled (no store)")
 		return
 	}
 
 	backlog := objective.New(s.ObjectiveStore())
-	src := autosrc.NewBacklogSource(backlog, autosrc.BacklogConfig{})
+	// Idle gating (Pillar 7): only pull a standing objective when serve has NO foreground
+	// drive queued or running, so a reactive conversation always preempts background
+	// self-service. A nil predicate ⇒ always idle (the prior, always-on behavior) — but
+	// serve always passes its drive-gate idle check.
+	src := autosrc.NewBacklogSource(backlog, autosrc.BacklogConfig{Idle: idle})
 
 	handler := func(ctx context.Context, sig trigger.Signal) error {
 		// Run the operator-authored objective goal through the verified orchestrator:

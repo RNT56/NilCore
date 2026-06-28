@@ -79,7 +79,7 @@ A sandboxed, `guard.Wrap`'d **client-side web search/fetch** already ships
 | OpenRouter `models[]` fallback + served-model id | OpenRouter | ❌ missing; `response.model` not decoded | server-side single-call failover; meter prices the model that served | medium |
 | Attribution headers (`HTTP-Referer`/`X-Title`) | OpenRouter | ❌ never sent | static config strings (never the key) | low |
 | `tool_choice` / `service_tier` / `parallel_tool_calls` | OpenAI/OpenRouter | ❌ always auto/default; read-side multi-tool works but untested | force/suppress tools, flex economics, disable parallel | low–med |
-| Typed error envelope + `Retry-After` | all | ❌ raw body tail; resilience retries everything blindly | `model.APIError` → terminal vs retryable, honour `Retry-After` | high |
+| Typed error envelope + `Retry-After` | all | ✅ **WIRED** — both adapters build `model.APIError` from a non-2xx response (key-free); `resilience.go` fast-fails a terminal 4xx and honours a 429/5xx `Retry-After` (was: raw body tail, retry-everything) | `model.APIError` → terminal vs retryable, honour `Retry-After` | high |
 
 ---
 

@@ -76,10 +76,22 @@ var snapshotJS = `(function(){
     if (style && (style.visibility === 'hidden' || style.display === 'none')) continue;
     el.setAttribute('data-nilref', String(n));
     var role = el.getAttribute('role') || el.tagName.toLowerCase();
+    // Never surface the live value of a secret-bearing field back to the model (I3):
+    // a host-side {{secret:NAME}} substitution that the model typed must not reflow
+    // out via the next snapshot's .value. A password input (or one masking its own
+    // input) is treated as secret: its value is replaced by a length-only sentinel,
+    // and el.value is dropped from the name fallback below.
+    var isSecret = (el.tagName.toLowerCase() === 'input') &&
+                   (el.type === 'password' ||
+                    (el.getAttribute('autocomplete') || '').indexOf('current-password') >= 0 ||
+                    (el.getAttribute('autocomplete') || '').indexOf('new-password') >= 0);
+    var nameVal = isSecret ? '' : (el.value || '');
     var name = (el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
-                (el.innerText || el.textContent || '').trim() || el.value || el.title ||
+                (el.innerText || el.textContent || '').trim() || nameVal || el.title ||
                 el.getAttribute('alt') || el.name || '').replace(/\s+/g, ' ').slice(0, 200);
-    var val = (el.value || '').slice(0, 200);
+    var val = isSecret
+      ? (el.value ? '••• (' + el.value.length + ' chars, hidden)' : '')
+      : (el.value || '').slice(0, 200);
     out.push({ ref: n, role: role, name: name, value: val,
                x: r.left + r.width / 2, y: r.top + r.height / 2 });
     n++;

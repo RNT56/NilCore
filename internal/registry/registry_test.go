@@ -51,6 +51,36 @@ func TestInstallSkillRollsBackUnparseable(t *testing.T) {
 	}
 }
 
+// TestInstallSkillBadReinstallPreservesPrior proves a failed re-install (bad source
+// overwriting an existing good skill) restores the prior-good skill rather than
+// deleting it — the rollback must never destroy working state.
+func TestInstallSkillBadReinstallPreservesPrior(t *testing.T) {
+	skillsDir := t.TempDir()
+	good := filepath.Join(t.TempDir(), "SKILL.md")
+	writeSkill(t, good, "deploy", "1.0.0", "Step 1. Good.")
+	if err := InstallSkill(Entry{Name: "deploy", Kind: KindSkill, Version: "1.0.0", Source: good}, skillsDir); err != nil {
+		t.Fatalf("initial install: %v", err)
+	}
+
+	// A bad re-install at the same name.
+	bad := filepath.Join(t.TempDir(), "SKILL.md")
+	if err := os.WriteFile(bad, []byte("no frontmatter, unparseable"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallSkill(Entry{Name: "deploy", Kind: KindSkill, Source: bad}, skillsDir); err == nil {
+		t.Fatal("bad re-install must error")
+	}
+
+	// The prior-good skill must survive.
+	got, err := Installed(skillsDir)
+	if err != nil {
+		t.Fatalf("installed: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "deploy" || got[0].Version != "1.0.0" {
+		t.Fatalf("prior-good skill was destroyed by the bad re-install rollback: %+v", got)
+	}
+}
+
 func TestInstallSkillRejectsNonSkillKind(t *testing.T) {
 	if err := InstallSkill(Entry{Name: "x", Kind: KindMCP, Source: "y"}, t.TempDir()); err == nil {
 		t.Fatal("mcp install is a follow-up; must reject here")

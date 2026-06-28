@@ -32,9 +32,15 @@ type Bot struct {
 	baseURL string
 	http    *http.Client
 
-	offset  int                   // last seen update_id
+	// smu guards offset + pending. In serve mode the Receive loop and a backgrounded
+	// drive's gate Ask loop can both call poll() (advancing offset) and both touch
+	// pending concurrently — so these need synchronization (the network call in poll
+	// runs OUTSIDE the lock). Kept separate from amu to avoid re-entrancy with
+	// handleAskCallback, which locks amu.
+	smu     sync.Mutex
+	offset  int                   // last seen update_id (guarded by smu)
 	askSeq  atomic.Int64          // unique gate/ask-callback ids
-	pending []channel.TaskRequest // task messages (and resolved ask taps) seen while awaiting a gate answer
+	pending []channel.TaskRequest // task messages (and resolved ask taps) seen while awaiting a gate answer (guarded by smu)
 
 	amu  sync.Mutex           // guards asks
 	asks map[string]*askEntry // ask_user choice prompts awaiting a tap, by correlation token
@@ -99,12 +105,29 @@ type updatesResp struct {
 	Result []tgUpdate `json:"result"`
 }
 
+// popPending removes and returns the head of the buffered request queue (smu-guarded).
+func (b *Bot) popPending() (channel.TaskRequest, bool) {
+	b.smu.Lock()
+	defer b.smu.Unlock()
+	if len(b.pending) == 0 {
+		return channel.TaskRequest{}, false
+	}
+	tr := b.pending[0]
+	b.pending = b.pending[1:]
+	return tr, true
+}
+
+// pushPending appends a request to the buffered queue (smu-guarded).
+func (b *Bot) pushPending(tr channel.TaskRequest) {
+	b.smu.Lock()
+	b.pending = append(b.pending, tr)
+	b.smu.Unlock()
+}
+
 // Receive blocks until the next text message, returning it as a task request.
 func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 	for {
-		if len(b.pending) > 0 {
-			tr := b.pending[0]
-			b.pending = b.pending[1:]
+		if tr, ok := b.popPending(); ok {
 			return tr, nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -129,7 +152,7 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 					if got == nil {
 						got = tr
 					} else {
-						b.pending = append(b.pending, *tr)
+						b.pushPending(*tr)
 					}
 				}
 				continue
@@ -141,7 +164,7 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 			if got == nil {
 				got = &tr
 			} else {
-				b.pending = append(b.pending, tr) // don't drop concurrent messages
+				b.pushPending(tr) // don't drop concurrent messages
 			}
 		}
 		if got != nil {
@@ -313,12 +336,12 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 			// unauthorized tap yields nil.
 			if u.CallbackQuery != nil && strings.HasPrefix(u.CallbackQuery.Data, "ask:") {
 				if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
-					b.pending = append(b.pending, *tr)
+					b.pushPending(*tr)
 				}
 				continue
 			}
 			if u.Message != nil && strings.TrimSpace(u.Message.Text) != "" {
-				b.pending = append(b.pending, toRequest(u.Message)) // buffer, don't drop
+				b.pushPending(toRequest(u.Message)) // buffer, don't drop
 			}
 		}
 	}
@@ -332,17 +355,27 @@ func toRequest(m *tgMessage) channel.TaskRequest {
 	}
 }
 
-// poll fetches the next batch of updates (long poll) and advances the offset.
+// poll fetches the next batch of updates (long poll) and advances the offset. The
+// offset read/write is smu-guarded (Receive and a gate Ask loop can poll
+// concurrently); the network call itself runs OUTSIDE the lock so a 50s long poll
+// never serializes the other loop.
 func (b *Bot) poll(ctx context.Context) ([]tgUpdate, error) {
+	b.smu.Lock()
+	off := b.offset
+	b.smu.Unlock()
+
 	var r updatesResp
-	if err := b.call(ctx, "getUpdates", map[string]any{"offset": b.offset + 1, "timeout": 50}, &r); err != nil {
+	if err := b.call(ctx, "getUpdates", map[string]any{"offset": off + 1, "timeout": 50}, &r); err != nil {
 		return nil, err
 	}
+
+	b.smu.Lock()
 	for _, u := range r.Result {
 		if u.UpdateID > b.offset {
 			b.offset = u.UpdateID
 		}
 	}
+	b.smu.Unlock()
 	return r.Result, nil
 }
 

@@ -157,6 +157,13 @@ type Controller struct {
 	Budget    *budget.Ledger
 	Log       *eventlog.Log
 
+	// OnPass, if set, is called once at the end of every completed pass (after the
+	// pass's verdicts are folded and persisted). The cmd wiring uses it to emit a
+	// scoreboard_snapshot to the log so a replayed report reconstructs the same
+	// pass-by-pass scoreboard the live render showed (the "live == replay" contract).
+	// nil = no-op. It must not block meaningfully (it runs in the pass loop).
+	OnPass func()
+
 	// GlobalCeiling is the run's hard dollar wall (the same value the wiring passed to
 	// Budget.SetGlobalCeiling). The per-pass headroom probe reads it NON-RECORDINGLY:
 	// it compares the ledger's live Total() against this ceiling instead of charging a
@@ -288,6 +295,13 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			if lerr := c.Log.Err(); lerr != nil {
 				return c.finish(ctx, st, board, passed, ReasonError, false), lerr
 			}
+		}
+
+		// Emit the per-pass scoreboard snapshot (live == replay): without this the only
+		// emitter of scoreboard_snapshot events never ran in production, so a replayed
+		// swarm report came out all-zero.
+		if c.OnPass != nil {
+			c.OnPass()
 		}
 
 		// --- convergence: an empty worklist is the only green exit ---

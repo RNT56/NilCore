@@ -12,6 +12,7 @@ import (
 	"nilcore/internal/artifact/evverify"
 	"nilcore/internal/artifact/packs"
 	"nilcore/internal/artifact/packs/finance"
+	"nilcore/internal/artifact/schema"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/secrets"
@@ -151,8 +152,21 @@ func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVer
 		return []verify.NamedVerifier{{Name: "evidence:packs", V: failClosed{reason: err.Error()}}}
 	}
 
-	out := make([]verify.NamedVerifier, 0, len(paths))
+	// The shape gate (structural, no box, no network) — the SAME catalog the swarm path
+	// uses in packs.Build. Composing it here too means the run/chat/serve evidence path
+	// enforces the identical acceptance bar (CitationRequired, MinClaims, VerifierRequired,
+	// duplicate-id detection, Kind match) instead of only the per-claim ArtifactVerifier —
+	// so a structurally degenerate artifact (a one-row matrix, an uncited report claim) is
+	// rejected on every ship path, not just under swarm. It runs FIRST per artifact, so a
+	// shape defect short-circuits before the (network/box) claim checks run.
+	schemaReg := schema.Default()
+
+	out := make([]verify.NamedVerifier, 0, len(paths)*2)
 	for _, p := range paths {
+		out = append(out, verify.NamedVerifier{
+			Name: "schema:" + artifactID(p),
+			V:    &schema.SchemaVerifier{Reg: schemaReg, RelPath: p},
+		})
 		av := &evverify.ArtifactVerifier{
 			Box:       box,
 			Reg:       reg,

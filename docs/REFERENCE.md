@@ -161,7 +161,6 @@ The complete current map of the binary, grouped by role. One line per package, s
 | `internal/planner` | Goal → inspectable, contract-first task tree |
 | `internal/spawn` | Subtasks as scoped subworkers in parallel worktrees + the DAG scheduler |
 | `internal/roster` | The role system (research / understand / plan / implement / review) |
-| `internal/blackboard` | Concurrent-safe shared state (statuses + named artifacts) |
 | `internal/integrate` | Merge parallel subagent branches into one verifier-green tree |
 | `internal/scheduler` | Fixed-cap FIFO concurrent task pool with backpressure |
 | `internal/route` | Adaptive routing — race best-of-N judged by the verifier + cross-model review |
@@ -404,7 +403,7 @@ The **Rule-of-Two capguard** gates untrusted ∧ private (`-read`) ∧ open-egre
 
 Three nested machines over one contract, one rule (the verifier decides): the **native loop** (bounded by `-max-steps`); the **supervisor** (`nilcore build` / chat `/execute`) that plans, spawns role-workers over a typed bus, integrates their parallel worktrees into one green tree, re-plans to convergence (greenfield `-new` or `-dir`); and the **project loop** (plan→slice→integrate→verify→reflect→re-plan, provably terminating).
 
-**Multi-agent concurrency** (`-concurrency`): siblings run through a DAG scheduler over a race-tested pool; the supervisor reasons serially between waves, the integrator stays serial, so the tip is always green. `-concurrency 1` is byte-identical to serial. Subworkers get fresh context (a `ContextSummary` + blackboard facts), never the parent's transcript. ([`CONCURRENCY.md`](CONCURRENCY.md), [`MULTI-AGENT.md`](MULTI-AGENT.md))
+**Multi-agent concurrency** (`-concurrency`): siblings run through a DAG scheduler over a race-tested pool; the supervisor reasons serially between waves, the integrator stays serial, so the tip is always green. `-concurrency 1` is byte-identical to serial. Subworkers get fresh context (a `ContextSummary` + facts from the shared store/event log), never the parent's transcript. ([`CONCURRENCY.md`](CONCURRENCY.md), [`MULTI-AGENT.md`](MULTI-AGENT.md))
 
 **Verified swarm** (`nilcore swarm`) — fan N units into a bounded in-process pool on one host (`-agents`, `-concurrency`); each produces a **typed artifact judged by a verify-pack**; only verifier-green shards ship, failed shards **requeue until clean** (or a budget/pass limit). Five presets (research/code/audit/benchmark/ui), a tiered provider pool, a live scoreboard. ([`SWARM.md`](SWARM.md))
 

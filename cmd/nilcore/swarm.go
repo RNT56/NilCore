@@ -515,6 +515,10 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 		Budget:        ledger,
 		GlobalCeiling: *sf.budget, // the same wall SetGlobalCeiling got; read non-recordingly each pass
 		Log:           d.log,
+		// Emit a scoreboard_snapshot per pass so a replayed report reconstructs the
+		// same scoreboard the live render showed (live == replay). Coalesced by
+		// boardMinInterval; the forced final emit in run() guarantees the terminal one.
+		OnPass: func() { bd.EmitSnapshot(d.log) },
 	}
 
 	// --- the initial shard set + the run state. A FRESH run shards the goal via the
@@ -572,6 +576,10 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 // gate's nil approver default-denies, so a converged run stops at the promote gate.
 func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
 	out, err := swarmViaKernel(ctx, a.controller, a.state, a.initial)
+	// Always force the terminal scoreboard snapshot to the log (even on error/cap),
+	// so a replayed report reflects the same final scoreboard the live render prints
+	// — the per-pass OnPass emits are coalesced and may have skipped the last one.
+	a.board.EmitSnapshotForce(a.log())
 	if err != nil {
 		return out, err
 	}

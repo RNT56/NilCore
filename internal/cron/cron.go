@@ -148,7 +148,13 @@ func (s *Scheduler) Tick(ctx context.Context, now time.Time) int {
 			s.Log.Append(eventlog.Event{Kind: "cron_fire", Detail: map[string]any{"job": j.Name, "source": src}})
 		}
 		if s.Fire != nil {
-			_, _ = s.Fire(ctx, trigger.Signal{Source: src, Goal: j.Goal})
+			// A failed scheduled run must leave an audit trail: an unattended operator
+			// otherwise has no record that a cron-driven run errored. The boolean (auto-
+			// started?) is not needed here; the error is the signal worth recording (I5).
+			if _, ferr := s.Fire(ctx, trigger.Signal{Source: src, Goal: j.Goal}); ferr != nil && s.Log != nil {
+				s.Log.Append(eventlog.Event{Kind: "cron_fire_error",
+					Detail: map[string]any{"job": j.Name, "source": src, "error": ferr.Error()}})
+			}
 		}
 		fired++
 	}

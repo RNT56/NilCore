@@ -59,13 +59,27 @@ func Race(ctx context.Context, candidates []Candidate, log *eventlog.Log) (backe
 			c := candidates[i]
 			res, err := c.Backend.Run(ctx, c.Task)
 			passed := false
-			if err == nil {
-				if rep, verr := c.Verifier.Check(ctx); verr == nil {
-					passed = rep.Passed
+			// Distinguish the three not-passed reasons in the audit trail (I5): a backend
+			// run error, a verifier infrastructure error, and a clean verify miss are very
+			// different signals for the operator — conflating them all as a silent
+			// "passed:false" hides infra failures. The decision is unchanged: only a
+			// verifier-green candidate can win (I2), so any error still yields passed=false.
+			var failReason string
+			if err != nil {
+				failReason = "run_error: " + err.Error()
+			} else if rep, verr := c.Verifier.Check(ctx); verr != nil {
+				failReason = "verify_error: " + verr.Error()
+			} else {
+				passed = rep.Passed
+				if !passed {
+					failReason = "verify_failed"
 				}
 			}
 			results[i] = outcome{res, passed}
 			detail := map[string]any{"passed": passed}
+			if failReason != "" {
+				detail["reason"] = failReason
+			}
 			if c.Class != "" {
 				detail["class"] = c.Class
 			}

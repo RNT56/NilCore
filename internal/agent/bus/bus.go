@@ -237,24 +237,36 @@ func (b *Bus) deliverReply(m Message) bool {
 // waits at most defaultSendWait for a full mailbox, then drops + logs. A missing
 // mailbox (deregistered) is an undeliverable drop, also logged.
 func (b *Bus) deliverOne(ctx context.Context, id AgentID, m Message) {
+	// Hold the READ lock across the send. Deregister closes the mailbox under the
+	// WRITE lock, so close() cannot run while we hold RLock — this closes the
+	// TOCTOU window where the lookup-then-unlock-then-send pattern could send on an
+	// already-closed channel and panic. The lock is read-shared, so concurrent
+	// deliveries to OTHER mailboxes still proceed; only a concurrent Register/
+	// Deregister waits, and at most defaultSendWait (bounded teardown latency).
 	b.mu.RLock()
 	ch, ok := b.boxes[id]
-	b.mu.RUnlock()
 	if !ok {
+		b.mu.RUnlock()
 		b.event("bus_undeliverable", m, map[string]any{"to": string(id), "reason": "no_mailbox"})
 		return
 	}
 
 	timer := time.NewTimer(defaultSendWait)
 	defer timer.Stop()
+	// Capture the outcome under the lock, then emit the audit event AFTER releasing it
+	// so the (disk-backed) log append does not extend the lock window past the send.
+	var kind string
+	detail := map[string]any{"to": string(id)}
 	select {
 	case ch <- m:
-		b.event("bus_deliver", m, map[string]any{"to": string(id)})
+		kind = "bus_deliver"
 	case <-timer.C:
-		b.event("bus_drop", m, map[string]any{"to": string(id), "reason": "mailbox_full"})
+		kind, detail["reason"] = "bus_drop", "mailbox_full"
 	case <-ctx.Done():
-		b.event("bus_drop", m, map[string]any{"to": string(id), "reason": "ctx_done"})
+		kind, detail["reason"] = "bus_drop", "ctx_done"
 	}
+	b.mu.RUnlock()
+	b.event(kind, m, detail)
 }
 
 // identify binds the trusted control fields the harness owns: a fresh id (if

@@ -11,6 +11,55 @@ import (
 	"nilcore/internal/store"
 )
 
+// TestResumeAfterTornFinalLine proves a crash that leaves a torn final line does
+// not (a) concatenate the next record into the partial line, nor (b) reset the
+// sequence to 0. After reopening, the new record resumes from the last GOOD event's
+// Seq+1 and lands on its own line.
+func TestResumeAfterTornFinalLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Append(Event{Kind: "a"}) // seq 0
+	log.Append(Event{Kind: "b"}) // seq 1
+	_ = log.Close()
+
+	// Simulate a crash mid-write: a partial line with no trailing newline.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"time":"2020`); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	// Reopen and append: must resume at seq 2 (last good was seq 1), not 0.
+	log2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log2.Append(Event{Kind: "c"})
+	_ = log2.Close()
+
+	data, _ := os.ReadFile(path)
+	// The new record must be on its own line (not spliced into the torn one).
+	if strings.Contains(string(data), `{"time":"2020{`) {
+		t.Fatalf("new record was spliced into the torn line:\n%s", data)
+	}
+	var lastGood Event
+	for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		var e Event
+		if json.Unmarshal([]byte(ln), &e) == nil && e.Kind == "c" {
+			lastGood = e
+		}
+	}
+	if lastGood.Kind != "c" || lastGood.Seq != 2 {
+		t.Fatalf("resumed event must be kind=c seq=2, got kind=%q seq=%d", lastGood.Kind, lastGood.Seq)
+	}
+}
+
 func TestOnAppendHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hook.jsonl")
 	log, err := Open(path)
@@ -249,6 +298,34 @@ func TestRedactionShapesAndNesting(t *testing.T) {
 	}
 	if !strings.Contains(s, "harmless") {
 		t.Error("non-secret content should be preserved")
+	}
+}
+
+// TestRedactionInlineSecrets covers the broadened free-text masking: a credential
+// assigned to a named field inside a model-authored shell command (stored under
+// "cmd") that no prefixed-token pattern would catch. The key name is kept; only the
+// value is masked. Without inlineSecretRe/flagSecretRe these would leak (audit I3).
+func TestRedactionInlineSecrets(t *testing.T) {
+	d := map[string]any{
+		"export":  "export DB_PASSWORD=hunter2longvalue && run",
+		"flag":    "mysql -p s3cr3tpw -h db",
+		"longopt": "deploy --token=abc123def456 --env prod",
+		"auth":    "curl -H 'Authorization: Bearer zzzTOPSECRETzzz' https://x",
+		"keep":    "the password is set elsewhere",
+	}
+	redact(d)
+	blob, _ := json.Marshal(d)
+	s := string(blob)
+	for _, leak := range []string{"hunter2longvalue", "s3cr3tpw", "abc123def456", "zzzTOPSECRETzzz"} {
+		if strings.Contains(s, leak) {
+			t.Errorf("inline secret leaked through redaction: %q present in %s", leak, s)
+		}
+	}
+	// The field names / structure must survive so the audit line stays meaningful.
+	for _, keep := range []string{"DB_PASSWORD", "--token", "Authorization"} {
+		if !strings.Contains(s, keep) {
+			t.Errorf("redaction destroyed structure: %q missing from %s", keep, s)
+		}
 	}
 }
 

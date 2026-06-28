@@ -112,7 +112,7 @@ func NewWorker(p Profile, box sandbox.Sandbox, v verify.Verifier, log *eventlog.
 
 ## 3. The communication protocol (`internal/agent/bus`)
 
-A typed in-process bus, **not** an overloaded blackboard or generalized `channel.Channel`. The blackboard stays the durable fact store; the bus is the transport; durable findings get written to both.
+A typed in-process bus, **not** an overloaded blackboard or generalized `channel.Channel`. The bus is the transport; durable findings get written to the event log. _(History: `internal/blackboard` was specced (P3-T03) as a separate "durable fact store", but the shipped supervisor/swarm thread shared state through the durable `store`/`eventlog` + the supervisor's own snapshot/resume instead. The blackboard package was never wired and has been **removed** (2026-06 cleanup); shared state lives in `store`/`eventlog`.)_
 
 ```go
 package bus
@@ -253,7 +253,7 @@ type Loop struct {
 func (l *Loop) Run(ctx) (Outcome, error)
 ```
 
-**Control flow:** detect greenfield → bootstrap (slice 0) → `DeriveAcceptance` → loop: poll ceilings → `JudgeProject` (done?) → `Plan` next slice → `RunSlice` (spawn+integrate) → re-verify converged tree → `Reflect` + measure progress → no-progress guard (narrow/switch/stop) → repeat. Carry-over between iterations is **bounded state only** (`summarize.ContextSummary` + blackboard + project-scope memory), never transcripts.
+**Control flow:** detect greenfield → bootstrap (slice 0) → `DeriveAcceptance` → loop: poll ceilings → `JudgeProject` (done?) → `Plan` next slice → `RunSlice` (spawn+integrate) → re-verify converged tree → `Reflect` + measure progress → no-progress guard (narrow/switch/stop) → repeat. Carry-over between iterations is **bounded state only** (`summarize.ContextSummary` + the durable store/event log + project-scope memory), never transcripts.
 
 **Greenfield bootstrap (`bootstrap.go`)** — closes the chicken-and-egg I2 hole (no checks → everything looks done). Trigger: `Repo==""` or not-a-git-repo or `verify.Detect(Repo)=="true"`. Steps: `git init` + **an initial empty commit** (so worktrees have a HEAD — closes the empty-HEAD blocker) → advisor maps goal → stack + first acceptance command → a **bounded, sandboxed native-backend task** scaffolds a minimal skeleton **and a runnable, currently-RED verifier** *before any feature code* → `st.VerifyCmd = DetectOrOverride(repo, chosenCmd)`. **Promotion is forbidden until a non-trivial, currently-red verifier exists** (a `policy`-level predicate: deny promote if verify would pass on an empty tree) — closes adversary R6 (vacuous verifier).
 

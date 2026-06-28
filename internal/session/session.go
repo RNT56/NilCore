@@ -432,6 +432,15 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 			s.State.Branch = res.Branch
 		}
 		s.State.LastOutcome = res.Outcome
+		// Fold a chat reply back into History so a follow-up chat turn sees the
+		// agent's own prior answer ("continue, not restart"). Work drives carry their
+		// continuation in the bounded Summary instead, and append nothing here. The
+		// user turn that prompted this reply is already in History (appended by Turn),
+		// so the assistant turn lands right after it. Growth is bounded by maybeCompact
+		// at the next Turn.
+		if in.Route == RouteChat && res.Outcome != "" {
+			s.History = append(s.History, assistantTurn(res.Outcome))
+		}
 	}
 	s.Phase = Idle
 	s.clearDriveCancelLocked()
@@ -682,6 +691,16 @@ func classifyInterrupt(text string) inbox.Mode {
 func userTurn(text string) model.Message {
 	return model.Message{
 		Role:    "user",
+		Content: []model.Block{{Type: "text", Text: text}},
+	}
+}
+
+// assistantTurn builds the canonical one-block assistant message folded into History
+// after a chat reply, so a follow-up chat turn continues with the agent's own prior
+// answer in context rather than re-entering with only the user's questions.
+func assistantTurn(text string) model.Message {
+	return model.Message{
+		Role:    "assistant",
 		Content: []model.Block{{Type: "text", Text: text}},
 	}
 }

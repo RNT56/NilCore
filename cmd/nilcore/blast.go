@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 
@@ -35,9 +36,20 @@ var blastPresets = map[string]blastEnvelope{
 // changes nothing (byte-identical default-off). The budget is the SINGLE shared
 // meter the graduated-auto-approval policy reads for its $/rate ceiling.
 func mintBlastBudget(preset string, log *eventlog.Log) *blastbudget.Budget {
+	switch preset {
+	case "", "off":
+		return nil // intentional: unfenced (the default), byte-identical
+	}
 	env, ok := blastPresets[preset]
 	if !ok {
-		return nil // "off" or unknown ⇒ no fence
+		// A typo/unknown value on a SAFETY flag must NEVER silently disable the fence
+		// (fail-open is the dangerous direction for an unattended/auto-approval run).
+		// Fail CLOSED to the tightest envelope and warn loudly so the operator notices.
+		fmt.Fprintf(os.Stderr, "nilcore: unknown -blast-radius %q; falling back to \"tight\" (valid: off|tight|standard)\n", preset)
+		env = blastPresets["tight"]
+		if log != nil {
+			log.Append(eventlog.Event{Kind: "blast_radius_unknown", Detail: map[string]any{"value": preset, "fallback": "tight"}})
+		}
 	}
 	b := blastbudget.New()
 	b.SetHostCeiling(env.hosts)

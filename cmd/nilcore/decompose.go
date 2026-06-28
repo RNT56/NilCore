@@ -13,6 +13,7 @@ import (
 
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/integrate"
 	"nilcore/internal/kernel"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
@@ -104,53 +105,62 @@ type integrateResult struct {
 	dropped  int
 }
 
+// verifyFuncAdapter adapts the decompose verifyFunc (dir → ok) to integrate.Verifier
+// (Check → verify.Report), so the decompose preset reuses the SAME canonical
+// integrate.Integrator engine the build/swarm paths use — one merge→re-verify→rollback
+// implementation, and the same integration_* audit events for report/trace visibility.
+type verifyFuncAdapter struct {
+	verify verifyFunc
+	dir    string
+}
+
+func (a verifyFuncAdapter) Check(ctx context.Context) (verify.Report, error) {
+	ok, err := a.verify(ctx, a.dir)
+	return verify.Report{Passed: ok}, err
+}
+
 // integrateBranches merges each verified child branch into a FRESH integration worktree
-// cut from baseRepo HEAD, re-verifying after EVERY merge and DROPPING any child that
-// conflicts (Merge auto-aborts, restoring the tip) or turns the tree red (reset to the
-// last green tip). The final tip is verified iff the project verifier passes on it — the
-// merged children never decide "done" (I2). The caller owns the returned worktree's
-// lifecycle (keep its branch on success, Cleanup otherwise).
-func integrateBranches(ctx context.Context, baseRepo, integLeaf string, children []childResult, verify verifyFunc) (*worktree.Worktree, integrateResult, error) {
-	wt, err := worktree.CreateFrom(ctx, baseRepo, "task/"+integLeaf, integLeaf, "HEAD")
-	if err != nil {
-		return nil, integrateResult{}, fmt.Errorf("decompose: integration worktree: %w", err)
-	}
-	res := integrateResult{branch: wt.Branch()}
+// via the canonical integrate.Integrator, re-verifying after EVERY merge and DROPPING any
+// child that conflicts (clean abort, tip restored) or turns the tree red (reset to the
+// last green tip). It then re-verifies the FINAL tip — a decompose-specific I2 backstop:
+// a zero-merge decompose leaves the tip at base HEAD, which the per-merge loop never
+// checked, so the tip must not claim verified on an unchecked tree. The caller owns the
+// returned worktree's lifecycle (keep its branch on success, Cleanup otherwise).
+func integrateBranches(ctx context.Context, baseRepo string, children []childResult, verify verifyFunc, log *eventlog.Log) (*worktree.Worktree, integrateResult, error) {
+	// Build the merge order from the verified children, in plan (topological) order; an
+	// unverified child or one with no branch is dropped up front, never merged.
+	order := make([]integrate.MergeItem, 0, len(children))
+	dropped := 0
 	for _, c := range children {
 		if !c.verified || c.branch == "" {
-			res.dropped++
+			dropped++
 			continue
 		}
-		prev, herr := wt.Head(ctx)
-		if herr != nil {
-			_ = wt.Cleanup()
-			return nil, integrateResult{}, fmt.Errorf("decompose: read tip: %w", herr)
-		}
-		conflict, merr := wt.Merge(ctx, c.branch, "decompose: integrate "+c.subGoal)
-		if merr != nil { // a failed abort left the tree dirty — a real fault
-			_ = wt.Cleanup()
-			return nil, integrateResult{}, fmt.Errorf("decompose: merge %q: %w", c.subGoal, merr)
-		}
-		if conflict {
-			res.dropped++ // Merge restored the pre-merge tip; the child is dropped
-			continue
-		}
-		ok, verr := verify(ctx, wt.Path())
-		if verr != nil || !ok {
-			// The merge applied but turned the tree red — undo it so the next child
-			// merges onto the last green tip (I2: a red tip is never kept).
-			if rerr := wt.Reset(ctx, prev); rerr != nil {
-				_ = wt.Cleanup()
-				return nil, integrateResult{}, fmt.Errorf("decompose: undo red merge %q: %w", c.subGoal, rerr)
-			}
-			res.dropped++
-			continue
-		}
-		res.merged++
+		order = append(order, integrate.MergeItem{ID: c.subGoal, Branch: c.branch})
 	}
-	// I2: the integrated tip is "done" only if the verifier passes on the final tree —
-	// re-checked here even after the per-merge checks (the base itself may be red, and a
-	// zero-merge decompose must not claim verified on an unchecked tip).
+
+	it := &integrate.Integrator{
+		BaseRepo: baseRepo, // BaseRef "" ⇒ HEAD
+		NewEnv: func(dir string) integrate.Env {
+			return integrate.Env{Verifier: verifyFuncAdapter{verify: verify, dir: dir}}
+		},
+		Log: log,
+	}
+	wt, results, err := it.Integrate(ctx, order)
+	if err != nil {
+		return nil, integrateResult{}, fmt.Errorf("decompose: integrate: %w", err)
+	}
+	res := integrateResult{branch: wt.Branch(), dropped: dropped}
+	for _, r := range results {
+		if r.Verified {
+			res.merged++ // kept on the verified tip
+		} else {
+			res.dropped++ // conflict or red — rolled back off the tip
+		}
+	}
+	// I2 backstop: the integrated tip is "done" only if the verifier passes on the FINAL
+	// tree — re-checked even after the per-merge checks (a zero-merge decompose's tip is
+	// the unchecked base HEAD). A final-verify error is fatal: clean up, claim no verdict.
 	final, ferr := verify(ctx, wt.Path())
 	if ferr != nil {
 		_ = wt.Cleanup()
@@ -178,7 +188,7 @@ type decomposeState struct {
 // one re-verified tip — I2). It is bounded by maxChildren (fail-closed) and depth 1, and
 // obs records the recursion tree to the log. The returned decomposeState exposes the
 // integration worktree for the caller's keep/clean decision after kernel.Run returns.
-func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify verifyFunc, maxChildren int, obs kernel.Observer) (kernel.Envelope, *decomposeState) {
+func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify verifyFunc, maxChildren int, obs kernel.Observer, log *eventlog.Log) (kernel.Envelope, *decomposeState) {
 	st := &decomposeState{}
 	env := kernel.Envelope{
 		Name:        "decompose",
@@ -208,7 +218,7 @@ func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify ver
 		for i, o := range outs {
 			children[i] = childResult{subGoal: o.Summary, branch: o.Branch, verified: o.Verified}
 		}
-		wt, res, err := integrateBranches(ctx, baseRepo, n.ID+"-integ", children, verify)
+		wt, res, err := integrateBranches(ctx, baseRepo, children, verify, log)
 		if err != nil {
 			return kernel.Outcome{}, err
 		}
@@ -297,7 +307,7 @@ Usage:
 	defer stop()
 
 	rootID := fmt.Sprintf("decompose-%d", time.Now().UnixNano())
-	env, st := decomposeEnvelope(rootID, absDir, runChild, verifyTip, *maxChildren, logObserver{log})
+	env, st := decomposeEnvelope(rootID, absDir, runChild, verifyTip, *maxChildren, logObserver{log}, log)
 	out, err := kernel.Run(ctx, env, kernel.Node{ID: rootID, Goal: *goal})
 	if err != nil {
 		fatal(fmt.Errorf("decompose: %w", err))

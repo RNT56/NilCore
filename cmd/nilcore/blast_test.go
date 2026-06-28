@@ -52,11 +52,26 @@ func TestXC04_BlastDayWindowRebuildsFromLog(t *testing.T) {
 }
 
 func TestMintBlastBudget_OffIsNil(t *testing.T) {
-	// "off" / empty / unknown ⇒ no budget (unfenced, byte-identical default-off).
-	for _, p := range []string{"off", "", "bogus"} {
+	// "off" / empty ⇒ no budget (unfenced, byte-identical default-off).
+	for _, p := range []string{"off", ""} {
 		if b := mintBlastBudget(p, nil); b != nil {
 			t.Errorf("mintBlastBudget(%q) = non-nil, want nil (no fence)", p)
 		}
+	}
+}
+
+// TestMintBlastBudget_UnknownFailsClosed proves a typo on the safety flag does NOT
+// silently disable the fence (the old fail-open bug): it falls back to the tightest
+// envelope instead of returning nil/unfenced.
+func TestMintBlastBudget_UnknownFailsClosed(t *testing.T) {
+	b := mintBlastBudget("standrd", nil) // typo of "standard"
+	if b == nil {
+		t.Fatal("unknown -blast-radius must fail CLOSED (tight), not unfenced (nil)")
+	}
+	u := b.Used("2026-06-26")
+	tight := blastPresets["tight"]
+	if u.HostCeiling != tight.hosts || u.IrrevCeiling != tight.irrev || u.DayCeiling != tight.dollarsDay {
+		t.Errorf("unknown value must fall back to the tight envelope, got %+v", u)
 	}
 }
 

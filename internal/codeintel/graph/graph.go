@@ -57,6 +57,11 @@ func Open(path string) (*Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open graph: %w", err)
 	}
+	// Pin to a single connection (mirrors internal/store). This is REQUIRED for a
+	// ":memory:" graph — each pooled connection gets its OWN private in-memory database,
+	// so a second connection would see an empty schema; it also serializes writers on a
+	// file-backed graph, avoiding SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("graph schema: %w", err)

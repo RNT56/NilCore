@@ -229,6 +229,14 @@ func searchRoot(b *strings.Builder, root string, relative bool, glob string, re 
 			}
 			return nil
 		}
+		// Never read through a symlink (I4 worktree confinement). filepath.WalkDir
+		// yields a symlink as a non-dir entry without descending it, but os.ReadFile
+		// would follow it — so a symlink planted in-tree by the sandboxed shell could
+		// otherwise leak out-of-worktree file contents to the model. The sibling
+		// ReadTool is hardened via worktreefs.OpenNoFollow; search must match it.
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
 		if glob != "" {
 			if ok, _ := filepath.Match(glob, d.Name()); !ok {
 				return nil

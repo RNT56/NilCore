@@ -142,6 +142,60 @@ func TestImprovedCandidateIsProposed(t *testing.T) {
 	}
 }
 
+// TestScoreCandidateUsedForAfter proves the candidate-aware seam: when ScoreCandidate
+// is wired, the fence's "after" report comes from IT (the candidate applied), not a
+// second RunSuite over the unchanged state — so a candidate that beats the baseline is
+// accepted. This is the fix for the previously-no-op fence.
+func TestScoreCandidateUsedForAfter(t *testing.T) {
+	log := writeFailLog(t, 3)
+	baseline := &suiteRunner{passRates: []float64{0.5}} // RunSuite = baseline only (0.5)
+	prop := &recordingPropose{merged: true}
+	scored := 0
+	lp := loop.New(loop.Config{
+		LogPath:  log,
+		RunSuite: baseline.run,
+		ScoreCandidate: func(_ context.Context, _ []eval.Case, _ selfimprove.Proposal) (eval.Report, error) {
+			scored++
+			return eval.Report{PassRate: 1.0}, nil // candidate clears the baseline
+		},
+		Propose: prop.propose,
+	})
+	sum, err := lp.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if scored == 0 {
+		t.Fatal("ScoreCandidate was never used for the after-score")
+	}
+	if sum.Accepted != 1 || sum.Proposed != 1 {
+		t.Fatalf("Accepted=%d Proposed=%d, want 1/1 (candidate-aware after beat baseline)", sum.Accepted, sum.Proposed)
+	}
+}
+
+// TestScoreCandidateNotImprovedDropped proves a candidate-aware "after" that does NOT
+// beat the baseline is dropped (fail-closed direction): a fail-closed empty report from
+// production (PassRate 0) can therefore never auto-accept.
+func TestScoreCandidateNotImprovedDropped(t *testing.T) {
+	log := writeFailLog(t, 3)
+	baseline := &suiteRunner{passRates: []float64{0.8}}
+	prop := &recordingPropose{merged: true}
+	lp := loop.New(loop.Config{
+		LogPath:  log,
+		RunSuite: baseline.run,
+		ScoreCandidate: func(_ context.Context, _ []eval.Case, _ selfimprove.Proposal) (eval.Report, error) {
+			return eval.Report{}, nil // fail-closed shape: empty ⇒ PassRate 0 ⇒ no gain
+		},
+		Propose: prop.propose,
+	})
+	sum, err := lp.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if sum.Accepted != 0 || sum.Proposed != 0 || len(prop.got) != 0 {
+		t.Fatalf("Accepted=%d Proposed=%d calls=%d, want 0/0/0 (no measured gain ⇒ dropped)", sum.Accepted, sum.Proposed, len(prop.got))
+	}
+}
+
 // TestNotImprovedCandidateIsRejected proves the regression fence: a candidate
 // that does NOT improve the frozen suite is dropped and NEVER reaches the gated
 // propose flow (the C6 guard — no shipping on a hunch).

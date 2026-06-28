@@ -49,6 +49,21 @@ func isProd(s string) bool {
 	return s == "prod" || strings.HasPrefix(s, "prod")
 }
 
+// isProtectedBase reports whether a scope is a protected base branch that must
+// NEVER be auto-approved, regardless of an operator-authored envelope. The presets
+// bake these into commonDeny, but a hand-built ClassClause could omit them — so this
+// is the STRUCTURAL floor enforced in ApproveStructured (the charter invariant
+// "graduated auto-approval never auto-approves main/prod"). Matches main, master,
+// and any release branch (release, release/*, release-*).
+func isProtectedBase(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "main", "master", "release", "trunk", "stable":
+		return true
+	}
+	return strings.HasPrefix(s, "release/") || strings.HasPrefix(s, "release-")
+}
+
 // countAutoApprovalsToday folds the append-only log READ-ONLY and counts the
 // `auto_approve` events for (action,scope) whose event-day equals today (UTC). This
 // rebuilds the per-day rate window from the durable log on every decision, so a

@@ -34,6 +34,44 @@ jobs:
       - name: Build, vet, test
         run: make verify
 
+  # The race detector over the concurrency-bearing packages (session, swarm, agent
+  # bus/supervisor, scheduler, pool, chat transports, blast fence). `make verify` does
+  # NOT run -race (slower, needs CGO), so the repo's many *Race*/*Concurrent* tests were
+  # tautological without this lane — a real data race could merge green. This makes them
+  # load-bearing. Git identity is set for the same reason the verify job needs it.
+  race:
+    name: go test -race (concurrency)
+    runs-on: ubuntu-latest
+    env:
+      GIT_AUTHOR_NAME: nilcore-ci
+      GIT_AUTHOR_EMAIL: ci@nilcore.local
+      GIT_COMMITTER_NAME: nilcore-ci
+      GIT_COMMITTER_EMAIL: ci@nilcore.local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Race detector
+        run: make test-race
+
+  # Build/vet/test the `-tags tui` Charm code, which `make verify` deliberately excludes
+  # (the default binary links zero Charm — I6). Without this lane a change that breaks the
+  # ~1k-LOC TUI or its tests merges green; the lane also indirectly re-asserts I6 (the
+  # untagged build stays Charm-free) by keeping the tagged build a separate, explicit step.
+  tui:
+    name: tui-verify (-tags tui)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build/vet/test the tui-tagged code
+        run: make tui-verify
+
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest

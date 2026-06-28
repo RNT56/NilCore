@@ -484,7 +484,8 @@ func (o *OpenAI) Complete(ctx context.Context, system string, msgs []model.Messa
 		return model.Response{}, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return model.Response{}, fmt.Errorf("openai api: %s: %s", resp.Status, tail(string(raw), 1000))
+		// Typed error: fast-fail a terminal 4xx, honor a 429/5xx Retry-After (I3: key-free).
+		return model.Response{}, newAPIError(resp.StatusCode, resp.Header, raw)
 	}
 
 	var out oaiResponse
@@ -658,7 +659,7 @@ func (o *OpenAI) Stream(ctx context.Context, system string, msgs []model.Message
 
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return model.Response{}, fmt.Errorf("openai api: %s: %s", resp.Status, tail(string(raw), 1000))
+		return model.Response{}, newAPIError(resp.StatusCode, resp.Header, raw)
 	}
 
 	return assembleOpenAIStream(ctx, resp.Body, onChunk)

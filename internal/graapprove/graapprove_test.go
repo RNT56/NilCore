@@ -315,6 +315,37 @@ func TestApproveStructuredAllPass(t *testing.T) {
 	}
 }
 
+// TestApproveStructuredProtectedBaseFloor proves the STRUCTURAL protected-base floor
+// holds even for a sloppy custom envelope that ALLOWS main and supplies NO
+// DenyBranches: a merge/promote onto main/master/release must never auto-approve,
+// regardless of operator config (charter: graduated auto-approval never auto-approves
+// main/prod). Without isProtectedBase this would auto-approve onto main.
+func TestApproveStructuredProtectedBaseFloor(t *testing.T) {
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	// A custom envelope that recklessly allows everything and denies nothing.
+	reckless := Envelope{Classes: []ClassClause{{
+		Type:          "open-pr",
+		AllowBranches: []string{"*"},
+		DenyBranches:  nil, // operator forgot to deny main/master/release
+		MinSuccesses:  2,
+		MinSample:     2,
+		RecencyDays:   7,
+		MaxPerDay:     5,
+	}}}
+	for _, scope := range []string{"main", "master", "release", "release/1.2", "release-2026"} {
+		dir := t.TempDir()
+		path := writeLog(t, dir, greenRun("open-pr", scope, 3))
+		human := &recHuman{reply: false}
+		g := newGraded(human, reckless, path, nil, WithClock(fixedClock(now)), WithRoot(dir))
+		if g.ApproveStructured(openPR(scope)) {
+			t.Errorf("scope %q: protected base must NOT auto-approve even when the envelope allows it", scope)
+		}
+		if !human.called {
+			t.Errorf("scope %q: must fall through to the human gate", scope)
+		}
+	}
+}
+
 func TestApproveStructuredKillSwitchFile(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)

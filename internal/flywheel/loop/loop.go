@@ -139,6 +139,16 @@ type Config struct {
 	// regression never passes).
 	Fence measure.Fence
 
+	// ScoreCandidate, when set, scores the frozen suite AGAINST THE CANDIDATE — it
+	// applies the proposal in a scratch worktree and re-runs the suite there, so the
+	// fence's "after" report reflects the proposed edit's actual effect (the true
+	// before/after the measured-delta guarantee requires). When nil the "after" score
+	// falls back to RunSuite over the current state — BYTE-IDENTICAL to the prior
+	// behavior, which is why the loop's own tests (whose fake RunSuite simulates the
+	// candidate effect) are unaffected. Production wires this to a real scratch-worktree
+	// scorer; the deterministic test suites leave it nil.
+	ScoreCandidate func(ctx context.Context, cases []eval.Case, prop selfimprove.Proposal) (eval.Report, error)
+
 	// MaxIterations bounds how many cycles ONE Run performs (the hard cap that
 	// makes a runaway loop impossible). New defaults a non-positive value to
 	// DefaultMaxIterations.
@@ -343,13 +353,19 @@ func (l *Loop) cycle(ctx context.Context, sum *Summary) (more bool, err error) {
 			continue
 		}
 
-		// FENCE: re-score the FROZEN suite WITH the candidate's hypothesized
-		// effect and accept it ONLY if it measurably improved (measure). The
-		// candidate report is produced by the SAME injected RunSuite over the SAME
-		// frozen cases — the only thing that differs is that production runs it
-		// against the proposed edit; the fence reads the verifier-judged pass-rate
-		// delta, never a self-claim (I2). A tie or regression is rejected (C6).
-		after, err := l.cfg.RunSuite(ctx, suite.Cases)
+		// FENCE: re-score the FROZEN suite WITH the candidate's effect and accept it
+		// ONLY if it measurably improved (measure). When ScoreCandidate is wired, the
+		// "after" report is produced by APPLYING the proposal in a scratch worktree and
+		// re-running the suite there — a true before/after; the fence reads the verifier-
+		// judged pass-rate delta, never a self-claim (I2). When it is nil, "after" falls
+		// back to RunSuite over the current state (byte-identical to before). A tie or
+		// regression is rejected (C6).
+		var after eval.Report
+		if l.cfg.ScoreCandidate != nil {
+			after, err = l.cfg.ScoreCandidate(ctx, suite.Cases, prop)
+		} else {
+			after, err = l.cfg.RunSuite(ctx, suite.Cases)
+		}
 		if err != nil {
 			return true, fmt.Errorf("running candidate self-eval: %w", err)
 		}

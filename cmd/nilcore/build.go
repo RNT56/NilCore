@@ -469,6 +469,27 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		// Durable resume: seed from a prior snapshot when one was wired in (nil ⇒ fresh).
 		Resume: d.resume,
 	}
+	// Granular requeue (Pillar 4): when opted in (NILCORE_REQUEUE + a >0 attempt budget)
+	// and a read/integration tree exists, hand the supervisor a RequeueHook that, at
+	// convergence-red, re-dispatches ONLY the still-red evidence claims (focused, bounded)
+	// instead of failing the whole run. Unset / no budget / no read tree ⇒ nil hook ⇒
+	// byte-identical to before. The dispatched typed-research worker's own evidence
+	// verifier governs each re-verdict (I2), so no separate reverify factory is needed;
+	// the in-memory ledger bounds retries within the run.
+	if requeueEnabled() && readDir != "" {
+		runner := &requeueRunner{
+			root:          readDir,
+			role:          roster.RoleTypedResearch,
+			maxConcurrent: d.concurrency,
+			maxAttempts:   requeueMaxAttempts(),
+			log:           d.log,
+			taskID:        d.taskID,
+			goal:          d.goal,
+			dispatch:      requeueDispatch(sup.Spawn),
+		}
+		sup.RequeueHook = runner.Hook() // nil when the attempt budget is 0 (byte-identical)
+	}
+
 	// Wire the durable-snapshot seam: with a checkpoint + a stable task id, every tip
 	// advance translates the supervisor's leaf Snapshot to agent.RunState, pins the tip
 	// with a resume/<taskID> ref the run-end sweep never touches (so the merged work
