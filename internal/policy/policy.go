@@ -36,11 +36,44 @@ var irreversibleSignals = []string{
 func Classify(action string) Class {
 	a := collapseWS(strings.ToLower(action))
 	for _, sig := range irreversibleSignals {
-		if strings.Contains(a, collapseWS(sig)) {
+		if containsWord(a, collapseWS(sig)) {
 			return Irreversible
 		}
 	}
 	return Reversible
+}
+
+// containsWord reports whether needle occurs in haystack on WORD BOUNDARIES, so a
+// bare signal like "merge"/"pay"/"curl" matches the command word but NOT a larger
+// word that merely contains it ("merger", "display", "payload", "recharge",
+// "curly", "transferable"). A boundary is only required at an end whose needle char
+// is itself a word char, so multi-word/punctuated signals ("git push", "rm -rf /",
+// "git reset --hard") still match as phrases. Both inputs are already lowercased +
+// whitespace-collapsed by the caller.
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		leftOK := i == 0 || !isWordByte(needle[0]) || !isWordByte(haystack[i-1])
+		rightOK := end == len(haystack) || !isWordByte(needle[len(needle)-1]) || !isWordByte(haystack[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+// isWordByte reports whether b is an ASCII word character (letter, digit, underscore).
+// The action is already lowercased, so only lowercase letters appear.
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // collapseWS collapses every run of whitespace (spaces, tabs, newlines) to a

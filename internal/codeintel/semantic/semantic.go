@@ -81,6 +81,10 @@ func Open(path string, e Embedder) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open semantic index: %w", err)
 	}
+	// Pin to a single connection (mirrors internal/store). REQUIRED for ":memory:"
+	// (each pooled connection is a separate private in-memory DB) and serializes
+	// writers on a file-backed index, avoiding SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("semantic schema: %w", err)

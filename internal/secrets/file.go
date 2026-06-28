@@ -114,7 +114,47 @@ func (f *FileStore) save(v vaultFile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(f.path, b, 0o600)
+	// Atomic write: a crash mid-write must not truncate/corrupt the vault and lose
+	// EVERY secret. Write a sibling temp file, fsync it, then rename over the vault
+	// (rename is atomic on the same filesystem). 0o600 throughout.
+	return writeFileAtomic(f.path, b, 0o600)
+}
+
+// writeFileAtomic writes data to a temp file in the target's directory, fsyncs it, and
+// renames it over path so a reader never sees a partial file and a crash never corrupts
+// the existing one. The temp file is removed on any error before the rename.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".vault-*.tmp")
+	if err != nil {
+		return fmt.Errorf("vault temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpName) }
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
 
 func (f *FileStore) gcm() (cipher.AEAD, error) {
