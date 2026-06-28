@@ -13,12 +13,22 @@ test:
 # its own repo with -verify "make verify" to have it dogfood this gate.
 verify: build vet test
 
-# Race-detector pass over the concurrency-bearing packages (the conversational
-# session lifecycle). NOT folded into `verify` (the race build is slower and the
-# detector needs CGO), but the canonical gate for changes to session/Cancel/Turn —
-# run it after touching the drive lifecycle. See cancel_race_test.go.
+# Race-detector pass over the concurrency-bearing packages. NOT folded into `verify`
+# (the race build is slower and the detector needs CGO), but the canonical gate for
+# changes to any concurrent path — the conversational session lifecycle, the multi-
+# agent bus/supervisor/swarm fan-out, the bounded scheduler/pool, the chat transports,
+# and the closed-loop budget fence. A `*Race*`/`*Concurrent*` test only proves anything
+# under this lane, so CI runs it (see .github/workflows/ci.yml).
 test-race:
-	go test -race ./internal/session/...
+	go test -race \
+		./internal/session/... \
+		./internal/swarm/... \
+		./internal/agent/... \
+		./internal/super/... \
+		./internal/scheduler/... \
+		./internal/pool/... \
+		./internal/channel/... \
+		./internal/blastbudget/...
 
 run:
 	go run ./cmd/nilcore $(ARGS)

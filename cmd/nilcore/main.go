@@ -101,6 +101,8 @@ func main() {
 		swarmMain(args[1:])
 	case "decompose":
 		decomposeMain(args[1:])
+	case "flows":
+		flowsMain(args[1:])
 	case "init":
 		initMain(args[1:])
 	case "doctor":
@@ -172,6 +174,7 @@ WHAT IT CAN DO — capabilities the agent reaches for on demand (or invoke direc
   nilcore build -goal "<project>" -new ./svc          drive a whole project to a verifier-green tree (multi-agent)
   nilcore swarm -goal "<objective>" -preset research  fan out a verified agent swarm (typed artifacts, requeue-until-clean)
   nilcore decompose -goal "<a> and <b>"  split a goal into independent sub-goals, run each, merge-and-re-verify into one tip (kernel recursion)
+  nilcore flows validate -flow f.json   preflight a portable agentic-flows workflow; 'flows run' executes its agent_task nodes (github.com/RNT56/agentic-flows)
   nilcore browse -goal "..."            drive a persistent in-sandbox browser (observe→plan→act→verify; findings re-verified)
   nilcore desktop -goal "..."           drive a contained virtual desktop (Set-of-Marks; --mac-host drives a real Mac, gated)
   nilcore watch [-signals ./signals]    self-start tasks from dropped signal files (reversible auto, else gated)
@@ -1080,6 +1083,13 @@ func serveMain(args []string) {
 	// memory (the opt-in live tool) + the checkpointer that gives serve threads
 	// conversation persistence and leftover-task resume across a restart.
 	mem, ckpt, serveStore := setupPersistence(log, *c.logPath)
+	// serve is long-running and owns the shared *sql.DB for its whole lifetime; close it
+	// on shutdown so the WAL is checkpointed and the handle released cleanly (the daemon
+	// folds + objective backlog share this one handle, so it is closed only here, after
+	// the serve loop returns and those goroutines have drained on ctx cancel).
+	if serveStore != nil {
+		defer serveStore.Close()
+	}
 	// Reclaim worktree admin entries left by a crashed prior process. SAFE: only
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.

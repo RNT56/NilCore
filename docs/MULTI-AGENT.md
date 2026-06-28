@@ -112,7 +112,7 @@ func NewWorker(p Profile, box sandbox.Sandbox, v verify.Verifier, log *eventlog.
 
 ## 3. The communication protocol (`internal/agent/bus`)
 
-A typed in-process bus, **not** an overloaded blackboard or generalized `channel.Channel`. The blackboard stays the durable fact store; the bus is the transport; durable findings get written to both.
+A typed in-process bus, **not** an overloaded blackboard or generalized `channel.Channel`. The bus is the transport; durable findings get written to the event log. _(Status note: `internal/blackboard` was specced as a separate "durable fact store" but the shipped supervisor/swarm thread shared state through the durable `store`/`eventlog` + the supervisor's own snapshot/resume instead, so `internal/blackboard` is currently a standalone, unwired component — kept available, not on the live path.)_
 
 ```go
 package bus

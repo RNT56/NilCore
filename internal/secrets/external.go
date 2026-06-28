@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -20,11 +21,19 @@ type ExternalStore struct {
 // Name identifies the backend.
 func (e ExternalStore) Name() string { return "external" }
 
-// Get fetches the secret via the hook (value read from stdout).
+// Get fetches the secret via the hook (value read from stdout). It distinguishes a
+// hook that RAN and reported the secret absent (a non-zero exit ⇒ ErrNotFound, so the
+// resolver falls through to the next store) from a hook that could not be RUN at all
+// (missing command, permission denied ⇒ a misconfiguration error, surfaced loudly so
+// the operator notices instead of silently treating every secret as absent).
 func (e ExternalStore) Get(name string) (string, error) {
 	out, err := e.run(nil, "get", name)
 	if err != nil {
-		return "", fmt.Errorf("secret %q: %w", name, ErrNotFound)
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return "", fmt.Errorf("secret %q (external hook exit %d): %w", name, exit.ExitCode(), ErrNotFound)
+		}
+		return "", fmt.Errorf("external get %q: %w", name, err) // hook could not run
 	}
 	return strings.TrimRight(out, "\n"), nil
 }
