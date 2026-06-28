@@ -25,6 +25,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"sort"
@@ -142,41 +143,27 @@ func loadFlow(path string) (flowDoc, error) {
 }
 
 // flowsMain dispatches `nilcore flows <validate|run> -flow <file.json> [-dir <repo>]`.
+// The verb comes first (git-style), then flags parsed via flag.NewFlagSet — the same
+// flag machinery every other subcommand uses.
 func flowsMain(args []string) {
 	if len(args) == 0 {
 		flowsUsage()
 		os.Exit(2)
 	}
 	verb := args[0]
-	rest := args[1:]
-	var flowPath, dir string
-	for i := 0; i < len(rest); i++ {
-		switch rest[i] {
-		case "-flow", "--flow":
-			if i+1 < len(rest) {
-				flowPath = rest[i+1]
-				i++
-			}
-		case "-dir", "--dir":
-			if i+1 < len(rest) {
-				dir = rest[i+1]
-				i++
-			}
-		case "-h", "--help":
-			flowsUsage()
-			return
-		}
-	}
-	if flowPath == "" {
+	fs := flag.NewFlagSet("flows "+verb, flag.ExitOnError)
+	flowPath := fs.String("flow", "", "path to the flow JSON (required)")
+	dir := fs.String("dir", ".", "repo directory to run the flow against (run only)")
+	fs.Usage = flowsUsage
+	_ = fs.Parse(args[1:])
+
+	if *flowPath == "" {
 		fmt.Fprintln(os.Stderr, "error: -flow <file.json> is required")
 		flowsUsage()
 		os.Exit(2)
 	}
-	if dir == "" {
-		dir = "."
-	}
 
-	doc, err := loadFlow(flowPath)
+	doc, err := loadFlow(*flowPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -187,7 +174,7 @@ func flowsMain(args []string) {
 	case "validate":
 		os.Exit(flowsValidate(doc, flow))
 	case "run":
-		flowsRun(doc, flow, dir)
+		flowsRun(doc, flow, *dir)
 	default:
 		fmt.Fprintf(os.Stderr, "error: unknown flows verb %q\n", verb)
 		flowsUsage()

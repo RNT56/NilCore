@@ -547,7 +547,7 @@ before leaving the process.
 
 ## Layer map & dependency direction
 
-Dependencies point **inward/downward only**. Leaf packages must not import the orchestrator. This keeps the core acyclic and the seams clean.
+Dependencies point **inward/downward only**. Leaf packages must not import the orchestrator (`agent`/`session`/`super`/`project`/`swarm`). This keeps the core acyclic and the seams clean. The rule is **executable** — the contract + leaf packages carry a `deps_test.go` that walks `go list -deps` and fails the build on a forbidden import (`backend`, `channel`, `model`, `policy`, `eventlog`, `agenticflows`, `kernel`, `router`, `experience`, `capability`, `blastbudget`, …). The "May import" column lists the *intended* footprint; the test is the source of truth.
 
 ```
 cmd/nilcore ──▶ agent ──▶ backend (contract) ──▶ model, sandbox, verify, eventlog
@@ -563,9 +563,9 @@ policy  (leaf, imported by agent)
 | `internal/provider` | vendor adapters (anthropic / openai / openrouter) | `model` |
 | `internal/sandbox` | container **and** namespace+Landlock command execution | stdlib + `golang.org/x/sys` (namespace backend, Linux) |
 | `internal/verify` | run project checks, report pass/fail | `sandbox` |
-| `internal/eventlog` | append-only JSONL audit | stdlib only |
-| `internal/policy` | reversibility classifier + gate | stdlib only |
-| `internal/backend` | `CodingBackend` + native/codex/claude-code | `model`, `sandbox`, `verify`, `eventlog` |
+| `internal/eventlog` | append-only JSONL audit | stdlib + `store` (optional second backing, P4-T02) |
+| `internal/policy` | reversibility classifier + gate | stdlib + `blastbudget` (egress-proxy runtime fence) |
+| `internal/backend` | `CodingBackend` + native/codex/claude-code | `model`, `sandbox`, `verify`, `eventlog`, + the native-loop machinery (`tools`, `advisor`, `emit`, `guard`, `loopctl`, `summarize`) — never the orchestrator |
 | `internal/emit` | live reasoning/intent sink (conversational) | stdlib only |
 | `internal/inbox` | user→agent message seam (queue/steer) | `model`, `eventlog` |
 | `internal/steering` | trusted operator steering file (`NILCORE.md`/`AGENTS.md`) loader (I7 exception) | stdlib only |
