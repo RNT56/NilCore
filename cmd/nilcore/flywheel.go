@@ -135,6 +135,15 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 // returns an error the caller turns into a fail-closed "no gain" — so a buggy scorer can
 // only ever be conservative, never accept a non-improving edit (I2: the verifier still
 // governs each run; this only ORDERS whether to pursue the merge).
+//
+// NOTE — this is a MEASURE step, deliberately NOT an integration loop, so it does NOT use
+// internal/integrate.Integrator (the canonical merge→re-verify→rollback engine the build,
+// swarm, and decompose paths share). The Integrator verifies the merged tip and ROLLS BACK
+// a red merge; here we want the single verified edit to STAY merged so we can SCORE the
+// eval suite against it (success is a higher eval pass-rate, not the project verifier's
+// verdict on the merge). It is a throwaway measurement — nothing ships — so it correctly
+// emits no integration_* audit events; it reuses the shared worktree.Merge primitive, not
+// a second integration engine.
 func scoreFlywheelCandidate(ctx context.Context, orch *agent.Orchestrator, cases []eval.Case, prop selfimprove.Proposal) (eval.Report, error) {
 	leaf := fmt.Sprintf("fw-cand-%d", time.Now().UnixNano())
 	wt, err := worktree.CreateFrom(ctx, orch.BaseRepo, "flywheel-cand/"+leaf, leaf, "HEAD")

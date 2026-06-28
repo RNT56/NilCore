@@ -87,7 +87,7 @@ func TestIntegrateBranchesMergesVerified(t *testing.T) {
 		{subGoal: "do a", branch: "child-a", verified: true},
 		{subGoal: "do b", branch: "child-b", verified: true},
 	}
-	wt, res, err := integrateBranches(context.Background(), repo, "integ-1", children, alwaysGreen)
+	wt, res, err := integrateBranches(context.Background(), repo, children, alwaysGreen, nil)
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestIntegrateBranchesDropsRedMerge(t *testing.T) {
 		{subGoal: "good", branch: "child-good", verified: true},
 		{subGoal: "bad", branch: "child-bad", verified: true},
 	}
-	wt, res, err := integrateBranches(context.Background(), repo, "integ-2", children, verify)
+	wt, res, err := integrateBranches(context.Background(), repo, children, verify, nil)
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestIntegrateBranchesDropsConflict(t *testing.T) {
 		{subGoal: "one", branch: "child-1", verified: true},
 		{subGoal: "two", branch: "child-2", verified: true},
 	}
-	wt, res, err := integrateBranches(context.Background(), repo, "integ-3", children, alwaysGreen)
+	wt, res, err := integrateBranches(context.Background(), repo, children, alwaysGreen, nil)
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestIntegrateBranchesSkipsUnverifiedChildren(t *testing.T) {
 		{subGoal: "ok", branch: "child-ok", verified: true},
 		{subGoal: "failed", branch: "", verified: false}, // a child that never verified
 	}
-	wt, res, err := integrateBranches(context.Background(), repo, "integ-4", children, alwaysGreen)
+	wt, res, err := integrateBranches(context.Background(), repo, children, alwaysGreen, nil)
 	if err != nil {
 		t.Fatalf("integrate: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestDecomposeEnvelopeEndToEnd(t *testing.T) {
 	}
 	alwaysGreen := func(context.Context, string) (bool, error) { return true, nil }
 
-	env, st := decomposeEnvelope("root", repo, runChild, alwaysGreen, 8, nil)
+	env, st := decomposeEnvelope("root", repo, runChild, alwaysGreen, 8, nil, nil)
 	out, err := kernel.Run(context.Background(), env,
 		kernel.Node{ID: "root", Goal: "add a model and add a handler and add a test"})
 	if err != nil {
@@ -227,7 +227,7 @@ func TestIntegrateBranchesFinalVerifyError(t *testing.T) {
 		return true, nil
 	}
 	children := []childResult{{subGoal: "a", branch: "child-a", verified: true}}
-	wt, _, err := integrateBranches(context.Background(), repo, "integ-fv", children, verify)
+	wt, _, err := integrateBranches(context.Background(), repo, children, verify, nil)
 	if err == nil {
 		t.Fatal("a final-verify error must surface as an error")
 	}
