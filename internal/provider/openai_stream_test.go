@@ -243,8 +243,9 @@ func TestOpenAIStreamHTTPError(t *testing.T) {
 	if errors.Is(err, context.Canceled) {
 		t.Errorf("400 should not be a context error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "openai api") {
-		t.Errorf("err = %v, want openai api prefix", err)
+	var apiErr *model.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest || apiErr.Retryable {
+		t.Errorf("err = %v, want a terminal (non-retryable) *model.APIError with status 400", err)
 	}
 }
 

@@ -1224,7 +1224,7 @@ func serveMain(args []string) {
 		// it never opens a competing single-writer handle to the same file.
 		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
 		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
-		go runAutonomyDaemon(ctx, autoOrch, log, serveStore)
+		go runAutonomyDaemon(ctx, autoOrch, log, serveStore, gate.idle)
 	}
 
 	// Durable resume: re-drive any native task a prior process left running or

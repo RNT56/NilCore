@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sync/atomic"
 
 	"nilcore/internal/emit"
 	"nilcore/internal/model"
@@ -25,6 +26,17 @@ const defaultServeConcurrency = 4
 // inline (no cap), so non-serve paths stay byte-identical.
 type driveGate struct {
 	sched *scheduler.Scheduler
+	// inflight counts foreground serve drives that are queued OR running. The autonomy
+	// daemon's idle predicate reads it so background objectives only run when serve has
+	// no foreground work pending (Pillar 7 "self-services when idle; reactive work
+	// preempts it").
+	inflight atomic.Int64
+}
+
+// idle reports whether no foreground serve drive is queued or running. A nil gate
+// (non-serve paths) is always idle.
+func (g *driveGate) idle() bool {
+	return g == nil || g.inflight.Load() == 0
 }
 
 // newDriveGate builds a gate capping concurrency to max (≤0 ⇒ default) and starts
@@ -46,6 +58,10 @@ func (g *driveGate) runOutcome(ctx context.Context, id string, fn func(context.C
 	if g == nil {
 		return fn(ctx)
 	}
+	// Count this drive as foreground work for the whole time it is queued + running, so
+	// the autonomy daemon's idle predicate sees it and yields.
+	g.inflight.Add(1)
+	defer g.inflight.Add(-1)
 	var out session.DriveOutcome
 	var ferr error
 	done := make(chan struct{})

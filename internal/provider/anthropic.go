@@ -102,7 +102,9 @@ func (a *Anthropic) Complete(ctx context.Context, system string, msgs []model.Me
 		return model.Response{}, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return model.Response{}, fmt.Errorf("anthropic api: %s: %s", resp.Status, tail(string(raw), 1000))
+		// Typed error so the resilience wrapper fast-fails a terminal 4xx and honors a
+		// 429/5xx Retry-After, instead of failing over on a bad key (I3: key-free).
+		return model.Response{}, newAPIError(resp.StatusCode, resp.Header, raw)
 	}
 
 	var ar anthropicResponse
@@ -223,7 +225,7 @@ func (a *Anthropic) Stream(ctx context.Context, system string, msgs []model.Mess
 
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return model.Response{}, fmt.Errorf("anthropic api: %s: %s", resp.Status, tail(string(raw), 1000))
+		return model.Response{}, newAPIError(resp.StatusCode, resp.Header, raw)
 	}
 
 	return assembleAnthropicStream(ctx, resp.Body, onChunk)

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"nilcore/internal/model"
 )
@@ -90,6 +91,49 @@ func TestAnthropicCompleteWebSearchResult(t *testing.T) {
 	}
 	if resp.StopReason != "end_turn" || resp.Usage.InputTokens != 12 || resp.Usage.OutputTokens != 7 {
 		t.Errorf("stop/usage = %q %+v", resp.StopReason, resp.Usage)
+	}
+}
+
+// TestAnthropicCompleteTypedAPIError proves a non-2xx response yields a typed
+// *model.APIError (not a plain fmt.Errorf), so the resilience wrapper can fast-fail a
+// terminal 401 and honor a 429 Retry-After. Before this, both were returned as plain
+// errors and the typed fast-fail/backoff machinery was dead.
+func TestAnthropicCompleteTypedAPIError(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		retryAfter    string
+		wantRetryable bool
+		wantAfter     time.Duration
+	}{
+		{"terminal 401", 401, "", false, 0},
+		{"rate limited 429", 429, "7", true, 7 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+			}))
+			defer srv.Close()
+			a := NewAnthropic("k", "claude-x")
+			a.baseURL = srv.URL
+			_, err := a.Complete(context.Background(), "sys",
+				[]model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "go"}}}}, nil, 100)
+			var apiErr *model.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("want *model.APIError, got %T: %v", err, err)
+			}
+			if apiErr.StatusCode != tc.status || apiErr.Retryable != tc.wantRetryable || apiErr.RetryAfter != tc.wantAfter {
+				t.Errorf("APIError = %+v, want status=%d retryable=%v after=%v", apiErr, tc.status, tc.wantRetryable, tc.wantAfter)
+			}
+			if strings.Contains(apiErr.Error(), "k") && strings.Contains(apiErr.Error(), "api-key") {
+				t.Error("APIError must not leak the key/header (I3)")
+			}
+		})
 	}
 }
 
@@ -289,8 +333,9 @@ func TestAnthropicStreamHTTPError(t *testing.T) {
 	if errors.Is(err, context.Canceled) {
 		t.Errorf("400 should not be a context error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "anthropic api") {
-		t.Errorf("err = %v, want anthropic api prefix", err)
+	var apiErr *model.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest || apiErr.Retryable {
+		t.Errorf("err = %v, want a terminal (non-retryable) *model.APIError with status 400", err)
 	}
 }
 
