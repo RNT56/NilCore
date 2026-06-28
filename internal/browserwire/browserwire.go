@@ -77,7 +77,7 @@ const (
 	OpForward  = "forward"  // history forward
 	OpSelect   = "select"   // set a <select> Ref to option Text/Value
 	OpWait     = "wait"     // bounded sleep MS, then settle (DOM-stability)
-	OpExtract  = "extract"  // re-snapshot (the host turns it into an artifact claim)
+	OpExtract  = "extract"  // DEPRECATED back-compat alias for observe (no mutation). Extraction → the record_finding tool, NOT this op; no longer advertised to the model.
 	OpClose    = "close"    // session protocol only: shut the daemon down
 )
 

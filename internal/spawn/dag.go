@@ -93,8 +93,11 @@ func (d *DAGScheduler) Run(ctx context.Context, subs []Subtask) map[string]Resul
 		}
 	}
 
-	// Wave loop: run every currently-ready node, fold their results, repeat.
-	for {
+	// Wave loop: run every currently-ready node, fold their results, repeat. A done
+	// ctx (deadline/shutdown) stops releasing NEW waves immediately — no point cutting
+	// fresh worktrees for work that would only be cancelled; the sweep below marks every
+	// still-unrun node Skipped(cancelled).
+	for ctx.Err() == nil {
 		ready := d.collectReady(order, nodes, results)
 		if len(ready) == 0 {
 			break
