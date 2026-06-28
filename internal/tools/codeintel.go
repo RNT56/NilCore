@@ -205,17 +205,53 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 			break
 		}
 		b, rerr := os.ReadFile(path)
-		if rerr != nil || len(b) == 0 || len(b) > maxEmbedBytes {
+		if rerr != nil || len(b) == 0 {
 			continue
 		}
-		rel, relErr := filepath.Rel(workdir, path)
-		if relErr != nil {
-			rel = path
+		// Index per-SYMBOL, keyed by symbol NAME — NOT per-file keyed by path. The
+		// retrieval graph keys its nodes by symbol name (graph.BuildFile), and the
+		// fusion step resolves a semantic hit via fileOf[hit.ID] and expands it through
+		// Graph.Callees/Callers(hit.ID). A file-path key never matches a symbol-name
+		// node, so a path-keyed index made the semantic lens silently dead (it resolved
+		// to no file and got no graph-neighbour expansion). Keying by symbol name puts
+		// the index in the graph's id space and matches the docs ("embeddings over whole
+		// symbols"). Add is content-hash cached (D2-T01): an unchanged symbol body does
+		// not re-embed.
+		syms, serr := ast.Symbols(path)
+		if serr != nil || len(syms) == 0 {
+			continue
 		}
-		// Add is content-hash cached (D2-T01): an unchanged file does not re-embed.
-		_ = ix.Add(ctx, rel, string(b))
+		lines := strings.Split(string(b), "\n")
+		for _, s := range syms {
+			if s.Name == "" {
+				continue
+			}
+			body := symbolBody(lines, s.Span.StartLine, s.Span.EndLine)
+			if body == "" || len(body) > maxEmbedBytes {
+				continue
+			}
+			_ = ix.Add(ctx, s.Name, body)
+		}
 	}
 	return ix
+}
+
+// symbolBody slices a symbol's source body from a file's lines using its 1-based
+// inclusive line span, clamped to the file. Returns "" when the span is unusable.
+func symbolBody(lines []string, start, end int) string {
+	if start < 1 {
+		start = 1
+	}
+	if end < start {
+		end = start
+	}
+	if start > len(lines) {
+		return ""
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return strings.Join(lines[start-1:end], "\n")
 }
 
 // renderBundle turns a retrieve.Bundle into a compact, human/model-readable

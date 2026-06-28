@@ -9,6 +9,32 @@ import (
 	"testing"
 )
 
+// TestSymbolBody covers the per-symbol body slicer that the semantic indexer uses to
+// embed each symbol (the A3 fix: index by symbol body keyed by symbol name, so a hit
+// resolves to a graph node). It must clamp a 1-based inclusive span to the file.
+func TestSymbolBody(t *testing.T) {
+	lines := []string{"package p", "func A() {", "  return", "}", "func B() {}"}
+	cases := []struct {
+		name       string
+		start, end int
+		want       string
+	}{
+		{"single line", 5, 5, "func B() {}"},
+		{"multi line", 2, 4, "func A() {\n  return\n}"},
+		{"clamp end past EOF", 4, 99, "}\nfunc B() {}"},
+		{"clamp start below 1", 0, 1, "package p"},
+		{"start past EOF -> empty", 99, 99, ""},
+		{"end<start normalized", 3, 1, "  return"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := symbolBody(lines, c.start, c.end); got != c.want {
+				t.Errorf("symbolBody(%d,%d) = %q, want %q", c.start, c.end, got, c.want)
+			}
+		})
+	}
+}
+
 // writeFile is a small helper for staging a worktree fixture.
 func writeFile(t *testing.T, dir, rel, content string) {
 	t.Helper()
