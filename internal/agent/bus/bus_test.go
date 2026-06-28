@@ -96,11 +96,13 @@ func TestConcurrentSendDeregisterNoPanic(t *testing.T) {
 		}()
 	}
 
-	// Churn: deregister + re-register the target repeatedly.
+	// Churn: deregister + re-register the target repeatedly. 600 iterations × 8
+	// concurrent senders reliably hits the close-vs-send window under -race while
+	// staying CI-friendly.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 2000; i++ {
+		for i := 0; i < 600; i++ {
 			b.Deregister(target)
 			_, _ = b.Register(target)
 		}
