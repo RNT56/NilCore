@@ -268,6 +268,37 @@ func TestPinnedModeBypassesRouterAndThreadsMode(t *testing.T) {
 	s.Wait()
 }
 
+// TestChatReplyFoldedIntoHistory proves a chat reply is appended to History so a
+// follow-up chat turn continues with the agent's own prior answer in context
+// ("continue, not restart"). Before the fold, History held only the user's turns.
+func TestChatReplyFoldedIntoHistory(t *testing.T) {
+	rt := &fakeRouter{route: RouteChat}
+	drv := newFakeDriver(DriveResult{Verified: true, Outcome: "use net/http from the stdlib"})
+	s := New("c", "local", "/repo", nil)
+	s.Router = rt
+	s.Drivers = Drivers{Chat: drv}
+
+	if err := s.Turn(context.Background(), "which http lib?"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	waitClosed(t, drv.started)
+	close(drv.release)
+	s.Wait()
+
+	s.mu.Lock()
+	hist := append([]model.Message(nil), s.History...)
+	s.mu.Unlock()
+	if len(hist) != 2 {
+		t.Fatalf("History len = %d, want 2 (user turn + assistant reply): %+v", len(hist), hist)
+	}
+	if hist[0].Role != "user" || hist[1].Role != "assistant" {
+		t.Fatalf("History roles = [%s %s], want [user assistant]", hist[0].Role, hist[1].Role)
+	}
+	if hist[1].Content[0].Text != "use net/http from the stdlib" {
+		t.Fatalf("assistant turn text = %q, want the chat reply", hist[1].Content[0].Text)
+	}
+}
+
 // An added read root must be captured into the launched DriveInput (so the wiring
 // closure can build the read/search tools with it) and must NOT be duplicated.
 func TestAddReadRootThreadsIntoDrive(t *testing.T) {
