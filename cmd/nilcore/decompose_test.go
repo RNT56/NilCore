@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ func TestDecomposePlan(t *testing.T) {
 		{"semicolons", "add tests; update docs; bump version", []string{"add tests", "update docs", "bump version"}},
 		{"comma-and", "scaffold the API, and add a healthcheck", []string{"scaffold the API", "add a healthcheck"}},
 		{"numbered list", "1. add a model\n2. add a handler\n3. add a test", []string{"add a model", "add a handler", "add a test"}},
+		{"multiline collapsing to one item", "the one thing to do\n\n", []string{"the one thing to do"}},
 		{"dash list", "- parser\n- printer", []string{"parser", "printer"}},
 		{"trailing period stripped", "do a thing.", []string{"do a thing"}},
 	}
@@ -205,5 +207,31 @@ func TestDecomposeEnvelopeEndToEnd(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(st.wt.Path(), f)); err != nil {
 			t.Errorf("integrated tip missing %s: %v", f, err)
 		}
+	}
+}
+
+// TestIntegrateBranchesFinalVerifyError: the FINAL re-verify (after every per-merge check)
+// is a distinct path — if it errors, the integrator must surface the error and clean up the
+// integration worktree (return nil), never leak it or claim a verdict.
+func TestIntegrateBranchesFinalVerifyError(t *testing.T) {
+	repo := initEquivGitRepo(t)
+	base := baseBranch(t, repo)
+	addChildBranch(t, repo, base, "child-a", "a.txt", "alpha\n")
+
+	calls := 0
+	verify := func(context.Context, string) (bool, error) {
+		calls++
+		if calls >= 2 { // call 1 = the per-merge check; call 2 = the final re-verify
+			return false, errors.New("verifier crashed")
+		}
+		return true, nil
+	}
+	children := []childResult{{subGoal: "a", branch: "child-a", verified: true}}
+	wt, _, err := integrateBranches(context.Background(), repo, "integ-fv", children, verify)
+	if err == nil {
+		t.Fatal("a final-verify error must surface as an error")
+	}
+	if wt != nil {
+		t.Fatal("on a final-verify error the integration worktree must be cleaned up (nil returned)")
 	}
 }
