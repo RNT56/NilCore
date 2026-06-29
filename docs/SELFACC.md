@@ -78,13 +78,15 @@ NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json nilcore run ...
 # auto-approves within the envelope; first appearances + any command change still gate).
 # Unattended self-acceptance REQUIRES an operator auto-approval envelope with a
 # `bind-self-authored` clause — without one, a headless run can approve nothing and the
-# feature self-disables. Configure it in your nilcore config (the `auto_approve` block):
+# feature self-disables. Simplest: a named preset (the `standard`/`trusted` presets both
+# include the bind-self-authored clause):
+NILCORE_AUTOAPPROVE_PRESET=standard NILCORE_SELFACC=1 nilcore serve   # + NILCORE_AUTONOMY
+# Or hand-author the envelope in your nilcore config (an explicit `auto_approve` block
+# always wins over the preset):
 #   { "auto_approve": { "classes": [
 #       { "type": "bind-self-authored", "allow_branches": ["*"],
 #         "deny_branches": ["main","master","release/*","prod*"],
 #         "min_successes": 15, "min_sample": 15, "recency_days": 7, "max_per_day": 3 } ] } }
-# (the `standard`/`trusted` graapprove presets already include this clause). Then:
-NILCORE_SELFACC=1 nilcore serve   # + NILCORE_AUTONOMY, with auto_approve configured
 
 # Review aids (read-only — run nothing, change no verdict):
 nilcore selfacc propose -goal "..." -plan plan.json   # see the contract-first criteria

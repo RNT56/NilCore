@@ -181,7 +181,7 @@ NilCore today is single-host, single-process, self-hosted. The roadmap items eac
 
 **The gate.** A decision to operate/trust a remote registry, with artifact-verification design reviewed.
 
-**How it would be built.** A fetch step in front of `U2-T06`'s local registry: download → verify signature/provenance → present to `selfimprove.Flow` for verified, human-gated install into the existing discovery dirs. The per-tool `mcp.Gate` (`internal/mcp/client.go:26-28`) and untrusted-output fence stay. A registry client is a new dependency needing `I6` justification (prefer stdlib HTTP).
+**How it would be built.** A fetch step in front of `U2-T06`'s local registry: download → verify signature/provenance → present to `selfimprove.Flow` for verified, human-gated install into the existing discovery dirs. MCP authorization (now at the codegen-descriptor boundary, `cmd/nilcore/mcp.go`) and the untrusted-output fence stay. A registry client is a new dependency needing `I6` justification (prefer stdlib HTTP).
 
 **What must not change.** `I7` (remote artifact = untrusted until verified), the verify+human-gate install path, the no-core-edit scope.
 
