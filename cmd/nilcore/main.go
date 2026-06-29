@@ -117,6 +117,8 @@ func main() {
 		reportMain(args[1:])
 	case "trust":
 		trustMain(args[1:])
+	case "selfacc":
+		selfaccMain(args[1:])
 	case "experience":
 		experienceMain(args[1:])
 	case "lessons":
@@ -191,6 +193,7 @@ THE COCKPIT — read-only / operator surfaces to inspect, audit, and steer:
   nilcore lessons                       recurring verifier-failure patterns the agent has learned from
   nilcore auto-approvals [-denied]      account of past graduated auto-approvals + the per-class undo story
   nilcore objective <list|add|disable|enable>   manage the standing-objectives backlog (operator-only)
+  nilcore selfacc <propose|check>       review self-authored acceptance verifiers (operator-gated; NILCORE_SELFACC to bind)
   nilcore inspect [health]              replay the event log (summary), or probe its health (exit 0/1)
   nilcore registry list|install <m>     manage local skills / MCP-server specs
 
