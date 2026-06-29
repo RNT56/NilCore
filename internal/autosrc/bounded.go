@@ -107,7 +107,13 @@ func (q *boundedQueue) wakeOnCancel(ctx context.Context) (stop func()) {
 	go func() {
 		select {
 		case <-ctx.Done():
+			// Broadcast UNDER the same lock the waiter holds in cond.Wait, so the wake
+			// can never slip into the window between the waiter's ctx.Err check and its
+			// Wait (the classic lost-wakeup). Without this, cancellation relied on the
+			// eventual close() as a backstop.
+			q.mu.Lock()
 			q.cond.Broadcast()
+			q.mu.Unlock()
 		case <-done:
 		}
 	}()

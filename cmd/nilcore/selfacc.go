@@ -333,8 +333,8 @@ func selfAcceptFileInsideBox(path string, box sandbox.Sandbox) string {
 // can never flood a gate prompt or an event Detail.
 func clipSelfacc(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n] + "…"
+	if r := []rune(s); len(r) > n { // rune-safe: never split a multi-byte UTF-8 rune
+		return string(r[:n]) + "…"
 	}
 	return s
 }

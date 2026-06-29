@@ -1,6 +1,8 @@
 package graapprove
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -30,8 +32,13 @@ func killSwitchEngaged(root, sentinel string) bool {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(root, path)
 	}
-	if _, err := os.Stat(path); err == nil {
+	// Fail-CLOSED: the sentinel existing engages the kill-switch; so does ANY stat error
+	// other than a clean "does not exist" (a permission error, an I/O fault, a path that
+	// can't be resolved must never be read as "kill-switch off" — that would silently
+	// keep auto-approval live on a misconfigured/locked-down host).
+	_, err := os.Stat(path)
+	if err == nil {
 		return true
 	}
-	return false
+	return !errors.Is(err, fs.ErrNotExist)
 }

@@ -138,14 +138,21 @@ func fileSignalFeeder(ctx context.Context, dir string, ch chan<- autosrc.FileSig
 }
 
 // wakeFeeder polls the wake registry on a ticker and fires every wake whose instant has
-// passed: it DISARMS the wake first (so a slow/busy queue can never re-queue it on the
-// next tick — at-most-once), then sends it onto ch for the WakeSource adapter. This is
-// what makes durable self-timers actually re-engage in serve (they were armed but never
-// fired before). A registry read error is skipped, never fatal.
+// passed, re-engaging durable self-timers in serve (they were armed but never fired
+// before). A registry read error is skipped, never fatal.
+//
+// Ordering matters for durability. It DELIVERS the wake onto the queue FIRST, then
+// disarms it — so a shutdown (or a cancel) caught mid-handoff leaves the wake ARMED and
+// it re-fires on the next boot (at-least-once), rather than disarming it and losing the
+// timer forever. The inFlight set bridges the brief window between delivery and disarm
+// (and an undisarmable wake) so the next tick can never re-queue the same wake — giving
+// effectively-once delivery in steady state without the lose-on-shutdown hazard of
+// disarming first.
 func wakeFeeder(ctx context.Context, reg *wake.Registry, ch chan<- autosrc.Wake, interval time.Duration) {
 	defer close(ch)
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	inFlight := make(map[string]bool) // delivered-but-not-yet-disarmed (or undisarmable)
 	for {
 		select {
 		case <-ctx.Done():
@@ -158,17 +165,21 @@ func wakeFeeder(ctx context.Context, reg *wake.Registry, ch chan<- autosrc.Wake,
 		}
 		now := time.Now()
 		for _, w := range pending {
-			if w.WakeAt.After(now) {
-				continue // not due yet
+			if w.WakeAt.After(now) || inFlight[w.ThreadID] {
+				continue // not due yet, or already handed off this session
 			}
-			// Disarm before sending so a long, busy queue cannot re-queue it next tick.
-			if derr := reg.Disarm(ctx, w.ThreadID); derr != nil {
-				continue // could not disarm ⇒ skip rather than risk a re-fire loop
-			}
+			// Deliver FIRST: a shutdown here leaves the wake armed (re-fires next boot).
 			select {
 			case ch <- autosrc.Wake{ThreadID: w.ThreadID, Note: w.Note}:
 			case <-ctx.Done():
-				return
+				return // not delivered, not disarmed ⇒ survives to next boot
+			}
+			// Delivered. Mark in-flight so the next tick won't re-queue it during the
+			// gap until Disarm lands; on a successful disarm it leaves Pending and we can
+			// forget it. A disarm error keeps it in-flight (no tight re-fire loop).
+			inFlight[w.ThreadID] = true
+			if reg.Disarm(ctx, w.ThreadID) == nil {
+				delete(inFlight, w.ThreadID)
 			}
 		}
 	}
