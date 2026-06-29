@@ -794,3 +794,31 @@ func TestMaybeWrapReturnsHumanUnchanged(t *testing.T) {
 		t.Fatalf("expected *GradedApprover, got %T", got)
 	}
 }
+
+// TestCountAutoApprovalsToday: the per-day rate counter folds only `auto_approve` events
+// for the exact (action,scope) on today's day — never boundary_outcome / auto_deny, never
+// another scope, never another day. (M11: the gate's MaxPerDay rate window depends on
+// this counting only the right events.)
+func TestCountAutoApprovalsToday(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLog(t, dir, []logEntry{
+		{kind: "auto_approve", action: "open-pr", scope: "feat/x", passed: true},
+		{kind: "auto_approve", action: "open-pr", scope: "feat/x", passed: true},
+		{kind: "auto_approve", action: "open-pr", scope: "feat/y", passed: true},         // different scope
+		{kind: "auto_approve", action: "promote-to-base", scope: "feat/x", passed: true}, // different action
+		{kind: "boundary_outcome", action: "open-pr", scope: "feat/x", passed: true},     // wrong kind
+		{kind: "auto_deny", action: "open-pr", scope: "feat/x"},                          // wrong kind
+	})
+	today := dayKey(time.Now().UTC())
+
+	n, err := countAutoApprovalsToday(path, "open-pr", "feat/x", today)
+	if err != nil || n != 2 {
+		t.Fatalf("count = %d, %v; want 2 (only today's auto_approve for open-pr+feat/x)", n, err)
+	}
+	if n, _ := countAutoApprovalsToday(path, "open-pr", "feat/x", "1999-01-01"); n != 0 {
+		t.Errorf("a non-today day must count 0, got %d", n)
+	}
+	if n, err := countAutoApprovalsToday(dir+"/missing.log", "open-pr", "feat/x", today); err != nil || n != 0 {
+		t.Errorf("a missing log = (0, nil), got (%d, %v)", n, err)
+	}
+}
