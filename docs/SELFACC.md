@@ -1,124 +1,123 @@
-# Self-authored acceptance verifiers (`selfacc`) — capabilities & risks
+# Self-authored acceptance — the closed loop (`selfacc`)
 
-> **What this is:** the agent can PROPOSE how its own work should be checked, and an
-> operator can promote a proposed check into a real, sandboxed, fail-closed verifier
-> that the existing verification spine then enforces. The agent writes the contract;
-> the operator decides which clauses become binding; the verifier of record still rules.
+> **What this is:** during a run, once the project's own verifier passes, the agent's
+> OWN acceptance checks — authored for *this* goal — must ALSO pass before the work is
+> judged done. The agent raises its own bar; each proposed check is gated (and the gate
+> amortizes over time); the verifier of record still rules. The loop closes:
+> **propose → author → gate → bind → run → fold into the verdict → earn trust.**
 >
-> **Status:** SHIPPED and wired, **default-off**. Nothing changes until an operator opts
-> in with `NILCORE_SELFACC=1` and names an approved-candidates file. Read §4 (risks)
-> before you turn it on.
+> **Status:** SHIPPED, **default-off** (`NILCORE_SELFACC`). Read §5 (risks) before enabling.
 
-## 1. The idea (and why it's gated)
+## 1. Why this is novel (and not just "relocated work")
 
-NilCore's first invariant of "done" is I2: *the verifier is the sole authority.* Normally
-the operator (or a domain pack) defines the bar. But an under-specified goal often
-arrives with **no acceptance pack** — and hand-writing every criterion doesn't scale.
+The static v1 had a real flaw: it asked the operator to pre-author a file of checks, which
+mostly *moved* the work rather than removing it. The deepened version fixes that on two axes:
 
-`selfacc` lets the agent do the contract-first half itself: given a goal (and any plan it
-produced), it **proposes** machine-checkable acceptance criteria, and can **author
-candidate verifiers** — each just `{verifier_id, command, rationale}`, where `command` is
-a single shell line run *inside the sandbox*.
+1. **Runtime, in-the-loop.** The agent derives acceptance checks for the actual goal *during
+   the run* and is then held to them by the same verdict that gates the commit — not a static
+   config divorced from the work.
+2. **The gate amortizes.** A self-check is gated like any boundary action. The FIRST times a
+   given check class appears, a human approves it (or a headless run denies it). Once it has
+   **earned trust** — verifier-green N times within the operator envelope — graduated
+   auto-approval (`graapprove`) admits it without asking again. Review is paid **once per
+   check-pattern**, then reused. That is the answer to "doesn't the gate just relocate work":
+   it does the first few times, by design, and then it doesn't.
 
-The danger is obvious: an agent that writes its own test and then grades itself against it
-has defeated the point of having a verifier. So the design draws a hard line:
+The result is genuinely new: **self-authored, runtime, verified, gated, trust-amortized
+acceptance** — most valuable exactly where there's no human to write or review checks per run
+(the autonomy daemon, swarm), because a proven self-check class auto-approves within the fence.
 
-- **Proposing is free. Binding is gated.** The agent can propose/author all day; none of
-  it affects a verdict. A candidate becomes a real verifier **only** when an operator
-  performs two explicit acts: set `NILCORE_SELFACC=1` *and* place the candidate in the
-  file named by `NILCORE_SELFACC_FILE`. Those two acts **are** the human gate.
-- **A self-check can only RAISE the bar, never lower it.** It runs *after* the build
-  verifier and only resolves claims that *name* it; a self-check resolves a claim to
-  `Pass` solely on an affirmative sandbox **exit 0**, and to `Unverifiable` otherwise. It
-  can never turn a red build green, and a missing/rejected check is `Unverifiable`, never
-  a silent pass (fail-closed).
-- **A self-check is always sandboxed (I4).** The meta-check (`Admit`) rejects any
-  candidate that hints at host/in-process execution; the only execution path is
-  `sandbox.Exec`. There is no host-side fallback — a nil box is `Unverifiable`.
+## 2. The loop (where each piece lives)
 
-## 2. How it works (the pieces)
-
-| Piece | Where | Role |
+| Step | Where | What happens |
 |---|---|---|
-| `Propose(goal, tree)` | `internal/verify/selfacc/selfacc.go` | derive contract-first criteria from a plan (pure, no model call) |
-| `Candidate{VerifierID, Command, Rationale}` | `internal/verify/selfacc/candidate.go` | an UNTRUSTED, model-authored verifier proposal (sandbox command only) |
-| `Admit(c)` — the meta-check | `candidate.go` | the I4 gate: admits only a bounded sandbox command; rejects empty/over-long/control-byte/host-marker |
-| `CheckFunc(c)` / `Register(reg, c)` | `candidate.go` / `resolve.go` | turn an *admitted* candidate into an evverify check; bind it (re-admits, defense-in-depth) |
-| **`registerSelfAcceptance(reg)`** — the wiring | `cmd/nilcore/selfacc.go` | the operator-gated layer: opt-in + approved file ⇒ admit each ⇒ bind the admissible into the run's `evverify.Registry` |
-| `nilcore selfacc propose\|check` | `cmd/nilcore/selfacc.go` | operator review surface (see proposed criteria; meta-check a file before trusting it) |
+| **floor** | `agent.executeSingle` → `env.Verifier.Check` | the project's verifier runs first and **governs** (I2). Self-acceptance is consulted ONLY if it's green. |
+| **propose+author** | `cmd/nilcore/selfacc.go` `authorSelfAcceptCandidates` | one bounded model call authors up to `N` sandbox-command checks for the goal (untrusted data — I7). Operator pre-approved checks (`NILCORE_SELFACC_FILE`) are added too. |
+| **admit** | `selfacc.Admit` (leaf) | the I4 meta-check: sandbox command only; un-admissible ⇒ skipped, never bound. |
+| **gate** | `policy.GateStructured(BindSelfAuthored)` via `orch.Approver` | each AGENT check is approved (attended human / headless deny / `graapprove` auto-approve on earned trust). Operator-file checks are pre-approved and skip the gate. |
+| **bind+run** | `selfacc.CheckFunc` → `box.Exec` | each approved check runs INSIDE the worktree box; exit 0 = holds, else not. |
+| **fold** | `agent.executeSingle` | the run is done only if EVERY bound check passed; a failure reddens the verdict. It can only **ADD** to the bar. |
+| **audit+trust** | `eventlog` + `emitBoundaryOutcome` | `selfacc_propose/gate/bind/skip` events (I5); each gated check's pass/fail emits a `boundary_outcome` so the class earns (or loses) trust. |
 
-The wiring hangs off `evidenceRegistry()` (the same builder that adds domain packs), so a
-bound self-check participates in the **identical** verified-artifact spine as every other
-evidence check (`NILCORE_EVIDENCE_VERIFY`): schema shape-gate → per-claim in-box
-verification → any red claim reddens the whole verdict.
+The hook is an opt-in `agent.SelfAcceptFunc` on the orchestrator. **nil ⇒ byte-identical.**
 
-## 3. Operator workflow
+## 3. The invariants (why it's safe)
+
+- **I2 — the verifier of record still rules.** The floor verifier runs first and a red floor
+  is never consulted for self-acceptance (the hook is only called when `rep.Passed`). A
+  self-check can therefore only ever **raise** the bar — it cannot turn a red build green. A
+  bound check passes a criterion only on an affirmative sandbox **exit 0**; anything else
+  (non-zero, sandbox error, no box) is *not a pass*.
+- **I3 — no ambient authority.** Candidates are inert data; nothing secret is read here or
+  handed to a check beyond what the sandbox already exposes.
+- **I4 — sandboxed.** `Admit` rejects any host/in-process marker; every check runs only via
+  `box.Exec`. There is no host-side fallback.
+- **I5 — append-only audit.** Every propose/gate/bind/skip + the trust `boundary_outcome` is a
+  metadata-only appended event.
+- **I7 — data, not instructions.** The goal and every authored field (id/command/rationale)
+  are carried as data, validated structurally, never interpreted.
+- **the gate.** `BindSelfAuthored` is `Irreversible`; headless deny-defaults; auto-approval is
+  earned-trust + operator-envelope + blast-fenced only (`graapprove` presets `standard`
+  MinSuccesses 15, `trusted` 25 — a *higher* bar than open-pr, since the agent is judging
+  itself). `prod`/`main`/`release` are structurally denied as for every class.
+
+## 4. Operator workflow
 
 ```sh
-# 1. See what the agent would assert for a goal (read-only, inert):
-nilcore selfacc propose -goal "ship a working /health endpoint" -plan plan.json
+# Attended run: the agent proposes checks for the goal; you approve/deny each at the gate,
+# and approved checks must pass for the run to be judged done.
+NILCORE_SELFACC=1 nilcore run -dir ./repo -goal "ship a /health endpoint that returns ok"
 
-# 2. Author an approved file (you review every command — these run in the box):
-cat > approved.json <<'JSON'
-{ "candidates": [
-  { "verifier_id": "candidate.health_ok",
-    "command": "curl -fsS localhost:8080/health | grep -q ok",
-    "rationale": "the endpoint returns ok" }
-] }
-JSON
+# Cap how many checks the agent may author per run (default 5):
+NILCORE_SELFACC=1 NILCORE_SELFACC_MAX=3 nilcore run ...
 
-# 3. Meta-check it BEFORE trusting it (non-zero exit if any candidate is un-admissible):
-nilcore selfacc check -file approved.json
+# Pre-approve a stable check set you authored (skips the gate — the file IS your approval):
+NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json nilcore run ...
 
-# 4. Turn it on for a verified run (both signals required):
-NILCORE_EVIDENCE_VERIFY=1 NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json \
-  nilcore run -dir ./repo -goal "..."
+# Amortized auto-approval for unattended autonomy (a proven self-check class auto-approves
+# within the envelope; first appearances still gate):
+NILCORE_AUTO_APPROVE_PRESET=standard NILCORE_SELFACC=1 nilcore serve   # + NILCORE_AUTONOMY
+
+# Review aids (read-only — run nothing, change no verdict):
+nilcore selfacc propose -goal "..." -plan plan.json   # see the contract-first criteria
+nilcore selfacc check   -file approved.json           # meta-check a candidate file
 ```
 
-A claim whose `verifier` field names `candidate.health_ok` now resolves through that
-sandboxed check. Any candidate the meta-check rejects is **skipped with a stderr note**
-(never bound). A malformed/unreadable approved file is a **hard error that reddens the
-evidence verdict** — like a bad pack list, it never silently falls back.
+`approved.json` shape: `{"candidates":[{"verifier_id":"candidate.health_ok","command":"curl -fsS localhost:8080/health | grep -q ok","rationale":"the endpoint returns ok"}]}`.
 
-## 4. Risks — read before enabling
+## 5. Risks — read before enabling
 
-1. **You are trusting your own approved file, not the agent.** The whole safety model
-   rests on the approved file being *operator-curated*. Keep it at a stable,
-   operator-controlled path **outside the disposable worktree** (an absolute path), so a
-   run can never write or edit its own approval. Never point `NILCORE_SELFACC_FILE` at a
-   path the model can write.
-2. **A weak self-check is a weak bar.** The sandbox + fail-closed rules stop a check from
-   *cheating* (it can't run host code, can't pass without exit 0), but they cannot make a
-   *trivial* command meaningful. If you approve `command: "true"`, you approved a check
-   that asserts nothing. The agent can propose junk; **you** decide what binds — review
-   each command like a test you're committing.
-3. **It raises the bar, so a bad check can block good work.** A self-check can only add a
-   criterion that must *also* pass. A flaky or wrong command therefore reddens otherwise-
-   good runs. That's the safe direction (fail-closed), but it's still a footgun — meta-
-   check and dry-run candidates before trusting them.
-4. **Command injection is structurally blocked, not semantically.** `Admit` rejects NUL/
-   control bytes, over-long commands, and host markers, and the command is data (never
-   templated from claim text). But it is still a shell line you approved — apply the same
-   scrutiny you would to any script that runs in your build box.
-5. **Sandbox egress still applies.** A check that needs the network only reaches it
-   through the box's egress policy (default-deny). A check assuming open egress will be
-   `Unverifiable`, not silently skipped.
+1. **A weak check is a weak bar.** The sandbox + fail-closed rules stop a check from *cheating*
+   (no host code, no pass without exit 0), but cannot make a *trivial* check meaningful. If
+   you approve `command:"true"`, you approved a check that asserts nothing. Review each
+   command like a test you're committing — and remember that approving it repeatedly is what
+   teaches the system to auto-approve it.
+2. **Earned-trust amortization cuts both ways.** Auto-approval means a check class you approved
+   N times now binds without asking. That's the point — but it's why the bar is high
+   (15/25 successes) and per-class (scope = verifier id). A self-check still only ever ADDS to
+   the bar, so an auto-approved weak check is at worst a no-op; the danger it cannot create is
+   a *lowered* bar.
+3. **It raises the bar, so a flaky/wrong check blocks good work.** A self-check that's wrong in
+   the failing direction reddens otherwise-good runs. Safe (fail-closed), still a footgun —
+   `nilcore selfacc check` and dry-run before trusting.
+4. **The operator file must stay yours.** Keep `NILCORE_SELFACC_FILE` at an absolute path
+   *outside* the disposable worktree, so a run can never write its own approval.
+5. **Authoring is a model call.** Enabling `selfacc` adds one bounded model call per
+   *green* run (skipped on red runs and when off). It reads only the goal; it never sees secrets.
 
-## 5. What it does **not** do
+## 6. What it does NOT do
 
-- It does **not** let the agent mark its own work done. Self-reports never decide a
-  verdict (I2); only an admitted, operator-approved, sandboxed check can, and only by
-  *adding* a criterion.
-- It does **not** auto-register anything. There is no path by which a proposed candidate
-  binds without the two explicit operator opt-ins.
+- It does **not** let the agent mark its own work done — the floor verifier governs; a
+  self-check only adds a criterion that must *also* pass.
+- It does **not** auto-bind un-gated agent checks — every agent check is gated; only earned
+  trust (your repeated approvals) lets a class auto-approve later.
 - It does **not** run on the host or in-process — ever (I4).
 - It is **not** on by default and is byte-identical when off.
 
-## 6. Bottom line
+## 7. Bottom line
 
-`selfacc` closes the loop on *contract authorship* — the agent can raise its own bar —
-while keeping every safety property that makes the bar trustworthy: the operator gates
-what binds, the check is sandboxed and fail-closed, and the verifier of record still
-rules. Turn it on when you want the agent to propose acceptance criteria you'll review;
-keep the approved file under your control, and treat every approved command as a test you
-own.
+The agent can now raise its own acceptance bar at run time, you decide which of its checks to
+trust, that trust amortizes so you're not asked twice for the same proven check, and the
+verifier of record still rules. That's the version with real value — especially for unattended
+autonomy, where self-defined acceptance behind an earned-trust fence is something no static
+config can give you.

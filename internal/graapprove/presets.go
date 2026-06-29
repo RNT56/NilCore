@@ -54,6 +54,21 @@ func Preset(name string) (Envelope, error) {
 				MaxPerDay:     2,
 				MaxDollarsDay: 0,
 			},
+			{
+				// Binding a model-authored acceptance verifier is a trust escalation
+				// (the agent judging its own work), so it carries a HIGHER earned-trust
+				// bar than open-pr: a self-check class auto-approves only after the
+				// agent has proven that class many times. Scope is the verifier id
+				// (carried as Branch); the bound check can only ADD to the bar (I2).
+				Type:          "bind-self-authored",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  15,
+				MinSample:     15,
+				RecencyDays:   7,
+				MaxPerDay:     3,
+				MaxDollarsDay: 0,
+			},
 		}}, nil
 	case "trusted":
 		// + Deploy to staging (redeploy previous to undo), bounded by a $/day cap.
@@ -90,6 +105,19 @@ func Preset(name string) (Envelope, error) {
 				RecencyDays:   7,
 				MaxPerDay:     2,
 				MaxDollarsDay: 25,
+			},
+			{
+				// Self-acceptance binding, trusted tier: a higher bar than `standard`
+				// (a proven self-check class only). Scope is the verifier id (Branch);
+				// the bound check can only ADD to the bar (I2).
+				Type:          "bind-self-authored",
+				AllowBranches: []string{"*"},
+				DenyBranches:  commonDeny,
+				MinSuccesses:  25,
+				MinSample:     25,
+				RecencyDays:   7,
+				MaxPerDay:     3,
+				MaxDollarsDay: 0,
 			},
 		}}, nil
 	default:

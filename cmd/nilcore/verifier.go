@@ -308,15 +308,6 @@ func evidenceRegistry() (*evverify.Registry, error) {
 		}
 		seedKeyedPackSecrets(names)
 	}
-	// Operator-approved self-authored acceptance verifiers (NILCORE_SELFACC). Default-off
-	// and fail-closed: a malformed approved file is an error that reddens the verdict
-	// (like a bad pack list), never a silent fall-through. Admissible candidates bind a
-	// sandboxed, fail-closed check; un-admissible ones are skipped (never bound).
-	if ids, err := registerSelfAcceptance(reg); err != nil {
-		return nil, fmt.Errorf("self-acceptance verifiers: %w", err)
-	} else if len(ids) > 0 {
-		fmt.Fprintf(os.Stderr, "nilcore: bound %d operator-approved self-acceptance verifier(s): %s\n", len(ids), strings.Join(ids, ", "))
-	}
 	return reg, nil
 }
 

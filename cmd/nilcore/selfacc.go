@@ -1,49 +1,59 @@
 package main
 
-// selfacc.go is the OPERATOR-CONTROLLED WIRING LAYER for self-authored acceptance
-// verifiers (internal/verify/selfacc) — the piece that package deliberately does NOT
-// contain so that an agent-proposed verifier can never make itself binding. It does
-// two things:
+// selfacc.go is the CLOSED-LOOP self-acceptance wiring (internal/verify/selfacc) — the
+// piece the leaf deliberately does NOT contain so that an agent-proposed verifier can
+// never make itself binding. The agent raises its OWN bar at run time: once the
+// project's verifier (the floor — I2) is green, the agent's own acceptance checks must
+// ALSO pass before the run is judged done.
 //
-//   - registerSelfAcceptance — the run-time wiring: when (and only when) the operator
-//     has BOTH opted in (NILCORE_SELFACC) AND pointed NILCORE_SELFACC_FILE at a file
-//     they authored/reviewed, it admits each candidate (the I4 meta-check) and
-//     registers the admissible ones into the run's evverify.Registry, so a claim that
-//     names one resolves through a real, SANDBOXED, fail-closed check. The two explicit
-//     operator actions ARE the human gate: the agent may PROPOSE candidates, but only
-//     the operator placing them in the approved file makes one binding.
+// The loop (selfAcceptHook → runSelfAcceptance, the orchestrator's SelfAcceptFunc):
 //
-//   - selfaccMain (`nilcore selfacc`) — the operator's review surface: `propose` turns
-//     a goal (+ optional plan) into the contract-first criteria the agent would assert,
-//     and `check` runs the meta-check over an approved file so the operator sees exactly
-//     which candidates are admissible (and why a rejected one is not) BEFORE trusting it.
+//  1. PROPOSE+AUTHOR: a single bounded model call authors up to N sandbox-command
+//     acceptance checks for THIS goal (authorSelfAcceptCandidates). The operator may
+//     ALSO supply pre-approved checks via NILCORE_SELFACC_FILE.
+//  2. ADMIT: every candidate passes the I4 meta-check (selfacc.Admit) — sandbox command
+//     only; an un-admissible one is skipped, never bound.
+//  3. GATE: each AGENT-authored check is approved like any boundary action via a typed
+//     policy.GateAction{Type: BindSelfAuthored} — an attended operator approves, a
+//     headless run denies, and graduated auto-approval (graapprove) admits only a
+//     self-check class that has EARNED trust. Operator-file checks are pre-approved (the
+//     file IS the operator's approval) and skip the gate.
+//  4. BIND+RUN: each approved+admitted check runs INSIDE the worktree box (selfacc.
+//     CheckFunc → box.Exec); exit 0 = the criterion holds, anything else = not held.
+//  5. FOLD: the run is judged done only if EVERY bound check passed. A bound check that
+//     fails reddens the verdict (it can only ADD to the bar — it never greens a red
+//     floor; the orchestrator consults it only when the floor is already green).
+//  6. AUDIT + EARN TRUST: every step emits an append-only event (I5); each gated check's
+//     pass/fail emits a boundary_outcome so a proven self-check class can amortize its
+//     review and later auto-approve within the envelope.
 //
-// Invariants this layer preserves (it adds NO permissive path of its own):
-//   - I2: a self-acceptance check can only ADD a criterion that must ALSO pass; it
-//     resolves a claim to Pass only on an affirmative sandboxed exit 0, else
-//     Unverifiable. It never turns the build verifier's verdict green and runs only
-//     AFTER it (any red claim still reddens the whole verdict).
-//   - I3: candidates are inert data; no secret is read here or handed to a check beyond
-//     what the sandbox already exposes.
-//   - I4: every admitted candidate runs ONLY as a sandbox command (selfacc.Admit
-//     rejects any host/in-process marker); there is no host-side fallback.
-//   - I7: every field of a candidate (id, command, rationale) is treated as data —
-//     validated structurally, never interpreted as an instruction.
+// `nilcore selfacc` (selfaccMain) is the read-only operator review surface: `propose`
+// shows the contract-first criteria for a goal+plan; `check` meta-checks a candidate
+// file before you trust it.
 //
-// DEFAULT-OFF: with NILCORE_SELFACC unset (or no file), registerSelfAcceptance is a
-// no-op and the verify path is byte-identical. FAIL-CLOSED: a malformed/unreadable
-// approved file is an ERROR that reddens the evidence verdict (via the caller), never a
-// silent fall-through to the generic-only registry.
+// Invariants: I2 (floor verifier still governs; self-acceptance only ADDS), I3
+// (candidates inert; no secret read/handed beyond the sandbox), I4 (every check runs
+// only as a sandbox command — no host fallback), I7 (the goal + every authored field is
+// data, validated structurally, never an instruction). DEFAULT-OFF: NILCORE_SELFACC
+// unset ⇒ selfAcceptHook returns nil ⇒ the orchestrator is byte-identical.
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
+	"nilcore/internal/agent"
+	"nilcore/internal/artifact"
 	"nilcore/internal/artifact/evverify"
+	"nilcore/internal/eventlog"
+	"nilcore/internal/model"
 	"nilcore/internal/planner"
+	"nilcore/internal/policy"
+	"nilcore/internal/sandbox"
 	"nilcore/internal/verify/selfacc"
 )
 
@@ -98,36 +108,192 @@ func loadApprovedCandidates(path string) ([]selfacc.Candidate, error) {
 	return out, nil
 }
 
-// registerSelfAcceptance is the run-time wiring entry. It is a no-op unless the operator
-// has opted in (selfAcceptanceEnv) AND named an approved file (selfAcceptanceFileEnv).
-// It admits each candidate and registers the admissible ones into reg, returning the
-// bound verifier ids. A NON-admissible candidate is SKIPPED (with a stderr note) — never
-// registered — so an untrusted candidate can never bind. A malformed/unreadable file is
-// an error (the caller reddens the verdict), never a silent skip.
-func registerSelfAcceptance(reg *evverify.Registry) ([]string, error) {
-	if strings.TrimSpace(os.Getenv(selfAcceptanceEnv)) == "" {
-		return nil, nil // default-off
+// selfAcceptMaxEnv overrides the cap on how many checks the model may author per run
+// (so an attended operator is never asked to approve an unbounded list). Default below.
+const selfAcceptMaxEnv = "NILCORE_SELFACC_MAX"
+
+// defaultSelfAcceptMax bounds authored checks per run.
+const defaultSelfAcceptMax = 5
+
+// selfAcceptEnabled reports the opt-in. Unset ⇒ off (selfAcceptHook returns nil).
+func selfAcceptEnabled() bool { return strings.TrimSpace(os.Getenv(selfAcceptanceEnv)) != "" }
+
+// selfAcceptMax returns the per-run authored-check cap (NILCORE_SELFACC_MAX, else 5).
+func selfAcceptMax() int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(selfAcceptMaxEnv))); err == nil && v > 0 {
+		return v
 	}
-	cands, err := loadApprovedCandidates(os.Getenv(selfAcceptanceFileEnv))
+	return defaultSelfAcceptMax
+}
+
+// selfAcceptHook builds the orchestrator's closed-loop self-acceptance hook, capturing
+// the model provider for authoring. It returns nil when self-acceptance is off, so the
+// orchestrator is byte-identical (the hook is never installed).
+func selfAcceptHook(prov model.Provider) agent.SelfAcceptFunc {
+	if !selfAcceptEnabled() {
+		return nil
+	}
+	maxN := selfAcceptMax()
+	return func(ctx context.Context, goal string, box sandbox.Sandbox, gate func(policy.GateAction) bool, log *eventlog.Log) (bool, string) {
+		return runSelfAcceptance(ctx, prov, maxN, goal, box, gate, log)
+	}
+}
+
+// runSelfAcceptance gathers the run's self-acceptance checks — operator pre-approved
+// (NILCORE_SELFACC_FILE) plus up to maxN agent-authored (one model call) — and runs
+// them through runCandidates. A model/parse error in authoring is non-fatal (no
+// proposals); a malformed operator file is non-fatal here (skipped with a note) — the
+// floor verifier already governs, and self-acceptance only ever ADDS to the bar.
+func runSelfAcceptance(ctx context.Context, prov model.Provider, maxN int, goal string, box sandbox.Sandbox, gate func(policy.GateAction) bool, log *eventlog.Log) (bool, string) {
+	preApproved, ferr := loadApprovedCandidates(os.Getenv(selfAcceptanceFileEnv))
+	if ferr != nil {
+		fmt.Fprintf(os.Stderr, "nilcore selfacc: ignoring approved file: %v\n", ferr)
+		preApproved = nil
+	}
+	var proposed []selfacc.Candidate
+	if prov != nil {
+		var aerr error
+		if proposed, aerr = authorSelfAcceptCandidates(ctx, prov, goal, maxN); aerr != nil {
+			fmt.Fprintf(os.Stderr, "nilcore selfacc: authoring skipped: %v\n", aerr)
+			proposed = nil
+		}
+	}
+	appendSelfaccEvent(log, "selfacc_propose", map[string]any{
+		"pre_approved": len(preApproved), "proposed": len(proposed),
+	})
+	return runCandidates(ctx, box, gate, log, preApproved, proposed)
+}
+
+// runCandidates is the testable core: admit → (gate the agent-proposed) → bind into a
+// fresh per-run registry → resolve (run) each against the box → fold. It binds through
+// the leaf's designed seam — selfacc.Register (the ONLY path a self-authored verifier
+// becomes runnable) + selfacc.Resolve (fail-closed: an unbound/un-admitted id is
+// Unverifiable, never Pass). preApproved candidates skip the gate (the operator file IS
+// their approval); proposed candidates are each gated via a typed BindSelfAuthored
+// action. Only a BOUND check that RUNS and does not pass reddens the result — an
+// un-admissible or gate-denied candidate simply does not participate (denial ≠ failure).
+// With no bound checks the result is green (byte-identical to no self-acceptance).
+func runCandidates(ctx context.Context, box sandbox.Sandbox, gate func(policy.GateAction) bool, log *eventlog.Log, preApproved, proposed []selfacc.Candidate) (bool, string) {
+	reg := evverify.New() // fresh, per-run: holds ONLY this run's bound self-checks
+	var failures []string
+	run := func(c selfacc.Candidate, needGate bool) {
+		if err := selfacc.Admit(c); err != nil {
+			appendSelfaccEvent(log, "selfacc_skip", map[string]any{"id": c.VerifierID, "reason": err.Error()})
+			fmt.Fprintf(os.Stderr, "nilcore selfacc: skipping un-admissible candidate %q: %v\n", c.VerifierID, err)
+			return
+		}
+		if needGate {
+			action := policy.GateAction{Type: policy.BindSelfAuthored, Branch: c.VerifierID, Detail: clipSelfacc(c.Command, 120)}
+			approved := gate(action)
+			appendSelfaccEvent(log, "selfacc_gate", map[string]any{"id": c.VerifierID, "approved": approved})
+			if !approved {
+				return // not trusted ⇒ not bound; denial is not a failure
+			}
+		}
+		if _, err := selfacc.Register(reg, c); err != nil { // re-admits (defense in depth)
+			appendSelfaccEvent(log, "selfacc_skip", map[string]any{"id": c.VerifierID, "reason": err.Error()})
+			return
+		}
+		claim := artifact.Claim{Evidence: artifact.Evidence{Verifier: c.VerifierID}}
+		status, detail := selfacc.Resolve(ctx, reg, box, claim)
+		passed := status == artifact.StatusPass
+		appendSelfaccEvent(log, "selfacc_bind", map[string]any{
+			"id": c.VerifierID, "status": string(status), "passed": passed,
+		})
+		if needGate {
+			// Earn (or lose) trust for this self-check class so a proven one can later
+			// auto-approve within the operator envelope (amortized review). Only gated
+			// (agent-authored) checks feed trust; pre-approved operator checks do not.
+			emitBoundaryOutcome(log, policy.BindSelfAuthored.String(), c.VerifierID, passed)
+		}
+		if !passed {
+			d := strings.TrimSpace(detail)
+			if d == "" {
+				d = string(status)
+			}
+			failures = append(failures, fmt.Sprintf("%s (%s)", c.VerifierID, clipSelfacc(d, 160)))
+		}
+	}
+	for _, c := range preApproved {
+		run(c, false)
+	}
+	for _, c := range proposed {
+		run(c, true)
+	}
+	if len(failures) > 0 {
+		return false, "failed self-authored check(s): " + strings.Join(failures, "; ")
+	}
+	return true, ""
+}
+
+// authorSelfAcceptCandidates makes ONE bounded model call asking the agent to author up
+// to maxN sandbox-command acceptance checks for the goal, and parses the JSON reply as
+// UNTRUSTED data (I7) — each becomes a selfacc.Candidate, validated later by Admit. A
+// model error or unparseable reply returns an error (the caller treats it as "no
+// proposals", never a silent pass).
+func authorSelfAcceptCandidates(ctx context.Context, prov model.Provider, goal string, maxN int) ([]selfacc.Candidate, error) {
+	sys := fmt.Sprintf(`You author ACCEPTANCE CHECKS for a coding task. For the given goal, propose up to %d checks that would prove the work is actually done. Each check is a SINGLE shell command run INSIDE a sandbox at the repository root; exit code 0 means the criterion holds, non-zero means it does not. Commands must be deterministic, non-interactive, self-contained, and avoid the network. Do NOT propose host/in-process execution. Return ONLY a JSON object, no prose:
+{"candidates":[{"verifier_id":"candidate.<short_snake_case>","command":"<one shell line>","rationale":"<why this proves the criterion>"}]}`, maxN)
+	msgs := []model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "Goal:\n" + goal}}}}
+	resp, err := prov.Complete(ctx, sys, msgs, nil, 1024)
+	if err != nil {
+		return nil, fmt.Errorf("authoring model call: %w", err)
+	}
+	cands, err := parseSelfaccCandidates(firstSelfaccText(resp.Content))
 	if err != nil {
 		return nil, err
 	}
-	var registered []string
-	for _, c := range cands {
-		if aerr := selfacc.Admit(c); aerr != nil {
-			// Fail-closed: a rejected candidate stays untrusted and simply never binds.
-			fmt.Fprintf(os.Stderr, "nilcore selfacc: skipping un-admissible candidate %q: %v\n", c.VerifierID, aerr)
-			continue
-		}
-		id, rerr := selfacc.Register(reg, c)
-		if rerr != nil {
-			// Defense in depth (Register re-admits): treat as a hard error so a
-			// supposedly-admitted candidate that fails to bind never silently vanishes.
-			return nil, fmt.Errorf("registering self-acceptance verifier %q: %w", c.VerifierID, rerr)
-		}
-		registered = append(registered, id)
+	if len(cands) > maxN {
+		cands = cands[:maxN]
 	}
-	return registered, nil
+	return cands, nil
+}
+
+// parseSelfaccCandidates extracts the JSON object from the model reply and maps it to
+// candidates. UNTRUSTED data: no field is interpreted, only carried for Admit.
+func parseSelfaccCandidates(s string) ([]selfacc.Candidate, error) {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON object in authoring reply")
+	}
+	var f approvedFile
+	if err := json.Unmarshal([]byte(s[start:end+1]), &f); err != nil {
+		return nil, fmt.Errorf("parsing authored candidates: %w", err)
+	}
+	out := make([]selfacc.Candidate, 0, len(f.Candidates))
+	for _, c := range f.Candidates {
+		out = append(out, c.toCandidate())
+	}
+	return out, nil
+}
+
+// firstSelfaccText returns the first text block of a model response.
+func firstSelfaccText(blocks []model.Block) string {
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			return b.Text
+		}
+	}
+	return ""
+}
+
+// appendSelfaccEvent appends a metadata-only self-acceptance audit event (I5). nil-safe.
+func appendSelfaccEvent(log *eventlog.Log, kind string, detail map[string]any) {
+	if log == nil {
+		return
+	}
+	log.Append(eventlog.Event{Kind: kind, Detail: detail})
+}
+
+// clipSelfacc bounds a string for a prompt/detail field so an untrusted command/output
+// can never flood a gate prompt or an event Detail.
+func clipSelfacc(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // selfaccMain implements `nilcore selfacc` — the operator review surface. Subcommands:
@@ -197,9 +363,9 @@ func selfaccPropose(args []string) {
 	for _, c := range p.Criteria {
 		fmt.Printf("  - [%s] %s\n", c.Field, c.Statement)
 	}
-	fmt.Println("\nThese are INERT proposals. To make any one binding, author a sandbox-command")
-	fmt.Println("candidate for it, review it with `nilcore selfacc check`, place it in your")
-	fmt.Printf("approved file, and run with %s=1 %s=<file>.\n", selfAcceptanceEnv, selfAcceptanceFileEnv)
+	fmt.Println("\nThese are INERT proposals. With NILCORE_SELFACC=1 the agent authors a")
+	fmt.Println("sandbox-command check per criterion at run time and you approve each at the")
+	fmt.Printf("gate; or pre-approve a reviewed set via %s=<file>. See docs/SELFACC.md.\n", selfAcceptanceFileEnv)
 }
 
 // selfaccCheck admits every candidate in an approved file and reports the verdict per
@@ -238,6 +404,7 @@ func selfaccCheck(args []string) {
 		fmt.Printf("\n%d candidate(s) un-admissible — they would be SKIPPED (never bound).\n", rejected)
 		os.Exit(1)
 	}
-	fmt.Println("\nAll candidates admissible. With NILCORE_SELFACC=1 and this file named by")
-	fmt.Println("NILCORE_SELFACC_FILE, each binds a sandboxed, fail-closed check at verify time.")
+	fmt.Println("\nAll candidates admissible. Named by NILCORE_SELFACC_FILE (with NILCORE_SELFACC=1)")
+	fmt.Println("each runs as a PRE-APPROVED, sandboxed, fail-closed check during the run (it skips")
+	fmt.Println("the gate — the file is your approval). Agent-authored checks are gated per-run instead.")
 }

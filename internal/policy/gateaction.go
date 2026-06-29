@@ -38,6 +38,17 @@ const (
 	// remote), so it is always gated. Added last so the existing iota values are
 	// unchanged.
 	OpenPR
+	// BindSelfAuthored binds a MODEL-AUTHORED acceptance verifier so it becomes a
+	// real, sandboxed check that gates the run (internal/verify/selfacc, the
+	// closed-loop "the agent raises its own bar"). It is a trust escalation — the
+	// agent is proposing how its own work is judged — so it is gated like any other
+	// boundary action: an attended operator approves each, a headless run denies by
+	// default, and graduated auto-approval (graapprove) admits only a self-check
+	// that has EARNED trust within the operator envelope. The bound check can only
+	// ADD a criterion that must also pass (it never lowers the bar — I2); the gate
+	// governs only WHETHER the agent's proposed check is trusted to participate.
+	// Added last so the existing iota values are unchanged.
+	BindSelfAuthored
 )
 
 func (t GateActionType) String() string {
@@ -50,6 +61,8 @@ func (t GateActionType) String() string {
 		return "deploy"
 	case OpenPR:
 		return "open-pr"
+	case BindSelfAuthored:
+		return "bind-self-authored"
 	default:
 		return "unknown"
 	}

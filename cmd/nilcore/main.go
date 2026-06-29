@@ -1052,6 +1052,10 @@ func buildRunOrchestratorWith(c commonFlags, b boot, log *eventlog.Log, absDir s
 	// Phase 13: -backends (two or more) activates strength-routing for the run-style
 	// commands (propose-edit / watch / self-improve / schedule). EMPTY/single ⇒ no-op.
 	wireMultiBackend(orch, c, b, log, mem, absDir, blast)
+	// P16 closed-loop self-acceptance (opt-in, NILCORE_SELFACC): after the floor
+	// verifier passes, the agent's own gated acceptance checks must ALSO pass. nil when
+	// off ⇒ byte-identical. Captures the run's model provider for authoring.
+	orch.SelfAccept = selfAcceptHook(prov)
 	return orch
 }
 
@@ -2018,7 +2022,7 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 				n.SteeringContext = func() string { return steer }
 			}
 		}
-		return agent.Env{Backend: be, Verifier: v}
+		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
 }
 
@@ -2052,7 +2056,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 				n.SteeringContext = func() string { return steer }
 			}
 		}
-		return agent.Env{Backend: be, Verifier: v}
+		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
 }
 
