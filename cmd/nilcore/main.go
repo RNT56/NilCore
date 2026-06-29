@@ -1065,6 +1065,7 @@ func serveMain(args []string) {
 	maxConcurrent := fs.Int("max-concurrent", 0, "max serve drives running at once across all threads (0 = default 4)")
 	maxLifetime := fs.Duration("max-lifetime", 0, "after this wall-clock duration, serve checkpoints in-flight work and exits cleanly so a supervisor (systemd) restarts it into the resume path (0 = no cap)")
 	webhookAddr := fs.String("webhook", "", "address for the SCM/CI webhook intake (e.g. 127.0.0.1:8099); needs NILCORE_WEBHOOK_SECRET")
+	autonomySignals := fs.String("autonomy-signals", "", "directory the autonomy daemon (NILCORE_AUTONOMY) watches for dropped goal files, folded into the unified self-start queue alongside standing objectives + due wakes (empty = no file funnel)")
 	egressProfile := fs.String("egress-profile", "", "opt into a named research egress preset (finance|docs|web-research) that WIDENS the sandbox allowlist to a sanctioned host set; empty = default-deny. Overrides NILCORE_EGRESS_PROFILE and the persisted config.")
 	c := registerCommon(fs)
 	_ = fs.Parse(args)
@@ -1234,7 +1235,10 @@ func serveMain(args []string) {
 		// it never opens a competing single-writer handle to the same file.
 		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
 		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
-		go runAutonomyDaemon(ctx, autoOrch, log, serveStore, gate.idle)
+		// The daemon drains the unified queue: standing objectives + dropped file signals
+		// (-autonomy-signals) + due durable wakes (wakeReg, which serve otherwise never
+		// fires) — all through the verified, headless-gated orchestrator.
+		go runAutonomyDaemon(ctx, autoOrch, log, serveStore, gate.idle, wakeReg, *autonomySignals)
 	}
 
 	// Durable resume: re-drive any native task a prior process left running or
