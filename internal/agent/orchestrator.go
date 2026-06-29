@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/policy"
 	"nilcore/internal/project"
 	"nilcore/internal/route"
+	"nilcore/internal/sandbox"
 	"nilcore/internal/trust"
 	"nilcore/internal/verify"
 	"nilcore/internal/worktree"
@@ -27,7 +29,24 @@ import (
 type Env struct {
 	Backend  backend.CodingBackend
 	Verifier verify.Verifier
+	// Box is the worktree sandbox the backend/verifier run against. It is exposed so
+	// the optional SelfAccept hook can run the agent's gated acceptance checks inside
+	// the SAME box (I4) after the floor verifier passes. May be nil (paths that do
+	// not wire self-acceptance leave it unset; the hook is then never called).
+	Box sandbox.Sandbox
 }
+
+// SelfAcceptFunc is the optional closed-loop self-acceptance hook (internal/verify/
+// selfacc). After the project's verifier (the floor — I2) passes, the orchestrator
+// calls it so the agent's OWN gated acceptance checks must ALSO pass before the run
+// is judged done. It receives the goal (untrusted data — I7), the worktree box (to
+// run checks inside the sandbox — I4), a structured-gate closure (so each proposed
+// check is approved like any boundary action — attended human / headless deny /
+// graduated auto-approval), and the log (audit — I5). It returns whether the self-
+// authored acceptance bar held, plus a bounded detail for the verdict output. It can
+// only ADD to the bar: the orchestrator consults it ONLY when the floor is green and
+// a false result reddens the verdict — it can never green a red floor.
+type SelfAcceptFunc func(ctx context.Context, goal string, box sandbox.Sandbox, gate func(policy.GateAction) bool, log *eventlog.Log) (passed bool, detail string)
 
 // Router selects the backend for a task. The default (SingleRouter) returns the
 // configured backend unchanged; Phase 3 (P3-T04) races best-of-N and lets the
@@ -44,8 +63,8 @@ type Spawner interface {
 
 // Selector orders/filters a set of candidate backend NAMES best-first for a task
 // (Phase 13 multi-backend strength-routing). It is the structural seam the Trust
-// Ledger plugs into — trust.Selector satisfies this shape WITHOUT importing agent,
-// exactly like trust.Router satisfies Router. I2 boundary: a Selector only orders
+// Ledger plugs into — trust.Selector satisfies this shape WITHOUT importing agent
+// (the leaf rule: the orchestrator wires the leaf, never the reverse). I2 boundary: a Selector only orders
 // WHICH backend to run first; it NEVER decides "done" or the race winner. The
 // verifier still judges every race (route.Race) and re-runs as the final gate
 // (executeSingle), so a Selector is a bias on the first attempt, never an override.
@@ -76,6 +95,11 @@ type Orchestrator struct {
 	Router   Router          // defaults to SingleRouter
 	Spawner  Spawner         // defaults to NoSpawner
 	Approver policy.Approver // consulted for irreversible actions; nil denies them
+
+	// SelfAccept, when set, is the closed-loop self-acceptance hook (opt-in). After
+	// the floor verifier passes, the agent's own gated acceptance checks must ALSO
+	// pass (it can only ADD to the bar — I2). nil ⇒ never called (byte-identical).
+	SelfAccept SelfAcceptFunc
 
 	// RaceN, when > 1, escalates a VERIFY-FAILED single task to a best-of-N race
 	// (P3-T04, internal/route): N fresh worktrees run a backend in parallel and the
@@ -391,6 +415,22 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	if !rep.Passed && (raceN > 1 || o.multiBackend()) {
 		if rout, ok := o.raceEscalate(ctx, t, raceN); ok {
 			return rout, nil
+		}
+	}
+
+	// Closed-loop self-acceptance (opt-in, P16): once the project's verifier (the
+	// floor — I2) is GREEN, the agent's OWN gated acceptance checks must ALSO pass
+	// before the run is judged done. The hook is consulted ONLY when rep.Passed, and
+	// a false result reddens the verdict — so it can only ever RAISE the bar, never
+	// green a red floor. Each proposed check is gated (attended human / headless deny
+	// / graduated auto-approval) and runs inside the worktree box (I4). nil hook ⇒
+	// byte-identical. (Raced winners take the early return above and skip this extra
+	// bar — a deliberate, safe scoping: the floor still governed them.)
+	if rep.Passed && o.SelfAccept != nil {
+		gate := func(a policy.GateAction) bool { return policy.GateStructured(a, o.Approver) }
+		if saPassed, saDetail := o.SelfAccept(ctx, t.Goal, env.Box, gate, o.Log); !saPassed {
+			rep.Passed = false
+			rep.Output = strings.TrimSpace(rep.Output + "\nself-acceptance: " + saDetail)
 		}
 	}
 

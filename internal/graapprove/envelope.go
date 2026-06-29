@@ -39,13 +39,14 @@ import (
 
 // classTypes is the CLOSED set of admissible ClassClause.Type strings, mirroring
 // the closed policy.GateActionType String() set {promote-to-base, push, deploy,
-// open-pr}. Anything outside it is rejected by Validate — a new boundary action is
-// a deliberate addition, never inferred.
+// open-pr, bind-self-authored}. Anything outside it is rejected by Validate — a new
+// boundary action is a deliberate addition, never inferred.
 var classTypes = map[string]struct{}{
-	"promote-to-base": {},
-	"push":            {},
-	"deploy":          {},
-	"open-pr":         {},
+	"promote-to-base":    {},
+	"push":               {},
+	"deploy":             {},
+	"open-pr":            {},
+	"bind-self-authored": {},
 }
 
 // Envelope is the operator-authored auto-approval policy: one clause per action
@@ -112,7 +113,7 @@ func (e *Envelope) Validate() error {
 
 func (c ClassClause) validate() error {
 	if _, ok := classTypes[c.Type]; !ok {
-		return fmt.Errorf("unknown type %q (must be one of promote-to-base|push|deploy|open-pr)", c.Type)
+		return fmt.Errorf("unknown type %q (must be one of promote-to-base|push|deploy|open-pr|bind-self-authored)", c.Type)
 	}
 	if c.MinSuccesses < 1 {
 		return errors.New("min_successes must be >= 1 (a blank trust bar is rejected, never unlimited)")

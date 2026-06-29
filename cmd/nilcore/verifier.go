@@ -302,14 +302,12 @@ func verifyPacks() []string {
 // command string, the persisted Evidence.SourceURL, or any event Detail (I3).
 func evidenceRegistry() (*evverify.Registry, error) {
 	reg := evverify.Default()
-	names := verifyPacks()
-	if len(names) == 0 {
-		return reg, nil
+	if names := verifyPacks(); len(names) > 0 {
+		if err := packs.Select(names, reg); err != nil {
+			return nil, err
+		}
+		seedKeyedPackSecrets(names)
 	}
-	if err := packs.Select(names, reg); err != nil {
-		return nil, err
-	}
-	seedKeyedPackSecrets(names)
 	return reg, nil
 }
 

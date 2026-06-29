@@ -4,8 +4,8 @@
 // orchestrator will consult to make trust-informed routing the default: which
 // candidate backends to try, in what order, with how much escalation budget.
 // The Trust Ledger (internal/trust) IMPLEMENTS this interface WITHOUT importing
-// agent — exactly like trust.Selector satisfies Selector and trust.Router
-// satisfies Router. The dependency direction stays orchestrator <- trust: the
+// agent — exactly like trust.Selector satisfies Selector. The dependency
+// direction stays orchestrator <- trust: the
 // orchestrator wires the leaf; the leaf never reaches back.
 //
 // I2 boundary: a TrustOracle only ORDERS / PRUNES / SIZES candidacy. It never
