@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"nilcore/internal/channel"
 )
 
 type fakeSource struct {
@@ -170,4 +172,75 @@ func TestAskRejectsUnauthorizedClicker(t *testing.T) {
 	if ok {
 		t.Fatal("an unauthorized clicker's approval was honored")
 	}
+}
+
+// chanSource is a controllable eventSource for concurrency tests: the test pushes
+// envelopes on ch and the single intake reads them in order.
+type chanSource struct{ ch chan event }
+
+func (c *chanSource) Next(ctx context.Context) (event, error) {
+	select {
+	case e := <-c.ch:
+		return e, nil
+	case <-ctx.Done():
+		return event{}, ctx.Err()
+	}
+}
+func (c *chanSource) Ack(context.Context, string) error { return nil }
+func (c *chanSource) Close() error                      { return nil }
+
+// TestSlackConcurrentReceiveAndAsk proves the single-intake demux: Receive and a gate
+// Ask run CONCURRENTLY on one Bot, the gate answer routes to Ask and the message routes
+// to Receive, and `go test -race` sees no data race over the socket (the bug this fix
+// closes — previously both read b.src concurrently).
+func TestSlackConcurrentReceiveAndAsk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true,"ts":"1"}`)
+	}))
+	defer srv.Close()
+	b := New("app", "bot")
+	b.apiBase = srv.URL
+	src := &chanSource{ch: make(chan event, 8)}
+	b.src = src
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	askDone := make(chan bool, 1)
+	go func() { ok, _ := b.Ask(ctx, "C9", "merge?"); askDone <- ok }()
+	waitGate(t, b, "ask-1") // Ask has registered its gate
+
+	recvDone := make(chan channel.TaskRequest, 1)
+	go func() { tr, _ := b.Receive(ctx); recvDone <- tr }()
+
+	src.ch <- event{Type: "interactive", EnvelopeID: "e1", Payload: json.RawMessage(`{"type":"block_actions","actions":[{"value":"yes:ask-1"}],"channel":{"id":"C9"}}`)}
+	src.ch <- event{Type: "events_api", EnvelopeID: "e2", Payload: json.RawMessage(`{"event":{"type":"message","text":"do it","user":"U1","channel":"C9"}}`)}
+
+	select {
+	case ok := <-askDone:
+		if !ok {
+			t.Error("gate answer yes:ask-1 should resolve the gate to true")
+		}
+	case <-ctx.Done():
+		t.Fatal("Ask never resolved")
+	}
+	select {
+	case tr := <-recvDone:
+		if tr.Goal != "do it" {
+			t.Errorf("Receive got %+v, want goal 'do it'", tr)
+		}
+	case <-ctx.Done():
+		t.Fatal("Receive never delivered the message")
+	}
+}
+
+func waitGate(t *testing.T, b *Bot, id string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.lookupGate(id) != nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("gate %q never registered", id)
 }

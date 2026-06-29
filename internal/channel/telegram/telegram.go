@@ -37,10 +37,15 @@ type Bot struct {
 	// pending concurrently — so these need synchronization (the network call in poll
 	// runs OUTSIDE the lock). Kept separate from amu to avoid re-entrancy with
 	// handleAskCallback, which locks amu.
-	smu     sync.Mutex
-	offset  int                   // last seen update_id (guarded by smu)
-	askSeq  atomic.Int64          // unique gate/ask-callback ids
-	pending []channel.TaskRequest // task messages (and resolved ask taps) seen while awaiting a gate answer (guarded by smu)
+	smu           sync.Mutex
+	offset        int                   // last seen update_id (guarded by smu)
+	askSeq        atomic.Int64          // unique gate/ask-callback ids
+	pending       []channel.TaskRequest // task messages (and resolved ask taps) (guarded by smu)
+	gates         map[string]*gateEntry // pending gate id -> answer waiter (guarded by smu; the poller routes here)
+	intakeStarted bool                  // the single poller goroutine is running (guarded by smu)
+	// taskWake is poked (buffered, non-blocking) after a task is queued so a parked
+	// Receive re-checks the queue. Buffered(1): the single poller never blocks on it.
+	taskWake chan struct{}
 
 	amu  sync.Mutex           // guards asks
 	asks map[string]*askEntry // ask_user choice prompts awaiting a tap, by correlation token
@@ -49,14 +54,24 @@ type Bot struct {
 	log       *eventlog.Log     // for recording rejected gate/ask clicks (may be nil)
 }
 
+// gateEntry is one pending Ask awaiting its yes/no answer. reply is buffered(1) so the
+// single poller delivers the first answer without ever blocking; thread is kept for the
+// unauthorized-click audit line.
+type gateEntry struct {
+	reply  chan bool
+	thread string
+}
+
 var _ channel.Channel = (*Bot)(nil)
 
 // New returns a bot for the given TELEGRAM_BOT_TOKEN.
 func New(token string) *Bot {
 	return &Bot{
-		token:   token,
-		baseURL: defaultAPIBase,
-		asks:    map[string]*askEntry{},
+		token:    token,
+		baseURL:  defaultAPIBase,
+		asks:     map[string]*askEntry{},
+		gates:    map[string]*gateEntry{},
+		taskWake: make(chan struct{}, 1),
 		// Slightly longer than the long-poll timeout below.
 		http: &http.Client{Timeout: 70 * time.Second},
 	}
@@ -117,58 +132,34 @@ func (b *Bot) popPending() (channel.TaskRequest, bool) {
 	return tr, true
 }
 
-// pushPending appends a request to the buffered queue (smu-guarded).
+// pushPending appends a request to the buffered queue (smu-guarded) and pokes taskWake
+// so a parked Receive re-checks. The poke is non-blocking (buffered 1) so the single
+// poller goroutine never stalls on it.
 func (b *Bot) pushPending(tr channel.TaskRequest) {
 	b.smu.Lock()
 	b.pending = append(b.pending, tr)
 	b.smu.Unlock()
+	select {
+	case b.taskWake <- struct{}{}:
+	default:
+	}
 }
 
-// Receive blocks until the next text message, returning it as a task request.
+// Receive blocks until the next task request arrives. It NEVER polls itself: the single
+// poller goroutine (startIntake) owns the offset + getUpdates and queues task requests,
+// and Receive drains that queue. That removes the Receive/Ask double-delivery race —
+// previously two concurrent poll() calls read the same offset and each advanced it,
+// delivering every update twice.
 func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
+	b.startIntake(ctx)
 	for {
 		if tr, ok := b.popPending(); ok {
 			return tr, nil
 		}
-		if err := ctx.Err(); err != nil {
-			return channel.TaskRequest{}, err
-		}
-		ups, err := b.poll(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return channel.TaskRequest{}, ctx.Err()
-			}
-			time.Sleep(retryWait) // graceful: network blip, retry
-			continue
-		}
-		var got *channel.TaskRequest
-		for _, u := range ups {
-			// An ask_user button tap (callback) becomes an ORDINARY authorized task
-			// request carrying the formatted answer line — it then flows through the
-			// same intake→Permit→Turn→Resolve path a typed message does (I7: no new
-			// trust promotion). A toggle/unauthorized/stale tap yields nil.
-			if u.CallbackQuery != nil {
-				if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
-					if got == nil {
-						got = tr
-					} else {
-						b.pushPending(*tr)
-					}
-				}
-				continue
-			}
-			if u.Message == nil || strings.TrimSpace(u.Message.Text) == "" {
-				continue
-			}
-			tr := toRequest(u.Message)
-			if got == nil {
-				got = &tr
-			} else {
-				b.pushPending(tr) // don't drop concurrent messages
-			}
-		}
-		if got != nil {
-			return *got, nil
+		select {
+		case <-b.taskWake:
+		case <-ctx.Done():
+			return channel.TaskRequest{}, ctx.Err()
 		}
 	}
 }
@@ -293,6 +284,13 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 		return false, fmt.Errorf("bad thread id %q: %w", threadID, err)
 	}
 	id := fmt.Sprintf("ask-%d", b.askSeq.Add(1))
+	reply := make(chan bool, 1)
+	// Register the gate BEFORE the poller could read its answer (and before posting),
+	// so a fast answer is always routed to a registered waiter.
+	b.registerGate(id, threadID, reply)
+	defer b.unregisterGate(id)
+	b.startIntake(ctx)
+
 	keyboard := map[string]any{"inline_keyboard": [][]map[string]any{{
 		{"text": "✅ Yes", "callback_data": "yes:" + id},
 		{"text": "❌ No", "callback_data": "no:" + id},
@@ -302,49 +300,114 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 	}, nil); err != nil {
 		return false, err
 	}
+	select {
+	case ans := <-reply:
+		return ans, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
 
+// startIntake launches the SINGLE poller goroutine once, for the lifetime of the first
+// caller's ctx — in serve that is the long-lived Receive loop. Exactly one goroutine
+// ever advances the offset / calls getUpdates, so Receive and any number of concurrent
+// Asks never double-deliver updates.
+func (b *Bot) startIntake(ctx context.Context) {
+	b.smu.Lock()
+	start := !b.intakeStarted
+	if start {
+		b.intakeStarted = true
+	}
+	b.smu.Unlock()
+	if start {
+		go b.intake(ctx)
+	}
+}
+
+// intake is the sole poller: it long-polls getUpdates and routes each update — a gate
+// answer to the waiting Ask, an ask_user tap or a message to the task queue.
+func (b *Bot) intake(ctx context.Context) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return
 		}
 		ups, err := b.poll(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return
 			}
-			time.Sleep(retryWait)
+			time.Sleep(retryWait) // graceful: network blip, retry
 			continue
 		}
 		for _, u := range ups {
-			if u.CallbackQuery != nil && strings.HasSuffix(u.CallbackQuery.Data, ":"+id) {
-				clicker := strconv.FormatInt(u.CallbackQuery.From.ID, 10)
-				if b.authorize != nil && !b.authorize(clicker) {
-					if b.log != nil {
-						b.log.Append(eventlog.Event{Kind: "unauthorized_gate",
-							Detail: map[string]any{"principal": clicker, "thread": threadID}})
-					}
-					_ = b.call(ctx, "answerCallbackQuery", map[string]any{
-						"callback_query_id": u.CallbackQuery.ID, "text": "Not authorized to answer this gate."}, nil)
-					continue // ignore; keep waiting for an authorized responder
-				}
-				_ = b.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": u.CallbackQuery.ID}, nil)
-				return strings.HasPrefix(u.CallbackQuery.Data, "yes:"), nil
-			}
-			// An ask_user button tap that lands in THIS gate's poll loop (the gate and
-			// Receive can race the shared offset) must not be dropped: resolve it and
-			// buffer the resulting answer task so Receive delivers it. A toggle/stale/
-			// unauthorized tap yields nil.
-			if u.CallbackQuery != nil && strings.HasPrefix(u.CallbackQuery.Data, "ask:") {
-				if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
-					b.pushPending(*tr)
-				}
-				continue
-			}
-			if u.Message != nil && strings.TrimSpace(u.Message.Text) != "" {
-				b.pushPending(toRequest(u.Message)) // buffer, don't drop
-			}
+			b.route(ctx, u)
 		}
 	}
+}
+
+// route classifies one update. A gate answer for a PENDING gate is delivered to that
+// gate's waiter (after the authorizer check + the callback ack); an ask_user tap or a
+// message becomes a task request. A stale/foreign callback is dropped.
+func (b *Bot) route(ctx context.Context, u tgUpdate) {
+	if u.CallbackQuery != nil {
+		data := u.CallbackQuery.Data
+		if g := b.lookupGate(gateID(data)); g != nil {
+			clicker := strconv.FormatInt(u.CallbackQuery.From.ID, 10)
+			if b.authorize != nil && !b.authorize(clicker) {
+				if b.log != nil {
+					b.log.Append(eventlog.Event{Kind: "unauthorized_gate",
+						Detail: map[string]any{"principal": clicker, "thread": g.thread}})
+				}
+				_ = b.call(ctx, "answerCallbackQuery", map[string]any{
+					"callback_query_id": u.CallbackQuery.ID, "text": "Not authorized to answer this gate."}, nil)
+				return // ignore; the gate keeps waiting for an authorized responder
+			}
+			_ = b.call(ctx, "answerCallbackQuery", map[string]any{"callback_query_id": u.CallbackQuery.ID}, nil)
+			select {
+			case g.reply <- strings.HasPrefix(data, "yes:"):
+			default: // already answered (buffered 1) — first answer wins
+			}
+			return
+		}
+		// Not a gate answer: an ask_user tap becomes an ORDINARY authorized task request
+		// (the answer line, Sender=clicker), flowing through the same intake→Permit→Turn
+		// path a typed message does (I7).
+		if strings.HasPrefix(data, "ask:") {
+			if tr := b.handleAskCallback(ctx, u.CallbackQuery); tr != nil {
+				b.pushPending(*tr)
+			}
+		}
+		return
+	}
+	if u.Message != nil && strings.TrimSpace(u.Message.Text) != "" {
+		b.pushPending(toRequest(u.Message))
+	}
+}
+
+// gateID extracts the gate id from a callback ("yes:ask-3" / "no:ask-3" → "ask-3").
+func gateID(data string) string {
+	if i := strings.IndexByte(data, ':'); i >= 0 {
+		return data[i+1:]
+	}
+	return ""
+}
+
+func (b *Bot) registerGate(id, thread string, reply chan bool) {
+	b.smu.Lock()
+	b.gates[id] = &gateEntry{reply: reply, thread: thread}
+	b.smu.Unlock()
+}
+
+func (b *Bot) unregisterGate(id string) {
+	b.smu.Lock()
+	delete(b.gates, id)
+	b.smu.Unlock()
+}
+
+func (b *Bot) lookupGate(id string) *gateEntry {
+	b.smu.Lock()
+	defer b.smu.Unlock()
+	return b.gates[id]
 }
 
 func toRequest(m *tgMessage) channel.TaskRequest {
