@@ -2,7 +2,7 @@
 //
 // This file DEFINES (never implements) an additive, optional seam the
 // orchestrator will consult to make trust-informed routing the default: which
-// candidate backends to try, in what order, with how much escalation budget.
+// candidate backends to try and in what order, with what best-of-N sizing.
 // The Trust Ledger (internal/trust) IMPLEMENTS this interface WITHOUT importing
 // agent — exactly like trust.Selector satisfies Selector. The dependency
 // direction stays orchestrator <- trust: the
@@ -14,7 +14,7 @@
 // bias on what to attempt and how hard, never an override of the verdict.
 //
 // DEFAULT-OFF: a nil TrustOracle ⇒ today's static behaviour, byte-identical. The
-// PlanRoute / OracleRaceN / OracleEscalateAfter helpers below let the
+// PlanRoute / OracleRaceN helpers below let the
 // orchestrator call THROUGH a possibly-nil oracle without branching at each call
 // site — a nil oracle returns the inputs / default values unchanged.
 
@@ -29,8 +29,8 @@ import "context"
 //
 // The sizing hints are OPTIONAL and use a zero-as-unset convention: a hint of 0
 // means "no opinion — keep the orchestrator's configured default" (so a plan that
-// only reorders candidates leaves race-N and escalate-after exactly as the static
-// path would have them). A wired oracle that wants to size sets a value > 0.
+// only reorders candidates leaves race-N exactly as the static
+// path would have it). A wired oracle that wants to size sets a value > 0.
 type RoutePlan struct {
 	// Candidates is the ordered, possibly-pruned set of backend names to try,
 	// best-first. An empty slice means "no opinion": the orchestrator keeps its
@@ -42,10 +42,6 @@ type RoutePlan struct {
 	// verify-fail escalation of this task class (replacing the fixed RaceN flag).
 	// 0 ⇒ no opinion: the orchestrator's configured default stands.
 	RaceN int
-
-	// EscalateAfter, when > 0, is the oracle's data-driven attempt budget before
-	// escalating this task class. 0 ⇒ no opinion: the configured default stands.
-	EscalateAfter int
 }
 
 // TrustOracle is the optional seam the orchestrator consults to make routing
@@ -57,15 +53,12 @@ type RoutePlan struct {
 //     class given the configured candidate names.
 //   - RaceN returns the data-driven best-of-N for a task class, or the supplied
 //     default when the oracle has no confident opinion (cold/low-confidence cell).
-//   - EscalateAfter returns the data-driven attempt budget for a task class, or
-//     the supplied default when the oracle has no confident opinion.
 //
 // taskClass is a deterministic keyword bucket (trust.Classify); candidates are
 // backend names in configured order.
 type TrustOracle interface {
 	Plan(ctx context.Context, taskClass string, candidates []string) RoutePlan
 	RaceN(taskClass string, def int) int
-	EscalateAfter(taskClass string, def int) int
 }
 
 // PlanRoute consults a possibly-nil oracle and returns the candidate ordering the
@@ -87,8 +80,7 @@ func PlanRoute(ctx context.Context, o TrustOracle, taskClass string, candidates 
 	plan := o.Plan(ctx, taskClass, candidates)
 	if len(plan.Candidates) == 0 {
 		// Degenerate plan: keep the configured set but preserve any sizing hints
-		// the oracle still expressed (race-N / escalate-after are independent of
-		// the candidate list).
+		// the oracle still expressed (race-N is independent of the candidate list).
 		plan.Candidates = candidates
 	}
 	return plan, true
@@ -102,13 +94,4 @@ func OracleRaceN(o TrustOracle, taskClass string, def int) int {
 		return def
 	}
 	return o.RaceN(taskClass, def)
-}
-
-// OracleEscalateAfter returns the attempt budget through a possibly-nil oracle: a
-// nil oracle yields the default unchanged (static path).
-func OracleEscalateAfter(o TrustOracle, taskClass string, def int) int {
-	if o == nil {
-		return def
-	}
-	return o.EscalateAfter(taskClass, def)
 }

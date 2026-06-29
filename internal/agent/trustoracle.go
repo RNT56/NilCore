@@ -221,15 +221,6 @@ func (o *TrustRouteOracle) RaceN(_ string, def int) int {
 	return def
 }
 
-// EscalateAfter returns the attempt budget before escalating a class, never LESS
-// safe than the supplied default. Lowering the budget would escalate sooner (which
-// could be cheaper but trades away the cheaper-backend's extra attempts); raising
-// it is always safe (more attempts before escalation). With thin evidence the safe
-// move is to keep the default, so this is a conservative no-op for now.
-func (o *TrustRouteOracle) EscalateAfter(_ string, def int) int {
-	return def
-}
-
 // hasConfidentCell reports whether at least one candidate has a class cell sampled
 // enough to act on (>= minRacesForOpinion races). This is the cold-start gate: no
 // confident cell ⇒ the oracle abstains and returns candidates unchanged.

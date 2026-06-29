@@ -41,8 +41,8 @@ func TestTrustRouteOracle_ColdLedgerByteIdentical(t *testing.T) {
 	if !reflect.DeepEqual(plan.Candidates, cands) {
 		t.Fatalf("cold ledger changed candidates: got %v want %v", plan.Candidates, cands)
 	}
-	if plan.RaceN != 0 || plan.EscalateAfter != 0 {
-		t.Fatalf("cold ledger expressed sizing hints: raceN=%d escalateAfter=%d", plan.RaceN, plan.EscalateAfter)
+	if plan.RaceN != 0 {
+		t.Fatalf("cold ledger expressed sizing hints: raceN=%d", plan.RaceN)
 	}
 
 	// Nil ledger is equally an abstain.
@@ -178,9 +178,6 @@ func TestTrustRouteOracle_SizingConservative(t *testing.T) {
 	for _, def := range []int{1, 2, 3, 5} {
 		if got := o.RaceN("refactor", def); got < def {
 			t.Fatalf("RaceN returned a LESS safe value: got %d < default %d", got, def)
-		}
-		if got := o.EscalateAfter("refactor", def); got < def {
-			t.Fatalf("EscalateAfter returned a LESS safe value: got %d < default %d", got, def)
 		}
 	}
 }

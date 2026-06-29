@@ -76,16 +76,6 @@ type Native struct {
 	Advisor       *advisor.Advisor
 	EscalateAfter int // consecutive verifier failures before auto-consulting (0 = off)
 
-	// EscalateAfterFn, when set, supplies the escalate-after threshold DYNAMICALLY in
-	// place of the static EscalateAfter field (RTE-T05). The caller wires it from
-	// agent.OracleEscalateAfter so the trust oracle can size the budget per task-class
-	// from earned evidence (a strongly-proven class can wait longer before paying for
-	// the advisor). It is consulted once per verifier failure and folded through the
-	// SAME advisor.ShouldEscalate gate as the static field — the oracle only SIZES the
-	// budget, it never decides "done" (I2) and the threshold the model never sees (I3).
-	// nil ⇒ the static EscalateAfter is used exactly as today, byte-identical.
-	EscalateAfterFn func() int
-
 	// Peer, if set, is this subagent's handle on the inter-agent bus (multi-agent
 	// design §3). It registers the three bus tools (ask_supervisor / share_finding
 	// / request_review) and dispatches them. nil leaves the loop byte-identical —
@@ -223,15 +213,9 @@ type Peer interface {
 
 func (n *Native) Name() string { return "native" }
 
-// escalateAfter is the effective consecutive-failure threshold before auto-consulting
-// the advisor: the dynamic EscalateAfterFn budget when one is wired (RTE-T05 — the
-// trust oracle sizes it per task-class), else the static EscalateAfter field. With
-// EscalateAfterFn nil this returns EscalateAfter verbatim, so the escalation gate is
-// byte-identical to the pre-RTE loop. It is a pure read of config — no IO, no model.
+// escalateAfter is the consecutive-failure threshold before auto-consulting the advisor.
+// A pure read of config — no IO, no model.
 func (n *Native) escalateAfter() int {
-	if n.EscalateAfterFn != nil {
-		return n.EscalateAfterFn()
-	}
 	return n.EscalateAfter
 }
 
@@ -961,8 +945,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			failText := "The checks did not pass. Fix the issues and call finish again.\n\n" + guard.Wrap("verifier output", rep.Output)
 			// Fallback escalation: after K failures in a row, auto-consult the
 			// advisor even when the executor did not ask (advisor.ShouldEscalate). K is
-			// the dynamic EscalateAfterFn budget when wired (RTE-T05), else the static
-			// EscalateAfter — byte-identical when EscalateAfterFn is nil.
+			// the EscalateAfter threshold (0 ⇒ off).
 			if n.Advisor != nil && advisor.ShouldEscalate(consecutiveFailures, n.escalateAfter()) {
 				// Fence the verifier output as untrusted data for the advisor too —
 				// the executor already gets it fenced above (I7 symmetry).
