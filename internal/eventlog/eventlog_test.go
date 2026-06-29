@@ -377,3 +377,26 @@ func TestSequenceAnchorDetectsReorder(t *testing.T) {
 		t.Fatal("reordered events were not detected")
 	}
 }
+
+// TestOnAppendPanicDoesNotBreakLog: a buggy projector that PANICS in the OnAppend hook
+// must not corrupt the audit log — the event is already durable when the hook fires, so
+// the panic is recovered and both events stay written + hash-chained (I5).
+func TestOnAppendPanicDoesNotBreakLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.OnAppend(func(Event) { panic("projector boom") })
+	log.Append(Event{Kind: "a"})
+	log.Append(Event{Kind: "b"})
+	if err := log.Err(); err != nil {
+		t.Fatalf("a panicking OnAppend hook must not corrupt the log: Err=%v", err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(path); err != nil {
+		t.Fatalf("both events must be durable + chained despite the hook panic: Verify=%v", err)
+	}
+}

@@ -241,6 +241,80 @@ func TestSelfAcceptScopeCommandBound(t *testing.T) {
 	}
 }
 
+// TestSelfAccBoundaryOutcomeOnFailingGatedCheck is the I2 trust-hinge guard: a FAILING
+// gated (agent-authored) self-check must emit exactly one boundary_outcome{passed:false}
+// at the (id+command) scope, so earned trust can only ever come from a real verifier
+// verdict — an inverted/missing emit would corrupt the amortized auto-approval.
+func TestSelfAccBoundaryOutcomeOnFailingGatedCheck(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	box := &recordingBox{exit: map[string]int{"false": 1}}
+	passed, _ := runCandidates(context.Background(), box, approveGate, log, nil, []selfacc.Candidate{cand("candidate.f", "false")})
+	log.Close()
+	if passed {
+		t.Error("a failing gated check must redden the verdict")
+	}
+	bo := readEvents(t, path, "boundary_outcome")
+	if len(bo) != 1 {
+		t.Fatalf("want exactly one boundary_outcome, got %d", len(bo))
+	}
+	d := bo[0].Detail
+	if d["action"] != policy.BindSelfAuthored.String() {
+		t.Errorf("action = %v, want %q", d["action"], policy.BindSelfAuthored.String())
+	}
+	if d["passed"] != false {
+		t.Errorf("passed = %v, want false (real verdict)", d["passed"])
+	}
+	if d["scope"] != selfAcceptScope("candidate.f", "false") {
+		t.Errorf("scope = %v, want the (id+command) scope", d["scope"])
+	}
+}
+
+// TestSelfAccPassingGatedCheckEarnsTrust: a PASSING gated check emits boundary_outcome
+// {passed:true} (the positive trust signal).
+func TestSelfAccPassingGatedCheckEarnsTrust(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, _ := eventlog.Open(path)
+	box := &recordingBox{exit: map[string]int{"true": 0}}
+	runCandidates(context.Background(), box, approveGate, log, nil, []selfacc.Candidate{cand("candidate.ok", "true")})
+	log.Close()
+	bo := readEvents(t, path, "boundary_outcome")
+	if len(bo) != 1 || bo[0].Detail["passed"] != true {
+		t.Fatalf("a passing gated check must emit one boundary_outcome{passed:true}, got %+v", bo)
+	}
+}
+
+// TestSelfAccNoBoundaryOutcomeWhenNotBound: a gate-DENIED, an un-admissible, and a
+// PRE-APPROVED (operator-file) check must emit NO boundary_outcome — denial/skip is not
+// a verdict, and pre-approved checks do not feed earned trust.
+func TestSelfAccNoBoundaryOutcomeWhenNotBound(t *testing.T) {
+	cases := []struct {
+		name string
+		pre  []selfacc.Candidate
+		prop []selfacc.Candidate
+		gate func(policy.GateAction) bool
+	}{
+		{"gate-denied", nil, []selfacc.Candidate{cand("candidate.d", "true")}, denyGate},
+		{"un-admissible", nil, []selfacc.Candidate{cand("candidate.e", "go:in-process x")}, approveGate},
+		{"pre-approved", []selfacc.Candidate{cand("candidate.p", "true")}, nil, approveGate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ev.jsonl")
+			log, _ := eventlog.Open(path)
+			box := &recordingBox{exit: map[string]int{"true": 0}}
+			runCandidates(context.Background(), box, tc.gate, log, tc.pre, tc.prop)
+			log.Close()
+			if bo := readEvents(t, path, "boundary_outcome"); len(bo) != 0 {
+				t.Errorf("%s must emit no boundary_outcome, got %d", tc.name, len(bo))
+			}
+		})
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

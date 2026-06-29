@@ -108,3 +108,40 @@ func TestWakeFeederFiresAndDisarms(t *testing.T) {
 		}
 	}
 }
+
+// TestWakeFeederSkipsNotDueAndFiresAtMostOnce: a not-yet-due wake is never delivered,
+// and a due wake fires exactly once across many ticks (deliver-then-disarm + the
+// in-flight guard prevent a re-fire) while the future wake stays armed.
+func TestWakeFeederSkipsNotDueAndFiresAtMostOnce(t *testing.T) {
+	store := &fakeWakeStore{}
+	reg := wake.New(store, nil)
+	if _, err := reg.Arm(context.Background(), "due", "s", 0, "now"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Arm(context.Background(), "future", "s", time.Hour, "later"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan autosrc.Wake)
+	go wakeFeeder(ctx, reg, ch, 2*time.Millisecond)
+
+	select {
+	case w := <-ch:
+		if w.ThreadID != "due" {
+			t.Fatalf("only the due wake should fire, got %q", w.ThreadID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the due wake never fired")
+	}
+	// No second delivery across many ticks: the due wake is at-most-once, the future
+	// wake is not due.
+	select {
+	case w := <-ch:
+		t.Fatalf("unexpected second delivery: %+v", w)
+	case <-time.After(80 * time.Millisecond):
+	}
+	if store.armed() != 1 {
+		t.Errorf("the future (not-due) wake must stay armed, armed=%d", store.armed())
+	}
+}
