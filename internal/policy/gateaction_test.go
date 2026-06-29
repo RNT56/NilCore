@@ -9,6 +9,8 @@ func TestGateActionType_String(t *testing.T) {
 		PromoteToBase:        "promote-to-base",
 		Push:                 "push",
 		Deploy:               "deploy",
+		OpenPR:               "open-pr",
+		BindSelfAuthored:     "bind-self-authored",
 		GateActionType(9999): "unknown",
 	}
 	for typ, want := range cases {
@@ -21,7 +23,7 @@ func TestGateActionType_String(t *testing.T) {
 // TestGateAction_Class proves every structured boundary action is Irreversible —
 // reversible steps are the *absence* of a GateAction, never a GateAction value.
 func TestGateAction_Class(t *testing.T) {
-	for _, typ := range []GateActionType{PromoteToBase, Push, Deploy} {
+	for _, typ := range []GateActionType{PromoteToBase, Push, Deploy, OpenPR, BindSelfAuthored} {
 		if got := (GateAction{Type: typ}).Class(); got != Irreversible {
 			t.Errorf("GateAction{%v}.Class() = %v, want irreversible", typ, got)
 		}

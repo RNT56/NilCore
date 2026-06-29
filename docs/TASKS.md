@@ -797,7 +797,7 @@ Three philosophy-consistent upgrades, none touching the frozen `backend.CodingBa
 - **Depends on:** —  **Owns:** `internal/skills/`, `internal/mcp/`, `internal/registry/`
 - **Acceptance criteria:**
   - A version/manifest layer: `skills.Skill` and `mcp.ServerSpec` gain version metadata; `internal/registry` reads a local manifest/lockfile and installs into the existing discovery dirs (`$NILCORE_SKILLS_DIR` / `mcp.json`).
-  - **Trust preserved:** MCP servers stay operator-configured-not-model-emitted; wrappers stay deterministically schema-generated; the per-tool `mcp.Gate` + the untrusted-output fence (I7) are unchanged; an installed skill is still a `skill_<name>` tool that only returns instructions.
+  - **Trust preserved:** MCP servers stay operator-configured-not-model-emitted; wrappers stay deterministically schema-generated; MCP authorization stays at the codegen-descriptor boundary + the untrusted-output fence (I7) are unchanged; an installed skill is still a `skill_<name>` tool that only returns instructions.
   - **Self-edit boundary preserved:** any registry-driven manifest change routes through `selfimprove.Flow` (scope-check → verified task → human gate → merge); **remote fetch is out of scope** (it is `EXT-07`).
   - Stdlib only; no remote/network fetch in this task (I6).
 - **Verify:** `make verify`; tests — a local manifest installs a versioned skill that surfaces as a tool; a duplicate/older version is handled; an out-of-scope self-edit is rejected.

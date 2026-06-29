@@ -84,9 +84,11 @@ type GateAction struct {
 // classification without invoking the approver.
 func (a GateAction) Class() Class { return Irreversible }
 
-// describe renders a stable, human-readable line for the approver prompt and the
-// event log. It is data, not an instruction, and is never fed back to Classify.
-func (a GateAction) describe() string {
+// Describe renders a stable, human-readable line for the approver prompt and the
+// event log. It is data, not an instruction, and is never fed back to Classify. It is
+// exported so the graduated-auto-approval policy (internal/graapprove) renders an
+// identical fall-through prompt from the SAME source, never a drifting copy.
+func (a GateAction) Describe() string {
 	d := a.Type.String()
 	if a.Branch != "" {
 		d += " " + a.Branch
@@ -120,7 +122,7 @@ func GateStructured(a GateAction, ask Approver) bool {
 	if sa, ok := ask.(StructuredApprover); ok {
 		return sa.ApproveStructured(a)
 	}
-	return ask.Approve(a.describe())
+	return ask.Approve(a.Describe())
 }
 
 // StructuredApprover is the OPTIONAL extension an approver implements to receive

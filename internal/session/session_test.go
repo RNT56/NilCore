@@ -82,8 +82,9 @@ func (f *fakeDriver) input() DriveInput {
 
 // testWaitBudget bounds the package's test-sync helpers (waitClosed, waitFor). It is
 // deliberately generous: the helpers return the instant their condition holds, so the
-// bound only ever bites a genuine hang — a tighter value flaked under CI load.
-const testWaitBudget = 10 * time.Second
+// bound only ever bites a genuine hang — a tighter value flaked under CI load (even 10s
+// flaked when the whole suite runs in parallel, so it is 30s with headroom).
+const testWaitBudget = 30 * time.Second
 
 // waitClosed blocks until ch closes or the deadline elapses (test sync without
 // arbitrary sleeps). The bound is generous (returns the instant ch closes, so it only
@@ -101,7 +102,7 @@ func waitClosed(t *testing.T, ch <-chan struct{}) {
 // waitPhase polls PhaseNow until it equals want or the deadline elapses.
 func waitPhase(t *testing.T, s *Session, want Phase) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(testWaitBudget)
 	for time.Now().Before(deadline) {
 		if s.PhaseNow() == want {
 			return

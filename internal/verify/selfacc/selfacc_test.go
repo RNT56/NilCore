@@ -111,6 +111,11 @@ func TestAdmitRejectsNonSandboxAndUnboundedCandidates(t *testing.T) {
 		{"in-process marker", Candidate{VerifierID: "candidate.x", Command: "run in-process go check"}},
 		{"host-exec marker", Candidate{VerifierID: "candidate.x", Command: "host:exec /bin/sh"}},
 		{"go in-process marker", Candidate{VerifierID: "candidate.x", Command: "go:in-process Verify()"}},
+		// Case- and position-evasion must NOT slip past: Admit lower-cases before the
+		// substring check, and the marker matches anywhere in the line.
+		{"uppercase host marker", Candidate{VerifierID: "candidate.x", Command: "HOST:EXEC /bin/sh"}},
+		{"mixed-case go marker", Candidate{VerifierID: "candidate.x", Command: "GO:In-Process Verify()"}},
+		{"in-process mid-line", Candidate{VerifierID: "candidate.x", Command: "do it IN-PROCESS now"}},
 		{"NUL byte", Candidate{VerifierID: "candidate.x", Command: "echo a\x00b"}},
 		{"control byte", Candidate{VerifierID: "candidate.x", Command: "echo \x07"}},
 		{"id with space", Candidate{VerifierID: "candidate x", Command: "true"}},

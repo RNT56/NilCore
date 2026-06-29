@@ -259,9 +259,9 @@ func sortStatsByScore(stats []Stat) {
 }
 
 // Rank returns the known backend names ordered best-first by smoothed pass rate
-// (see score). It is the routing order the Router consults: the first name that
+// (see score). It is the routing order the Selector consults: the first name that
 // names a wired backend gets the first attempt. Ties break by name for
-// determinism. An empty ledger returns nil — "no earned signal", which the Router
+// determinism. An empty ledger returns nil — "no earned signal", which the Selector
 // reads as "use the default" (a nil slice ranges zero times, so callers need no
 // special case).
 func (l *Ledger) Rank() []string {

@@ -33,7 +33,7 @@ type raceEvent struct {
 // routing must never be earned from forged evidence.
 //
 // A MISSING log is a clean empty ledger (nil error), not a failure: a fresh
-// install with no history simply has no earned signal yet, which the Router reads
+// install with no history simply has no earned signal yet, which the Selector reads
 // as "use the default backend". Only an EXISTING but unreadable/broken log errors.
 func Replay(logPath string) (*Ledger, error) {
 	f, err := os.Open(logPath)

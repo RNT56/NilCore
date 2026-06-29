@@ -31,6 +31,11 @@ const EnvSelfImproveAutoApprove = "NILCORE_SELFIMPROVE_AUTOAPPROVE"
 // audited auto_approve_selfimprove event (via the optional sink) so a merged self-edit
 // is NEVER silent.
 func SelfImproveGate(human func(action string) bool, sink Sink) func(action string) bool {
+	if human == nil {
+		// Deny-default for a nil human: never panic, never auto-grant authority to a
+		// missing approver (mirrors the nil-human discipline elsewhere in the package).
+		human = func(string) bool { return false }
+	}
 	return func(action string) bool {
 		if os.Getenv(EnvSelfImproveAutoApprove) == "" {
 			return human(action) // default-off: the human decides

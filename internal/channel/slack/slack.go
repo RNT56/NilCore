@@ -52,12 +52,26 @@ type Bot struct {
 	askSeq  atomic.Int64
 	pending []channel.TaskRequest
 
-	mu     sync.Mutex             // guards drafts + asks + pending
-	drafts map[string]*slackDraft // per-thread in-place streaming message (chat.update)
-	asks   map[string]*askEntry   // ask_user choice prompts awaiting a tap, by token
+	mu            sync.Mutex             // guards src, pending, drafts, asks, gates, intakeStarted
+	drafts        map[string]*slackDraft // per-thread in-place streaming message (chat.update)
+	asks          map[string]*askEntry   // ask_user choice prompts awaiting a tap, by token
+	gates         map[string]*gateEntry  // pending gate id -> answer waiter (the intake routes here)
+	intakeStarted bool                   // the single socket-owner goroutine is running
+
+	// taskWake is poked (buffered, non-blocking) after a task is queued so a parked
+	// Receive re-checks the queue. Buffered(1): the intake never blocks on it.
+	taskWake chan struct{}
 
 	authorize func(string) bool // who may answer a gate (nil = anyone; serve sets it)
 	log       *eventlog.Log     // for recording rejected gate clicks (may be nil)
+}
+
+// gateEntry is one pending Ask awaiting its yes/no answer. reply is buffered(1) so the
+// intake delivers the first answer without ever blocking; thread is kept for the
+// unauthorized-click audit line.
+type gateEntry struct {
+	reply  chan bool
+	thread string
 }
 
 // slackDraft is the in-place message a thread is currently streaming into: Slack
@@ -77,7 +91,8 @@ var (
 // New returns a bot for the given SLACK_APP_TOKEN (socket) and SLACK_BOT_TOKEN.
 func New(appToken, botToken string) *Bot {
 	b := &Bot{appToken: appToken, botToken: botToken, apiBase: defaultAPIBase,
-		http: &http.Client{Timeout: 30 * time.Second}, drafts: map[string]*slackDraft{}, asks: map[string]*askEntry{}}
+		http: &http.Client{Timeout: 30 * time.Second}, drafts: map[string]*slackDraft{},
+		asks: map[string]*askEntry{}, gates: map[string]*gateEntry{}, taskWake: make(chan struct{}, 1)}
 	b.connect = b.dialSocket
 	return b
 }
@@ -106,52 +121,33 @@ func (b *Bot) popPending() (channel.TaskRequest, bool) {
 	return tr, true
 }
 
-// pushPending appends a request to the buffered queue (mu-guarded).
+// pushPending appends a request to the buffered queue (mu-guarded) and pokes taskWake
+// so a parked Receive re-checks. The poke is non-blocking (buffered 1) so the single
+// intake goroutine never stalls on it.
 func (b *Bot) pushPending(tr channel.TaskRequest) {
 	b.mu.Lock()
 	b.pending = append(b.pending, tr)
 	b.mu.Unlock()
+	select {
+	case b.taskWake <- struct{}{}:
+	default:
+	}
 }
 
+// Receive blocks until the next task request arrives. It NEVER reads the socket itself:
+// the single intake goroutine (startIntake) owns the socket and queues task requests,
+// and Receive drains that queue. That is what removes the Receive/Ask data race over the
+// one WebSocket (a gate's Ask and the serve Receive loop run concurrently).
 func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
+	b.startIntake(ctx)
 	for {
 		if tr, ok := b.popPending(); ok {
 			return tr, nil
 		}
-		if err := b.ensure(ctx); err != nil {
-			if ctx.Err() != nil {
-				return channel.TaskRequest{}, ctx.Err()
-			}
-			time.Sleep(retryWait)
-			continue
-		}
-		ev, err := b.src.Next(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return channel.TaskRequest{}, ctx.Err()
-			}
-			b.reset()
-			continue
-		}
-		if ev.EnvelopeID != "" {
-			_ = b.src.Ack(ctx, ev.EnvelopeID)
-		}
-		if ev.Type == "interactive" {
-			// An ask_user button tap becomes an ORDINARY authorized task request (the
-			// answer line, Sender=clicker) — it flows through the same intake→Permit→
-			// Turn→Resolve path a typed message does (I7). A toggle/unauthorized/stale
-			// action yields nil.
-			if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
-				if tr := b.handleAskAction(ctx, a); tr != nil {
-					return *tr, nil
-				}
-				continue
-			}
-		}
-		if ev.Type == "events_api" {
-			if tr, ok := messageRequest(ev.Payload); ok {
-				return tr, nil
-			}
+		select {
+		case <-b.taskWake:
+		case <-ctx.Done():
+			return channel.TaskRequest{}, ctx.Err()
 		}
 	}
 }
@@ -238,6 +234,13 @@ func escapeSlack(s string) string {
 // Ask posts a gate question with Yes/No buttons and blocks for the answer.
 func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) {
 	id := fmt.Sprintf("ask-%d", b.askSeq.Add(1))
+	reply := make(chan bool, 1)
+	// Register the gate BEFORE the intake could ever read its answer (and before posting
+	// the question), so a fast answer is always routed to a registered waiter.
+	b.registerGate(id, threadID, reply)
+	defer b.unregisterGate(id)
+	b.startIntake(ctx)
+
 	blocks := []map[string]any{
 		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*GATE* — " + question}},
 		{"type": "actions", "elements": []map[string]any{
@@ -248,54 +251,127 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 	if err := b.postMessage(ctx, map[string]any{"channel": threadID, "text": "GATE — " + question, "blocks": blocks}); err != nil {
 		return false, err
 	}
+	select {
+	case ans := <-reply:
+		return ans, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
 
+// startIntake launches the SINGLE socket-owner goroutine once, for the lifetime of the
+// first caller's ctx — in serve that is the long-lived Receive loop. Exactly one
+// goroutine ever reads the socket, so Receive and any number of concurrent Asks never
+// race over it.
+func (b *Bot) startIntake(ctx context.Context) {
+	b.mu.Lock()
+	start := !b.intakeStarted
+	if start {
+		b.intakeStarted = true
+	}
+	b.mu.Unlock()
+	if start {
+		go b.intake(ctx)
+	}
+}
+
+// intake is the sole socket reader: it pulls each Socket Mode envelope and routes it —
+// a gate answer to the waiting Ask, an ask_user tap or a message to the task queue.
+func (b *Bot) intake(ctx context.Context) {
 	for {
-		if err := b.ensure(ctx); err != nil {
+		if err := b.ensureConn(ctx); err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return
 			}
 			time.Sleep(retryWait)
 			continue
 		}
-		ev, err := b.src.Next(ctx)
+		src := b.currentSrc()
+		if src == nil {
+			continue
+		}
+		ev, err := src.Next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return
 			}
 			b.reset()
 			continue
 		}
 		if ev.EnvelopeID != "" {
-			_ = b.src.Ack(ctx, ev.EnvelopeID)
+			_ = src.Ack(ctx, ev.EnvelopeID)
 		}
-		switch ev.Type {
-		case "interactive":
-			if val, user, ok := blockAction(ev.Payload); ok && strings.HasSuffix(val, ":"+id) {
+		b.route(ctx, ev)
+	}
+}
+
+// route classifies one envelope. A gate button answer for a PENDING gate is delivered to
+// that gate's waiter (after the authorizer check); an ask_user tap or a message becomes a
+// task request. A stale/foreign action is dropped.
+func (b *Bot) route(ctx context.Context, ev event) {
+	switch ev.Type {
+	case "interactive":
+		if val, user, ok := blockAction(ev.Payload); ok {
+			if g := b.lookupGate(gateID(val)); g != nil {
 				if b.authorize != nil && !b.authorize(user) {
 					if b.log != nil {
 						b.log.Append(eventlog.Event{Kind: "unauthorized_gate",
-							Detail: map[string]any{"principal": user, "thread": threadID}})
+							Detail: map[string]any{"principal": user, "thread": g.thread}})
 					}
-					continue // ignore; keep waiting for an authorized responder
+					return // ignore; the gate keeps waiting for an authorized responder
 				}
-				return strings.HasPrefix(val, "yes:"), nil
-			}
-			// An ask_user tap landing in THIS gate's loop must not be dropped: resolve
-			// it and buffer the answer task so Receive delivers it.
-			if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
-				if tr := b.handleAskAction(ctx, a); tr != nil {
-					b.pushPending(*tr)
+				select {
+				case g.reply <- strings.HasPrefix(val, "yes:"):
+				default: // already answered (buffered 1) — first answer wins
 				}
+				return
 			}
-		case "events_api":
-			if tr, ok := messageRequest(ev.Payload); ok {
-				b.pushPending(tr) // don't drop tasks during a gate
+		}
+		// Not a gate answer: an ask_user tap becomes an ORDINARY authorized task request
+		// (the answer line, Sender=clicker), flowing through the same intake→Permit→Turn
+		// path a typed message does (I7).
+		if a, ok := askAction(ev.Payload); ok && strings.HasPrefix(a.value, "ask:") {
+			if tr := b.handleAskAction(ctx, a); tr != nil {
+				b.pushPending(*tr)
 			}
+		}
+	case "events_api":
+		if tr, ok := messageRequest(ev.Payload); ok {
+			b.pushPending(tr)
 		}
 	}
 }
 
-func (b *Bot) ensure(ctx context.Context) error {
+// gateID extracts the gate id from a button value ("yes:ask-3" / "no:ask-3" → "ask-3").
+func gateID(val string) string {
+	if i := strings.IndexByte(val, ':'); i >= 0 {
+		return val[i+1:]
+	}
+	return ""
+}
+
+func (b *Bot) registerGate(id, thread string, reply chan bool) {
+	b.mu.Lock()
+	b.gates[id] = &gateEntry{reply: reply, thread: thread}
+	b.mu.Unlock()
+}
+
+func (b *Bot) unregisterGate(id string) {
+	b.mu.Lock()
+	delete(b.gates, id)
+	b.mu.Unlock()
+}
+
+func (b *Bot) lookupGate(id string) *gateEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gates[id]
+}
+
+// ensureConn connects the socket if needed (mu-guarded; only the intake calls it).
+func (b *Bot) ensureConn(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.src != nil {
 		return nil
 	}
@@ -307,11 +383,19 @@ func (b *Bot) ensure(ctx context.Context) error {
 	return nil
 }
 
+func (b *Bot) currentSrc() eventSource {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.src
+}
+
 func (b *Bot) reset() {
+	b.mu.Lock()
 	if b.src != nil {
 		_ = b.src.Close()
 		b.src = nil
 	}
+	b.mu.Unlock()
 	time.Sleep(retryWait)
 }
 

@@ -1,12 +1,40 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"strings"
+
 	"nilcore/internal/blastbudget"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/graapprove"
 	"nilcore/internal/onboard"
 	"nilcore/internal/policy"
 )
+
+// autoApprovePresetEnv names a graduated-auto-approval preset (conservative|standard|
+// trusted) when no explicit envelope is configured — the documented opt-in shortcut
+// (ARCHITECTURE.md §0).
+const autoApprovePresetEnv = "NILCORE_AUTOAPPROVE_PRESET"
+
+// applyAutoApprovePreset seeds cfg.AutoApprove from NILCORE_AUTOAPPROVE_PRESET when the
+// config does not already define an envelope. This makes the documented env opt-in real
+// and gives graapprove.Preset a production consumer. An EXPLICIT config envelope always
+// wins; an unknown preset name is reported and ignored (fail-closed — auto-approval
+// stays OFF rather than activating a wrong envelope).
+func applyAutoApprovePreset(cfg onboard.Config) onboard.Config {
+	name := strings.TrimSpace(os.Getenv(autoApprovePresetEnv))
+	if name == "" || !cfg.AutoApprove.Empty() {
+		return cfg
+	}
+	env, err := graapprove.Preset(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: %v (auto-approval stays off)\n", err)
+		return cfg
+	}
+	cfg.AutoApprove = &env
+	return cfg
+}
 
 // autoapprove.go is the cmd-side wiring for graduated auto-approval (Phase 16,
 // GAA-T07). It is the ONLY place the graapprove policy is constructed, so every

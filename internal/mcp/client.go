@@ -4,7 +4,8 @@
 // server's tools once and generates deterministic wrappers under
 // ./mcp/servers/<server>/<tool>; the executor discovers them on demand with its
 // read/search tools and invokes/chains them by writing code that runs in the
-// sandbox, so unused tools cost ~zero tokens. Calls are gated (P2-T04) and the
+// sandbox, so unused tools cost ~zero tokens. Authorization is enforced at the
+// codegen-descriptor boundary the model invokes through (cmd/nilcore/mcp.go), and the
 // glue runs under the injection guard (P2-T05). Implemented over JSON-RPC 2.0 in
 // the standard library — no external dependency (invariant I6).
 package mcp

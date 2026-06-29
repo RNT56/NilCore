@@ -242,8 +242,10 @@ func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []stri
 // Gate decides whether an action may proceed right now and records the decision.
 // Reversible actions auto-proceed unattended; irreversible ones (merge, push,
 // deploy, payments) require the human Approver — denied by default when none is
-// wired. This is the integration-boundary seam that later phases call before any
-// irreversible step (P3 routing/proactivity, P5 self-edit, serve-mode channels).
+// wired. It is the audited FREE-TEXT gate entry (Classify + policy.Gate + a logged
+// decision), retained as the orchestrator's primitive for gating a model-emitted
+// command string; the live integration-boundary path uses the TYPED GateStructured /
+// policy.GateAction (which classifies by Type, not substring) instead.
 func (o *Orchestrator) Gate(action string) bool {
 	class := policy.Classify(action)
 	allowed := policy.Gate(action, o.Approver)
@@ -396,8 +398,15 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	if err != nil {
 		return Outcome{Backend: res.Backend, Summary: res.Summary}, fmt.Errorf("final verify: %w", err)
 	}
-	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify",
-		Detail: map[string]any{"passed": rep.Passed}})
+	finalDetail := map[string]any{"passed": rep.Passed}
+	if !rep.Passed {
+		// LRN-T01: tag a failure with its STRUCTURAL fail-class (build/test/lint/…) so the
+		// distiller/lessons learning pipeline clusters by real class instead of bucketing
+		// everything as "unknown". Derived from the report's shape, never raw output (I7);
+		// empty on a pass, so it is added only to a failure.
+		finalDetail["fail_class"] = verify.FailClass(rep)
+	}
+	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify", Detail: finalDetail})
 
 	// Adaptive escalation: the cheap single path failed verification — race to
 	// recover. On the single path this is best-of-N copies of the one backend, gated

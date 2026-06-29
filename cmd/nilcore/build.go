@@ -344,12 +344,14 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 	// vacuous "true" (an unrecognized layout) and bootstraps that too.
 	repo := firstNonEmpty(d.dir, d.fresh)
 	verifyCmd := d.verify
+	bootstrapped := false
 	if project.NeedsBootstrap(repo) {
 		res, err := bootstrapGreenfield(context.Background(), d, repo, exec, strong)
 		if err != nil {
 			return buildAssembly{}, fmt.Errorf("build: bootstrap: %w", err)
 		}
 		repo, verifyCmd = res.Repo, res.VerifyCmd
+		bootstrapped = true
 	}
 	if verifyCmd == "" {
 		verifyCmd = verify.Detect(repo)
@@ -534,6 +536,36 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		MaxIterations: d.maxIter,
 		Budget:        ledger,
 		Deadline:      time.Time{}, // wall-clock is enforced by the ctx deadline in buildMain
+	}
+
+	// Vacuous-verifier guard (design risk #6): a greenfield bootstrap MUST leave a
+	// currently-RED verifier — a real check that fails before the feature lands — else a
+	// later "converged" promote would ship "done" that means "we never checked".
+	// PromotionPermitted asserts that invariant at the bootstrap phase (its intended
+	// use). It is checked ONLY for a bootstrapped (greenfield) repo: an existing -dir
+	// whose tests already pass has a real, non-vacuous green verifier, so the guard would
+	// wrongly refuse it — there it does not apply.
+	if bootstrapped {
+		if v := newEnv(repo).Verifier; !project.PromotionPermitted(context.Background(), v) {
+			return buildAssembly{}, fmt.Errorf("build: bootstrap produced a vacuous (green) verifier — refusing (a real, currently-red check is required before promotion)")
+		}
+	}
+
+	// Advisor-derived acceptance bar (LRN, the project-loop analogue of self-acceptance):
+	// the strong advisor PROPOSES machine-checkable acceptance criteria, each is DRY-RUN
+	// in the sandbox and dropped if unrunnable, and the survivors seed the loop ADD-ONLY
+	// so JudgeProject gates on them from iteration 0 (the model proposes the bar; the
+	// sandbox decides it — never lowers it). No advisor ⇒ empty bar ⇒ done rests on the
+	// project VerifyCmd alone (byte-identical). Derivation uses a background context, like
+	// the bootstrap above, since it is a one-shot setup step.
+	//
+	// It is one model call, so it MUST respect the same budget wall the loop's per-
+	// iteration probe enforces: a refused tiny reservation (ErrCeiling) means no headroom
+	// to spend, so derivation is skipped (a budget-exhausted run makes no model call
+	// before the budget rail fires). The 1e-6 reservation mirrors project.budgetReservation.
+	if loop.Advisor != nil && ledger.Charge(context.Background(), "project", 0, 1e-6) == nil {
+		env := newEnv(repo)
+		loop.SeedCriteria(project.DeriveAcceptance(context.Background(), loop.Advisor, env.Box, d.goal, nil, d.log))
 	}
 
 	return buildAssembly{loop: loop, repo: repo, ledger: ledger, sup: sup, cleanup: cleanup}, nil

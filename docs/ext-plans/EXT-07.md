@@ -9,6 +9,13 @@ this document is a boundary to defend, not a backlog to burn down.
 **Read order:** `CLAUDE.md` → `docs/ARCHITECTURE.md` → `docs/ROADMAP-EXTERNAL-INFRA.md` (§0 gate,
 §8 EXT-07) → `docs/SWARM.md` (the depth template) → this file.
 
+> **Stale-reference note (2026-06 cleanup):** this plan predates the removal of the per-tool
+> `mcp.Client.Gate`. MCP authorization now lives at the **codegen-descriptor boundary** the
+> model invokes through (`cmd/nilcore/mcp.go`), not on `internal/mcp/client.go`. Every reference
+> to `mcp.Gate` / `client.go:26-28,130-135` below should be read as **that** boundary; the
+> security property (MCP calls are operator-authorized, never model-emitted) is unchanged — only
+> the enforcement location moved. The `file:line` citations are historical.
+
 ---
 
 ## Table of contents

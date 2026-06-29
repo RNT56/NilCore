@@ -30,8 +30,6 @@ type GradedApprover struct {
 	now func() time.Time
 	// root resolves the kill-switch sentinel (normally the worktree).
 	root string
-	// sentinel overrides the default kill-switch path (tests).
-	sentinel string
 }
 
 // Option configures a GradedApprover.
@@ -45,9 +43,6 @@ func WithClock(now func() time.Time) Option { return func(g *GradedApprover) { g
 
 // WithRoot sets the directory the kill-switch sentinel is resolved against.
 func WithRoot(root string) Option { return func(g *GradedApprover) { g.root = root } }
-
-// WithSentinel overrides the kill-switch sentinel path (tests).
-func WithSentinel(p string) Option { return func(g *GradedApprover) { g.sentinel = p } }
 
 // newGraded constructs a GradedApprover. Callers go through MaybeWrap so the
 // default-off (return-human-unchanged) discipline is enforced in one place.
@@ -82,20 +77,6 @@ func (g *GradedApprover) clauseFor(t string) (ClassClause, bool) {
 	return ClassClause{}, false
 }
 
-// describe renders a stable, human-readable line for the human approver prompt.
-// It mirrors policy.GateAction.describe (unexported) so the fall-through human sees
-// the same string today's path would show. It is pure DATA (I7), never policy.
-func describe(a policy.GateAction) string {
-	d := a.Type.String()
-	if a.Branch != "" {
-		d += " " + a.Branch
-	}
-	if a.Detail != "" {
-		d += " (" + a.Detail + ")"
-	}
-	return d
-}
-
 // scopeFor derives the scope string a clause is matched against. Today every action
 // scopes on Branch: for Deploy that Branch carries the target environment name (the
 // structured action has no Environment field), for every other type it is the git
@@ -117,16 +98,16 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	scope := scopeFor(a)
 
 	// (1) Kill-switch first — instant, no restart.
-	if killSwitchEngaged(g.root, g.sentinel) {
+	if killSwitchEngaged(g.root) {
 		g.emitDeny("killswitch", typ, scope, nil)
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 
 	// (2) Eligibility — no clause for this Type ⇒ human.
 	clause, ok := g.clauseFor(typ)
 	if !ok {
 		g.emitDeny("not_eligible", typ, scope, nil)
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 
 	// (3) Blast radius — protected bases (prod*, main/master/release*), DenyBranches
@@ -136,16 +117,16 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	// graduated auto-approval never auto-approves main/prod).
 	if isProd(scope) || isProtectedBase(scope) || matchAny(scope, clause.DenyBranches) {
 		g.emitDeny("out_of_scope", typ, scope, map[string]any{"protected": true})
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 	if !matchAny(scope, clause.AllowBranches) {
 		g.emitDeny("out_of_scope", typ, scope, nil)
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 	if a.Type == policy.Deploy {
 		if len(clause.Environments) == 0 || !matchAny(scope, clause.Environments) {
 			g.emitDeny("out_of_scope", typ, scope, map[string]any{"environment": scope})
-			return g.human.Approve(describe(a))
+			return g.human.Approve(a.Describe())
 		}
 	}
 
@@ -154,7 +135,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	view, err := BuildTrust(g.logPath)
 	if err != nil || !view.ChainOK {
 		g.emitDeny("chain_broken", typ, scope, map[string]any{"chain_ok": view.ChainOK})
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 	t := view.Tally(ScopeKey{Type: typ, Scope: scope})
 	now := g.now().UTC()
@@ -167,7 +148,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 			"min_successes": clause.MinSuccesses, "min_sample": clause.MinSample,
 			"recency_days": clause.RecencyDays, "recent_ok": recentOK,
 		})
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 
 	// (5) Rate — per-UTC-day auto_approve count for (type,scope) must be < MaxPerDay.
@@ -178,7 +159,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		g.emitDeny("rate_exceeded", typ, scope, map[string]any{
 			"rate": rate, "max_per_day": clause.MaxPerDay,
 		})
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 
 	// (5b) Blast irreversible fence — every auto-approval consumes one slot of the
@@ -190,7 +171,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	ctx := context.Background()
 	if cerr := g.blast.ChargeIrreversible(ctx, 1); cerr != nil {
 		g.emitDeny("blast_radius", typ, scope, map[string]any{"axis": "irreversible"})
-		return g.human.Approve(describe(a))
+		return g.human.Approve(a.Describe())
 	}
 
 	// (5c) Dollars — when a clause carries a $/day ceiling, charge it through the SAME
@@ -204,7 +185,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 			g.emitDeny("over_ceiling", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})
-			return g.human.Approve(describe(a))
+			return g.human.Approve(a.Describe())
 		}
 	}
 

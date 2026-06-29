@@ -151,9 +151,11 @@ func (b *Bot) handleAskAction(ctx context.Context, a askActionPayload) *channel.
 	}
 	switch {
 	case action == "done":
-		line := ent.line()
-		b.consume(token)
-		return &channel.TaskRequest{Goal: line, Sender: a.user, ThreadID: ent.channel}
+		claimed, ok := b.claim(token) // atomic lookup+delete: only the first finalize wins
+		if !ok {
+			return nil
+		}
+		return &channel.TaskRequest{Goal: claimed.line(), Sender: a.user, ThreadID: claimed.channel}
 	case strings.HasPrefix(action, "t"):
 		if i, err := strconv.Atoi(action[1:]); err == nil {
 			ent.toggle(i)
@@ -165,15 +167,25 @@ func (b *Bot) handleAskAction(ctx context.Context, a askActionPayload) *channel.
 		if err != nil {
 			return nil
 		}
-		b.consume(token)
-		return &channel.TaskRequest{Goal: strconv.Itoa(i + 1), Sender: a.user, ThreadID: ent.channel}
+		claimed, ok := b.claim(token) // atomic: a second concurrent tap gets nothing
+		if !ok {
+			return nil
+		}
+		return &channel.TaskRequest{Goal: strconv.Itoa(i + 1), Sender: a.user, ThreadID: claimed.channel}
 	}
 }
 
-func (b *Bot) consume(token string) {
+// claim atomically looks up AND removes a pending prompt, so only the FIRST terminal tap
+// for a token produces an answer (a concurrent second tap gets ok=false) — closing the
+// lookup→consume TOCTOU that could otherwise double-resolve a single question.
+func (b *Bot) claim(token string) (*askEntry, bool) {
 	b.mu.Lock()
-	delete(b.asks, token)
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+	ent, ok := b.asks[token]
+	if ok {
+		delete(b.asks, token)
+	}
+	return ent, ok
 }
 
 // updateBlocks re-renders the prompt's buttons in place (chat.update) after a toggle so

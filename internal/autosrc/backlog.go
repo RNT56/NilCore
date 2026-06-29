@@ -51,11 +51,11 @@ import (
 )
 
 // DefaultBacklogPriority is the priority band the backlog source emits at unless an
-// operator overrides it. It is deliberately LOW (a small positive value) so reactive
-// sources — which use higher bands — always preempt idle backlog work in the shared
-// queue. It is positive (not zero) only so an operator may, if they wish, configure a
-// reactive source strictly below it; the contract that matters is "below reactive."
-const DefaultBacklogPriority = 1
+// operator overrides it. It is deliberately the LOWEST band — BELOW PriorityFile (the
+// 0 reactive floor in adapters.go) — so EVERY reactive source (file/cron/wake/webhook)
+// preempts idle backlog work in the shared queue. (An operator wanting backlog above a
+// given reactive source can still set BacklogConfig.Priority to a positive band.)
+const DefaultBacklogPriority = -1
 
 // DefaultBacklogInterval is the poll spacing the backlog source waits between "is
 // anything due / am I idle?" checks when it has nothing to emit. It bounds how often

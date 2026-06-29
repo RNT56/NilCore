@@ -2326,7 +2326,7 @@ type boot struct {
 }
 
 func loadBoot(configPath string) boot {
-	cfg := loadConfig(configPath)
+	cfg := applyAutoApprovePreset(loadConfig(configPath))
 	return boot{cfg: cfg, cred: compatCredOverlay(cfg, newCredResolver(cfg, detectStore(false), os.Getenv))}
 }
 

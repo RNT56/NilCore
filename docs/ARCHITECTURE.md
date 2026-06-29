@@ -48,7 +48,7 @@ The native loop exposes three tiers of tools, all registered through one registr
 
 This follows Anthropic's *Code execution with MCP* guidance (Nov 2025), which reported up to a ~98% token reduction versus loading every tool definition and routing each intermediate result through context. NilCore is unusually well-suited to it: it is *already* a sandboxed code-execution environment, so MCP-as-code reuses the container, the structured filesystem tools, and the same context discipline as summarize-and-handover — keep bulk data out of the model's window.
 
-**MCP trust boundary:** MCP servers are third-party and **untrusted**. The wrappers are generated **deterministically from each server's declared schema** (not model-written); the executor's glue code runs in the sandbox under the gate (irreversible → human) and the prompt-injection guard (Phase 2), with per-server policy and default-deny egress. MCP is a sanctioned dependency (invariant I6), scoped to `internal/mcp`.
+**MCP trust boundary:** MCP servers are third-party and **untrusted**. The wrappers are generated **deterministically from each server's declared schema** (not model-written); the executor's glue code runs in the sandbox under the prompt-injection guard (Phase 2), with authorization enforced at the operator-driven `mcp` command (the codegen-descriptor boundary the model invokes through, `cmd/nilcore/mcp.go`), per-server policy, and default-deny egress. MCP is a sanctioned dependency (invariant I6), scoped to `internal/mcp`.
 
 ## Advisor-Executor (two-tier models)
 

@@ -13,19 +13,105 @@ import (
 )
 
 // recordingSelfAccept captures whether the closed-loop hook was consulted and what it
-// received, and returns a configurable verdict.
+// received (goal, box, and the result of calling the threaded gate), and returns a
+// configurable verdict.
 type recordingSelfAccept struct {
-	called  bool
-	gotGoal string
-	passed  bool
-	detail  string
+	called      bool
+	gotGoal     string
+	gotBox      sandbox.Sandbox
+	gateAllowed bool
+	passed      bool
+	detail      string
 }
 
 func (r *recordingSelfAccept) fn() agent.SelfAcceptFunc {
-	return func(_ context.Context, goal string, _ sandbox.Sandbox, _ func(policy.GateAction) bool, _ *eventlog.Log) (bool, string) {
+	return func(_ context.Context, goal string, box sandbox.Sandbox, gate func(policy.GateAction) bool, _ *eventlog.Log) (bool, string) {
 		r.called = true
 		r.gotGoal = goal
+		r.gotBox = box
+		r.gateAllowed = gate(policy.GateAction{Type: policy.BindSelfAuthored, Branch: "candidate.x"})
 		return r.passed, r.detail
+	}
+}
+
+// sentinelBox is an identity-comparable sandbox.Sandbox so a test can assert the hook
+// received the very Env.Box the factory built.
+type sentinelBox struct{}
+
+func (sentinelBox) Exec(context.Context, string) (sandbox.Result, error) {
+	return sandbox.Result{}, nil
+}
+func (sentinelBox) ExecWithEnv(context.Context, string, map[string]string) (sandbox.Result, error) {
+	return sandbox.Result{}, nil
+}
+func (sentinelBox) Workdir() string { return "" }
+
+// TestSelfAcceptReceivesBoxAndWorkingGate: the orchestrator threads env.Box and a gate
+// that routes to o.Approver into the hook — an approving approver ⇒ gate allows; a nil
+// approver ⇒ gate deny-defaults (so a headless run can never auto-bind).
+func TestSelfAcceptReceivesBoxAndWorkingGate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initGitRepo(t)
+	box := sentinelBox{}
+	newEnv := func(dir string) agent.Env {
+		return agent.Env{Backend: &fakeBackend{name: "fake"}, Verifier: &fakeVerifier{passed: true}, Box: box}
+	}
+
+	sa := &recordingSelfAccept{passed: true}
+	orch := &agent.Orchestrator{BaseRepo: repo, NewEnv: newEnv, Approver: &stubApprover{ok: true}, SelfAccept: sa.fn()}
+	if _, err := orch.Execute(context.Background(), backend.Task{ID: "sa-box", Goal: "g"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if sa.gotBox != box {
+		t.Error("hook did not receive env.Box")
+	}
+	if !sa.gateAllowed {
+		t.Error("gate did not route to the approving Approver")
+	}
+
+	saNil := &recordingSelfAccept{passed: true}
+	orchNil := &agent.Orchestrator{BaseRepo: repo, NewEnv: newEnv, Approver: nil, SelfAccept: saNil.fn()}
+	if _, err := orchNil.Execute(context.Background(), backend.Task{ID: "sa-box2", Goal: "g"}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if saNil.gateAllowed {
+		t.Error("a nil Approver must deny-default the threaded gate")
+	}
+}
+
+// TestSelfAcceptReddenSkipsOnSuccessAndKeepBranch: when self-acceptance reddens a green
+// floor, the success side-effects must NOT fire — OnSuccess is not called and no branch
+// is preserved (the run is not "done").
+func TestSelfAcceptReddenSkipsOnSuccessAndKeepBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initGitRepo(t)
+	onSuccess := false
+	sa := &recordingSelfAccept{passed: false, detail: "candidate.x failed"}
+	orch := &agent.Orchestrator{
+		BaseRepo: repo,
+		NewEnv: func(dir string) agent.Env {
+			return agent.Env{Backend: &fakeBackend{name: "fake"}, Verifier: &fakeVerifier{passed: true}, Box: sentinelBox{}}
+		},
+		SelfAccept: sa.fn(),
+		KeepBranch: true,
+		OnSuccess:  func(context.Context, backend.Task, agent.Outcome) { onSuccess = true },
+	}
+	out, err := orch.Execute(context.Background(), backend.Task{ID: "sa-redden", Goal: "g"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if out.Verified {
+		t.Error("self-acceptance failure must redden the verdict")
+	}
+	if onSuccess {
+		t.Error("OnSuccess must NOT fire when self-acceptance reddens the verdict")
+	}
+	if out.Branch != "" {
+		t.Error("KeepBranch must not preserve a branch on a self-acceptance-reddened verdict")
 	}
 }
 

@@ -25,8 +25,7 @@ type Selector struct {
 // agentSelector is a LOCAL restatement of the agent.Selector interface. Asserting
 // *Selector against it at compile time proves the structural match WITHOUT importing
 // agent (which would invert the leaf dependency direction). If agent.Selector's
-// signature ever drifts, this assertion stops compiling — a deliberate tripwire,
-// mirroring router.go's agentRouter guard.
+// signature ever drifts, this assertion stops compiling — a deliberate tripwire.
 type agentSelector interface {
 	Select(ctx context.Context, t backend.Task, names []string) []string
 }

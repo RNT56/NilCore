@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"nilcore/internal/channel"
 )
 
 func ctx5(t *testing.T) (context.Context, context.CancelFunc) {
@@ -144,4 +147,67 @@ func TestAskRejectsUnauthorizedClicker(t *testing.T) {
 	if ok {
 		t.Fatal("an unauthorized clicker's approval was honored")
 	}
+}
+
+// TestTelegramConcurrentReceiveAndAsk proves the single-poller demux: Receive and a gate
+// Ask run CONCURRENTLY on one Bot; the gate callback routes to Ask and the message routes
+// to Receive, with no double-delivery and `go test -race` clean (previously two
+// concurrent poll() calls read the same offset and delivered every update twice).
+func TestTelegramConcurrentReceiveAndAsk(t *testing.T) {
+	var deliver atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getUpdates") {
+			if deliver.CompareAndSwap(true, false) {
+				_, _ = io.WriteString(w, `{"ok":true,"result":[`+
+					`{"update_id":1,"callback_query":{"id":"cq1","from":{"id":42},"data":"yes:ask-1","message":{"chat":{"id":99}}}},`+
+					`{"update_id":2,"message":{"from":{"id":42},"chat":{"id":99},"text":"do it"}}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"ok":true,"result":[]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`) // sendMessage / answerCallbackQuery
+	}))
+	defer srv.Close()
+	b := New("t")
+	b.baseURL = srv.URL
+	ctx, cancel := ctx5(t)
+	defer cancel()
+
+	askDone := make(chan bool, 1)
+	go func() { ok, _ := b.Ask(ctx, "99", "merge?"); askDone <- ok }()
+	waitGate(t, b, "ask-1") // Ask has registered its gate
+
+	recvDone := make(chan channel.TaskRequest, 1)
+	go func() { tr, _ := b.Receive(ctx); recvDone <- tr }()
+	deliver.Store(true) // the next getUpdates returns the batch
+
+	select {
+	case ok := <-askDone:
+		if !ok {
+			t.Error("gate callback yes:ask-1 should resolve the gate to true")
+		}
+	case <-ctx.Done():
+		t.Fatal("Ask never resolved")
+	}
+	select {
+	case tr := <-recvDone:
+		if tr.Goal != "do it" {
+			t.Errorf("Receive got %+v, want goal 'do it'", tr)
+		}
+	case <-ctx.Done():
+		t.Fatal("Receive never delivered the message")
+	}
+}
+
+func waitGate(t *testing.T, b *Bot, id string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.lookupGate(id) != nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("gate %q never registered", id)
 }

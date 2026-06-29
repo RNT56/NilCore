@@ -57,9 +57,10 @@ func Preset(name string) (Envelope, error) {
 			{
 				// Binding a model-authored acceptance verifier is a trust escalation
 				// (the agent judging its own work), so it carries a HIGHER earned-trust
-				// bar than open-pr: a self-check class auto-approves only after the
-				// agent has proven that class many times. Scope is the verifier id
-				// (carried as Branch); the bound check can only ADD to the bar (I2).
+				// bar than open-pr: a self-check auto-approves only after that exact
+				// check has proven itself many times. Scope (carried as Branch) is the
+				// verifier id bound to a hash of its command (id@<cmd-hash>), so a
+				// CHANGED command re-gates; the bound check can only ADD to the bar (I2).
 				Type:          "bind-self-authored",
 				AllowBranches: []string{"*"},
 				DenyBranches:  commonDeny,
@@ -107,9 +108,9 @@ func Preset(name string) (Envelope, error) {
 				MaxDollarsDay: 25,
 			},
 			{
-				// Self-acceptance binding, trusted tier: a higher bar than `standard`
-				// (a proven self-check class only). Scope is the verifier id (Branch);
-				// the bound check can only ADD to the bar (I2).
+				// Self-acceptance binding, trusted tier: a higher bar than `standard`.
+				// Scope (Branch) is the verifier id bound to a hash of its command
+				// (id@<cmd-hash>) — a changed command re-gates; can only ADD to the bar (I2).
 				Type:          "bind-self-authored",
 				AllowBranches: []string{"*"},
 				DenyBranches:  commonDeny,

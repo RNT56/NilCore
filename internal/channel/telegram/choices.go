@@ -146,10 +146,13 @@ func (b *Bot) handleAskCallback(ctx context.Context, cb *tgCallback) *channel.Ta
 	threadID := strconv.FormatInt(cb.Message.Chat.ID, 10)
 	switch {
 	case action == "done": // multi-select finalize
-		line := ent.line()
-		b.consume(token)
+		claimed, ok := b.claim(token) // atomic lookup+delete: only the first finalize wins
+		if !ok {
+			_ = b.answerCallback(ctx, cb.ID, "this question is already answered")
+			return nil
+		}
 		_ = b.answerCallback(ctx, cb.ID, "✓")
-		return &channel.TaskRequest{Goal: line, Sender: clicker, ThreadID: threadID}
+		return &channel.TaskRequest{Goal: claimed.line(), Sender: clicker, ThreadID: threadID}
 	case strings.HasPrefix(action, "t"): // multi-select toggle: update + re-render, no answer yet
 		if i, err := strconv.Atoi(action[1:]); err == nil {
 			ent.toggle(i)
@@ -165,16 +168,26 @@ func (b *Bot) handleAskCallback(ctx context.Context, cb *tgCallback) *channel.Ta
 			_ = b.answerCallback(ctx, cb.ID, "")
 			return nil
 		}
-		b.consume(token)
+		if _, ok := b.claim(token); !ok { // atomic: a second concurrent tap gets nothing
+			_ = b.answerCallback(ctx, cb.ID, "this question is already answered")
+			return nil
+		}
 		_ = b.answerCallback(ctx, cb.ID, "✓")
 		return &channel.TaskRequest{Goal: strconv.Itoa(i + 1), Sender: clicker, ThreadID: threadID}
 	}
 }
 
-func (b *Bot) consume(token string) {
+// claim atomically looks up AND removes a pending prompt, so only the FIRST terminal tap
+// for a token produces an answer (a concurrent second tap gets ok=false). This closes the
+// lookup→consume TOCTOU that could otherwise double-resolve a single question.
+func (b *Bot) claim(token string) (*askEntry, bool) {
 	b.amu.Lock()
-	delete(b.asks, token)
-	b.amu.Unlock()
+	defer b.amu.Unlock()
+	ent, ok := b.asks[token]
+	if ok {
+		delete(b.asks, token)
+	}
+	return ent, ok
 }
 
 func (b *Bot) answerCallback(ctx context.Context, id, text string) error {
