@@ -55,7 +55,9 @@ func DefaultEgress() Egress {
 // EgressWith returns the DefaultEgress allowlist extended with operator-supplied
 // hosts, appended in order after the defaults and de-duplicated (case- and
 // space-insensitive on the host text). With no extra hosts it is identical to
-// DefaultEgress — the conservative default is never mutated.
+// DefaultEgress — the conservative default is never mutated. It is the public
+// primitive for composing the sandbox egress allowlist (retained for that purpose;
+// the named egress-profile path builds its allowlist separately today).
 //
 // IMPORTANT: this allowlist governs the SANDBOX container network only — the
 // hosts that model-emitted (sandboxed) code is permitted to reach. It does NOT

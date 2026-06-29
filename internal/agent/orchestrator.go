@@ -242,8 +242,10 @@ func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []stri
 // Gate decides whether an action may proceed right now and records the decision.
 // Reversible actions auto-proceed unattended; irreversible ones (merge, push,
 // deploy, payments) require the human Approver — denied by default when none is
-// wired. This is the integration-boundary seam that later phases call before any
-// irreversible step (P3 routing/proactivity, P5 self-edit, serve-mode channels).
+// wired. It is the audited FREE-TEXT gate entry (Classify + policy.Gate + a logged
+// decision), retained as the orchestrator's primitive for gating a model-emitted
+// command string; the live integration-boundary path uses the TYPED GateStructured /
+// policy.GateAction (which classifies by Type, not substring) instead.
 func (o *Orchestrator) Gate(action string) bool {
 	class := policy.Classify(action)
 	allowed := policy.Gate(action, o.Approver)

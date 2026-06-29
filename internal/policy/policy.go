@@ -88,7 +88,11 @@ type Approver interface {
 	Approve(action string) bool
 }
 
-// Gate reports whether the action may proceed right now.
+// Gate reports whether the action may proceed right now. It is the FREE-TEXT gate
+// primitive (it Classify-s an arbitrary command/action string for reversibility); the
+// structured integration-boundary path uses GateStructured/GateAction instead. Retained
+// as the public primitive paired with Classify for gating a model-emitted command string
+// — not dead despite the typed path being the live orchestrator seam.
 func Gate(action string, ask Approver) bool {
 	if Classify(action) == Reversible {
 		return true
