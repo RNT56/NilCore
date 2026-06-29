@@ -66,7 +66,8 @@ const (
 )
 
 // Hasher computes a content hash over everything the verifier reads — by default
-// the whole worktree tree (see HashWorktree). It is injected so tests stay
+// the whole worktree tree (the production wiring injects verify.ContentHashWorktree).
+// It is injected so tests stay
 // hermetic and so a wiring layer can widen the hashed surface (e.g. fold in
 // pinned-tool digests) without this package importing the file system walker
 // directly. It takes ctx first and honors cancellation.

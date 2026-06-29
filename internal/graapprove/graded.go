@@ -30,8 +30,6 @@ type GradedApprover struct {
 	now func() time.Time
 	// root resolves the kill-switch sentinel (normally the worktree).
 	root string
-	// sentinel overrides the default kill-switch path (tests).
-	sentinel string
 }
 
 // Option configures a GradedApprover.
@@ -45,9 +43,6 @@ func WithClock(now func() time.Time) Option { return func(g *GradedApprover) { g
 
 // WithRoot sets the directory the kill-switch sentinel is resolved against.
 func WithRoot(root string) Option { return func(g *GradedApprover) { g.root = root } }
-
-// WithSentinel overrides the kill-switch sentinel path (tests).
-func WithSentinel(p string) Option { return func(g *GradedApprover) { g.sentinel = p } }
 
 // newGraded constructs a GradedApprover. Callers go through MaybeWrap so the
 // default-off (return-human-unchanged) discipline is enforced in one place.
@@ -117,7 +112,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	scope := scopeFor(a)
 
 	// (1) Kill-switch first — instant, no restart.
-	if killSwitchEngaged(g.root, g.sentinel) {
+	if killSwitchEngaged(g.root) {
 		g.emitDeny("killswitch", typ, scope, nil)
 		return g.human.Approve(describe(a))
 	}

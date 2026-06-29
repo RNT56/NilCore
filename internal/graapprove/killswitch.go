@@ -21,17 +21,11 @@ const killSwitchEnv = "NILCORE_AUTOAPPROVE_OFF"
 // root is the directory the sentinel path is resolved against (empty ⇒ relative to
 // the process cwd). This is checked FIRST on every decision so revocation is
 // instant.
-func killSwitchEngaged(root, sentinel string) bool {
+func killSwitchEngaged(root string) bool {
 	if os.Getenv(killSwitchEnv) == "1" {
 		return true
 	}
-	path := sentinel
-	if path == "" {
-		path = defaultKillSwitchPath
-	}
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, path)
-	}
+	path := filepath.Join(root, defaultKillSwitchPath)
 	// Fail-CLOSED: the sentinel existing engages the kill-switch; so does ANY stat error
 	// other than a clean "does not exist" (a permission error, an I/O fault, a path that
 	// can't be resolved must never be read as "kill-switch off" — that would silently
