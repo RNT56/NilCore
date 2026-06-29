@@ -945,8 +945,13 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			if err != nil {
 				return Result{Backend: n.Name(), Summary: summary}, fmt.Errorf("verify: %w", err)
 			}
-			n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "verify",
-				Detail: map[string]any{"passed": rep.Passed}})
+			verifyDetail := map[string]any{"passed": rep.Passed}
+			if !rep.Passed {
+				// LRN-T01: structural fail-class for the learning pipeline (build/test/lint/…),
+				// derived from the report shape, never raw output (I7); only on a failure.
+				verifyDetail["fail_class"] = verify.FailClass(rep)
+			}
+			n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "verify", Detail: verifyDetail})
 			if rep.Passed {
 				return Result{Backend: n.Name(), Summary: summary, SelfClaimed: true}, nil
 			}
