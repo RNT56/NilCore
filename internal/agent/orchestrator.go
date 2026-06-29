@@ -44,8 +44,8 @@ type Spawner interface {
 
 // Selector orders/filters a set of candidate backend NAMES best-first for a task
 // (Phase 13 multi-backend strength-routing). It is the structural seam the Trust
-// Ledger plugs into — trust.Selector satisfies this shape WITHOUT importing agent,
-// exactly like trust.Router satisfies Router. I2 boundary: a Selector only orders
+// Ledger plugs into — trust.Selector satisfies this shape WITHOUT importing agent
+// (the leaf rule: the orchestrator wires the leaf, never the reverse). I2 boundary: a Selector only orders
 // WHICH backend to run first; it NEVER decides "done" or the race winner. The
 // verifier still judges every race (route.Race) and re-runs as the final gate
 // (executeSingle), so a Selector is a bias on the first attempt, never an override.

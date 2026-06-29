@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,7 +8,6 @@ import (
 	"testing"
 
 	"nilcore/eval"
-	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/trust"
 )
@@ -177,56 +175,5 @@ func TestTrustBadEvalReportErrors(t *testing.T) {
 func TestTrustUnknownFormatErrors(t *testing.T) {
 	if _, err := runTrust(seedTrustLog(t), "yaml", "", plainStyle(t)); err == nil {
 		t.Fatal("unknown -format must error")
-	}
-}
-
-// realBackend is a minimal CodingBackend for exercising the trust Router seam
-// (trustRouterFor / routeContext) hermetically — it never runs.
-type realBackend struct{ name string }
-
-func (b realBackend) Name() string { return b.name }
-func (b realBackend) Run(_ context.Context, _ backend.Task) (backend.Result, error) {
-	return backend.Result{}, nil
-}
-
-func TestTrustRouterSeam(t *testing.T) {
-	// trustRouterFor over the seeded log ranks alpha first. With both backends WIRED,
-	// the Router selects alpha (the historically strongest). This proves the helper
-	// builds a correct, ledger-backed Router — the I2-respecting "who tries first"
-	// seam — even though live orchestrator activation is deferred.
-	logPath := seedTrustLog(t)
-	alpha := realBackend{name: "alpha"}
-	beta := realBackend{name: "beta"}
-	backends := map[string]backend.CodingBackend{"alpha": alpha, "beta": beta}
-	r, err := trustRouterFor(logPath, backends, beta) // default beta; ledger should still pick alpha
-	if err != nil {
-		t.Fatalf("trustRouterFor: %v", err)
-	}
-	got := routeContext(r, beta)
-	if got.Name() != "alpha" {
-		t.Errorf("Router should pick the historically strongest wired backend (alpha), got %q", got.Name())
-	}
-}
-
-func TestTrustRouterBrokenChainFailsClosed(t *testing.T) {
-	logPath := seedTrustLog(t)
-	breakTrustChain(t, logPath)
-	def := realBackend{name: "alpha"}
-	if _, err := trustRouterFor(logPath, map[string]backend.CodingBackend{"alpha": def}, def); err == nil {
-		t.Fatal("trustRouterFor over a broken chain must fail-closed (error), got nil")
-	}
-}
-
-func TestTrustEnabledDefaultOff(t *testing.T) {
-	t.Setenv("NILCORE_TRUST", "")
-	if trustEnabled(false) {
-		t.Error("trust must be off by default (no flag, no env)")
-	}
-	if !trustEnabled(true) {
-		t.Error("the -trust flag must enable trust routing")
-	}
-	t.Setenv("NILCORE_TRUST", "1")
-	if !trustEnabled(false) {
-		t.Error("NILCORE_TRUST must enable trust routing")
 	}
 }

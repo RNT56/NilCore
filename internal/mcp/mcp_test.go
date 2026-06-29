@@ -57,30 +57,7 @@ func TestClientFlow(t *testing.T) {
 	}
 }
 
-func TestGateDeniesCall(t *testing.T) {
-	cConn, sConn := net.Pipe()
-	go mockServer(sConn)
-	c := NewClient("mock", cConn)
-	c.Gate = func(_, tool string, _ json.RawMessage) (bool, string) {
-		if tool == "delete" {
-			return false, "irreversible"
-		}
-		return true, ""
-	}
-	defer c.Close()
-	ctx := context.Background()
-	if err := c.Initialize(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.CallTool(ctx, "search", nil); err != nil {
-		t.Fatalf("allowed call: %v", err)
-	}
-	if _, err := c.CallTool(ctx, "delete", nil); err == nil {
-		t.Error("gate should deny the irreversible call before it reaches the server")
-	}
-}
-
-func TestGenerateAndDiscover(t *testing.T) {
+func TestGenerateWrappers(t *testing.T) {
 	base := t.TempDir()
 	tools := []Tool{
 		{Name: "search", Description: "s", InputSchema: json.RawMessage(`{"type":"object"}`)},
@@ -89,18 +66,13 @@ func TestGenerateAndDiscover(t *testing.T) {
 	if err := GenerateWrappers(base, "docs", tools); err != nil {
 		t.Fatalf("GenerateWrappers: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(base, "mcp", "servers", "docs", "search.json")); err != nil {
-		t.Fatalf("wrapper not written: %v", err)
-	}
-	names, err := Discover(base, "docs")
-	if err != nil || len(names) != 2 || names[0] != "fetch" || names[1] != "search" {
-		t.Fatalf("Discover = %v, %v", names, err)
+	for _, name := range []string{"search", "fetch"} {
+		if _, err := os.Stat(filepath.Join(base, "mcp", "servers", "docs", name+".json")); err != nil {
+			t.Fatalf("wrapper %s not written: %v", name, err)
+		}
 	}
 	b, _ := os.ReadFile(filepath.Join(base, "mcp", "servers", "docs", "search.json"))
 	if !strings.Contains(string(b), "inputSchema") || !strings.Contains(string(b), "nilcore mcp-call docs search") {
 		t.Errorf("descriptor missing schema/invoke: %s", b)
-	}
-	if n, err := Discover(base, "nope"); err != nil || n != nil {
-		t.Errorf("Discover(unknown) = %v, %v", n, err)
 	}
 }

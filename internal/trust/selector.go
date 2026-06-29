@@ -10,9 +10,8 @@ import (
 // of candidate backend NAMES best-first by their earned, verifier-judged track
 // record, so the orchestrator's multi-backend path tries the historically-strongest
 // backend first and races the distinct backends in that order. It STRUCTURALLY
-// satisfies agent.Selector (same Select signature) WITHOUT importing agent, exactly
-// like trust.Router satisfies agent.Router — the leaf rule holds (the orchestrator
-// wires the leaf, never the reverse).
+// satisfies agent.Selector (same Select signature) WITHOUT importing agent — the
+// leaf rule holds (the orchestrator wires the leaf, never the reverse).
 //
 // I2 boundary: Select only ORDERS which backend gets the first attempt. It never
 // runs a task, never judges one, and never decides "done" or the race winner. The

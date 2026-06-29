@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 )
 
 // wrapperDir is where a server's tool wrappers live on the sandbox filesystem.
@@ -42,23 +41,3 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 	return nil
 }
 
-// Discover lists the tool names available for a server by reading the generated
-// wrapper directory — the on-demand discovery path the executor uses (only what
-// it opens reaches context).
-func Discover(base, server string) ([]string, error) {
-	entries, err := os.ReadDir(wrapperDir(base, server))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var names []string
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".json" {
-			names = append(names, e.Name()[:len(e.Name())-len(".json")])
-		}
-	}
-	sort.Strings(names)
-	return names, nil
-}

@@ -23,14 +23,9 @@ type Tool struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
-// Gate decides whether an MCP tool call may proceed. It returns (false, reason)
-// to deny — e.g. an irreversible call routed to the human gate. nil allows all.
-type Gate func(server, tool string, args json.RawMessage) (allowed bool, reason string)
-
 // Client speaks JSON-RPC 2.0 to one MCP server over a duplex stream.
 type Client struct {
 	Server string
-	Gate   Gate
 
 	enc    *json.Encoder
 	dec    *json.Decoder
@@ -125,14 +120,10 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 	return res.Tools, nil
 }
 
-// CallTool invokes a tool after the gate approves it. A denied call never reaches
-// the server — it returns a structured error the executor surfaces as data.
+// CallTool invokes a tool and returns its concatenated text content. (Authorization
+// is enforced upstream at the codegen-descriptor boundary the model actually calls
+// through — cmd/nilcore/mcp.go — not here; this client is the low-level transport.)
 func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
-	if c.Gate != nil {
-		if ok, reason := c.Gate(c.Server, name, args); !ok {
-			return "", fmt.Errorf("mcp call %s/%s denied: %s", c.Server, name, reason)
-		}
-	}
 	var res struct {
 		Content []struct {
 			Type string `json:"type"`

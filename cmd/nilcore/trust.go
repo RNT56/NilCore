@@ -15,21 +15,19 @@ package main
 // over forged evidence (I5). The ledger only ORDERS candidate backends; the
 // verifier still decides "done" (I2) — Render says so in plain words.
 //
-// trustRouterFor builds the strength-routing Router for the orchestrator, but the
-// single-backend run/serve construction sites cannot wire it correctly without a
-// per-worktree backend seam the leaf does not expose (see the comment there); it
-// is retained as the documented activation point and exercised by the test, while
-// the live wiring stays deferred (out_of_scope_need).
+// This file is the READ-ONLY scoreboard only. Live strength-routing is the
+// agent.TrustOracle / trust.Selector path (activatable via NILCORE_TRUST_DEFAULT);
+// the old trust.Router seam was removed as dead — it was never wired (its
+// single-construction-time-instance shape could not route per-worktree) and the
+// oracle/selector path superseded it.
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 
 	"nilcore/eval"
-	"nilcore/internal/backend"
 	"nilcore/internal/termui"
 	"nilcore/internal/trust"
 )
@@ -124,42 +122,4 @@ func readEvalReport(path string) (eval.Report, error) {
 		return eval.Report{}, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	return rep, nil
-}
-
-// trustRouterFor builds the strength-routing Router over the event log at logPath
-// and a set of wired backends: it replays the ledger (fail-closed on a broken
-// chain — no ranking over forged evidence, I5) and returns a *trust.Router that
-// ORDERS candidate backends so the historically strongest WIRED one is tried first,
-// else the configured default (I2 — it only selects; the verifier still decides
-// "done"). A nil/empty ledger or a single-backend set degrades to returning the
-// default unchanged (byte-identical to no router).
-//
-// It is the documented activation point for trust-routing in the orchestrator.
-// Activation is gated on -trust / NILCORE_TRUST being set; UNSET leaves the
-// SingleRouter default untouched, so the binary is byte-identical when trust is
-// off. The run/serve construction sites build their backend per-worktree (NewEnv),
-// so a Router holding a single construction-time instance would route to a backend
-// pinned at the wrong worktree dir; correct live wiring needs a per-worktree seam
-// the leaf does not expose, so the orchestrator activation is deferred (recorded as
-// an out_of_scope_need). This helper is the ready, tested seam for that follow-on.
-func trustRouterFor(logPath string, backends map[string]backend.CodingBackend, def backend.CodingBackend) (*trust.Router, error) {
-	ledger, err := trust.Replay(logPath)
-	if err != nil {
-		return nil, fmt.Errorf("trust router: %w", err)
-	}
-	return trust.NewRouter(ledger, backends, def), nil
-}
-
-// trustEnabled reports whether strength routing is requested: the -trust flag (when
-// a run/serve command threads it) or the NILCORE_TRUST env override. Default-off, so
-// an unset environment keeps the SingleRouter default (byte-identical).
-func trustEnabled(flagSet bool) bool {
-	return flagSet || os.Getenv("NILCORE_TRUST") != ""
-}
-
-// routeContext is a tiny indirection so the test can exercise trustRouterFor's
-// Route path without importing the orchestrator (the leaf rule applies to the
-// helper too): it asks the Router to pick a backend for a throwaway task.
-func routeContext(r *trust.Router, def backend.CodingBackend) backend.CodingBackend {
-	return r.Route(context.Background(), backend.Task{ID: "trust-probe"}, def)
 }
