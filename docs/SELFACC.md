@@ -74,9 +74,17 @@ NILCORE_SELFACC=1 NILCORE_SELFACC_MAX=3 nilcore run ...
 # Pre-approve a stable check set you authored (skips the gate — the file IS your approval):
 NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json nilcore run ...
 
-# Amortized auto-approval for unattended autonomy (a proven self-check class auto-approves
-# within the envelope; first appearances still gate):
-NILCORE_AUTO_APPROVE_PRESET=standard NILCORE_SELFACC=1 nilcore serve   # + NILCORE_AUTONOMY
+# Amortized auto-approval for unattended autonomy (a proven (id+command) self-check
+# auto-approves within the envelope; first appearances + any command change still gate).
+# Unattended self-acceptance REQUIRES an operator auto-approval envelope with a
+# `bind-self-authored` clause — without one, a headless run can approve nothing and the
+# feature self-disables. Configure it in your nilcore config (the `auto_approve` block):
+#   { "auto_approve": { "classes": [
+#       { "type": "bind-self-authored", "allow_branches": ["*"],
+#         "deny_branches": ["main","master","release/*","prod*"],
+#         "min_successes": 15, "min_sample": 15, "recency_days": 7, "max_per_day": 3 } ] } }
+# (the `standard`/`trusted` graapprove presets already include this clause). Then:
+NILCORE_SELFACC=1 nilcore serve   # + NILCORE_AUTONOMY, with auto_approve configured
 
 # Review aids (read-only — run nothing, change no verdict):
 nilcore selfacc propose -goal "..." -plan plan.json   # see the contract-first criteria
@@ -94,14 +102,17 @@ nilcore selfacc check   -file approved.json           # meta-check a candidate f
    teaches the system to auto-approve it.
 2. **Earned-trust amortization cuts both ways.** Auto-approval means a check class you approved
    N times now binds without asking. That's the point — but it's why the bar is high
-   (15/25 successes) and per-class (scope = verifier id). A self-check still only ever ADDS to
+   (15/25 successes) and scoped to the **(verifier id + command)** pair — change the command
+   and it re-gates, so an earned id can never auto-approve a different command. A self-check still only ever ADDS to
    the bar, so an auto-approved weak check is at worst a no-op; the danger it cannot create is
    a *lowered* bar.
 3. **It raises the bar, so a flaky/wrong check blocks good work.** A self-check that's wrong in
    the failing direction reddens otherwise-good runs. Safe (fail-closed), still a footgun —
    `nilcore selfacc check` and dry-run before trusting.
 4. **The operator file must stay yours.** Keep `NILCORE_SELFACC_FILE` at an absolute path
-   *outside* the disposable worktree, so a run can never write its own approval.
+   *outside* the disposable worktree. (Enforced: a file that resolves inside the worktree is
+   refused fail-closed, since a run could have written it — but keep it elsewhere anyway.) A
+   malformed/unreadable file you DID set reddens the run rather than silently dropping your bar.
 5. **Authoring is a model call.** Enabling `selfacc` adds one bounded model call per
    *green* run (skipped on red runs and when off). It reads only the goal; it never sees secrets.
 
@@ -113,6 +124,10 @@ nilcore selfacc check   -file approved.json           # meta-check a candidate f
   trust (your repeated approvals) lets a class auto-approve later.
 - It does **not** run on the host or in-process — ever (I4).
 - It is **not** on by default and is byte-identical when off.
+- It currently applies to the **single-run** path. A run whose floor failed and was
+  recovered by a best-of-N race, and the supervised/decompose path, do not (yet) run the
+  extra self-acceptance bar — the floor verifier still governs them; self-acceptance only
+  ever *adds*, so skipping it there is safe, just not yet covered.
 
 ## 7. Bottom line
 

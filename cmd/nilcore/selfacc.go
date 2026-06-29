@@ -39,10 +39,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -145,10 +148,19 @@ func selfAcceptHook(prov model.Provider) agent.SelfAcceptFunc {
 // proposals); a malformed operator file is non-fatal here (skipped with a note) — the
 // floor verifier already governs, and self-acceptance only ever ADDS to the bar.
 func runSelfAcceptance(ctx context.Context, prov model.Provider, maxN int, goal string, box sandbox.Sandbox, gate func(policy.GateAction) bool, log *eventlog.Log) (bool, string) {
-	preApproved, ferr := loadApprovedCandidates(os.Getenv(selfAcceptanceFileEnv))
+	filePath := os.Getenv(selfAcceptanceFileEnv)
+	// I4 defense-in-depth: a pre-approved file (it SKIPS the gate) must be operator-
+	// controlled. Refuse one that resolves INSIDE the disposable worktree — a file a run
+	// could have written is not the operator's approval. Fail-closed (redden).
+	if reason := selfAcceptFileInsideBox(filePath, box); reason != "" {
+		return false, reason
+	}
+	preApproved, ferr := loadApprovedCandidates(filePath)
 	if ferr != nil {
-		fmt.Fprintf(os.Stderr, "nilcore selfacc: ignoring approved file: %v\n", ferr)
-		preApproved = nil
+		// Fail-closed: a SET-but-unreadable operator file would otherwise silently DROP
+		// the operator's intended acceptance bar (stderr-only). Redden so it is fixed,
+		// never shipped without the checks the operator configured.
+		return false, "approved self-acceptance file unreadable: " + ferr.Error()
 	}
 	var proposed []selfacc.Candidate
 	if prov != nil {
@@ -182,10 +194,13 @@ func runCandidates(ctx context.Context, box sandbox.Sandbox, gate func(policy.Ga
 			fmt.Fprintf(os.Stderr, "nilcore selfacc: skipping un-admissible candidate %q: %v\n", c.VerifierID, err)
 			return
 		}
+		// Trust is keyed on (verifier id + command), not the id alone, so an earned id
+		// can NEVER auto-approve a DIFFERENT command — a changed command re-gates.
+		scope := selfAcceptScope(c.VerifierID, c.Command)
 		if needGate {
-			action := policy.GateAction{Type: policy.BindSelfAuthored, Branch: c.VerifierID, Detail: clipSelfacc(c.Command, 120)}
+			action := policy.GateAction{Type: policy.BindSelfAuthored, Branch: scope, Detail: clipSelfacc(c.Command, 120)}
 			approved := gate(action)
-			appendSelfaccEvent(log, "selfacc_gate", map[string]any{"id": c.VerifierID, "approved": approved})
+			appendSelfaccEvent(log, "selfacc_gate", map[string]any{"id": c.VerifierID, "scope": scope, "approved": approved})
 			if !approved {
 				return // not trusted ⇒ not bound; denial is not a failure
 			}
@@ -201,10 +216,10 @@ func runCandidates(ctx context.Context, box sandbox.Sandbox, gate func(policy.Ga
 			"id": c.VerifierID, "status": string(status), "passed": passed,
 		})
 		if needGate {
-			// Earn (or lose) trust for this self-check class so a proven one can later
+			// Earn (or lose) trust for this (id+command) scope so a proven one can later
 			// auto-approve within the operator envelope (amortized review). Only gated
 			// (agent-authored) checks feed trust; pre-approved operator checks do not.
-			emitBoundaryOutcome(log, policy.BindSelfAuthored.String(), c.VerifierID, passed)
+			emitBoundaryOutcome(log, policy.BindSelfAuthored.String(), scope, passed)
 		}
 		if !passed {
 			d := strings.TrimSpace(detail)
@@ -284,6 +299,34 @@ func appendSelfaccEvent(log *eventlog.Log, kind string, detail map[string]any) {
 		return
 	}
 	log.Append(eventlog.Event{Kind: kind, Detail: detail})
+}
+
+// selfAcceptScope is the earned-trust / gate scope for an agent-authored check: the
+// verifier id bound to a short hash of its command. Folding the command in means a
+// proven id cannot auto-approve a DIFFERENT command — any change to the command re-gates.
+func selfAcceptScope(id, command string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(command)))
+	return id + "@" + hex.EncodeToString(sum[:])[:12]
+}
+
+// selfAcceptFileInsideBox returns a non-empty refusal reason when path resolves INSIDE
+// the worktree box — a pre-approved file (which skips the gate) must be operator-
+// controlled, not something a run could have written. An empty path, a nil box, or an
+// unresolvable path returns "" (no refusal; a read error is surfaced downstream).
+func selfAcceptFileInsideBox(path string, box sandbox.Sandbox) string {
+	if strings.TrimSpace(path) == "" || box == nil || box.Workdir() == "" {
+		return ""
+	}
+	abs, err1 := filepath.Abs(path)
+	wd, err2 := filepath.Abs(box.Workdir())
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	rel, err := filepath.Rel(wd, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "" // outside the worktree — fine
+	}
+	return fmt.Sprintf("approved self-acceptance file %q resolves inside the worktree — keep it operator-controlled, outside the run's worktree", path)
 }
 
 // clipSelfacc bounds a string for a prompt/detail field so an untrusted command/output

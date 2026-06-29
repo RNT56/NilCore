@@ -315,6 +315,57 @@ func TestApproveStructuredAllPass(t *testing.T) {
 	}
 }
 
+// selfAccEnv is an envelope that auto-approves the bind-self-authored class (the
+// closed-loop self-acceptance gate) on any non-protected scope once it has earned trust.
+func selfAccEnv() Envelope {
+	return Envelope{Classes: []ClassClause{{
+		Type:          "bind-self-authored",
+		AllowBranches: []string{"*"},
+		DenyBranches:  commonDeny,
+		MinSuccesses:  2,
+		MinSample:     2,
+		RecencyDays:   7,
+		MaxPerDay:     3,
+	}}}
+}
+
+func bindSelf(scope string) policy.GateAction {
+	return policy.GateAction{Type: policy.BindSelfAuthored, Branch: scope}
+}
+
+// TestApproveStructuredBindSelfAuthored proves the NEW bind-self-authored class end-to-
+// end through the graded gate: an un-earned (id+command) scope falls to the human
+// (deny-default headless), and the SAME scope auto-approves once it has earned trust —
+// the amortization the closed-loop self-acceptance relies on.
+func TestApproveStructuredBindSelfAuthored(t *testing.T) {
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	scope := "candidate.build@abc123def456"
+
+	// Fresh scope, empty log ⇒ below bar ⇒ falls to the human (here: deny).
+	dir := t.TempDir()
+	fresh := writeLog(t, dir, nil)
+	human := &recHuman{reply: false}
+	g := newGraded(human, selfAccEnv(), fresh, nil, WithClock(fixedClock(now)), WithRoot(dir))
+	if g.ApproveStructured(bindSelf(scope)) {
+		t.Fatal("an un-earned self-check scope must NOT auto-approve")
+	}
+	if !human.called {
+		t.Fatal("an un-earned scope must fall to the human (deny-default)")
+	}
+
+	// Same scope after >= MinSuccesses greens ⇒ auto-approve without the human.
+	dir2 := t.TempDir()
+	earned := writeLog(t, dir2, greenRun("bind-self-authored", scope, 2))
+	human2 := &recHuman{reply: false}
+	g2 := newGraded(human2, selfAccEnv(), earned, nil, WithClock(fixedClock(now)), WithRoot(dir2))
+	if !g2.ApproveStructured(bindSelf(scope)) {
+		t.Fatal("an earned self-check scope must auto-approve within the envelope")
+	}
+	if human2.called {
+		t.Fatal("an earned scope must NOT consult the human")
+	}
+}
+
 // TestApproveStructuredProtectedBaseFloor proves the STRUCTURAL protected-base floor
 // holds even for a sloppy custom envelope that ALLOWS main and supplies NO
 // DenyBranches: a merge/promote onto main/master/release must never auto-approve,

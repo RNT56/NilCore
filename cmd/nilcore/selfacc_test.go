@@ -21,6 +21,7 @@ type recordingBox struct {
 	mu   sync.Mutex
 	ran  []string
 	exit map[string]int // trimmed command -> exit code
+	dir  string         // Workdir() value
 }
 
 func (b *recordingBox) Exec(_ context.Context, cmd string) (sandbox.Result, error) {
@@ -32,7 +33,7 @@ func (b *recordingBox) Exec(_ context.Context, cmd string) (sandbox.Result, erro
 func (b *recordingBox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
 	return b.Exec(ctx, cmd)
 }
-func (b *recordingBox) Workdir() string { return "" }
+func (b *recordingBox) Workdir() string { return b.dir }
 func (b *recordingBox) didRun(cmd string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -186,6 +187,57 @@ func TestParseSelfaccCandidates(t *testing.T) {
 	}
 	if _, err := parseSelfaccCandidates("no json here"); err == nil {
 		t.Error("a reply with no JSON object must error")
+	}
+}
+
+// TestRunSelfAcceptanceMalformedFileFailsClosed: a SET-but-unreadable operator file
+// reddens the run (fail-closed) rather than silently dropping the operator's bar.
+func TestRunSelfAcceptanceMalformedFileFailsClosed(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(bad, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(selfAcceptanceFileEnv, bad)
+	passed, detail := runSelfAcceptance(context.Background(), nil, 5, "g", &recordingBox{}, approveGate, testLog(t))
+	if passed {
+		t.Error("a malformed operator file must redden the run (fail-closed)")
+	}
+	if !contains(detail, "unreadable") {
+		t.Errorf("detail should explain the unreadable file, got %q", detail)
+	}
+}
+
+// TestSelfAcceptFileInsideBoxRefused: an approved file resolving INSIDE the worktree is
+// refused (it skips the gate, so it must be operator-controlled); outside is fine.
+func TestSelfAcceptFileInsideBoxRefused(t *testing.T) {
+	wd := t.TempDir()
+	box := &recordingBox{dir: wd}
+	inside := filepath.Join(wd, ".nilcore", "approved.json")
+	if r := selfAcceptFileInsideBox(inside, box); r == "" {
+		t.Error("a file inside the worktree must be refused")
+	}
+	outside := filepath.Join(t.TempDir(), "approved.json")
+	if r := selfAcceptFileInsideBox(outside, box); r != "" {
+		t.Errorf("a file outside the worktree must be allowed, got refusal %q", r)
+	}
+	// nil box / empty path ⇒ no refusal.
+	if selfAcceptFileInsideBox(inside, nil) != "" || selfAcceptFileInsideBox("", box) != "" {
+		t.Error("nil box or empty path must not refuse")
+	}
+}
+
+// TestSelfAcceptScopeCommandBound: the trust scope folds in the command, so the same id
+// with a different command yields a DIFFERENT scope (re-gates); identical (trimmed)
+// command yields the same scope.
+func TestSelfAcceptScopeCommandBound(t *testing.T) {
+	if selfAcceptScope("candidate.x", "go build") == selfAcceptScope("candidate.x", "go test") {
+		t.Error("different commands must produce different trust scopes")
+	}
+	if selfAcceptScope("candidate.x", "go build") != selfAcceptScope("candidate.x", "  go build  ") {
+		t.Error("the same (trimmed) command must produce the same trust scope")
+	}
+	if !contains(selfAcceptScope("candidate.x", "go build"), "candidate.x@") {
+		t.Error("scope must carry the verifier id")
 	}
 }
 

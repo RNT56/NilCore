@@ -1059,6 +1059,20 @@ func buildRunOrchestratorWith(c commonFlags, b boot, log *eventlog.Log, absDir s
 	return orch
 }
 
+// makeHeadlessBackground configures a BACKGROUND orchestrator (autonomy daemon, serve-
+// embedded flywheel) for unattended operation. buildRunOrchestratorWith defaults to the
+// attended ConsoleApprover (os.Stdin) — fatal for a background goroutine, which would
+// block forever on a gate prompt no human can answer. This deny-defaults the gate (with
+// graduated auto-approval WHEN an operator envelope is configured) and DISABLES self-
+// acceptance when there is NO envelope: a headless run with no envelope can never
+// approve an agent-authored check, so authoring it would be wasted model cost.
+func makeHeadlessBackground(orch *agent.Orchestrator, cfg onboard.Config, logPath string, log *eventlog.Log, blast *blastbudget.Budget) {
+	orch.Approver = wrapAutoApprove(denyAllApprover{}, cfg, logPath, log, blast)
+	if cfg.AutoApprove.Empty() {
+		orch.SelfAccept = nil
+	}
+}
+
 // serveMain listens on a chat channel and gives every thread the SAME
 // conversational Session the terminal front door uses (C3-T02): Telegram/Slack thus
 // get queue+steer and auto-routing. It builds the deny-all channel gate, a per-
@@ -1163,7 +1177,12 @@ func serveMain(args []string) {
 	if os.Getenv("NILCORE_FLYWHEEL") != "" {
 		// Reuse serve's already-opened persistence (mem/ckpt) — never re-open the store
 		// (one *sql.DB for the whole serve process; no competing single-writer handles).
-		fwLoop := newFlywheelLoop(buildRunOrchestratorWith(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log), mem, ckpt), log, *c.logPath, 1, time.Minute)
+		fwBlast := mintBlastBudget(*c.blastRadius, log)
+		fwOrch := buildRunOrchestratorWith(c, b, log, absDir, fwBlast, mem, ckpt)
+		// The flywheel ticks in a background goroutine — it must never gate against
+		// os.Stdin (no human attends it). Headless approver + envelope-gated self-accept.
+		makeHeadlessBackground(fwOrch, b.cfg, *c.logPath, log, fwBlast)
+		fwLoop := newFlywheelLoop(fwOrch, log, *c.logPath, 1, time.Minute)
 		go runFlywheelTicker(ctx, fwLoop)
 	}
 
@@ -1241,7 +1260,7 @@ func serveMain(args []string) {
 		// shares the one *sql.DB for both its orchestrator and the objective backlog, so
 		// it never opens a competing single-writer handle to the same file.
 		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
-		autoOrch.Approver = wrapAutoApprove(denyAllApprover{}, b.cfg, *c.logPath, log, d.blast)
+		makeHeadlessBackground(autoOrch, b.cfg, *c.logPath, log, d.blast)
 		// The daemon drains the unified queue: standing objectives + dropped file signals
 		// (-autonomy-signals) + due durable wakes (wakeReg, which serve otherwise never
 		// fires) — all through the verified, headless-gated orchestrator.
