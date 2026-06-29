@@ -40,4 +40,3 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 	}
 	return nil
 }
-
