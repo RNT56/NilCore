@@ -33,6 +33,7 @@ import (
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
 	"nilcore/internal/flywheel/loop"
+	"nilcore/internal/flywheel/selfeval"
 	"nilcore/internal/graapprove"
 	"nilcore/internal/policy"
 	"nilcore/internal/selfimprove"
@@ -86,13 +87,24 @@ func flywheelMain(args []string) {
 // only Run drives a cycle (default-off).
 func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string, maxIter int, interval time.Duration) *loop.Loop {
 	runSuite := func(ctx context.Context, cases []eval.Case) (eval.Report, error) {
-		return eval.Run(ctx, cases, "flywheel", func(ctx context.Context, cse eval.Case) (bool, float64) {
+		report := eval.Run(ctx, cases, "flywheel", func(ctx context.Context, cse eval.Case) (bool, float64) {
 			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("flywheel-eval-%d", time.Now().UnixNano()), Goal: cse.Goal})
 			if err != nil {
 				return false, 0
 			}
 			return out.Verified, 0 // the verifier's verdict, never a self-report (I2)
-		}), nil
+		})
+		// Closed-loop fold: record this baseline's verifier-judged self-eval pass-rate as a
+		// durable selfeval_report event (selfeval.Fold gates on a verified chain — I5 — and
+		// refuses a non-verifier-judged report — I2). trust.Replay folds it into the
+		// per-config EVIDENCE view so `nilcore trust` shows which config earned its standing;
+		// it never feeds routing. nil ledger ⇒ no transient in-memory fold (the durable
+		// record is the event). Best-effort behind the authoritative run: a fold error
+		// (e.g. no log yet) never fails the suite. Skipped when there is no log to verify.
+		if log != nil {
+			_, _ = selfeval.Fold(ctx, logPath, selfeval.NewVerifierJudged(report), nil, log)
+		}
+		return report, nil
 	}
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),

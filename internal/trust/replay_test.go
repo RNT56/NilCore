@@ -71,6 +71,48 @@ func TestReplayFoldsRaceOutcomes(t *testing.T) {
 	}
 }
 
+// TestReplayFoldsSelfevalReports: a selfeval_report event (emitted by flywheel
+// selfeval.Fold) folds into the per-config EVIDENCE view, NOT the routing standings —
+// so a self-eval pass-rate informs the operator without steering backend choice.
+func TestReplayFoldsSelfevalReports(t *testing.T) {
+	path := buildLog(t, []eventlog.Event{
+		raceEvt("t1", "native", true), // a normal routing outcome
+		{Kind: "selfeval_report", Detail: map[string]any{
+			"config": "flywheel", "cases": 10, "passes": 8, "pass_rate": 0.8, "chain_ok": true,
+		}},
+		{Kind: "selfeval_report", Detail: map[string]any{ // empty config ⇒ ignored
+			"config": "", "cases": 3, "pass_rate": 1.0,
+		}},
+	})
+
+	l, err := Replay(path)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	snap := l.Snapshot()
+
+	// The self-eval report lands in the config evidence view with its pass-rate/cases.
+	var found *ConfigStat
+	for i := range snap.Configs {
+		if snap.Configs[i].Config == "flywheel" {
+			found = &snap.Configs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("selfeval_report did not fold into Configs: %+v", snap.Configs)
+	}
+	if found.PassRate != 0.8 || found.Cases != 10 {
+		t.Errorf("folded config = %+v, want pass_rate=0.8 cases=10", *found)
+	}
+	if len(snap.Configs) != 1 {
+		t.Errorf("empty-config selfeval_report must fold nothing; Configs=%+v", snap.Configs)
+	}
+	// And it MUST NOT have created a routing standing (configs ≠ backend scoreboard).
+	if len(snap.Backends) != 1 || snap.Backends[0].Backend != "native" {
+		t.Errorf("selfeval folds must not touch routing standings; Backends=%+v", snap.Backends)
+	}
+}
+
 // TestReplayTamperedLogFailsClosed: corrupt one line and assert Replay returns an
 // error and a nil ledger — no ranking is ever earned over a broken chain.
 func TestReplayTamperedLogFailsClosed(t *testing.T) {

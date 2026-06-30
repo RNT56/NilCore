@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 
+	"nilcore/eval"
 	"nilcore/internal/eventlog"
 )
 
@@ -59,21 +60,38 @@ func Replay(logPath string) (*Ledger, error) {
 		if err := json.Unmarshal(line, &e); err != nil {
 			return nil, fmt.Errorf("event %d: parsing line: %w", n, err)
 		}
-		if e.Kind != "race_outcome" {
-			continue // only verifier-judged race outcomes carry routing signal
+		switch e.Kind {
+		case "race_outcome":
+			// Detail["passed"] is the verifier's verdict, written as a JSON bool by
+			// route.Race. A missing or non-bool value reads as a non-pass (fail-safe:
+			// absent evidence never counts as a win).
+			passed, _ := e.Detail["passed"].(bool)
+			// Detail["class"] / Detail["cost"] are the Phase-16 routing dimensions.
+			// Both are OPTIONAL: a pre-Phase-16 race_outcome carries neither, so class
+			// reads as "" (folding into the global-view cell exactly as before) and
+			// cost reads as 0. JSON decodes numbers as float64, so a present cost lands
+			// directly. A missing or wrong-typed value is the zero value (fail-safe).
+			class, _ := e.Detail["class"].(string)
+			cost, _ := e.Detail["cost"].(float64)
+			l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
+		case "selfeval_report":
+			// A verifier-judged self-eval report (emitted by flywheel selfeval.Fold ONLY
+			// over a verified chain, I5, and only for a verifier-judged report, I2) folds
+			// into the per-config EVIDENCE view (l.configs) — NOT the routing standings,
+			// which only race_outcome feeds. So a self-eval pass-rate informs the operator
+			// ("which config earned its standing") without ever steering backend choice.
+			// The wire literal is used (not a constant) to keep trust from importing the
+			// flywheel/selfeval package, which imports trust (an import cycle).
+			cfg, _ := e.Detail["config"].(string)
+			if cfg == "" {
+				continue // no config key ⇒ nothing to attribute (FoldEvalReport ignores it)
+			}
+			passRate, _ := e.Detail["pass_rate"].(float64)
+			casesF, _ := e.Detail["cases"].(float64)
+			l.FoldEvalReport(eval.Report{Config: cfg, PassRate: passRate, Results: make([]eval.Result, int(casesF))})
+		default:
+			continue // every other event kind carries no trust signal
 		}
-		// Detail["passed"] is the verifier's verdict, written as a JSON bool by
-		// route.Race. A missing or non-bool value reads as a non-pass (fail-safe:
-		// absent evidence never counts as a win).
-		passed, _ := e.Detail["passed"].(bool)
-		// Detail["class"] / Detail["cost"] are the Phase-16 routing dimensions.
-		// Both are OPTIONAL: a pre-Phase-16 race_outcome carries neither, so class
-		// reads as "" (folding into the global-view cell exactly as before) and
-		// cost reads as 0. JSON decodes numbers as float64, so a present cost lands
-		// directly. A missing or wrong-typed value is the zero value (fail-safe).
-		class, _ := e.Detail["class"].(string)
-		cost, _ := e.Detail["cost"].(float64)
-		l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("reading event log: %w", err)
