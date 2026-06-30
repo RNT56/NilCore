@@ -3,19 +3,30 @@
 // Rather than loading every tool definition into context, the client lists a
 // server's tools once and generates deterministic wrappers under
 // ./mcp/servers/<server>/<tool>; the executor discovers them on demand with its
-// read/search tools and invokes/chains them by writing code that runs in the
-// sandbox, so unused tools cost ~zero tokens. Authorization is enforced at the
-// codegen-descriptor boundary the model invokes through (cmd/nilcore/mcp.go), and the
-// glue runs under the injection guard (P2-T05). Implemented over JSON-RPC 2.0 in
-// the standard library — no external dependency (invariant I6).
+// read/search tools. A tool is then invoked HOST-SIDE through the native `mcp` tool
+// (cmd/nilcore wires it over a Manager) so it works the same on every sandbox tier —
+// including the macOS container default, where a binary baked into the box could not.
+//
+// Two MCP transports are supported (see transport.go): local stdio subprocesses and
+// remote Streamable HTTP servers. tools, and optionally resources + prompts, are
+// reachable. Implemented over JSON-RPC 2.0 in the standard library — no external
+// dependency (invariant I6).
 package mcp
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"strings"
+	"sync"
 )
+
+// ErrToolFailed marks a tool-LEVEL failure (the server returned isError=true) as
+// distinct from a transport/connection error, so the Manager retries a dead
+// connection but never re-runs a tool that genuinely failed (which could repeat a
+// side effect).
+var ErrToolFailed = errors.New("mcp tool failed")
 
 // Tool is an MCP tool definition.
 type Tool struct {
@@ -24,90 +35,94 @@ type Tool struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 }
 
-// Client speaks JSON-RPC 2.0 to one MCP server over a duplex stream.
+// Resource is an MCP resource descriptor (opt-in surface).
+type Resource struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	MIMEType    string `json:"mimeType"`
+}
+
+// Prompt is an MCP prompt descriptor (opt-in surface).
+type Prompt struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// Client speaks JSON-RPC 2.0 to one MCP server over a transport (stdio or HTTP).
 type Client struct {
 	Server string
 
-	enc    *json.Encoder
-	dec    *json.Decoder
-	closer io.Closer
+	t transport
+
+	mu     sync.Mutex
 	nextID int
 }
 
-// NewClient wires a client to a duplex transport (stdio pipe, socket, …).
-func NewClient(server string, rw io.ReadWriteCloser) *Client {
-	return &Client{Server: server, enc: json.NewEncoder(rw), dec: json.NewDecoder(rw), closer: rw}
+// NewClient wires a client to a transport.
+func NewClient(server string, t transport) *Client {
+	return &Client{Server: server, t: t}
 }
 
 // Close closes the transport.
 func (c *Client) Close() error {
-	if c.closer != nil {
-		return c.closer.Close()
+	if c.t != nil {
+		return c.t.Close()
 	}
 	return nil
 }
 
-type rpcRequest struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      int    `json:"id"`
-	Method  string `json:"method"`
-	Params  any    `json:"params,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type rpcResponse struct {
-	ID     int             `json:"id"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *rpcError       `json:"error,omitempty"`
-}
-
 func (c *Client) call(ctx context.Context, method string, params any, result any) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
+	c.mu.Lock()
 	c.nextID++
 	id := c.nextID
-	if err := c.enc.Encode(rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
-		return fmt.Errorf("mcp send %s: %w", method, err)
+	c.mu.Unlock()
+	resp, err := c.t.roundTrip(ctx, rpcRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
+	if err != nil {
+		return err
 	}
-	for {
-		var resp rpcResponse
-		if err := c.dec.Decode(&resp); err != nil {
-			return fmt.Errorf("mcp recv %s: %w", method, err)
-		}
-		if resp.ID != id {
-			continue // a notification or an unrelated message — skip it
-		}
-		if resp.Error != nil {
-			return fmt.Errorf("mcp %s: %s", method, resp.Error.Message)
-		}
-		if result != nil && len(resp.Result) > 0 {
-			return json.Unmarshal(resp.Result, result)
-		}
-		return nil
+	if resp.Error != nil {
+		return fmt.Errorf("mcp %s: %s", method, resp.Error.Message)
 	}
+	if result != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, result)
+	}
+	return nil
 }
 
-func (c *Client) notify(method string, params any) error {
-	return c.enc.Encode(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+func (c *Client) notify(ctx context.Context, method string, params any) error {
+	return c.t.notify(ctx, rpcNotification{JSONRPC: "2.0", Method: method, Params: params})
 }
+
+// protocolVersion is the MCP revision we advertise. 2025-03-26 introduced the
+// Streamable HTTP transport (single endpoint + Mcp-Session-Id + JSON-or-SSE reply), so
+// we negotiate a version that includes it for remote servers; stdio servers negotiate
+// down as needed.
+const protocolVersion = "2025-06-18"
 
 // Initialize performs the MCP handshake.
 func (c *Client) Initialize(ctx context.Context) error {
-	var res json.RawMessage
+	var res struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
 	err := c.call(ctx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "nilcore", "version": "0.1"},
 	}, &res)
 	if err != nil {
 		return err
 	}
-	return c.notify("notifications/initialized", map[string]any{})
+	// Echo the negotiated version on subsequent HTTP requests (a Streamable HTTP spec
+	// requirement); fall back to ours if the server omits it. No-op for stdio.
+	negotiated := res.ProtocolVersion
+	if negotiated == "" {
+		negotiated = protocolVersion
+	}
+	if vt, ok := c.t.(interface{ setProtocolVersion(string) }); ok {
+		vt.setProtocolVersion(negotiated)
+	}
+	return c.notify(ctx, "notifications/initialized", map[string]any{})
 }
 
 // ListTools returns the server's tools (used once to generate wrappers).
@@ -122,31 +137,104 @@ func (c *Client) ListTools(ctx context.Context) ([]Tool, error) {
 }
 
 // CallTool invokes a tool and returns its concatenated text content. (Authorization
-// is enforced upstream at the codegen-descriptor boundary the model actually calls
-// through — cmd/nilcore/mcp.go — not here; this client is the low-level transport.)
+// is enforced upstream: servers are operator-configured, never model-emitted, and the
+// model selects only a tool + JSON args, both fenced as untrusted data — I7.)
 func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	var res struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		IsError bool `json:"isError"`
+		Content []contentBlock `json:"content"`
+		IsError bool           `json:"isError"`
 	}
 	if err := c.call(ctx, "tools/call", map[string]any{"name": name, "arguments": args}, &res); err != nil {
 		return "", err
 	}
-	var out string
-	for _, b := range res.Content {
-		out += b.Text
-	}
+	out := joinText(res.Content)
 	// Per the MCP spec a tool-level failure is reported with isError=true and the
 	// error detail in content (NOT as a JSON-RPC error). Surface it as a Go error so
-	// the executor treats it as a failed tool call rather than a successful result —
-	// otherwise a failing MCP tool reads as success. The content carries the detail.
+	// the executor treats it as a failed tool call rather than a successful result.
 	if res.IsError {
-		return "", fmt.Errorf("mcp tool %s/%s failed: %s", c.Server, name, tailText(out, 500))
+		return "", fmt.Errorf("%w: %s/%s: %s", ErrToolFailed, c.Server, name, tailText(out, 500))
 	}
 	return out, nil
+}
+
+// ListResources returns the server's resources (opt-in surface).
+func (c *Client) ListResources(ctx context.Context) ([]Resource, error) {
+	var res struct {
+		Resources []Resource `json:"resources"`
+	}
+	if err := c.call(ctx, "resources/list", map[string]any{}, &res); err != nil {
+		return nil, err
+	}
+	return res.Resources, nil
+}
+
+// ReadResource fetches a resource by URI and returns its concatenated text contents.
+// Binary (blob) contents are omitted — only text parts are returned (I7: data only).
+func (c *Client) ReadResource(ctx context.Context, uri string) (string, error) {
+	var res struct {
+		Contents []contentBlock `json:"contents"`
+	}
+	if err := c.call(ctx, "resources/read", map[string]any{"uri": uri}, &res); err != nil {
+		return "", err
+	}
+	return joinText(res.Contents), nil
+}
+
+// ListPrompts returns the server's prompts (opt-in surface).
+func (c *Client) ListPrompts(ctx context.Context) ([]Prompt, error) {
+	var res struct {
+		Prompts []Prompt `json:"prompts"`
+	}
+	if err := c.call(ctx, "prompts/list", map[string]any{}, &res); err != nil {
+		return nil, err
+	}
+	return res.Prompts, nil
+}
+
+// GetPrompt renders a named prompt (with optional args) to text. Each message's text
+// content is concatenated; a prompt is INERT data (I7) — returned for the model to
+// read, never auto-executed as an instruction.
+func (c *Client) GetPrompt(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	params := map[string]any{"name": name}
+	if len(args) > 0 {
+		params["arguments"] = args
+	}
+	var res struct {
+		Description string `json:"description"`
+		Messages    []struct {
+			Role    string       `json:"role"`
+			Content contentBlock `json:"content"`
+		} `json:"messages"`
+	}
+	if err := c.call(ctx, "prompts/get", params, &res); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if res.Description != "" {
+		b.WriteString(res.Description)
+		b.WriteString("\n\n")
+	}
+	for _, m := range res.Messages {
+		if m.Content.Text != "" {
+			fmt.Fprintf(&b, "[%s] %s\n", m.Role, m.Content.Text)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// contentBlock is the shared MCP content shape (tool result / resource / prompt
+// message). Only text is consumed; non-text parts (images, blobs) are ignored.
+type contentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+func joinText(blocks []contentBlock) string {
+	var out strings.Builder
+	for _, b := range blocks {
+		out.WriteString(b.Text)
+	}
+	return out.String()
 }
 
 // tailText returns at most n characters of s (the trailing part when longer), so a

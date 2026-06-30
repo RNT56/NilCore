@@ -87,6 +87,15 @@ func loopTools() *tools.Registry {
 	for _, t := range skillTools() {
 		r.Register(t)
 	}
+	// The host-dispatched `mcp` tool — present only when servers are configured
+	// (setupMCP set mcpMgr). It runs operator-configured MCP servers host-side, so it
+	// works on every sandbox tier including the macOS container default, where the
+	// nilcore binary and the server runtime are not inside the box. It is an EXECUTION
+	// capability, so it rides loopTools() (the execute registry) and is absent from the
+	// read-only Discuss/Plan set, exactly like the shell `run` tool.
+	if mcpMgr != nil {
+		r.Register(newMCPTool(mcpMgr))
+	}
 	return r
 }
 

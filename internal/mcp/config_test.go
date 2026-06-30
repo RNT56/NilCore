@@ -88,3 +88,47 @@ func TestSpawnGracefulFailure(t *testing.T) {
 		t.Error("missing binary must error, not hang")
 	}
 }
+
+// TestManagerStdioReuseClose drives the Manager over a REAL stdio subprocess — the
+// exact host-side path that closes the container gap: spawn once, reuse the live
+// connection across calls, and tear the process down on Close.
+func TestManagerStdioReuseClose(t *testing.T) {
+	t.Setenv("NILCORE_MCP_MOCK", "1")
+	m := NewManager(Config{Servers: []ServerSpec{
+		{Name: "mock", Command: []string{os.Args[0], "-test.run=TestHelperMCPServer"}},
+	}})
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // a single subprocess answers all three (reuse)
+		out, err := m.CallTool(ctx, "mock", "search", json.RawMessage(`{}`))
+		if err != nil || out != "echoed-ok" {
+			t.Fatalf("CallTool[%d] = %q, %v", i, out, err)
+		}
+	}
+	if err := m.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	// Close is idempotent.
+	if err := m.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestLoadConfigHTTP(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mcp.json")
+	js := `{"servers":[{"name":"remote","url":"https://mcp.example.com/v1","headers":{"Authorization":"Bearer t"}}]}`
+	if err := os.WriteFile(path, []byte(js), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	spec, ok := cfg.Server("remote")
+	if !ok || spec.URL == "" || spec.stdio() {
+		t.Fatalf("remote spec = %+v, ok=%v (want non-stdio with URL)", spec, ok)
+	}
+	if spec.Headers["Authorization"] != "Bearer t" {
+		t.Errorf("headers not parsed: %+v", spec.Headers)
+	}
+}
