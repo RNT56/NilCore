@@ -2078,17 +2078,21 @@ func proxyBindAddr(prefer, runtime string) string {
 			prefer = env
 		}
 	}
-	switch sandbox.Backend(prefer) {
-	case sandbox.ContainerBackend:
-		return "0.0.0.0:0"
-	case sandbox.NamespaceBackend:
-		return "127.0.0.1:0"
-	default: // auto/empty/unknown: a container is used only when namespace is unavailable
-		if ns, _, _ := sandbox.Available(runtime); ns {
-			return "127.0.0.1:0"
-		}
+	// An explicit container always needs the proxy reachable across the runtime bridge.
+	if sandbox.Backend(prefer) == sandbox.ContainerBackend {
 		return "0.0.0.0:0"
 	}
+	// namespace (explicit) OR auto/empty: the namespace backend never uses the proxy and
+	// needs only loopback — BUT selectSandbox DEGRADES an unsatisfiable request (an
+	// explicit `-sandbox namespace`, or auto, on a host where the namespace backend is
+	// unavailable, e.g. macOS) to a *sandbox.Container, which DOES need the proxy across
+	// the bridge. So bind loopback only when the namespace backend is actually available;
+	// otherwise fall through to the container default — mirroring selectSandbox's fallback
+	// so the bind can never disagree with the box actually chosen.
+	if ns, _, _ := sandbox.Available(runtime); ns {
+		return "127.0.0.1:0"
+	}
+	return "0.0.0.0:0"
 }
 
 // envFactory builds the per-worktree backend+verifier factory. The optional blast

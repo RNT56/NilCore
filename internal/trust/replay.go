@@ -12,6 +12,12 @@ import (
 	"nilcore/internal/eventlog"
 )
 
+// maxSelfevalCases bounds the case count Replay will allocate for from a
+// selfeval_report event's Detail["cases"], so a forged/corrupt count cannot panic the
+// slice allocation before the chain check rejects the log. Far above any real frozen
+// self-eval suite (dozens of cases), so a legitimate report is never skipped.
+const maxSelfevalCases = 100000
+
 // raceEvent mirrors only the fields of an on-disk eventlog.Event that a
 // race_outcome carries trust signal in: the Backend that raced, the verifier's
 // pass/fail verdict (Detail["passed"]), and — added in Phase 16 — the task-class
@@ -86,8 +92,17 @@ func Replay(logPath string) (*Ledger, error) {
 			if cfg == "" {
 				continue // no config key ⇒ nothing to attribute (FoldEvalReport ignores it)
 			}
-			passRate, _ := e.Detail["pass_rate"].(float64)
 			casesF, _ := e.Detail["cases"].(float64)
+			// Guard the slice allocation against a forged/corrupt count. The chain Verify
+			// below would reject a tampered log, but `make([]Result, int(casesF))` runs
+			// FIRST — a negative, NaN, or absurdly large count would panic ("makeslice: len
+			// out of range") and crash trust.Replay, the routing hot path, before the
+			// fail-closed check fires. The condition is written so NaN (all comparisons
+			// false) is skipped too. A real self-eval report's case count is small.
+			if !(casesF >= 0 && casesF <= maxSelfevalCases) {
+				continue
+			}
+			passRate, _ := e.Detail["pass_rate"].(float64)
 			l.FoldEvalReport(eval.Report{Config: cfg, PassRate: passRate, Results: make([]eval.Result, int(casesF))})
 		default:
 			continue // every other event kind carries no trust signal

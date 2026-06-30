@@ -113,6 +113,30 @@ func TestReplayFoldsSelfevalReports(t *testing.T) {
 	}
 }
 
+// TestReplayForgedSelfevalCount: a selfeval_report with a negative or absurdly large
+// `cases` count must be SKIPPED, never allocated from — `make([]Result, int(casesF))`
+// would otherwise panic ("makeslice: len out of range") and crash trust.Replay (the
+// routing hot path) BEFORE the chain check could reject a tampered log.
+func TestReplayForgedSelfevalCount(t *testing.T) {
+	for _, cases := range []any{-5, 999999999, 1e18} {
+		path := buildLog(t, []eventlog.Event{
+			raceEvt("t1", "native", true),
+			{Kind: "selfeval_report", Detail: map[string]any{"config": "x", "pass_rate": 1.0, "cases": cases}},
+		})
+		l, err := Replay(path) // must not panic
+		if err != nil {
+			t.Fatalf("cases=%v: Replay errored: %v", cases, err)
+		}
+		// The forged-count event folds nothing; the race outcome still folds normally.
+		if got := len(l.Snapshot().Configs); got != 0 {
+			t.Errorf("cases=%v: a forged selfeval count must fold nothing, got %d configs", cases, got)
+		}
+		if got := len(l.Snapshot().Backends); got != 1 {
+			t.Errorf("cases=%v: the race outcome must still fold, got %d backends", cases, got)
+		}
+	}
+}
+
 // TestReplayTamperedLogFailsClosed: corrupt one line and assert Replay returns an
 // error and a nil ledger — no ranking is ever earned over a broken chain.
 func TestReplayTamperedLogFailsClosed(t *testing.T) {
