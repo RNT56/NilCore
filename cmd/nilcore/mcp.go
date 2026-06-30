@@ -12,9 +12,21 @@ import (
 	"nilcore/internal/mcp"
 )
 
+// envMCPResources opts INTO the resources + prompts surface (off by default). When
+// set, setupMCP also generates resource/prompt descriptors and the `mcp` tool honors
+// the resource/prompt request shapes; otherwise it is tools-only.
+const envMCPResources = "NILCORE_MCP_RESOURCES"
+
+func mcpResourcesEnabled() bool { return strings.TrimSpace(os.Getenv(envMCPResources)) != "" }
+
+// mcpMgr is the process-wide live MCP connection manager (host-side), set by setupMCP
+// when servers are configured and read by buildBackend to register the `mcp` tool. nil
+// ⇒ no MCP configured ⇒ the tool is never advertised (byte-identical).
+var mcpMgr *mcp.Manager
+
 // mcpConfigPath resolves the MCP server config file: $NILCORE_MCP_CONFIG, else
-// <workdir>/mcp.json. Servers are declared as {name, command} — the command (e.g.
-// a stdio MCP server binary) is operator-configured, never model-emitted.
+// <workdir>/mcp.json. Servers are declared as {name, command} (stdio) or {name, url}
+// (Streamable HTTP) — operator-configured, never model-emitted.
 func mcpConfigPath(workdir string) string {
 	if p := os.Getenv("NILCORE_MCP_CONFIG"); p != "" {
 		return p
@@ -22,15 +34,112 @@ func mcpConfigPath(workdir string) string {
 	return filepath.Join(workdir, "mcp.json")
 }
 
+// setupMCP loads the MCP config, opens a live Manager over the configured servers, and
+// generates the on-demand descriptors under workdir/mcp/servers/ (warming the
+// connections the `mcp` tool then reuses). It returns the Manager so the caller can
+// `defer mcpClose(...)`; nil when no servers are configured. Best-effort: a bad config
+// or a server that will not start is logged and skipped, never blocking the task.
+func setupMCP(workdir string) *mcp.Manager {
+	cfg, err := mcp.LoadConfig(mcpConfigPath(workdir))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: mcp config: %v\n", err)
+		return nil
+	}
+	if len(cfg.Servers) == 0 {
+		return nil
+	}
+	mgr := mcp.NewManager(cfg)
+	for _, e := range mgr.Discover(context.Background(), workdir, mcpResourcesEnabled()) {
+		fmt.Fprintf(os.Stderr, "nilcore: skipping mcp server %v\n", e)
+	}
+	mcpMgr = mgr
+	fmt.Fprintf(os.Stderr, "nilcore: mcp ready (%d server(s)); descriptors under %s/mcp/servers/\n", len(cfg.Servers), workdir)
+	return mgr
+}
+
+// mcpClose tears down the Manager's live server connections. nil-safe.
+func mcpClose(m *mcp.Manager) {
+	if m != nil {
+		_ = m.Close()
+	}
+}
+
+// mcpTool is the host-dispatched native tool the model calls to reach a configured MCP
+// server. Running it HOST-SIDE (like the structured read/write/git tools) is what makes
+// MCP work on EVERY sandbox tier — including the macOS container default, where the
+// nilcore binary and the server runtime are not inside the box. The server set is
+// operator-configured (mcp.json); the model only picks server + tool/resource/prompt +
+// JSON args, all carried as data (I7) and audited by the loop.
+type mcpTool struct{ mgr *mcp.Manager }
+
+func newMCPTool(mgr *mcp.Manager) *mcpTool { return &mcpTool{mgr: mgr} }
+
+func (t *mcpTool) Name() string { return "mcp" }
+
+func (t *mcpTool) Description() string {
+	d := "Call a configured MCP server's tool. Discover servers + tools by reading " +
+		"./mcp/servers/<server>/<tool>.json. Input: {\"server\":\"<name>\",\"tool\":\"<tool>\",\"args\":{…}}."
+	if mcpResourcesEnabled() {
+		d += " Resources/prompts are enabled: also {\"server\",\"resource\":\"<uri>\"} or " +
+			"{\"server\",\"prompt\":\"<name>\",\"args\":{…}} (descriptors under .../resources|prompts/)."
+	}
+	return d
+}
+
+func (t *mcpTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{` +
+		`"server":{"type":"string","description":"configured MCP server name"},` +
+		`"tool":{"type":"string","description":"tool to call"},` +
+		`"args":{"type":"object","description":"JSON arguments matching the tool's inputSchema"},` +
+		`"resource":{"type":"string","description":"resource URI to read (if enabled)"},` +
+		`"prompt":{"type":"string","description":"prompt name to render (if enabled)"}` +
+		`},"required":["server"]}`)
+}
+
+func (t *mcpTool) Run(ctx context.Context, _ string, input json.RawMessage) (string, error) {
+	var in struct {
+		Server   string          `json:"server"`
+		Tool     string          `json:"tool"`
+		Args     json.RawMessage `json:"args"`
+		Resource string          `json:"resource"`
+		Prompt   string          `json:"prompt"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil {
+		return "", fmt.Errorf("mcp: bad input: %w", err)
+	}
+	if strings.TrimSpace(in.Server) == "" {
+		return "", fmt.Errorf("mcp: 'server' is required")
+	}
+	if t.mgr == nil {
+		return "", fmt.Errorf("mcp: no servers configured")
+	}
+	switch {
+	case in.Resource != "":
+		if !mcpResourcesEnabled() {
+			return "", fmt.Errorf("mcp: resources are not enabled (set %s=1)", envMCPResources)
+		}
+		return t.mgr.ReadResource(ctx, in.Server, in.Resource)
+	case in.Prompt != "":
+		if !mcpResourcesEnabled() {
+			return "", fmt.Errorf("mcp: prompts are not enabled (set %s=1)", envMCPResources)
+		}
+		return t.mgr.GetPrompt(ctx, in.Server, in.Prompt, in.Args)
+	case in.Tool != "":
+		args := in.Args
+		if len(args) == 0 {
+			args = json.RawMessage(`{}`)
+		}
+		return t.mgr.CallTool(ctx, in.Server, in.Tool, args)
+	default:
+		return "", fmt.Errorf("mcp: provide 'tool' (or 'resource'/'prompt' when enabled)")
+	}
+}
+
 // mcpCallMain implements `nilcore mcp-call <server> <tool> ['<json-args>']` — the
-// runtime bridge the generated MCP wrappers invoke (mcp/codegen.go writes exactly
-// this invoke string). It connects to the configured stdio server, calls the tool,
-// and writes the textual result to stdout. The executor reads that output through
-// its `run` tool, where the loop fences it as untrusted before it re-enters the
-// model's context (I7); the call itself passes the loop's command-policy gate
-// (P2-T04) when the model runs `nilcore mcp-call …`. Errors go to stderr + a
-// non-zero exit, so a transient server failure surfaces as a command failure
-// rather than crashing the loop.
+// host-side CLI bridge (operator use, and the namespace-sandbox shell path). It is a
+// one-shot connect→call→teardown over the configured transport (stdio or HTTP). The
+// model's primary path is the native `mcp` tool above; this verb stays for operators
+// and scripts. Errors go to stderr + a non-zero exit.
 func mcpCallMain(args []string) {
 	fs := flag.NewFlagSet("mcp-call", flag.ExitOnError)
 	cfgPath := fs.String("mcp-config", "", "MCP servers config (default: $NILCORE_MCP_CONFIG or ./mcp.json)")
@@ -67,27 +176,4 @@ func mcpCallMain(args []string) {
 		os.Exit(1)
 	}
 	fmt.Print(out)
-}
-
-// setupMCP generates the on-demand MCP tool wrappers under workdir/mcp/servers/ for
-// each configured server, so the executor can discover them with its read/search
-// tools (only what it opens reaches context). Best-effort: an absent config or a
-// server that will not start is logged and skipped, never blocking the task.
-func setupMCP(workdir string) {
-	cfg, err := mcp.LoadConfig(mcpConfigPath(workdir))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "nilcore: mcp config: %v\n", err)
-		return
-	}
-	if len(cfg.Servers) == 0 {
-		return
-	}
-	ctx := context.Background()
-	for _, spec := range cfg.Servers {
-		if err := mcp.GenerateServer(ctx, workdir, spec); err != nil {
-			fmt.Fprintf(os.Stderr, "nilcore: skipping mcp server %q: %v\n", spec.Name, err)
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "nilcore: generated mcp wrappers for %q under %s/mcp/servers/\n", spec.Name, workdir)
-	}
 }

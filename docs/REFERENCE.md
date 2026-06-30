@@ -347,7 +347,7 @@ Two confinement tiers (the split **is** I4). Every tool result is `guard.Wrap`-f
 
 | Seam | Wire it with | Effect |
 |---|---|---|
-| **MCP** (`mcp`) | `{name, command}` in `mcp.json` (`NILCORE_MCP_CONFIG` else `<workdir>/mcp.json`) | On-disk JSON tool wrappers under `mcp/servers/…`, discovered on demand, invoked via `nilcore mcp-call`; unused tools cost ~zero context |
+| **MCP** (`mcp`) | `{name, command}` (stdio) or `{name, url, headers}` (HTTP/SSE) in `mcp.json` (`NILCORE_MCP_CONFIG` else `<workdir>/mcp.json`) | On-disk JSON wrappers under `mcp/servers/…`, discovered on demand, invoked via the host-dispatched `mcp` tool (works on every sandbox tier incl. macOS container) or the `nilcore mcp-call` CLI; unused tools cost ~zero context. Resources + prompts opt-in (`NILCORE_MCP_RESOURCES=1`) |
 | **Skills** (`skills`) | A `SKILL.md` in `$NILCORE_SKILLS_DIR` (else `<config>/nilcore/skills`) | A `skill_<name>` tool returning its instructions; auto-loaded into run/chat/serve/build |
 | **Registry** (`registry`) | `nilcore registry install <manifest.json>` (local sources) | Versioned skill install; `registry list` shows installed |
 | **Channels** (`channel`) | `serve -channel telegram\|slack` + tokens | Drive NilCore from a phone; progress streams; gates become inline / Block Kit Yes-No buttons |
@@ -484,7 +484,7 @@ Dispatch (`cmd/nilcore/main.go`): bare `nilcore` → chat; a `-`-prefixed argv (
 | Delegated backends | `NILCORE_CLAUDE_MODEL`/`_EFFORT`, `NILCORE_CODEX_MODEL`/`_EFFORT`, `CODEX_API_KEY` |
 | Sandbox / verify | `NILCORE_SANDBOX`, `NILCORE_RUNTIME`, `NILCORE_IMAGE`, `NILCORE_BROWSER_VERIFY` |
 | Web / egress | `NILCORE_EGRESS_PROFILE`, `BRAVE_API_KEY`, `NILCORE_WEB_SEARCH_NATIVE`, `NILCORE_WEB_SEARCH_MAX_USES` |
-| Connectors | `NILCORE_ALLOWLIST`, `TELEGRAM_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `NILCORE_MCP_CONFIG`, `NILCORE_SKILLS_DIR`, `NILCORE_WEBHOOK_SECRET`, `NILCORE_WEBHOOK_LABEL`, `NILCORE_FORGE_TOKEN` |
+| Connectors | `NILCORE_ALLOWLIST`, `TELEGRAM_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `NILCORE_MCP_CONFIG`, `NILCORE_MCP_RESOURCES`, `NILCORE_SKILLS_DIR`, `NILCORE_WEBHOOK_SECRET`, `NILCORE_WEBHOOK_LABEL`, `NILCORE_FORGE_TOKEN` |
 | Computer use | `NILCORE_COMPUTER_USE`, `NILCORE_COMPUTER_NATIVE`, `NILCORE_COMPUTER_MODEL`, `NILCORE_BROWSE_MODEL`, `NILCORE_DESKTOP_HOST` (=`1`), `NILCORE_DESKTOP_ALLOW_APPS`, `NILCORE_DESKTOP_STOP`, `NILCORE_DESKTOP_DRIVER`, `NILCORE_BROWSER` |
 | Code intel | `NILCORE_EMBED_KEY`, `NILCORE_EMBED_MODEL`, `NILCORE_LSP_COMMAND`, `NILCORE_LIVE_INDEX` |
 | Secrets / audit | `NILCORE_VAULT_PASSPHRASE`, `NILCORE_LOG_HMAC_KEY` |

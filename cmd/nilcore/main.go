@@ -823,7 +823,8 @@ func runMain(args []string) {
 	validateConcreteBackendFlag("-prefer-backend", *c.preferBackend)
 
 	absDir := mustAbs(*c.dir)
-	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
+	mcpManager := setupMCP(absDir) // start MCP servers + generate wrappers (if configured)
+	defer mcpClose(mcpManager)
 	log := openLog(*c.logPath)
 	defer log.Close()
 	// Resolve `-backend auto` (or config backend:auto, which applyConfigDefaults maps
@@ -1095,7 +1096,8 @@ func serveMain(args []string) {
 	applyConfigDefaults(c, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*c.dir)
-	setupMCP(absDir) // generate on-demand MCP wrappers if servers are configured
+	mcpManager := setupMCP(absDir) // start MCP servers + generate wrappers (if configured)
+	defer mcpClose(mcpManager)
 	// Rotate an over-large event log BEFORE opening the handle, so the fresh handle
 	// appends to the rotated (or recreated) path rather than a renamed inode.
 	_ = maint.RotateLog(*c.logPath, serveLogMaxBytes)

@@ -51,7 +51,8 @@ func tuiMain(args []string) {
 	applyConfigDefaults(cf.common, b.cfg, flagsSet(fs))
 
 	absDir := mustAbs(*cf.common.dir)
-	setupMCP(absDir) // on-demand MCP wrappers if servers are configured (parity with chat)
+	mcpManager := setupMCP(absDir) // start MCP servers + generate wrappers (parity with chat)
+	defer mcpClose(mcpManager)
 	log := openLog(*cf.common.logPath)
 	defer log.Close()
 

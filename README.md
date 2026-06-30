@@ -243,7 +243,7 @@ All opt-in — the default binary stays dependency-light and the loop is **byte-
 | Plug-in | Turn it on with | What you get |
 |---|---|---|
 | **Skills** | A `SKILL.md` (frontmatter + instructions) in `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) | Surfaces to the loop as a `skill_<name>` tool; unused skills cost **~zero context**. |
-| **MCP servers** | `{name, command}` entries in `mcp.json` | `nilcore` generates typed wrappers under `mcp/servers/`; the executor discovers them on demand and invokes via `nilcore mcp-call`. |
+| **MCP servers** | `{name, command}` (stdio) or `{name, url, headers}` (remote HTTP/SSE) entries in `mcp.json` | `nilcore` generates typed wrappers under `mcp/servers/`; the executor discovers them on demand and invokes the host-dispatched `mcp` tool — so MCP works on **every** sandbox tier, including the macOS container default. Resources + prompts are opt-in (`NILCORE_MCP_RESOURCES=1`). |
 | **LSP retrieval** | `NILCORE_LSP_COMMAND=gopls` (or any language server) | Compiler-grade **"precise"** retrieval. |
 | **Live index** | `NILCORE_LIVE_INDEX=1` | A worktree-aware, incrementally-updated `live` code-intelligence tool. |
 
