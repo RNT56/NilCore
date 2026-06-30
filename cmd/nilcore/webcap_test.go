@@ -9,9 +9,11 @@ func TestProviderSupportsNativeWebSearch(t *testing.T) {
 	}{
 		{"anthropic", "claude-sonnet-4-6", true},
 		{"openrouter", "anthropic/claude-3.5", true},
-		{"openai", "gpt-4o-search-preview", true}, // search-capable model
-		{"openai", "gpt-4o", false},               // conservative: no "search" → no native
-		{"openai-compatible", "llama-3", false},   // self-hosted → client-side
+		{"openai", "gpt-4o-search-preview", true},      // documented web-search family
+		{"openai", "gpt-4o-mini-search-preview", true}, // mini variant
+		{"openai", "gpt-4o", false},                    // conservative: not a search model
+		{"openai", "o3-deep-research", false},          // must NOT false-match on "research"
+		{"openai-compatible", "llama-3", false},        // self-hosted → client-side
 		{"", "x", false},
 	}
 	for _, c := range cases {

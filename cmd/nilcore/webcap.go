@@ -72,10 +72,13 @@ func selectNativeWebSearch(modelSpec string) tools.Tool {
 }
 
 // providerSupportsNativeWebSearch reports whether the vendor+model can run native
-// server-side web search. Conservative on OpenAI (only the search-capable models, so
-// an unsupported web_search_options never breaks a run); broad on Anthropic (GA tool)
-// and OpenRouter (the `web` plugin augments any model). Unknown vendors (generic
-// openai-compatible / self-hosted) get no native search → Path B fallback.
+// server-side web search. Conservative on OpenAI: only the documented web-search
+// model family ("*-search-preview", the ids that accept web_search_options on chat
+// completions) matches — a loose "search" substring would false-match unrelated ids
+// like "research-*" and emit web_search_options the model rejects. Broad on Anthropic
+// (GA tool) and OpenRouter (the `web` plugin augments ANY model — correct by design).
+// Unknown vendors (generic openai-compatible / self-hosted) get no native search →
+// Path B fallback.
 func providerSupportsNativeWebSearch(vendor, modelSpec string) bool {
 	switch vendor {
 	case "anthropic":
@@ -83,7 +86,7 @@ func providerSupportsNativeWebSearch(vendor, modelSpec string) bool {
 	case "openrouter":
 		return true
 	case "openai":
-		return strings.Contains(strings.ToLower(modelSpec), "search")
+		return strings.Contains(strings.ToLower(modelSpec), "search-preview")
 	default:
 		return false
 	}

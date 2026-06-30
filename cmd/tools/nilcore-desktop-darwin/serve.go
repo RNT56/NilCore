@@ -54,6 +54,14 @@ func runServe(ctx context.Context, control string, native bool) error {
 
 	d := &driver{native: native, idBox: map[int]image.Rectangle{}, scaleX: 1, scaleY: 1, bscale: fallbackBackingScale}
 
+	// Host-mode honesty (ROADMAP-COMPUTER-USE-DARWIN §3): surface the recorded
+	// host-control limitations once at startup — before any synthetic input runs — so
+	// the operator knows the screenshot terminal-exclusion is fail-closed-only and that
+	// synthetic CGEvents are not yet source-userData-tagged (both need the signed helper).
+	for _, n := range hostModeNotes() {
+		fmt.Fprintln(os.Stderr, "nilcore-desktop-darwin [host-mode]:", n)
+	}
+
 	if err := atomicWrite(filepath.Join(control, readyMarker), []byte("1")); err != nil {
 		return err
 	}

@@ -108,7 +108,7 @@ func (s *Store) migrateMemoryUnique(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("migrate memory: begin: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	stmts := []string{
 		`CREATE TABLE memory_new (
 			id      INTEGER PRIMARY KEY AUTOINCREMENT,

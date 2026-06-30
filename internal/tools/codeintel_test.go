@@ -62,7 +62,7 @@ func Run() int { return helper() }
 	if err != nil {
 		t.Fatalf("codeintel: %v", err)
 	}
-	if !strings.Contains(out, "indexed 1 Go file") {
+	if !strings.Contains(out, "indexed 1 source file") {
 		t.Errorf("expected a 1-file index header, got:\n%s", out)
 	}
 	// The lead is present...
@@ -136,7 +136,7 @@ func TestCodeintelToolSkipsUnparseable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("codeintel should not fail on an unparseable file: %v", err)
 	}
-	if !strings.Contains(out, "indexed 1 Go file") {
+	if !strings.Contains(out, "indexed 1 source file") {
 		t.Errorf("the unparseable file should be skipped (1 indexed), got:\n%s", out)
 	}
 }
@@ -161,7 +161,7 @@ func TestCodeintelToolEdgeCases(t *testing.T) {
 	}
 }
 
-// A query against a worktree with NO Go files indexes nothing and returns the
+// A query against a worktree with NO source files indexes nothing and returns the
 // graceful empty-bundle note instead of erroring.
 func TestCodeintelToolNoGoFiles(t *testing.T) {
 	dir := t.TempDir()
@@ -171,7 +171,7 @@ func TestCodeintelToolNoGoFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("an empty repo should not error: %v", err)
 	}
-	if !strings.Contains(out, "indexed 0 Go file") || !strings.Contains(out, "no relevant symbols") {
+	if !strings.Contains(out, "indexed 0 source file") || !strings.Contains(out, "no relevant symbols") {
 		t.Errorf("expected an empty-bundle note over a Go-less repo:\n%s", out)
 	}
 }
