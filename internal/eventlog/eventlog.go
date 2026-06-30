@@ -101,15 +101,26 @@ func (l *Log) OnAppend(fn func(e Event)) {
 func Open(path string) (*Log, error) {
 	// Heal a torn final line before opening for append. If the file is non-empty and
 	// does not end in '\n', a prior process crashed mid-write (or a short write
-	// occurred). Append a single newline so the NEXT record starts on its own line
-	// rather than being concatenated INTO the partial one (which would corrupt the
-	// next event too and, via lastEvent failing, silently reset the sequence to 0).
-	// This only ADDS a byte — still append-only (I5); the partial line itself stays
-	// as an honest corruption signal that Verify will surface.
+	// occurred), leaving a partial record with no terminator. TRUNCATE the partial
+	// bytes back to the end of the last complete line, so the NEXT record starts on a
+	// clean boundary rather than being concatenated into the partial one (which would
+	// corrupt the next event too) AND so Verify is not permanently broken by an
+	// unparseable trailing line (a single torn tail otherwise fails json.Unmarshal in
+	// the Verify loop forever, with no recovery path).
+	//
+	// This stays append-only in spirit (I5): the partial bytes NEVER durably became a
+	// committed event — Append advances l.prev/l.seq only AFTER a full line write lands,
+	// so no completed record is dropped here. We remove only the never-finished tail of
+	// an interrupted write, exactly the bytes that were never a record. (A fully written
+	// line always ends in '\n', so a missing terminator unambiguously marks an
+	// interrupted write — there is no valid record without it.)
 	if data, rerr := os.ReadFile(path); rerr == nil && len(data) > 0 && data[len(data)-1] != '\n' {
-		if hf, herr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644); herr == nil {
-			_, _ = hf.Write([]byte{'\n'})
-			_ = hf.Close()
+		// Keep everything up to and including the last newline; drop the partial tail.
+		// If there is no newline at all, the whole file is one torn line ⇒ truncate to 0.
+		keep := strings.LastIndexByte(string(data), '\n') + 1
+		if tf, terr := os.OpenFile(path, os.O_WRONLY, 0o644); terr == nil {
+			_ = tf.Truncate(int64(keep))
+			_ = tf.Close()
 		}
 	}
 

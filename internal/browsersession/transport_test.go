@@ -72,10 +72,12 @@ func runFakeDaemon(ctx context.Context, control string) {
 			return
 		}
 		// Echo the op into the URL and always offer one ref, so ref-based acts validate.
+		// The ref is stamped with this snapshot's version, exactly like the real driver,
+		// so the host-side version-stamped stale-ref guard accepts it.
 		obs := browserwire.Observation{
 			Version: uint64(seq),
 			URL:     "http://x.test/" + req.Act.Op,
-			Refs:    []browserwire.Ref{{ID: 1, Role: "button", Name: "Go"}},
+			Refs:    []browserwire.Ref{{ID: 1, Role: "button", Name: "Go", Version: uint64(seq)}},
 		}
 		_ = atomicWrite(filepath.Join(control, respPrefix+itoa(seq)+jsonSuffix),
 			mustJSON(browserwire.SessionResponse{Seq: seq, Observation: obs}))

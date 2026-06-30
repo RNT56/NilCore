@@ -87,6 +87,47 @@ func TestInstallSkillRejectsNonSkillKind(t *testing.T) {
 	}
 }
 
+// TestInstallSkillRejectsTraversalName proves a non-single-segment entry name is
+// refused BEFORE any filesystem write, so a manifest name cannot escape skillsDir.
+// The check fires before the source is even read, so an outside SKILL.md is never
+// written and the would-be parent dir is never touched.
+func TestInstallSkillRejectsTraversalName(t *testing.T) {
+	skillsDir := t.TempDir()
+	// A pre-existing victim dir a traversal name might otherwise target.
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "SKILL.md")
+	writeSkill(t, src, "ok", "1.0.0", "Step 1.")
+
+	for _, name := range []string{
+		"../escape",
+		"../../etc/x",
+		"a/b",
+		"/abs/path",
+		"..",
+		".",
+		"trailing/",
+	} {
+		err := InstallSkill(Entry{Name: name, Kind: KindSkill, Version: "1", Source: src}, skillsDir)
+		if err == nil {
+			t.Errorf("name %q must be rejected as a non-single-segment path", name)
+		}
+	}
+	// Nothing escaped: skillsDir holds no entries, and the victim dir is intact.
+	if ents, _ := os.ReadDir(skillsDir); len(ents) != 0 {
+		t.Errorf("traversal install wrote into skillsDir: %d entries", len(ents))
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Errorf("victim dir disturbed by a rejected traversal install: %v", err)
+	}
+	// A clean single segment still installs.
+	if err := InstallSkill(Entry{Name: "clean-name", Kind: KindSkill, Version: "1", Source: src}, skillsDir); err != nil {
+		t.Fatalf("a clean single-segment name must install: %v", err)
+	}
+}
+
 func TestLoadManifestAndFilter(t *testing.T) {
 	dir := t.TempDir()
 	mpath := filepath.Join(dir, "manifest.json")

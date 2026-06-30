@@ -37,7 +37,12 @@ func SelfImproveGate(human func(action string) bool, sink Sink) func(action stri
 		human = func(string) bool { return false }
 	}
 	return func(action string) bool {
-		if os.Getenv(EnvSelfImproveAutoApprove) == "" {
+		// Require an EXPLICIT affirmative ("1"), mirroring killSwitchEngaged. Any other
+		// value — including "0", "false", "no", "off", or unset — leaves this auto-approval
+		// path OFF and delegates to the human. (The previous `!= ""` test enabled it on ANY
+		// non-empty value, so an operator setting `=0` to DISABLE it would have ENABLED a
+		// free-text self-edit auto-approval — an intent-inverting footgun.)
+		if os.Getenv(EnvSelfImproveAutoApprove) != "1" {
 			return human(action) // default-off: the human decides
 		}
 		if sink != nil {

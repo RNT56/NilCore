@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -16,10 +17,12 @@ import (
 // PermissionReport is the probe's structured result. Ready is the AND of the grants
 // the host-control driver actually needs.
 type PermissionReport struct {
-	ScreenRecording   bool     `json:"screen_recording"`   // screencapture produced a real frame
-	CliclickInstalled bool     `json:"cliclick_installed"` // the actuation binary is on PATH
-	Ready             bool     `json:"ready"`              // all hard requirements satisfied
-	Guidance          []string `json:"guidance"`           // human, actionable, ordered
+	ScreenRecording   bool     `json:"screen_recording"`    // screencapture produced a real frame
+	CliclickInstalled bool     `json:"cliclick_installed"`  // the actuation binary is on PATH
+	BackingScaleKnown bool     `json:"backing_scale_known"` // the backing scale can be determined (env override OR osascript probe)
+	BackingScale      float64  `json:"backing_scale"`       // the resolved scale (1.0 fallback when unknown)
+	Ready             bool     `json:"ready"`               // all hard requirements satisfied
+	Guidance          []string `json:"guidance"`            // human, actionable, ordered
 }
 
 // lookPath is the PATH-lookup seam (a var so tests can fake a missing/present tool).
@@ -33,8 +36,10 @@ var lookPath = exec.LookPath
 func probePermissions(ctx context.Context) PermissionReport {
 	var r PermissionReport
 
-	if _, err := capture(ctx); err == nil {
+	pixelW := 0
+	if img, err := capture(ctx); err == nil && img != nil {
 		r.ScreenRecording = true
+		pixelW = img.Bounds().Dx()
 	} else {
 		r.Guidance = append(r.Guidance,
 			"Screen Recording is OFF (screencapture cannot read the display). Grant it: System Settings ▸ Privacy & Security ▸ Screen Recording ▸ enable your terminal, then RESTART the terminal.")
@@ -49,9 +54,25 @@ func probePermissions(ctx context.Context) PermissionReport {
 			"cliclick is NOT installed (clicks/typing will fail closed). Install it: brew install cliclick.")
 	}
 
+	// Backing-scale readiness (CU-MAC-T08, the #1 mis-click guard): a click is mapped
+	// pixel→point by dividing by the backing scale, so an undetermined scale on a
+	// non-Retina display silently sends clicks to the wrong place. Exercise the SAME
+	// resolution the live driver uses (env override, then the osascript desktop-width
+	// probe) and warn loudly when it cannot be determined — the Automation-TCC
+	// dependency the driver silently leaned on is now verified by --probe.
+	r.BackingScale, r.BackingScaleKnown = resolveBackingScale(ctx, pixelW)
+	if !r.BackingScaleKnown {
+		r.Guidance = append(r.Guidance,
+			"Backing scale could NOT be determined (the osascript desktop-width probe failed — Automation permission may be denied — and NILCORE_MAC_SCALE is unset). The driver will assume 1.0; on a Retina display this mis-clicks. Fix EITHER by granting Automation (System Settings ▸ Privacy & Security ▸ Automation ▸ your terminal ▸ Finder/System Events) OR by setting NILCORE_MAC_SCALE (e.g. 2 for Retina, 1 for a non-Retina external display).")
+	}
+
 	r.Ready = r.ScreenRecording && r.CliclickInstalled
 	if r.Ready {
-		r.Guidance = append([]string{"All hard requirements satisfied — host control can run (confirm Accessibility is granted if actuation fails)."}, r.Guidance...)
+		head := "All hard requirements satisfied — host control can run (confirm Accessibility is granted if actuation fails)."
+		if !r.BackingScaleKnown {
+			head += " NOTE: backing scale is a fallback 1.0 — set NILCORE_MAC_SCALE on a Retina display before driving it."
+		}
+		r.Guidance = append([]string{head}, r.Guidance...)
 	}
 	return r
 }
@@ -62,6 +83,7 @@ func (r PermissionReport) String() string {
 	b.WriteString("nilcore-desktop-darwin permission probe\n")
 	b.WriteString("  Screen Recording : " + yesNo(r.ScreenRecording) + "\n")
 	b.WriteString("  cliclick present : " + yesNo(r.CliclickInstalled) + "\n")
+	b.WriteString("  backing scale    : " + scaleStr(r.BackingScale, r.BackingScaleKnown) + "\n")
 	b.WriteString("  ready            : " + yesNo(r.Ready) + "\n")
 	for _, g := range r.Guidance {
 		b.WriteString("  • " + g + "\n")
@@ -74,4 +96,13 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// scaleStr renders the resolved backing scale, flagging the unity fallback.
+func scaleStr(s float64, known bool) string {
+	v := strconv.FormatFloat(s, 'g', -1, 64)
+	if !known {
+		return v + " (fallback — undetermined; set NILCORE_MAC_SCALE)"
+	}
+	return v
 }

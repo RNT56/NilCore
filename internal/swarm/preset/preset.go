@@ -1,4 +1,4 @@
-// Package preset is the plain-data catalog of NilCore's five swarm bundles (Phase 12,
+// Package preset is the plain-data catalog of NilCore's swarm bundles (Phase 12,
 // SW-T15). A Preset names everything an operator would otherwise have to tune by hand:
 // the artifact Kind the shards produce, the roster Role that produces it, that role's
 // Profile, the verify packs whose checks make the artifact GREEN, the egress those packs
@@ -68,8 +68,9 @@ const (
 	// SharderPlan asks the planner model to decompose the goal into a shard set
 	// (research/code/audit/ui) — the JSON-only planner parse, error on an invalid plan.
 	SharderPlan SharderKind = "plan"
-	// SharderFailure derives one shard per detected red test — reserved for the failure-
-	// driven flow; no shipped preset selects it, but the enum keeps the keyspace open.
+	// SharderFailure derives one shard per detected red test — the failure-driven "fix the
+	// red tests" flow. The "fix" preset selects it; the cmd layer builds a swarm.FailureSharder
+	// over a box, runs verify.Detect once, and emits one fix shard per failing test.
 	SharderFailure SharderKind = "failure"
 )
 
@@ -100,20 +101,21 @@ const (
 	tierPlanner = "planner"
 )
 
-// catalog is the five named bundles (SWARM.md §8.1). Each entry binds the static facts;
+// catalog is the named bundles (SWARM.md §8.1). Each entry binds the static facts;
 // VerifyPacks drives both the verifier registry (packs.Select) and the derived Egress
 // (union of packs.HostsFor) at Resolve time. The roles split three ways:
 //
 //   - research reuses the EXISTING roster.RoleTypedResearch (write-capable, web fetch) —
 //     SW-T15 adds NO new role for it; it already writes the spine Artifact.
-//   - code reuses roster.RoleImplementer (the only role whose Role.ReadOnly() is already
+//   - code/fix reuse roster.RoleImplementer (the only role whose Role.ReadOnly() is already
 //     false — it writes a spec/code shard's edits, merged via the Integrator).
 //   - audit/ui use the NEW roster.RoleAuditor/roster.RoleUI, whose Profiles
-//     (roster.AuditorProfile/roster.UIProfile) set ReadOnly:false explicitly because the
-//     Role.ReadOnly() helper would (wrongly, for these write roles) report true.
+//     (roster.AuditorProfile/roster.UIProfile) set ReadOnly:false explicitly.
 //
-// FanIn/Shape/Sharder encode the run shape: every preset but code collates flat; code
-// merges a DAG. benchmark uses a static list (operator-supplied inputs); the rest plan.
+// FanIn/Shape/Sharder encode the run shape: research/audit/benchmark/ui collate flat; code
+// and fix merge their branches (overlapping edits land as one tree). code plans a DAG;
+// benchmark uses a static list; fix derives one shard per detected red test (flat, since
+// failures are independent); the rest plan.
 var catalog = map[string]Preset{
 	"research": {
 		Name:        "research",
@@ -134,6 +136,21 @@ var catalog = map[string]Preset{
 		FanIn:       FanInMerge,
 		Shape:       ShapeDAG,
 		Sharder:     SharderPlan,
+		WorkerTier:  tierWorker,
+		PlannerTier: tierPlanner,
+	},
+	"fix": {
+		// fix is the failure-driven flow: SharderFailure runs verify.Detect once over a box
+		// and emits one shard per red test (flat — failures are independent units, no Deps).
+		// It reuses RoleImplementer + the code/software packs and merges its branches like the
+		// code preset, because a fix shard makes real edits that must land as one verified tree.
+		Name:        "fix",
+		Kind:        artifact.KindSpec,
+		Role:        roster.RoleImplementer,
+		VerifyPacks: []string{"software", "code"},
+		FanIn:       FanInMerge,
+		Shape:       ShapeFlat,
+		Sharder:     SharderFailure,
 		WorkerTier:  tierWorker,
 		PlannerTier: tierPlanner,
 	},

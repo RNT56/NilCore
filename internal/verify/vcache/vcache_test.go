@@ -210,6 +210,52 @@ func TestBrokenChainForcesRecompute(t *testing.T) {
 	}
 }
 
+// TestCorruptLineEmitsOneTimeDiagnostic: an unparseable line in the log aborts the
+// scan (and eventlog.Verify would reject the same log), so the cache permanently
+// recomputes. The fix emits ONE kindCacheCorrupt diagnostic so an operator notices a
+// poisoned-cache condition rather than a silent perpetual miss. The diagnostic is
+// guarded by corruptOnce: repeated lookups over the same corrupt log emit it once.
+func TestCorruptLineEmitsOneTimeDiagnostic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	// Write a single CORRUPT (non-JSON) line as the whole log, then close so a fresh
+	// reader sees it. The scan aborts on this line and reports corruption.
+	if err := os.WriteFile(path, []byte("this is not json\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real log we can both read corruption from and append the diagnostic to. We
+	// reopen the same path so the diagnostic lands in the same file the scan read.
+	log, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+
+	inner := &spy{report: verify.Report{Passed: true}}
+	c, err := New(Config{
+		Inner: inner, Log: log, LogPath: path,
+		Hash: fixedHash("content-A"), VerifierID: "make verify", Toolchain: "go1.25.0", Task: "T-diag",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two lookups over the corrupt log: both must recompute (return false), and exactly
+	// ONE diagnostic event must be emitted across both.
+	if hit := c.lookup("any-key"); hit {
+		t.Fatal("a corrupt log must never serve a hit")
+	}
+	if hit := c.lookup("any-key"); hit {
+		t.Fatal("a corrupt log must never serve a hit (second lookup)")
+	}
+
+	data, _ := os.ReadFile(path)
+	got := strings.Count(string(data), kindCacheCorrupt)
+	if got != 1 {
+		t.Fatalf("want exactly one %q diagnostic across repeated lookups, got %d:\n%s", kindCacheCorrupt, got, data)
+	}
+}
+
 // TestFailureNotCached: a red verifier result is never recorded as a cache pass, so
 // it can never be replayed as green. A second Check re-runs.
 func TestFailureNotCached(t *testing.T) {

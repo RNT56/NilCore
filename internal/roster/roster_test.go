@@ -548,3 +548,43 @@ func containsExact(xs []string, s string) bool {
 	}
 	return false
 }
+
+// TestReadOnlyHelperAgreesWithWriteProfiles is the B4-swarm.5 guard: Role.ReadOnly()
+// must agree with the Profile's ReadOnly field for the write-capable preset roles
+// (auditor, ui) as well as the pre-existing write roles (implementer, typed-research).
+// Before the fix the helper reported auditor/ui as read-only (a latent footgun: a caller
+// trusting the helper would mis-wire a read-only worker that cannot emit its artifact).
+// Profile.ReadOnly stays the structural source of truth NewWorker reads; this asserts the
+// convenience helper no longer DISAGREES with it for any write role.
+func TestReadOnlyHelperAgreesWithWriteProfiles(t *testing.T) {
+	cases := []struct {
+		role    Role
+		profile Profile
+	}{
+		{RoleAuditor, AuditorProfile(fakeProvider{"exec"}, policy.Egress{})},
+		{RoleUI, UIProfile(fakeProvider{"exec"}, policy.Egress{})},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.role), func(t *testing.T) {
+			if tc.profile.ReadOnly {
+				t.Fatalf("%s profile must be write-capable (ReadOnly:false)", tc.role)
+			}
+			if tc.role.ReadOnly() {
+				t.Errorf("%s.ReadOnly() = true, want false — helper disagrees with the write Profile (footgun)", tc.role)
+			}
+			// And the structural wiring honors it: the worker carries write tools.
+			w := NewWorker(tc.profile, &recordingBox{}, fakeVerifier{}, &eventlog.Log{}, fakeProvider{"exec"}, nil)
+			if !hasWriteTool(w.Tools) {
+				t.Errorf("%s worker must advertise write tools (it emits a spine artifact)", tc.role)
+			}
+		})
+	}
+	// Belt-and-suspenders: the four write roles are the ONLY roles the helper reports
+	// writable, and every default-roster role still agrees with its Profile.
+	writable := map[Role]bool{RoleImplementer: true, RoleTypedResearch: true, RoleAuditor: true, RoleUI: true}
+	for _, role := range []Role{RoleResearcher, RoleUnderstander, RolePlanner, RoleImplementer, RoleReviewer, RoleTypedResearch, RoleAuditor, RoleUI} {
+		if got, want := role.ReadOnly(), !writable[role]; got != want {
+			t.Errorf("%s.ReadOnly() = %v, want %v", role, got, want)
+		}
+	}
+}

@@ -127,8 +127,10 @@ func (a verifyFuncAdapter) Check(ctx context.Context) (verify.Report, error) {
 // checked, so the tip must not claim verified on an unchecked tree. The caller owns the
 // returned worktree's lifecycle (keep its branch on success, Cleanup otherwise).
 func integrateBranches(ctx context.Context, baseRepo string, children []childResult, verify verifyFunc, log *eventlog.Log) (*worktree.Worktree, integrateResult, error) {
-	// Build the merge order from the verified children, in plan (topological) order; an
-	// unverified child or one with no branch is dropped up front, never merged.
+	// Build the merge order from the verified children, in plan order (the order Plan
+	// emitted the sub-goals — the flows path supplies that topologically; standalone
+	// decompose's sub-goals are independent). An unverified child or one with no branch
+	// is dropped up front, never merged.
 	order := make([]integrate.MergeItem, 0, len(children))
 	dropped := 0
 	for _, c := range children {

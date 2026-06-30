@@ -1,8 +1,14 @@
 package trigger
 
 import (
+	"bufio"
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"nilcore/internal/eventlog"
 )
 
 func TestReversibleSelfStarts(t *testing.T) {
@@ -49,4 +55,59 @@ func TestDisabledDoesNothing(t *testing.T) {
 	if started, _ := tr.Handle(context.Background(), Signal{Goal: "anything"}); started {
 		t.Error("disabled trigger must not start work")
 	}
+}
+
+// TestNilStartDoesNotClaimStarted proves that when no runnable Start is wired,
+// Handle reports started=false (nothing ran) AND emits no trigger_start event,
+// so neither the return value nor the audit trail claims work that never began.
+func TestNilStartDoesNotClaimStarted(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "events.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+
+	tr := &Trigger{
+		Enabled: true,
+		Gate:    func(string) bool { return true }, // gate would pass; Start is nil
+		Start:   nil,
+		Log:     log,
+	}
+	// A reversible goal (no gate involved) with a nil Start must not claim a start.
+	started, err := tr.Handle(context.Background(), Signal{Source: "ci", Goal: "fix the failing test"})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if started {
+		t.Error("a nil Start must report started=false; nothing ran")
+	}
+
+	if err := log.Close(); err != nil {
+		t.Fatalf("close log: %v", err)
+	}
+	if got := countEvents(t, logPath, "trigger_start"); got != 0 {
+		t.Errorf("nil Start must emit no trigger_start event, got %d", got)
+	}
+}
+
+// countEvents counts append-only events of the given Kind in a JSONL event log.
+func countEvents(t *testing.T, path, kind string) int {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open log for read: %v", err)
+	}
+	defer f.Close()
+	n := 0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if strings.Contains(sc.Text(), `"kind":"`+kind+`"`) {
+			n++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan log: %v", err)
+	}
+	return n
 }

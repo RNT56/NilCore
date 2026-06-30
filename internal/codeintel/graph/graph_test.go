@@ -127,3 +127,48 @@ func TestBuildFilePrunesRemovedSymbols(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildFileReferencesEdges proves BuildFile emits `references` edges (the tag
+// map: file -> each identifier it uses) and prunes them on rebuild, so a reference
+// the file no longer contains does not linger.
+func TestBuildFileReferencesEdges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.go")
+	g := openMem(t)
+	ctx := context.Background()
+
+	// v1: Run calls helper — both names appear as references.
+	if err := os.WriteFile(path, []byte("package p\nfunc helper() int { return 1 }\nfunc Run() int { return helper() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	refTo := func() map[string]bool {
+		edges, err := g.Edges(ctx, "references")
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]bool{}
+		for _, e := range edges {
+			if e.From != path {
+				t.Errorf("reference edge from %q, want the file path %q", e.From, path)
+			}
+			m[e.To] = true
+		}
+		return m
+	}
+	if got := refTo(); !got["helper"] {
+		t.Errorf("v1 references = %v, want a reference to helper", got)
+	}
+
+	// v2: helper removed; its reference edge must be pruned on rebuild.
+	if err := os.WriteFile(path, []byte("package p\nfunc Run() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	if got := refTo(); got["helper"] {
+		t.Errorf("after re-index, references still include helper: %v (stale reference not pruned)", got)
+	}
+}

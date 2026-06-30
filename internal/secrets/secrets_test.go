@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -142,6 +143,129 @@ func TestExternalStore(t *testing.T) {
 	}
 	if err := e.Set("API", "secret"); err != nil {
 		t.Errorf("Set: %v", err)
+	}
+}
+
+// A hook that exits 0 but prints nothing must NOT yield an empty secret — fail
+// closed (I3): an empty / whitespace-only payload resolves as ErrNotFound so the
+// resolver falls through to the next store instead of injecting a blank credential.
+func TestExternalStoreEmptyIsNotFound(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell hook")
+	}
+	for _, tc := range []struct {
+		name string
+		emit string // the `get` branch body
+	}{
+		{"empty", "true"},                // prints nothing, exits 0
+		{"newline-only", "echo"},         // a bare `echo` ⇒ one newline
+		{"whitespace-only", "echo '  '"}, // spaces + newline
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "hook.sh")
+			body := "#!/bin/sh\ncase \"$1\" in get) " + tc.emit + ";; *) cat >/dev/null;; esac\nexit 0\n"
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			e := ExternalStore{Command: script}
+			got, err := e.Get("API")
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("empty hook stdout: Get = %q, %v, want ErrNotFound", got, err)
+			}
+			if got != "" {
+				t.Errorf("empty hook stdout should yield no value, got %q", got)
+			}
+		})
+	}
+}
+
+// fakeKeychain is an in-memory stand-in for the OS keychain CLI, keyed by
+// (service, account). It lets the round-trip test exercise KeychainStore.Get/Set/
+// Delete on the active platform's code path without ever touching the real keychain.
+type fakeKeychain struct {
+	store map[string]string // key: service\x00account
+}
+
+func keyOf(service, account string) string { return service + "\x00" + account }
+
+// run mirrors the argv contract of `security` (macOS) and `secret-tool` (linux)
+// closely enough to round-trip a value. It is wired into KeychainStore.run.
+func (f *fakeKeychain) run(name string, args []string, stdin string) (string, error) {
+	// Pull the service (-s / "service") and account (-a / "account") out of args.
+	flag := func(want ...string) string {
+		for i := 0; i < len(args)-1; i++ {
+			for _, w := range want {
+				if args[i] == w {
+					return args[i+1]
+				}
+			}
+		}
+		return ""
+	}
+	svc := flag("-s", "service")
+	acct := flag("-a", "account")
+	if len(args) == 0 {
+		return "", &exec.ExitError{}
+	}
+	switch {
+	case name == "security" && args[0] == "find-generic-password",
+		name == "secret-tool" && args[0] == "lookup":
+		v, ok := f.store[keyOf(svc, acct)]
+		if !ok {
+			return "", &exec.ExitError{} // a not-found lookup exits non-zero
+		}
+		// security emits a trailing newline; secret-tool does not. Reproduce the
+		// macOS newline so the test proves the Get path trims it on both platforms.
+		if name == "security" {
+			return v + "\n", nil
+		}
+		return v, nil
+	case name == "security" && args[0] == "add-generic-password":
+		f.store[keyOf(svc, acct)] = flag("-w") // macOS passes the value on argv via -w
+		return "", nil
+	case name == "secret-tool" && args[0] == "store":
+		f.store[keyOf(svc, acct)] = stdin // linux passes the value on stdin
+		return "", nil
+	case name == "security" && args[0] == "delete-generic-password",
+		name == "secret-tool" && args[0] == "clear":
+		delete(f.store, keyOf(svc, acct))
+		return "", nil
+	}
+	return "", &exec.ExitError{}
+}
+
+// TestKeychainStoreRoundTrip exercises Get/Set/Delete against an injected in-memory
+// keychain (never the real OS keychain), covering the active platform's code path.
+// It pins the cross-platform contract the auditor flagged: a stored value reads back
+// byte-for-byte with NO trailing-newline asymmetry between macOS and Linux.
+func TestKeychainStoreRoundTrip(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("keychain backend unsupported on %s", runtime.GOOS)
+	}
+	fake := &fakeKeychain{store: map[string]string{}}
+	k := KeychainStore{Service: "nilcore-test-throwaway", run: fake.run}
+
+	if _, err := k.Get("MISSING"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get(missing) = %v, want ErrNotFound", err)
+	}
+	const secret = "sk-keychain-roundtrip-123"
+	if err := k.Set("ANTHROPIC_API_KEY", secret); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, err := k.Get("ANTHROPIC_API_KEY")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// No trailing-newline asymmetry: the value comes back exactly as stored on
+	// either platform (the macOS path appends a newline that Get must trim).
+	if got != secret {
+		t.Fatalf("Get = %q, want %q (trailing-newline asymmetry?)", got, secret)
+	}
+	if err := k.Delete("ANTHROPIC_API_KEY"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := k.Get("ANTHROPIC_API_KEY"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("after delete Get = %v, want ErrNotFound", err)
 	}
 }
 

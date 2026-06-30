@@ -47,6 +47,17 @@ func setupMCP(workdir string) *mcp.Manager {
 		fmt.Fprintf(os.Stderr, "nilcore: mcp config: %v\n", err)
 		return nil
 	}
+	// Reconcile the discovery surface with the live config: prune the wrapper dir of
+	// any server no longer in mcp.json BEFORE (re)generating, so a removed server leaves
+	// no stale, still-discoverable tools behind. Runs even when the config is now empty
+	// (so emptying mcp.json clears every server). Best-effort, logged not fatal.
+	keep := make(map[string]bool, len(cfg.Servers))
+	for _, spec := range cfg.Servers {
+		keep[spec.Name] = true
+	}
+	if err := mcp.PruneServers(workdir, keep); err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: mcp prune stale servers: %v\n", err)
+	}
 	if len(cfg.Servers) == 0 {
 		return nil
 	}

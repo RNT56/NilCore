@@ -15,6 +15,7 @@ package wake
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"nilcore/internal/eventlog"
@@ -48,10 +49,22 @@ type detail struct {
 
 // Registry arms/disarms/lists durable wakes. The zero value is unusable; construct
 // with New. Now is injectable for tests (nil ⇒ time.Now).
+//
+// A single *Registry serializes Claim across goroutines (mu + claimed), so when two
+// pollers share ONE registry — the serve waker and the autonomy wake feeder both poll
+// the same instance (cmd/nilcore) — only one can win a given thread's wake. See Claim.
 type Registry struct {
 	store Store
 	log   *eventlog.Log
 	now   func() time.Time
+
+	mu sync.Mutex // guards claimed; serializes Claim's disarm-and-return as one step
+	// claimed records threadIDs already won via Claim, so a second concurrent Claim
+	// loses even before the store's disarm is durably visible (two pollers polling the
+	// SAME registry can otherwise both read a wake as Pending before either Disarm
+	// lands). It only grows for wakes Claim actually fired; Arm clears a thread's entry
+	// when a NEW wake is armed for it, so a re-armed wake is claimable again.
+	claimed map[string]struct{}
 }
 
 // New returns a Registry over a durable Store. A nil log disables audit (the wakes
@@ -87,8 +100,54 @@ func (r *Registry) Arm(ctx context.Context, threadID, sender string, after time.
 	if err := r.store.SaveWake(ctx, threadID, string(d)); err != nil {
 		return time.Time{}, err
 	}
+	// A freshly-armed wake is a NEW timer for this thread: clear any prior single-fire
+	// claim so the new wake is claimable again (the in-memory claimed set must not
+	// permanently shadow a re-armed thread).
+	r.mu.Lock()
+	delete(r.claimed, threadID)
+	r.mu.Unlock()
 	r.audit("wake_armed", map[string]any{"thread": threadID, "after_s": int(after.Seconds())})
 	return wakeAt, nil
+}
+
+// Claim is the single-fire primitive that makes "fire this wake exactly once" safe when
+// more than one poller shares this Registry. It atomically (within this *Registry)
+// records the thread as claimed AND disarms its wake, returning won=true to the FIRST
+// caller and won=false to every concurrent loser — so a wake read as Pending by two
+// pollers is delivered by exactly one of them, never both.
+//
+// The Store seam exposes no compare-and-disarm, so the atomicity is provided here: the
+// mu-guarded claimed set is the source of truth for "already fired" and the loser
+// observes the wake as already-gone WITHOUT a second store round-trip. The durable
+// DisarmWake still runs for the winner so the wake does not re-fire after a restart.
+// A loser does NOT touch the store. Safe with a nil store (no-op, always won=false so a
+// caller never double-delivers an unstored wake). It honors ctx for the store write.
+func (r *Registry) Claim(ctx context.Context, threadID string) (won bool, err error) {
+	if r.store == nil {
+		return false, nil
+	}
+	r.mu.Lock()
+	if _, taken := r.claimed[threadID]; taken {
+		r.mu.Unlock()
+		return false, nil // a concurrent caller already won this thread's wake
+	}
+	if r.claimed == nil {
+		r.claimed = make(map[string]struct{})
+	}
+	r.claimed[threadID] = struct{}{}
+	r.mu.Unlock()
+
+	// We hold the claim. Durably disarm so the wake never re-fires across a restart. If
+	// the disarm fails, release the in-memory claim so a retry (or the other poller) can
+	// pick it up rather than the wake being silently swallowed.
+	if err := r.store.DisarmWake(ctx, threadID); err != nil {
+		r.mu.Lock()
+		delete(r.claimed, threadID)
+		r.mu.Unlock()
+		return false, err
+	}
+	r.audit("wake_claimed", map[string]any{"thread": threadID})
+	return true, nil
 }
 
 // Disarm clears the pending wake for threadID (a status flip in the store, not a

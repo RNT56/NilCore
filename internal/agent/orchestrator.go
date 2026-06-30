@@ -239,22 +239,6 @@ func (o *Orchestrator) orderBackends(ctx context.Context, t backend.Task) []stri
 	return out
 }
 
-// Gate decides whether an action may proceed right now and records the decision.
-// Reversible actions auto-proceed unattended; irreversible ones (merge, push,
-// deploy, payments) require the human Approver — denied by default when none is
-// wired. It is the audited FREE-TEXT gate entry (Classify + policy.Gate + a logged
-// decision), retained as the orchestrator's primitive for gating a model-emitted
-// command string; the live integration-boundary path uses the TYPED GateStructured /
-// policy.GateAction (which classifies by Type, not substring) instead.
-func (o *Orchestrator) Gate(action string) bool {
-	class := policy.Classify(action)
-	allowed := policy.Gate(action, o.Approver)
-	o.Log.Append(eventlog.Event{Kind: "gate", Detail: map[string]any{
-		"action": action, "class": class.String(), "allowed": allowed,
-	}})
-	return allowed
-}
-
 // Outcome is the final, verifier-confirmed result of a task.
 type Outcome struct {
 	Backend  string

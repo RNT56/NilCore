@@ -10,9 +10,12 @@
 //     SCOPE here — it grants the process network-fetch authority and belongs to the
 //     external-infra roadmap (EXT-07), gated behind the §0 thesis gate.
 //   - An installed skill is still a `skill_<name>` tool that only returns
-//     instructions (no write surface); a registry-driven change to the agent's own
-//     skill set should still route through the verified, human-gated self-edit flow
-//     (internal/selfimprove) — registry does the mechanics, not the gating.
+//     instructions (no write surface). Install is the MECHANICS, not the gating.
+//     The trusted path today is the operator typing `nilcore registry install` —
+//     the human at the keyboard IS the approval. A FUTURE autonomous install path
+//     (an agent deciding to add to its own skill set) must route through the
+//     verified, human-gated self-edit flow (internal/selfimprove); that gate is the
+//     caller's responsibility, not this package's.
 //   - MCP-server install (writing mcp.json) is left to a follow-up; this package
 //     installs skills, the lower-risk half.
 //
@@ -24,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"nilcore/internal/skills"
 )
@@ -79,14 +83,23 @@ func (m Manifest) Skills() []Entry {
 // InstallSkill copies the entry's local source SKILL.md into
 // skillsDir/<name>/SKILL.md and verifies it loads (rolling back if it does not).
 // It is idempotent: re-installing the same content is a no-op overwrite. It does
-// NOT fetch over the network and does NOT gate — the caller routes a self-skill
-// change through the verified, human-gated self-edit flow.
+// NOT fetch over the network and does NOT gate — gating belongs to the caller
+// (operator-typed CLI today; the human-gated self-edit flow for a future
+// autonomous path).
 func InstallSkill(e Entry, skillsDir string) error {
 	if e.Kind != KindSkill {
 		return fmt.Errorf("registry: entry %q is kind %q, not a skill", e.Name, e.Kind)
 	}
 	if e.Name == "" || e.Source == "" {
 		return fmt.Errorf("registry: skill entry needs a name and a local source")
+	}
+	// The entry name becomes a directory under skillsDir, so it must be a single
+	// clean path segment — no separators, no "..", not absolute. A name like
+	// "../../etc/x" would otherwise write a SKILL.md outside the discovery dir. The
+	// manifest is operator-supplied/local-trusted, so this is defense-in-depth path
+	// hardening, but it costs nothing and removes the traversal write entirely.
+	if !singleSegment(e.Name) {
+		return fmt.Errorf("registry: skill name %q must be a single path segment (no separators, no '..', not absolute)", e.Name)
 	}
 	src, err := os.ReadFile(e.Source)
 	if err != nil {
@@ -122,6 +135,21 @@ func InstallSkill(e Entry, skillsDir string) error {
 		return fmt.Errorf("registry: installed skill %q produced no loadable skill", e.Name)
 	}
 	return nil
+}
+
+// singleSegment reports whether name is a single, clean path segment safe to join
+// under a directory: non-empty, not absolute, not "." or "..", no separator (OS or
+// '/'), and equal to its own filepath.Clean (which rejects embedded "..", "." and
+// trailing slashes). The explicit "." / ".." reject is needed because both are
+// their own filepath.Clean.
+func singleSegment(name string) bool {
+	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) {
+		return false
+	}
+	if strings.ContainsRune(name, '/') || strings.ContainsRune(name, filepath.Separator) {
+		return false
+	}
+	return filepath.Clean(name) == name
 }
 
 // Installed lists the skills currently present in skillsDir (with their versions),

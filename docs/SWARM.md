@@ -86,12 +86,13 @@ nilcore swarm \
   --budget 500
 ```
 
-Five **named presets** so an operator does not have to tune everything:
+Six **named presets** so an operator does not have to tune everything:
 
 | Preset | What it swarms | Artifact kind | Verify-pack(s) | Fan-in |
 |---|---|---|---|---|
 | `research` | verifiable reports & matrices, source-backed claims | `research-dossier` | `web` + `finance` | collate |
 | `code` | many implementation attempts; verifier picks green branches | `spec` | `software` + `code` | merge (Integrator) |
+| `fix` | one shard per detected red test (`FailureSharder` runs `verify.Detect` once); merges the green fixes | `spec` | `software` + `code` | merge (Integrator) |
 | `audit` | security / codebase / docs / API review, evidence-backed findings | `report` | `audit` + `web` | collate |
 | `benchmark` | repeated runs, variance checks, perf claims verified by scripts | `benchmark` | `benchmark` | collate |
 | `ui` | browser-flow shards: screenshots, console checks, visual assertions | `report` | `ui` | collate |
@@ -219,7 +220,7 @@ committed to in Phase 11; the swarm is the high-throughput driver over it.
 | 2 | **Shard-native task model** | `swarm.Shard{ID, Input, Kind, Pack, Role, Deps, Attempt, …}` maps DOWN to `spawn.Subtask`/`scheduler.Task`. Granularities: one company/source/package/benchmark/file-module/browser-flow → `ListSharder`/`PlanSharder`; **one test failure** → a `FailureSharder` (runs `verify.Detect` once, emits one shard per red test). `requeue.Scan` requeues **only** non-pass claims. |
 | 3 | **Provider pool** | `internal/pool`: strong planner/verifier tier + cheap worker tier + per-tier **fallback** model (`model.Resilient([primary,fallback])`) + **per-provider concurrency caps** (`strongcap`) + a delegated-CLI selector (`CodeBackendFor` → `buildBackend` for Codex/Claude-Code coding shards). All config over shipped seams; **no new module, no standing authority.** |
 | 4 | **Verification dashboard/report** | `internal/swarm/board` (live tally driven **strictly by the verifier verdict**) + `internal/report` swarm projection (`ReplaySwarmReport` → checked/passed/failed/retry-pass/remaining + final-clean + cost/time/token + **source–claim trace** + matrix). A pure read-only projection over the append-only log + persisted artifacts. |
-| 5 | **Swarm presets** | `internal/swarm/preset`: five named bundles (`research`/`code`/`audit`/`benchmark`/`ui`), each binding {sharder, role+Profile, artifact Kind, verify-pack(s), tiers, egress, fan-in, flat\|dag}. `Resolve(name)` is **fail-closed** (unknown ⇒ refuse to start). |
+| 5 | **Swarm presets** | `internal/swarm/preset`: named bundles (`research`/`code`/`fix`/`audit`/`benchmark`/`ui`), each binding {sharder, role+Profile, artifact Kind, verify-pack(s), tiers, egress, fan-in, flat\|dag}. `fix` selects `SharderFailure` (one shard per detected red test). `Resolve(name)` is **fail-closed** (unknown ⇒ refuse to start). |
 
 ---
 
@@ -227,7 +228,7 @@ committed to in Phase 11; the swarm is the high-throughput driver over it.
 
 This is the foundation the prompt demands first. The shipped spine (`artifact` + `evverify` +
 `packs/{web,software,finance,ui}` + `requeue` + `report`) already delivers most of it; this phase
-closes the gaps so all five presets have a real verify-pack.
+closes the gaps so every preset has a real verify-pack (`fix` reuses the `code` preset's `software`+`code` packs).
 
 ### 5.1 The cheap-first composed verifier (per shard)
 
@@ -387,8 +388,9 @@ type Preset struct {
 }
 ```
 
-The five presets bind: `research`→{`research-dossier`, `RoleTypedResearch`, `web`+`finance`, collate,
-flat}; `code`→{`spec`, `RoleImplementer`, `software`+`code`, merge, dag}; `audit`→{`report`,
+The presets bind: `research`→{`research-dossier`, `RoleTypedResearch`, `web`+`finance`, collate,
+flat}; `code`→{`spec`, `RoleImplementer`, `software`+`code`, merge, dag}; `fix`→{`spec`,
+`RoleImplementer`, `software`+`code`, merge, flat, `SharderFailure`}; `audit`→{`report`,
 `RoleAuditor` (**new**), `audit`+`web`, collate, flat}; `benchmark`→{`benchmark`, `RoleImplementer`,
 `benchmark`, collate, flat}; `ui`→{`report`, `RoleUI` (**new**), `ui`, collate, flat}.
 
@@ -401,7 +403,7 @@ import `preset` — the sharder carries `Kind`/`Pack`/`Role` as plain fields).
 ### 8.2 The `nilcore swarm` flag surface (SW-T17)
 
 ```
---goal STR             the swarm objective                        --preset NAME       research|code|audit|benchmark|ui (default research)
+--goal STR             the swarm objective                        --preset NAME       research|code|fix|audit|benchmark|ui (default research)
 --shard-file PATH      operator shard list (ListSharder)          --agents N          target shard count (PlanSharder budget)
 --concurrency K        pool cap (default 1 = byte-identical)      --passes until-clean|N
 --artifact LIST        '+'-joined deliverables: report+matrix|spec|benchmark|dossier|json

@@ -34,7 +34,7 @@ func TestSecretSubstitution(t *testing.T) {
 		return "", false
 	})
 	// Seed a snapshot so a ref would validate, though this act is selector-free.
-	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Role: "textbox"}}}
+	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Role: "textbox", Version: 1}}}
 
 	if _, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "pw={{secret:login_password}}"}); err != nil {
 		t.Fatalf("Act: %v", err)
@@ -54,7 +54,7 @@ func TestSecretSubstitution(t *testing.T) {
 func TestSecretMissingFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, func(string) (string, bool) { return "", false })
-	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1}}}
+	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Version: 1}}}
 
 	_, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "{{secret:nope}}"})
 	if err == nil {
@@ -68,7 +68,7 @@ func TestSecretMissingFailsClosed(t *testing.T) {
 func TestSecretNilResolverFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, nil)
-	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1}}}
+	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Version: 1}}}
 	if _, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "{{secret:x}}"}); err == nil {
 		t.Fatal("nil resolver + placeholder must fail closed")
 	}
@@ -77,7 +77,7 @@ func TestSecretNilResolverFailsClosed(t *testing.T) {
 func TestStaleRefFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, nil)
-	s.latest = browserwire.Observation{Version: 5, Refs: []browserwire.Ref{{ID: 1}, {ID: 2}}}
+	s.latest = browserwire.Observation{Version: 5, Refs: []browserwire.Ref{{ID: 1, Version: 5}, {ID: 2, Version: 5}}}
 
 	// Ref 9 is not in the current snapshot → must fail before reaching transport.
 	_, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpClick, Ref: 9})
@@ -89,13 +89,48 @@ func TestStaleRefFailsClosed(t *testing.T) {
 	}
 }
 
+// TestStaleRefVersionMismatchFailsClosed exercises the Cancel→Delete defense: a ref
+// whose ID is still present in the latest snapshot but whose stamped Version is older
+// (a re-render reused the positional id) must fail closed on the host side. A pure
+// membership check would have let this through.
+func TestStaleRefVersionMismatchFailsClosed(t *testing.T) {
+	ft := &fakeTransport{}
+	s := newSession(ft, nil)
+	// The snapshot is at version 6 but ref 1 still carries version 5 (a node that was
+	// swapped under the same id by a re-render the host has already advanced past).
+	s.latest = browserwire.Observation{Version: 6, Refs: []browserwire.Ref{{ID: 1, Version: 5}}}
+
+	_, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpClick, Ref: 1})
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected a stale-ref version guard error, got %v", err)
+	}
+	if len(ft.got) != 0 {
+		t.Fatal("a version-stale-ref act must never reach the transport")
+	}
+}
+
+// TestRefVersionMatchPasses confirms a ref stamped with the current snapshot version
+// validates and reaches the transport (the guard does not over-reject).
+func TestRefVersionMatchPasses(t *testing.T) {
+	ft := &fakeTransport{}
+	s := newSession(ft, nil)
+	s.latest = browserwire.Observation{Version: 6, Refs: []browserwire.Ref{{ID: 1, Version: 6}}}
+
+	if _, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpClick, Ref: 1}); err != nil {
+		t.Fatalf("a current-version ref must validate, got %v", err)
+	}
+	if len(ft.got) != 1 {
+		t.Fatalf("expected the act to reach the transport, sent %d", len(ft.got))
+	}
+}
+
 func TestDriverErrorSurfacedWithObservation(t *testing.T) {
 	ft := &fakeTransport{reply: func(seq int, a browserwire.Act) browserwire.SessionResponse {
 		return browserwire.SessionResponse{Seq: seq, Error: "selector matched no visible element",
 			Observation: browserwire.Observation{Version: 2, URL: "http://x.test/after"}}
 	}}
 	s := newSession(ft, nil)
-	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1}}}
+	s.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Version: 1}}}
 
 	obs, err := s.Act(context.Background(), browserwire.Act{Op: browserwire.OpClick, Ref: 1})
 	if err == nil {

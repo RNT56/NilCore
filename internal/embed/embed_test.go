@@ -80,3 +80,36 @@ func TestNewOpenAIDefaults(t *testing.T) {
 		t.Errorf("default model = %q", e.Model)
 	}
 }
+
+// TestEmbedderIsProviderAgnostic pins the embedder to the OpenAI-compatible wire
+// shape (OpenAI / OpenRouter / self-hosted), NOT any single vendor. It is the
+// regression for the stale "the semantic embedder is Anthropic-tied" assumption:
+// the default endpoint is the OpenAI-compatible /v1 base and the BaseURL is freely
+// overridable, so swapping providers needs no code change here.
+func TestEmbedderIsProviderAgnostic(t *testing.T) {
+	e := NewOpenAI("k", "m")
+	if e.BaseURL != "https://api.openai.com/v1" {
+		t.Errorf("default BaseURL = %q, want the OpenAI-compatible /v1 base", e.BaseURL)
+	}
+	if strings.Contains(strings.ToLower(e.BaseURL), "anthropic") {
+		t.Errorf("BaseURL must not be Anthropic-tied: %q", e.BaseURL)
+	}
+
+	// The endpoint is BaseURL + /embeddings; an overridden base (e.g. OpenRouter or
+	// a self-hosted server) is honored with no other change.
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[1]}]}`))
+	}))
+	defer srv.Close()
+	e2 := NewOpenAI("k", "m")
+	e2.BaseURL = srv.URL
+	e2.HTTP = srv.Client()
+	if _, err := e2.Embed(context.Background(), "x"); err != nil {
+		t.Fatalf("embed against an overridden base: %v", err)
+	}
+	if gotPath != "/embeddings" {
+		t.Errorf("endpoint path = %q, want /embeddings off the overridden base", gotPath)
+	}
+}

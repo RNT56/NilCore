@@ -28,6 +28,24 @@ func TestSummarizeParsesJSON(t *testing.T) {
 	}
 }
 
+// TestSummarizeParsesJSONWithTrailingBraceProse proves the JSON object is extracted
+// even when the model follows it with explanatory prose that itself contains a '}'
+// (e.g. a code snippet in the trailing text). The old first-'{'/last-'}' span would
+// over-capture and silently fall back to a lossy summary; the decoder stops at the
+// first complete object.
+func TestSummarizeParsesJSONWithTrailingBraceProse(t *testing.T) {
+	m := fakeModel{text: `{"goal":"fix bug","decisions":["found it"],"remaining":"write the fix"}
+
+Note: the failing case was a closure like func(){ return } — patch it.`}
+	cs, err := Summarize(context.Background(), m, "fix bug", "lots of state")
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if cs.Goal != "fix bug" || len(cs.Decisions) != 1 || cs.Remaining != "write the fix" {
+		t.Fatalf("trailing-brace prose mis-parsed (likely lossy fallback): %+v", cs)
+	}
+}
+
 func TestSummarizeFallback(t *testing.T) {
 	m := fakeModel{text: "no json here, sorry"}
 	cs, err := Summarize(context.Background(), m, "the goal", "remaining work state")

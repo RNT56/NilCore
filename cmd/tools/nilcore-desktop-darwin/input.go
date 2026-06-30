@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -52,12 +53,24 @@ func cliclickKey(chord string) []string {
 	return append(cmds, "ku:"+modList)
 }
 
-// cliclickScroll approximates scroll with page keys (cliclick has no wheel verb;
-// the production signed helper does a real CGEvent scroll). amount → repeat count.
-func cliclickScroll(dir string, amount int) []string {
-	key := "page-down"
-	if strings.ToLower(dir) == "up" {
+// cliclickScroll approximates VERTICAL scroll with page keys (cliclick has no wheel
+// verb; the production signed helper, CU-MAC-T05, does a real CGEvent scroll).
+// amount → repeat count. HORIZONTAL scroll (left/right) has no faithful page-key
+// substitute, so rather than silently page-DOWN — misleading the model into thinking
+// a horizontal scroll happened — it FAILS CLOSED with an explanatory error. An empty
+// dir defaults to down (the common case). Returns the command plus a non-nil error
+// for an unsupported direction.
+func cliclickScroll(dir string, amount int) ([]string, error) {
+	var key string
+	switch strings.ToLower(strings.TrimSpace(dir)) {
+	case "", "down":
+		key = "page-down"
+	case "up":
 		key = "page-up"
+	case "left", "right":
+		return nil, fmt.Errorf("horizontal scroll (%q) is unsupported on the cliclick MVP (no wheel verb); the signed helper does a real CGEvent scroll", dir)
+	default:
+		return nil, fmt.Errorf("unknown scroll direction %q", dir)
 	}
 	if amount < 1 {
 		amount = 1
@@ -66,7 +79,7 @@ func cliclickScroll(dir string, amount int) []string {
 	for i := 0; i < amount; i++ {
 		out = append(out, "kp:"+key)
 	}
-	return out
+	return out, nil
 }
 
 // specialKey maps a DOM/X-style key name to cliclick's key name.

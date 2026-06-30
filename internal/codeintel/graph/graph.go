@@ -1,8 +1,11 @@
-// Package graph is the code graph (P3-T10): nodes (symbols/files) and edges
-// (calls, references, defines, implements, …) in SQLite, with structural queries
-// — callers/callees and transitive reachability/closure via recursive CTEs. This
-// is the backbone pure-RAG lacks: structure, not just text. Builds are idempotent
-// (INSERT OR IGNORE), so re-indexing a file never duplicates.
+// Package graph is the code graph (P3-T10): nodes (symbols) and edges in SQLite,
+// with structural queries — callers/callees and transitive reachability/closure
+// via recursive CTEs. This is the backbone pure-RAG lacks: structure, not just
+// text. Two edge kinds ship today: `calls` (caller-name → callee-name, the call
+// graph the structural queries traverse) and `references` (file → each identifier
+// it uses, the tag map). The `kind` column is free-text, so richer kinds
+// (implements, imports, inherits, …) can slot in without a schema change. Builds
+// are idempotent (INSERT OR IGNORE), so re-indexing a file never duplicates.
 package graph
 
 import (
@@ -88,19 +91,26 @@ func (g *Graph) AddEdge(ctx context.Context, e Edge) error {
 	return err
 }
 
-// BuildFile (re)indexes a Go file: its symbols become nodes and its calls become
-// `calls` edges (by name, scoped to the fixture/package). It is a full REPLACE of
-// the file's contribution, not an append — it first prunes the file's prior nodes
-// and the edges originating from them, so a symbol or call that the file no longer
-// contains does NOT linger (the incremental `live` re-index depends on this).
-// Symbols are upserted, so a symbol's file/kind is refreshed on rebuild (e.g. when
-// it moves into this file). The prune+rebuild is atomic in one transaction.
+// BuildFile (re)indexes a source file: its symbols become nodes, its calls become
+// `calls` edges (by name, scoped to the fixture/package), and its references — the
+// "tag map" of identifiers it uses — become `references` edges from the file to
+// each referenced name. It is a full REPLACE of the file's contribution, not an
+// append — it first prunes the file's prior nodes and every edge originating from
+// the file (the edges from its symbols AND the file's own `references` edges), so
+// a symbol, call, or reference the file no longer contains does NOT linger (the
+// incremental `live` re-index depends on this). Symbols are upserted, so a
+// symbol's file/kind is refreshed on rebuild (e.g. when it moves into this file).
+// The prune+rebuild is atomic in one transaction.
 func (g *Graph) BuildFile(ctx context.Context, path string) error {
 	syms, err := ast.Symbols(path)
 	if err != nil {
 		return err
 	}
 	calls, err := ast.Calls(path)
+	if err != nil {
+		return err
+	}
+	refs, err := ast.References(path)
 	if err != nil {
 		return err
 	}
@@ -112,9 +122,14 @@ func (g *Graph) BuildFile(ctx context.Context, path string) error {
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
 	// Prune the file's prior contribution: the edges that originate from its
-	// symbols, then its nodes. Edges INTO this file's symbols from elsewhere are
-	// owned by the caller's file and are deliberately left intact.
+	// symbols, the file's own `references` edges (keyed by the file path, so they
+	// are not caught by the node-scoped delete), then its nodes. Edges INTO this
+	// file's symbols from elsewhere are owned by the caller's file and are
+	// deliberately left intact.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE file = ?)`, path); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_id = ? AND kind = 'references'`, path); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE file = ?`, path); err != nil {
@@ -137,6 +152,49 @@ func (g *Graph) BuildFile(ctx context.Context, path string) error {
 				return err
 			}
 		}
+	}
+	// References (the tag map): a `references` edge from the file to each name it
+	// uses. The file path is the edge source (not a symbol node) because the flat
+	// reference list is not attributed to an owning symbol; INSERT OR IGNORE
+	// collapses the many duplicate uses of a name into one edge.
+	for _, ref := range refs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO edges (from_id, to_id, kind) VALUES (?, ?, 'references')`,
+			path, ref.Name); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// RemoveFile drops a file's entire contribution from the graph: its symbol nodes,
+// every edge originating from those symbols, the file's own `references` edges, and
+// — unlike BuildFile — every edge pointing INTO those symbols from elsewhere. It is
+// the deletion/rename counterpart to BuildFile: BuildFile re-indexes a file that
+// still exists (and deliberately keeps incoming edges, since the file lives on),
+// whereas RemoveFile is for a path that is gone, so leaving incoming edges would
+// dangle them at a node that no longer exists. The whole removal is atomic in one
+// transaction; removing an unknown path is a clean no-op.
+func (g *Graph) RemoveFile(ctx context.Context, path string) error {
+	tx, err := g.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("remove file: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	// Edges out of, then into, the file's symbols (resolved before the nodes go).
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_id IN (SELECT id FROM nodes WHERE file = ?)`, path); err != nil {
+		return fmt.Errorf("remove out-edges of %q: %w", path, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE to_id IN (SELECT id FROM nodes WHERE file = ?)`, path); err != nil {
+		return fmt.Errorf("remove in-edges of %q: %w", path, err)
+	}
+	// The file's own `references` edges (keyed by the file path, not a node id).
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_id = ? AND kind = 'references'`, path); err != nil {
+		return fmt.Errorf("remove reference edges of %q: %w", path, err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE file = ?`, path); err != nil {
+		return fmt.Errorf("remove nodes of %q: %w", path, err)
 	}
 	return tx.Commit()
 }

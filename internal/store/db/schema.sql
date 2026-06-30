@@ -14,13 +14,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task);
 
+-- (scope, project, mkey) is the logical key: a "key" must actually be a key, so a
+-- changed value for the same key REPLACES rather than accumulating a stale duplicate
+-- row (PutMemory upserts ON CONFLICT). The UNIQUE constraint lands on a fresh DB here;
+-- a DB created before this constraint is migrated to it in Go (Store.migrateMemory),
+-- which collapses any pre-existing duplicates first since the constraint is enforced.
 CREATE TABLE IF NOT EXISTS memory (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     scope   TEXT NOT NULL,              -- 'project' | 'global'
     project TEXT NOT NULL DEFAULT '',
     mkey    TEXT NOT NULL,
     mvalue  TEXT NOT NULL,
-    created TEXT NOT NULL
+    created TEXT NOT NULL,
+    UNIQUE (scope, project, mkey)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, project);
 

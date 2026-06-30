@@ -143,6 +143,11 @@ func glyph(kind string) string {
 		return "!"
 	case KindAsk:
 		return "?"
+	case KindGate:
+		// An irreversible-action approval prompt — distinguishable at a glance from
+		// any other line on the plain-stdout WriterEmitter (the richer termui emitter
+		// special-cases it separately).
+		return "⛔"
 	default:
 		return "-"
 	}

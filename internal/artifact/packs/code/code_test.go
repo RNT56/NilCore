@@ -323,6 +323,31 @@ func TestTestCommandIsSingleQuoted(t *testing.T) {
 	}
 }
 
+// TestGoRunnerSelectorIsPackagePath documents (and pins) the corrected contract for
+// the go runner: the selector is emitted as a positional argument after `--`, so for
+// `go test` it can only ever be a PACKAGE PATH or file, never a `-run` test-name filter.
+// A package-path selector produces the expected `go test -- '<pkg>'` shape; a value that
+// happens to look like a test name is STILL emitted positionally (it would be read by
+// `go test` as a package import path), confirming a Go test-name selector is not honored.
+func TestGoRunnerSelectorIsPackagePath(t *testing.T) {
+	pkgCmd, err := buildTestCommand(claim(IDTestPasses, "go", "./internal/foo"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pkgCmd != "go test -- './internal/foo'" {
+		t.Fatalf("cmd = %q, want a package path positionally after '--'", pkgCmd)
+	}
+	// A test-name-looking value is emitted positionally too — it can NEVER become
+	// `go test -run '...'` (the leading-dash rule forbids ever producing a flag form).
+	nameCmd, err := buildTestCommand(claim(IDTestPasses, "go", "TestFoo"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(nameCmd, "-run") {
+		t.Fatalf("cmd = %q, the go runner must never emit a -run flag for a selector", nameCmd)
+	}
+}
+
 // TestValidateSelectorRejectsLeadingDash is the discriminating guard for the I2
 // laundering vector: a selector that begins with '-' (e.g. "-run=^$", which selects zero
 // tests, exits 0, and forges a green verdict) MUST be rejected by validateSelector — and

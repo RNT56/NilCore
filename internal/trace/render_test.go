@@ -61,7 +61,7 @@ func TestRender_BrokenChainBannerAndUntrustedRows(t *testing.T) {
 	tr, _ := Build(path, "T")
 	out := Render(tr, plainStyle)
 
-	if !strings.Contains(out, "CHAIN NOT VERIFIED") {
+	if !strings.Contains(out, "CHAIN BROKEN") {
 		t.Fatalf("broken-chain render missing the loud banner:\n%s", out)
 	}
 	if !strings.Contains(out, brokenChainVerdict) {

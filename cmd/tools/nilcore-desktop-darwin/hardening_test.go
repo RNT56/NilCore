@@ -12,8 +12,13 @@ import (
 )
 
 func TestProbePermissions(t *testing.T) {
-	oc, ol := capture, lookPath
-	defer func() { capture, lookPath = oc, ol }()
+	oc, ol, oo := capture, lookPath, osascriptDesktopWidth
+	defer func() { capture, lookPath, osascriptDesktopWidth = oc, ol, oo }()
+	// Fake the osascript desktop-width probe so the test never shells the REAL osascript
+	// (which can block on an Automation TCC prompt). A 1512-pt desktop with the 1x1
+	// capture below yields a derivable scale, keeping this hermetic.
+	osascriptDesktopWidth = func(context.Context) int { return 1512 }
+	t.Setenv("NILCORE_MAC_SCALE", "")
 
 	// Both grants present → ready.
 	capture = func(context.Context) (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 1, 1)), nil }
@@ -110,5 +115,71 @@ func TestGuardMutationWiredIntoPerform(t *testing.T) {
 	}
 	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpObserve}); err != nil {
 		t.Fatalf("observe must never be gated: %v", err)
+	}
+}
+
+func TestTerminalNamesMatch(t *testing.T) {
+	cases := []struct {
+		term, front string
+		want        bool
+	}{
+		{"Apple_Terminal", "Terminal", true},
+		{"iTerm.app", "iTerm2", true}, // prefix-match (iterm ⇄ iterm2)
+		{"iTerm.app", "iTerm", true},
+		{"vscode", "Code", false},
+		{"Apple_Terminal", "Safari", false},
+		{"", "Terminal", false},
+		{"Terminal", "", false},
+	}
+	for _, c := range cases {
+		if got := terminalNamesMatch(c.term, c.front); got != c.want {
+			t.Errorf("terminalNamesMatch(%q,%q) = %v, want %v", c.term, c.front, got, c.want)
+		}
+	}
+}
+
+func TestTerminalExclusionRefusesCapture(t *testing.T) {
+	oc, of := capture, frontmostApp
+	defer func() { capture, frontmostApp = oc, of }()
+	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
+	t.Setenv("NILCORE_MAC_SCALE", "")
+	frontmostApp = func(context.Context) string { return "Terminal" } // the controlling terminal is up front
+	captureCalled := false
+	capture = func(context.Context) (image.Image, error) {
+		captureCalled = true
+		return image.NewRGBA(image.Rect(0, 0, 100, 100)), nil
+	}
+
+	d := &driver{idBox: map[int]image.Rectangle{}, scaleX: 1, scaleY: 1, bscale: 1}
+	obs := d.observe(context.Background())
+	if captureCalled {
+		t.Fatal("capture must be REFUSED (never shelled) when the controlling terminal is frontmost")
+	}
+	if obs.Rung != desktopwire.RungCoordinate || len(obs.Console) == 0 {
+		t.Fatalf("expected a refused-capture observation with a console note, got rung=%d console=%v", obs.Rung, obs.Console)
+	}
+	if obs.ScreenshotB64 != "" {
+		t.Fatal("a refused capture must not carry a screenshot")
+	}
+}
+
+func TestTerminalExclusionAllowsWhenTargetFrontmost(t *testing.T) {
+	oc, of, oo, ob := capture, frontmostApp, osascriptDesktopWidth, backingScale
+	defer func() { capture, frontmostApp, osascriptDesktopWidth, backingScale = oc, of, oo, ob }()
+	t.Setenv("TERM_PROGRAM", "Apple_Terminal")
+	t.Setenv("NILCORE_MAC_SCALE", "1")
+	frontmostApp = func(context.Context) string { return "TextEdit" } // a target app, not the terminal
+	capture = func(context.Context) (image.Image, error) { return image.NewRGBA(image.Rect(0, 0, 100, 100)), nil }
+	osascriptDesktopWidth = func(context.Context) int { return 100 }
+	backingScale = func(context.Context, int) float64 { return 1 }
+
+	d := &driver{idBox: map[int]image.Rectangle{}, scaleX: 1, scaleY: 1, bscale: 1}
+	obs := d.observe(context.Background())
+	// A blank capture yields Rung 3 with a screenshot — the point is it was NOT refused
+	// for the terminal-exclusion reason.
+	for _, c := range obs.Console {
+		if c != "" && (containsAny(c, "capture refused")) {
+			t.Fatalf("capture must NOT be refused when a target app is frontmost: %q", c)
+		}
 	}
 }

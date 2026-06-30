@@ -1,30 +1,11 @@
 package agenticflows
 
 import (
-	"context"
 	"reflect"
 	"testing"
 
-	"nilcore/internal/sandbox"
 	"nilcore/internal/summarize"
 )
-
-type recordingSandbox struct {
-	commands []string
-}
-
-func (r *recordingSandbox) Exec(_ context.Context, cmd string) (sandbox.Result, error) {
-	r.commands = append(r.commands, cmd)
-	return sandbox.Result{Stdout: "ok:" + cmd, ExitCode: 0}, nil
-}
-
-func (r *recordingSandbox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
-	return r.Exec(ctx, cmd)
-}
-
-func (r *recordingSandbox) Workdir() string {
-	return "/work"
-}
 
 func TestAgentTaskSubtasksMapNodesAndDependencies(t *testing.T) {
 	flow := Flow{
@@ -94,7 +75,7 @@ func TestUnsupportedCapabilitiesAreSorted(t *testing.T) {
 	}
 }
 
-func TestToolNodesRequireSandboxAndRunThroughSandbox(t *testing.T) {
+func TestToolSandboxPlansMarkNodesSandboxRequired(t *testing.T) {
 	flow := Flow{
 		Nodes: []Node{
 			{ID: "verify", Type: "tool", Tool: "test.run"},
@@ -115,31 +96,72 @@ func TestToolNodesRequireSandboxAndRunThroughSandbox(t *testing.T) {
 		}
 	}
 
-	box := &recordingSandbox{}
-	results, err := RunToolSandboxPlans(context.Background(), box, plans, func(plan ToolSandboxPlan) (string, error) {
-		return "nilcore-tool " + plan.Tool, nil
-	})
-	if err != nil {
-		t.Fatalf("RunToolSandboxPlans returned error: %v", err)
-	}
-	if !reflect.DeepEqual(box.commands, []string{"nilcore-tool test.run", "nilcore-tool lint.run"}) {
-		t.Fatalf("expected sandbox commands, got %+v", box.commands)
-	}
-	if len(results) != 2 || results[0].Stdout != "ok:nilcore-tool test.run" {
-		t.Fatalf("unexpected sandbox results: %+v", results)
+	// A tool node missing its tool name is a hard error (no stable handle to sandbox).
+	if _, err := ToolSandboxPlans(Flow{Nodes: []Node{{ID: "x", Type: "tool"}}}); err == nil {
+		t.Fatal("expected error for a tool node missing its tool name")
 	}
 }
 
-func TestRunToolSandboxPlansRejectsHostSidePlan(t *testing.T) {
-	plans := []ToolSandboxPlan{{NodeID: "unsafe", Tool: "host.run", RequiresSandbox: false}}
-	box := &recordingSandbox{}
-
-	if _, err := RunToolSandboxPlans(context.Background(), box, plans, func(ToolSandboxPlan) (string, error) {
-		return "host-run", nil
-	}); err == nil {
-		t.Fatal("expected unsandboxed-plan error")
+// TestAgentTaskSubtasksTopologicalOrder proves the subtasks come back in dependency
+// order even when the flow declares nodes out of order, so the `flows run` flattening
+// honors the produces→requires DAG rather than node-declaration order.
+func TestAgentTaskSubtasksTopologicalOrder(t *testing.T) {
+	// Declared c, b, a but the dataflow is a -> b -> c, so the result must be a, b, c.
+	flow := Flow{
+		ID: "x", Version: "1",
+		Runtime: Runtime{SupportedCores: []string{"nilcore"}},
+		Nodes: []Node{
+			{ID: "c", Type: "agent_task", Title: "third"},
+			{ID: "b", Type: "agent_task", Title: "second"},
+			{ID: "a", Type: "agent_task", Title: "first"},
+		},
+		Edges: []Edge{{From: "a", To: "b"}, {From: "b", To: "c"}},
 	}
-	if len(box.commands) != 0 {
-		t.Fatalf("unsafe plan should not run commands, got %+v", box.commands)
+	subs, err := AgentTaskSubtasks(flow, summarize.ContextSummary{})
+	if err != nil {
+		t.Fatalf("AgentTaskSubtasks: %v", err)
+	}
+	got := []string{subs[0].ID, subs[1].ID, subs[2].ID}
+	if !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+		t.Fatalf("subtask order = %v, want [a b c] (topological)", got)
+	}
+}
+
+// TestAgentTaskSubtasksStableWhenIndependent proves independent tasks keep their
+// original declaration order (the sort is stable; no edges ⇒ no reordering).
+func TestAgentTaskSubtasksStableWhenIndependent(t *testing.T) {
+	flow := Flow{
+		ID: "x", Version: "1",
+		Runtime: Runtime{SupportedCores: []string{"nilcore"}},
+		Nodes: []Node{
+			{ID: "one", Type: "agent_task", Title: "1"},
+			{ID: "two", Type: "agent_task", Title: "2"},
+			{ID: "three", Type: "agent_task", Title: "3"},
+		},
+	}
+	subs, err := AgentTaskSubtasks(flow, summarize.ContextSummary{})
+	if err != nil {
+		t.Fatalf("AgentTaskSubtasks: %v", err)
+	}
+	got := []string{subs[0].ID, subs[1].ID, subs[2].ID}
+	if !reflect.DeepEqual(got, []string{"one", "two", "three"}) {
+		t.Fatalf("independent order = %v, want declaration order", got)
+	}
+}
+
+// TestAgentTaskSubtasksRejectsCycle proves a contradictory dataflow (a depends on b,
+// b depends on a) is reported, not silently dropped.
+func TestAgentTaskSubtasksRejectsCycle(t *testing.T) {
+	flow := Flow{
+		ID: "x", Version: "1",
+		Runtime: Runtime{SupportedCores: []string{"nilcore"}},
+		Nodes: []Node{
+			{ID: "a", Type: "agent_task", Title: "a"},
+			{ID: "b", Type: "agent_task", Title: "b"},
+		},
+		Edges: []Edge{{From: "a", To: "b"}, {From: "b", To: "a"}},
+	}
+	if _, err := AgentTaskSubtasks(flow, summarize.ContextSummary{}); err == nil {
+		t.Fatal("expected a dependency-cycle error")
 	}
 }

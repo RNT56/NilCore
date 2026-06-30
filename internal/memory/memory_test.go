@@ -2,6 +2,7 @@ package memory_test
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,9 +69,11 @@ func TestContextLabeledAndBounded(t *testing.T) {
 	m := newMem(t)
 	ctx := context.Background()
 	for i := 0; i < 5; i++ {
-		_ = m.Write(ctx, memory.Record{Scope: memory.ScopeProject, Project: "p", Key: "k", Value: "v"})
+		// Distinct keys: (scope,project,mkey) is now the logical key, so a same-key
+		// write would replace (upsert) rather than add a row. Five distinct keys ⇒
+		// five rows, of which Context bounds the rendering to 2.
+		_ = m.Write(ctx, memory.Record{Scope: memory.ScopeProject, Project: "p", Key: fmt.Sprintf("k%d", i), Value: "v"})
 	}
-	// 5 written but all dup-key/value? No — Write doesn't dedup; 5 rows.
 	blk, err := m.Context(ctx, memory.ScopeProject, "p", "", 2)
 	if err != nil {
 		t.Fatal(err)
@@ -85,6 +88,79 @@ func TestContextLabeledAndBounded(t *testing.T) {
 	// Empty when nothing matches.
 	if blk, _ := m.Context(ctx, memory.ScopeGlobal, "", "", 5); blk != "" {
 		t.Errorf("expected empty block, got %q", blk)
+	}
+}
+
+// TestWriteReplacesSameKey proves the (scope,project,key) is a real key: re-writing
+// the same key with a CHANGED value replaces the prior row rather than accumulating a
+// stale duplicate, so recall never surfaces both the old and current value.
+func TestWriteReplacesSameKey(t *testing.T) {
+	m := newMem(t)
+	ctx := context.Background()
+	if err := m.Write(ctx, memory.Record{Scope: memory.ScopeProject, Project: "p", Key: "task:7", Value: "first summary"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Write(ctx, memory.Record{Scope: memory.ScopeProject, Project: "p", Key: "task:7", Value: "revised summary"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Query(ctx, memory.ScopeProject, "p", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("same-key re-write must replace, got %d rows: %+v", len(got), got)
+	}
+	if got[0].Value != "revised summary" {
+		t.Errorf("expected current value, got %q", got[0].Value)
+	}
+}
+
+// TestRememberDifferentValueReplaces is the recall-pollution regression: Remember of a
+// same-key/different-value record (e.g. a re-run task with a changed summary) must end
+// with exactly one row carrying the new value, not the old and new side by side.
+func TestRememberDifferentValueReplaces(t *testing.T) {
+	m := newMem(t)
+	ctx := context.Background()
+	if _, err := m.Remember(ctx, []memory.Record{{Scope: memory.ScopeProject, Project: "p", Key: "task:7", Value: "old"}}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := m.Remember(ctx, []memory.Record{{Scope: memory.ScopeProject, Project: "p", Key: "task:7", Value: "new"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("changed value is a new write, got %d", n)
+	}
+	got, _ := m.Query(ctx, memory.ScopeProject, "p", "task:7")
+	if len(got) != 1 || got[0].Value != "new" {
+		t.Errorf("recall must return only the current value, got %+v", got)
+	}
+}
+
+// TestRememberBatchDedupesWithinBatch proves the hoisted dup set dedupes two identical
+// records inside one batch (the set is updated as we write), and that an already-stored
+// record is recognized as a dup without a per-record full-table read.
+func TestRememberBatchDedupesWithinBatch(t *testing.T) {
+	m := newMem(t)
+	ctx := context.Background()
+	if _, err := m.Remember(ctx, []memory.Record{{Scope: memory.ScopeProject, Project: "p", Key: "a", Value: "1"}}); err != nil {
+		t.Fatal(err)
+	}
+	recs := []memory.Record{
+		{Scope: memory.ScopeProject, Project: "p", Key: "a", Value: "1"}, // already stored → dup
+		{Scope: memory.ScopeProject, Project: "p", Key: "b", Value: "2"}, // new
+		{Scope: memory.ScopeProject, Project: "p", Key: "b", Value: "2"}, // dup within batch
+	}
+	n, err := m.Remember(ctx, recs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("batch should write exactly the one new distinct record, got %d", n)
+	}
+	all, _ := m.Query(ctx, memory.ScopeProject, "p", "")
+	if len(all) != 2 {
+		t.Errorf("expected 2 distinct keys stored, got %d: %+v", len(all), all)
 	}
 }
 

@@ -98,6 +98,15 @@ func (n *Namespace) ExecWithEnv(ctx context.Context, cmd string, env map[string]
 	// over any host-owned resource. Setgroups is denied (required for an
 	// unprivileged gid mapping). CLONE_NEWNET with no interfaces is default-deny
 	// egress, the equivalent of the container's --network none.
+	//
+	// LIMITATION (fail-closed by design): this backend supports ONLY deny-all
+	// egress. It has no allowlist path — there is no Namespace analogue of the
+	// container's AllowEgressVia (that would need a userspace network, e.g.
+	// slirp4netns/pasta, routing through the policy egress proxy inside the netns).
+	// Because Auto prefers this backend wherever Landlock + userns exist (see
+	// select.go), the common Linux deployment cannot do allowlisted egress / web_fetch
+	// unless the operator forces `-sandbox container`. This is a usability limitation,
+	// not a sandbox-escape risk: egress simply fails closed (the safe direction).
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS | syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWNET | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS,

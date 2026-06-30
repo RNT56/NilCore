@@ -55,8 +55,10 @@ func renderHeader(b *strings.Builder, tr *Trace, st termui.Style) {
 		fmt.Fprintf(b, "  %s chain verified — this trace is trustworthy\n", st.Success("✓"))
 		fmt.Fprintf(b, "  %s %s\n", st.Dim("verdict:"), fence(tr.Verdict))
 	} else {
-		// Fail closed on trustworthiness: loud, red, unmistakable.
-		fmt.Fprintf(b, "  %s %s\n", st.Danger("✗"), st.Danger("CHAIN NOT VERIFIED"))
+		// Fail closed on trustworthiness: loud, red, unmistakable. Use the same
+		// "CHAIN BROKEN" wording as the verdict const, the TUI header, and the
+		// package doc-comments so the label does not diverge across surfaces.
+		fmt.Fprintf(b, "  %s %s\n", st.Danger("✗"), st.Danger("CHAIN BROKEN"))
 		fmt.Fprintf(b, "  %s %s\n", st.Danger("verdict:"), st.Danger(fence(tr.Verdict)))
 	}
 	b.WriteString("\n")

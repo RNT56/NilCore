@@ -423,6 +423,12 @@ func TestResolveRunner(t *testing.T) {
 		wantContains string
 	}{
 		{"go-bench", runnerGoBench, false, "go test -bench"},
+		{"go-bench scoped", "go-bench:internal/foo", false, "'./internal/foo/...'"},
+		{"go-bench scoped keeps shape", "go-bench:internal/foo", false, "go test -bench=. -run='^$' -benchmem"},
+		{"go-bench scoped traversal", "go-bench:../../etc", true, ""},
+		{"go-bench scoped absolute", "go-bench:/etc", true, ""},
+		{"go-bench scoped metachar", "go-bench:foo;rm -rf /", true, ""},
+		{"go-bench scoped empty path", "go-bench:", true, ""},
 		{"make-bench", runnerMakeBench, false, "make bench"},
 		{"script ok", "script:bench/run.sh", false, "bench/run.sh"},
 		{"script traversal", "script:../../etc/passwd", true, ""},

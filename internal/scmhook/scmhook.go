@@ -26,12 +26,18 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"nilcore/internal/eventlog"
 	"nilcore/internal/trigger"
 )
 
 const maxBodyBytes = 2 << 20 // 2 MiB cap on a webhook body
+
+// maxSeenDeliveries bounds the replay-defense cache so a long-lived listener cannot
+// grow it without limit; once full the oldest-seen id is evicted (a simple FIFO ring).
+// A forge re-delivers the same id on retry within seconds, so a small window suffices.
+const maxSeenDeliveries = 4096
 
 // Handler verifies and routes inbound SCM webhooks.
 type Handler struct {
@@ -45,6 +51,39 @@ type Handler struct {
 	Handle func(ctx context.Context, sig trigger.Signal) (bool, error)
 	// Log records metadata-only audit events (invariant I5). Optional.
 	Log *eventlog.Log
+
+	// seen is the bounded set of already-processed X-GitHub-Delivery ids, the replay
+	// defense: a correctly-signed body re-POSTed later (a captured-and-replayed
+	// delivery) re-passes the HMAC check but is dropped here so it does not re-emit
+	// the same Signal / re-launch the same auto-run. order is the FIFO eviction ring.
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	order []string
+}
+
+// seenBefore records the delivery id and reports whether it was already processed.
+// An empty id (a forge that omits X-GitHub-Delivery) is never treated as seen, so the
+// pre-existing behaviour is preserved for callers without a delivery header.
+func (h *Handler) seenBefore(id string) bool {
+	if id == "" {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.seen == nil {
+		h.seen = make(map[string]struct{}, maxSeenDeliveries)
+	}
+	if _, ok := h.seen[id]; ok {
+		return true
+	}
+	if len(h.order) >= maxSeenDeliveries {
+		oldest := h.order[0]
+		h.order = h.order[1:]
+		delete(h.seen, oldest)
+	}
+	h.seen[id] = struct{}{}
+	h.order = append(h.order, id)
+	return false
 }
 
 func (h *Handler) log(kind string, detail map[string]any) {
@@ -70,6 +109,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !validSignature(h.Secret, r.Header.Get("X-Hub-Signature-256"), body) {
 		h.log("webhook_rejected", map[string]any{"reason": "bad-signature", "event": r.Header.Get("X-GitHub-Event")})
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	// Replay defense (I7-adjacent): a captured (body, signature) pair re-POSTed later
+	// re-passes the HMAC check, so drop a delivery id we have already processed as a
+	// no-op 200 BEFORE mapping/routing it — otherwise a replayed "issue labeled" could
+	// re-launch the same auto-run. Dropped before mapEvent so it never produces a Signal.
+	if delivery := r.Header.Get("X-GitHub-Delivery"); h.seenBefore(delivery) {
+		h.log("webhook_replay_dropped", map[string]any{"event": r.Header.Get("X-GitHub-Event")})
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 

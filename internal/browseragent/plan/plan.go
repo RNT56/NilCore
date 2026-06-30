@@ -51,7 +51,7 @@ func SystemPrompt(goal string, extract bool) string {
 
 	b.WriteString("STOP CONDITIONS:\n")
 	b.WriteString("- When the goal is achieved (or you have extracted what was asked), call the `finish` tool with a concise summary of what you did and what you found.\n")
-	b.WriteString("- For any consequential or irreversible action (a purchase, payment, transfer, deletion, accepting terms or cookies, sending a message), STOP and report it — the human gate decides; you do not perform it on your own.\n")
+	b.WriteString("- For any consequential or irreversible action (a purchase, payment, transfer, deletion, accepting terms or cookies, sending a message), STOP and report it — the human gate decides; you do not perform it on your own. The harness ALSO enforces this in code: a click/select on such a target is routed to the human gate (or blocked outright when unattended), so attempting one will simply fail until a human approves.\n")
 	b.WriteString("- You have a bounded action budget. If you cannot make progress, finish and report the blocker honestly. The verifier — not your own report — decides whether the work is done.")
 	return b.String()
 }

@@ -240,6 +240,96 @@ func TestMarkRunAdvancesLastRun(t *testing.T) {
 	}
 }
 
+// TestRetryCadenceReArmsAfterFailedAttempt is the B5-autonomy.7 fix: a selected run
+// whose outcome is NOT verified must re-arm after the (shorter) RetryPeriod, not be
+// parked for a full MinPeriod. MarkAttempt (selection-time debounce) advances LastRun
+// only; without a MarkSuccess the objective is "not succeeded since last run", so the
+// due gate applies RetryPeriod.
+func TestRetryCadenceReArmsAfterFailedAttempt(t *testing.T) {
+	st := newFakeStore(
+		Objective{ID: "ci", Goal: "keep CI green", Priority: 5, Enabled: true,
+			MinPeriod: time.Hour, RetryPeriod: 5 * time.Minute},
+	)
+	b := New(st)
+	ctx := context.Background()
+
+	// Selected and attempted at base (the run then fails — no MarkSuccess).
+	if err := b.MarkAttempt(ctx, "ci", base); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
+	}
+
+	// Within the short RetryPeriod ⇒ still debounced (no hot-loop on the next poll).
+	if _, ok, _ := b.NextIdle(ctx, base.Add(2*time.Minute)); ok {
+		t.Fatal("a failed objective must stay debounced within RetryPeriod")
+	}
+	// Past RetryPeriod but well within MinPeriod ⇒ due again (the failure-aware re-arm).
+	if _, ok, _ := b.NextIdle(ctx, base.Add(6*time.Minute)); !ok {
+		t.Fatal("a failed objective must re-arm after RetryPeriod, not wait a full MinPeriod")
+	}
+}
+
+// TestSuccessCadenceUsesMinPeriod proves that once a run VERIFIES (MarkSuccess), the
+// full MinPeriod cadence applies — the shorter RetryPeriod no longer shortens spacing.
+func TestSuccessCadenceUsesMinPeriod(t *testing.T) {
+	st := newFakeStore(
+		Objective{ID: "ci", Goal: "keep CI green", Priority: 5, Enabled: true,
+			MinPeriod: time.Hour, RetryPeriod: 5 * time.Minute},
+	)
+	b := New(st)
+	ctx := context.Background()
+
+	if err := b.MarkSuccess(ctx, "ci", base); err != nil {
+		t.Fatalf("MarkSuccess: %v", err)
+	}
+	got, err := b.Get(ctx, "ci")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.LastRun.Equal(base) || !got.LastSuccess.Equal(base) {
+		t.Fatalf("MarkSuccess must advance both LastRun and LastSuccess: %+v", got)
+	}
+
+	// Past RetryPeriod but within MinPeriod ⇒ NOT due, because the last run succeeded.
+	if _, ok, _ := b.NextIdle(ctx, base.Add(6*time.Minute)); ok {
+		t.Fatal("after a verified run the short RetryPeriod must not apply; MinPeriod governs")
+	}
+	// Past MinPeriod ⇒ due again.
+	if _, ok, _ := b.NextIdle(ctx, base.Add(2*time.Hour)); !ok {
+		t.Fatal("after MinPeriod elapses a succeeded objective is due again")
+	}
+}
+
+// TestZeroRetryPeriodFallsBackToMinPeriod proves the new field is opt-in: an objective
+// with no RetryPeriod keeps the legacy single-cadence behavior (MinPeriod for both
+// failed and succeeded runs), so existing configs are byte-identical.
+func TestZeroRetryPeriodFallsBackToMinPeriod(t *testing.T) {
+	st := newFakeStore(
+		Objective{ID: "ci", Goal: "keep CI green", Priority: 5, Enabled: true, MinPeriod: time.Hour},
+	)
+	b := New(st)
+	ctx := context.Background()
+
+	// Attempt (failed run, no success) with zero RetryPeriod ⇒ full MinPeriod still applies.
+	if err := b.MarkAttempt(ctx, "ci", base); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
+	}
+	if _, ok, _ := b.NextIdle(ctx, base.Add(10*time.Minute)); ok {
+		t.Fatal("zero RetryPeriod must fall back to MinPeriod debounce")
+	}
+	if _, ok, _ := b.NextIdle(ctx, base.Add(2*time.Hour)); !ok {
+		t.Fatal("past MinPeriod the objective is due again")
+	}
+}
+
+// TestMarkSuccessNotFound proves the success mark normalizes a missing objective to
+// ErrNotFound, like the other marks.
+func TestMarkSuccessNotFound(t *testing.T) {
+	b := New(newFakeStore())
+	if err := b.MarkSuccess(context.Background(), "ghost", base); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
 func TestMarkRunNotFound(t *testing.T) {
 	b := New(newFakeStore())
 	err := b.MarkRun(context.Background(), "ghost", base)
@@ -371,6 +461,12 @@ func TestNilStoreIsInert(t *testing.T) {
 	}
 	if err := b.MarkRun(ctx, "x", base); err != nil {
 		t.Fatalf("nil-store MarkRun should be nil, got %v", err)
+	}
+	if err := b.MarkAttempt(ctx, "x", base); err != nil {
+		t.Fatalf("nil-store MarkAttempt should be nil, got %v", err)
+	}
+	if err := b.MarkSuccess(ctx, "x", base); err != nil {
+		t.Fatalf("nil-store MarkSuccess should be nil, got %v", err)
 	}
 	if _, err := b.Get(ctx, "x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("nil-store Get should be ErrNotFound, got %v", err)

@@ -57,9 +57,9 @@ func writeFramed(w io.Writer, v any) error {
 	return err
 }
 
-// mockServer answers the minimal handshake plus one definition. It replies to
-// "initialize" with an empty result, swallows the "initialized" notification,
-// and answers "textDocument/definition" with a single Location. Reported errors
+// mockServer answers the minimal handshake plus one workspace/symbol. It replies
+// to "initialize" with an empty result, swallows the "initialized" notification,
+// and answers "workspace/symbol" with a single SymbolInformation. Reported errors
 // land on errc; the harness fails the test if any appear.
 func mockServer(conn net.Conn, errc chan<- error) {
 	defer func() { _ = conn.Close() }()
@@ -86,20 +86,6 @@ func mockServer(conn net.Conn, errc chan<- error) {
 			}
 		case "initialized":
 			// notification: no reply
-		case "textDocument/definition":
-			loc := map[string]any{
-				"uri": "file:///proj/main.go",
-				"range": map[string]any{
-					"start": map[string]any{"line": 41, "character": 5},
-					"end":   map[string]any{"line": 41, "character": 12},
-				},
-			}
-			if err := writeFramed(conn, map[string]any{
-				"jsonrpc": "2.0", "id": req.ID, "result": loc,
-			}); err != nil {
-				errc <- err
-				return
-			}
 		case "workspace/symbol":
 			syms := []map[string]any{{
 				"name": "Run",
@@ -124,7 +110,9 @@ func mockServer(conn net.Conn, errc chan<- error) {
 	}
 }
 
-func TestInitializeAndDefinition(t *testing.T) {
+// TestInitializeHandshake covers the initialize + initialized handshake against
+// the mock server, the prerequisite every query depends on.
+func TestInitializeHandshake(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	errc := make(chan error, 1)
 	go mockServer(serverConn, errc)
@@ -135,19 +123,6 @@ func TestInitializeAndDefinition(t *testing.T) {
 
 	if err := c.Initialize(ctx, "file:///proj"); err != nil {
 		t.Fatalf("Initialize: %v", err)
-	}
-
-	locs, err := c.Definition(ctx, "file:///proj/main.go", 41, 8)
-	if err != nil {
-		t.Fatalf("Definition: %v", err)
-	}
-	if len(locs) != 1 {
-		t.Fatalf("Definition returned %d locations, want 1", len(locs))
-	}
-	got := locs[0]
-	want := Location{URI: "file:///proj/main.go", StartLine: 41, StartChar: 5, EndLine: 41, EndChar: 12}
-	if got != want {
-		t.Errorf("Definition location = %+v, want %+v", got, want)
 	}
 
 	select {
@@ -188,41 +163,5 @@ func TestSpawnMissingCommand(t *testing.T) {
 	}
 	if _, _, err := Spawn(context.Background(), nil, "file:///p"); err == nil {
 		t.Error("Spawn with an empty command must error")
-	}
-}
-
-// TestParseLocationsArray covers the array-result branch (textDocument/references
-// shape) directly, since the protocol allows both single and array forms.
-func TestParseLocationsArray(t *testing.T) {
-	raw := json.RawMessage(`[
-		{"uri":"file:///a.go","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":4}}},
-		{"uri":"file:///b.go","range":{"start":{"line":9,"character":0},"end":{"line":9,"character":3}}}
-	]`)
-	locs, err := parseLocations(raw)
-	if err != nil {
-		t.Fatalf("parseLocations: %v", err)
-	}
-	want := []Location{
-		{URI: "file:///a.go", StartLine: 1, StartChar: 2, EndLine: 1, EndChar: 4},
-		{URI: "file:///b.go", StartLine: 9, StartChar: 0, EndLine: 9, EndChar: 3},
-	}
-	if len(locs) != len(want) {
-		t.Fatalf("got %d locations, want %d", len(locs), len(want))
-	}
-	for i := range want {
-		if locs[i] != want[i] {
-			t.Errorf("location[%d] = %+v, want %+v", i, locs[i], want[i])
-		}
-	}
-}
-
-// TestParseLocationsNull confirms a null result yields no locations and no error.
-func TestParseLocationsNull(t *testing.T) {
-	locs, err := parseLocations(json.RawMessage(`null`))
-	if err != nil {
-		t.Fatalf("parseLocations(null): %v", err)
-	}
-	if locs != nil {
-		t.Errorf("parseLocations(null) = %v, want nil", locs)
 	}
 }

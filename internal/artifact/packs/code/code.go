@@ -11,9 +11,14 @@
 //     never a spurious red" discipline. An operator/claim MAY override the detected
 //     command with an allowlisted one (see allowedBuild).
 //   - code.test_passes — runs the project's test suite in the box. The model supplies
-//     only DATA (a single test selector — a package path / test name / file) which is
-//     single-quoted into a FIXED, pack-authored command shape (`go test`, `npm test`,
-//     `pytest`); it can never name a free command.
+//     only DATA (a single test selector) which is single-quoted — after a literal `--`
+//     so it can never be read as a flag — into a FIXED, pack-authored command shape
+//     (`go test`, `npm test`, `pytest`); it can never name a free command. Because the
+//     selector follows `--`, what it can mean depends on the runner: for `npm`/`pytest`
+//     it is a test-name/file pattern passed through to the runner; for `go` it is a
+//     PACKAGE PATH or file only (e.g. `./internal/foo`) — `go test -- TestFoo` would be
+//     read as a package import path, not a `-run` filter, so a Go test-NAME selector is
+//     intentionally not supported (the leading-dash rejection forbids emitting `-run=`).
 //
 // Trust disciplines (the same as every shipped pack):
 //
@@ -186,10 +191,13 @@ func buildCommand(box sandbox.Sandbox, c artifact.Claim) (string, error) {
 
 // checkTestPasses asserts the project's tests pass in the box. The model supplies only
 // DATA: a pack-allowlisted ecosystem token (Evidence.ExtractionMethod ∈ {go,npm,pytest})
-// selecting a FIXED command shape, and an optional test SELECTOR (Evidence.Value — a
-// package path / test name / file) that is single-quoted into that shape. It can never
-// name a free command. exit 0 ⇒ Pass, non-zero ⇒ Fail, sandbox error / unallowlisted
-// runner / unsafe selector ⇒ Unverifiable.
+// selecting a FIXED command shape, and an optional test SELECTOR (Evidence.Value) that
+// is single-quoted (after a literal `--`) into that shape. It can never name a free
+// command. The selector's meaning is runner-dependent: for `npm`/`pytest` it is a
+// test-name/file pattern; for `go` it is a PACKAGE PATH or file only (`go test -- X`
+// reads X as a package import path, never a `-run` test-name filter — a Go test-NAME
+// selector is not supported). exit 0 ⇒ Pass, non-zero ⇒ Fail, sandbox error /
+// unallowlisted runner / unsafe selector ⇒ Unverifiable.
 func checkTestPasses(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) (artifact.Status, string) {
 	if box == nil {
 		return artifact.StatusUnverifiable, "no sandbox available (refusing host-side test)"

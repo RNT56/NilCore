@@ -197,6 +197,14 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	// current is the set of shards to run THIS pass. It starts as the full initial set
 	// and shrinks to the requeue set (failed-with-budget shards) on each subsequent pass.
 	current := initial
+	// deps is the run-wide id->dependency-ids map, captured ONCE from the full initial
+	// set. integrateGreen reads it to fold green branches in dependency order: passed
+	// accumulates across passes and carries no Deps, and current shrinks each pass, so
+	// the complete DAG must come from initial (the only place every shard's Deps live).
+	deps := make(map[string][]string, len(initial))
+	for i := range initial {
+		deps[initial[i].ID] = initial[i].Deps
+	}
 	// passed accumulates the shards that have ever gone green, keyed by id, so a later
 	// pass never re-runs them and integration can fold their branches. The Result holds
 	// the verified Branch.
@@ -277,7 +285,7 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 
 		// Integrate the green code branches onto the prior tip (BaseRef=TipSHA) and
 		// thread the new tip forward. Collate presets pass Integrate=nil and skip this.
-		tip, ierr := c.integrateGreen(ctx, passed, &st)
+		tip, ierr := c.integrateGreen(ctx, passed, deps, &st)
 		if ierr != nil {
 			return c.finish(ctx, st, board, passed, ReasonError, false), ierr
 		}
@@ -386,17 +394,19 @@ func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard
 	return out
 }
 
-// integrateGreen folds every green shard's branch through the IntegrateFunc, in shard-
-// id order (deterministic), with the prior tip as the base. It threads the resulting
-// integration tip onto st.TipSHA so the NEXT pass folds remaining green work on top of
-// the already-merged tip (no work lost across passes). A nil Integrate (collate preset)
-// is a no-op returning the current tip. A shard with no Branch (verified but not a code
-// branch — e.g. a research artifact) contributes no MergeItem.
-func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn.Result, st *SwarmState) (string, error) {
+// integrateGreen folds every green shard's branch through the IntegrateFunc, in a
+// DEPENDENCY-RESPECTING order (a node after the deps it was coded on top of), with the
+// prior tip as the base. It threads the resulting integration tip onto st.TipSHA so the
+// NEXT pass folds remaining green work on top of the already-merged tip (no work lost
+// across passes). A nil Integrate (collate preset) is a no-op returning the current tip.
+// A shard with no Branch (verified but not a code branch — e.g. a research artifact)
+// contributes no MergeItem. deps is the run-wide id->dependency-ids map (passed carries
+// no Deps), so the fold can honor the DAG even though passed accumulates across passes.
+func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn.Result, deps map[string][]string, st *SwarmState) (string, error) {
 	if c.Integrate == nil {
 		return st.TipSHA, nil // collate preset: artifacts stay independent, never merged
 	}
-	order := mergeOrder(passed)
+	order := mergeOrder(passed, deps)
 	if len(order) == 0 {
 		return st.TipSHA, nil // nothing green with a branch to fold yet
 	}
@@ -531,21 +541,71 @@ func distinctArtifacts(w requeue.Worklist) int {
 	return len(seen)
 }
 
-// mergeOrder builds the integration order from the passed shards, sorted by shard id
-// so the fold is deterministic and dependents (higher-numbered shards) merge after the
-// dependencies they were coded on top of. Only shards with a non-empty Branch produce a
-// MergeItem (a verified artifact with no code branch contributes nothing to integrate).
-func mergeOrder(passed map[string]spawn.Result) []integrate.MergeItem {
-	ids := make([]string, 0, len(passed))
+// mergeOrder builds the integration order from the passed shards, in a
+// DEPENDENCY-RESPECTING order (a node after every dependency it was coded on top
+// of). It mirrors super/dispatch.go's stable topological emit: only passed shards
+// with a non-empty Branch are included (a verified artifact with no code branch
+// contributes nothing to integrate), and an included shard is emitted only after
+// all of its included deps. deps is the id->dependency-ids map for the run's shard
+// set (Shard.Deps); passed lacks Deps, so the caller threads it in.
+//
+// This must NOT lexical-sort shard ids: ids are "swarm-<runID>-<n>" (sharder.go),
+// so sort.Strings would put "swarm-run-10" before "swarm-run-2" and could fold a
+// dependent before the dependency it builds on. Among ready nodes the emit order
+// is shard-id lexical (deterministic fold) — that is safe because ready nodes are
+// independent of each other by construction.
+func mergeOrder(passed map[string]spawn.Result, deps map[string][]string) []integrate.MergeItem {
+	included := make(map[string]bool, len(passed))
 	for id := range passed {
 		if passed[id].Branch != "" {
-			ids = append(ids, id)
+			included[id] = true
 		}
 	}
-	sort.Strings(ids)
-	order := make([]integrate.MergeItem, 0, len(ids))
-	for _, id := range ids {
-		order = append(order, integrate.MergeItem{ID: id, Branch: passed[id].Branch})
+	order := make([]integrate.MergeItem, 0, len(included))
+	emitted := make(map[string]bool, len(included))
+	// Bounded passes: each pass emits at least one ready node or stops; with N
+	// included nodes the loop runs at most N times (termination by construction).
+	for len(emitted) < len(included) {
+		// Collect the nodes that are ready THIS pass, then emit them in lexical id
+		// order so the fold is deterministic without re-introducing the cross-DAG
+		// lexical-before-dependency bug.
+		ready := make([]string, 0, len(included))
+		for id := range included {
+			if emitted[id] {
+				continue
+			}
+			blocked := false
+			for _, dep := range deps[id] {
+				if included[dep] && !emitted[dep] {
+					blocked = true
+					break
+				}
+			}
+			if !blocked {
+				ready = append(ready, id)
+			}
+		}
+		if len(ready) == 0 {
+			// A dependency cycle among included nodes: emit the remainder in lexical
+			// order rather than spin (the integrator handles conflicts by rollback).
+			rest := make([]string, 0, len(included)-len(emitted))
+			for id := range included {
+				if !emitted[id] {
+					rest = append(rest, id)
+				}
+			}
+			sort.Strings(rest)
+			for _, id := range rest {
+				order = append(order, integrate.MergeItem{ID: id, Branch: passed[id].Branch})
+				emitted[id] = true
+			}
+			break
+		}
+		sort.Strings(ready)
+		for _, id := range ready {
+			order = append(order, integrate.MergeItem{ID: id, Branch: passed[id].Branch})
+			emitted[id] = true
+		}
 	}
 	return order
 }

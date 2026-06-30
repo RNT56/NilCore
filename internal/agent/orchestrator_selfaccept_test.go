@@ -12,6 +12,18 @@ import (
 	"nilcore/internal/sandbox"
 )
 
+// stubApprover is a policy.Approver test double: it records that it was asked and
+// returns a fixed verdict.
+type stubApprover struct {
+	ok    bool
+	asked bool
+}
+
+func (s *stubApprover) Approve(string) bool {
+	s.asked = true
+	return s.ok
+}
+
 // recordingSelfAccept captures whether the closed-loop hook was consulted and what it
 // received (goal, box, and the result of calling the threaded gate), and returns a
 // configurable verdict.

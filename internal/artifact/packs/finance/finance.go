@@ -55,10 +55,17 @@ const (
 )
 
 // floatTolerance is the relative tolerance applied when comparing a model-authored
-// Evidence.Value against a float fact fetched from the source. Integers are compared
-// exactly; floats match iff |fetched-claimed| <= floatTolerance*max(1,|fetched|).
-// 1e-6 absorbs JSON float round-tripping and source-side rounding without admitting a
-// materially different number.
+// Evidence.Value against a float fact fetched from the source. Floats match iff
+// |fetched-claimed| <= floatTolerance*max(1,|fetched|). 1e-6 absorbs JSON float
+// round-tripping and source-side rounding without admitting a materially different
+// number.
+//
+// EXACT-INT comparison (no tolerance) fires ONLY when BOTH sides are integral. In
+// practice that is the sec_fact check, the one caller that probes the fetched value's
+// integrality (secLatestFact's Int64 probe) and passes fetchedIsInt=true; the
+// worldbank/imf/fred/market checks treat their fetched values as floats (those sources
+// are float series), so an integer claim against them goes through the tolerant-float
+// path, not the exact-int branch. (See numericMatch.)
 const floatTolerance = 1e-6
 
 // RegisterAll adds this pack's five verifier-ids to r. It registers exactly the three

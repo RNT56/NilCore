@@ -21,16 +21,23 @@ package autosrc
 // wiring layer supplies "am I idle?" exactly as it supplies the handler (I6 direction:
 // the daemon is installed by the orchestrator, never the reverse).
 //
-// MarkRun is called the moment a due objective is SELECTED (debounced by the objective
-// leaf's own LastRun/MinPeriod), so the same objective is not re-emitted on the very
-// next poll before its run has a chance to start. The advance timestamp is the same
-// injected `now` used for due-selection, so selection and debounce share one clock —
-// deterministic, never wall-clock (tests inject both `now` and the poll wait).
+// MarkAttempt is called the moment a due objective is SELECTED (debounced by the
+// objective leaf's own LastRun cadence), so the same objective is not re-emitted on the
+// very next poll before its run has a chance to start. It advances only the DEBOUNCE
+// clock, NOT a completion claim: a selected run that later fails or is gate-denied
+// re-arms after the objective's (shorter) RetryPeriod rather than a full MinPeriod, so a
+// standing objective is not silently parked for a whole period after an unverified run.
+// The handler signals a verified outcome separately via the backlog's MarkSuccess (the
+// daemon wiring) — this source only selects + debounces, it never marks work done (I2).
+// The advance timestamp is the same injected `now` used for due-selection, so selection
+// and debounce share one clock — deterministic, never wall-clock (tests inject both
+// `now` and the poll wait).
 //
 // # Invariants
 //
-//   - I2: the source emits a goal; it never marks work done or skips a verify. MarkRun
-//     advances only the backlog's debounce clock — it is NOT a completion claim.
+//   - I2: the source emits a goal; it never marks work done or skips a verify.
+//     MarkAttempt advances only the backlog's debounce clock — it is NOT a completion
+//     claim (the verified outcome is recorded separately by the handler's MarkSuccess).
 //   - I3: holds no secret/policy/envelope; emits a plain Goal string. Nothing reaches
 //     the model.
 //   - I7: Objective.Goal is operator-authored text treated strictly as data — queued,
@@ -70,7 +77,7 @@ const DefaultBacklogInterval = 30 * time.Second
 // objective package doc).
 type objectiveBacklog interface {
 	NextIdle(ctx context.Context, now time.Time) (objective.Objective, bool, error)
-	MarkRun(ctx context.Context, id string, when time.Time) error
+	MarkAttempt(ctx context.Context, id string, when time.Time) error
 }
 
 // compile-time proof the concrete backlog satisfies the seam.
@@ -179,9 +186,12 @@ func (s *BacklogSource) Next(ctx context.Context) (QueuedSignal, bool, error) {
 }
 
 // pull selects the next due objective at `now` and, if one is found, advances its
-// debounce clock (MarkRun) before returning it. MarkRun is at selection time so the
-// same objective is not re-emitted before its run starts; the advance uses the same
-// `now` as selection so the two share one clock. A nil backlog is inert (nothing due).
+// debounce clock (MarkAttempt) before returning it. MarkAttempt is at selection time so
+// the same objective is not re-emitted before its run starts; the advance uses the same
+// `now` as selection so the two share one clock. It advances only the debounce — NOT a
+// completion claim — so a run that later fails re-arms after the objective's RetryPeriod
+// (the verified outcome is recorded by the handler via MarkSuccess, not here). A nil
+// backlog is inert (nothing due).
 func (s *BacklogSource) pull(ctx context.Context, now time.Time) (objective.Objective, bool, error) {
 	if s.backlog == nil {
 		return objective.Objective{}, false, nil
@@ -193,7 +203,7 @@ func (s *BacklogSource) pull(ctx context.Context, now time.Time) (objective.Obje
 	if !ok {
 		return objective.Objective{}, false, nil
 	}
-	if err := s.backlog.MarkRun(ctx, obj.ID, now); err != nil {
+	if err := s.backlog.MarkAttempt(ctx, obj.ID, now); err != nil {
 		return objective.Objective{}, false, err
 	}
 	return obj, true, nil

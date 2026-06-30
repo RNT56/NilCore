@@ -235,11 +235,12 @@ func flowsValidate(doc flowDoc, flow agenticflows.Flow) int {
 }
 
 // flowsRun executes a consumable flow's agent_task nodes through the proven decompose
-// preset: it composes one sub-goal per agent_task (dependency order) into a multi-line
-// goal, which decomposePlan splits back into independent verified sub-runs that are
+// preset: it composes one sub-goal per agent_task (in topological order) into a
+// multi-line goal, which decomposePlan splits back into verified sub-runs that are
 // integrated into one re-verified tip (I2). It fails closed if the flow is not
-// consumable. Tool/verify/approval nodes are honored by the run machinery itself (the
-// sandbox, the verifier, the human gate) — this command does not pre-execute them.
+// consumable. It does NOT pre-execute tool/verify/approval nodes: a tool a flow needs
+// is reached transitively as a model-emitted command inside an agent_task, which then
+// hits the sandbox/verifier/gate like any other command.
 func flowsRun(doc flowDoc, flow agenticflows.Flow, dir string) {
 	if !agenticflows.SupportsNilCore(flow) {
 		fmt.Fprintf(os.Stderr, "error: flow %s does not support nilcore (runtime.supported_cores)\n", doc.ID)
@@ -257,8 +258,9 @@ func flowsRun(doc flowDoc, flow agenticflows.Flow, dir string) {
 
 	// Compose the worker-dispatch goal: the flow title as context, then one line per
 	// agent_task (decomposePlan splits on newlines, so each becomes an independent
-	// verified sub-run). Dependency order is preserved by AgentTaskSubtasks' topological
-	// shape — the integrator re-verifies after each merge regardless.
+	// verified sub-run). AgentTaskSubtasks returns the subs in TOPOLOGICAL order, so a
+	// task's dependencies appear before it in the goal list; the integrator then merges
+	// in that order and re-verifies after each merge regardless (I2).
 	var b strings.Builder
 	if doc.Title != "" {
 		fmt.Fprintf(&b, "%s\n", doc.Title)

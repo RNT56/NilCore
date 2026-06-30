@@ -126,7 +126,11 @@ func checkWorldBankIndicator(ctx context.Context, box sandbox.Sandbox, c artifac
 }
 
 // worldBankLatest pulls the most recent non-null indicator value. The response is
-// [meta, [{value,date}, ...]] with the newest first; we take the first non-null value.
+// [meta, [{value,date}, ...]]. We do NOT trust the response ORDERING (it is shaped by
+// the model-authored SourceURL query — e.g. &sort=asc or a date range could put the
+// OLDEST point first); instead we sort by the parsed `date` field DESCENDING and take
+// the latest non-null value, mirroring secLatestFact/imfLatest so the verdict never
+// depends on a model-influenced order (I2).
 func worldBankLatest(body string) (float64, bool) {
 	var doc []json.RawMessage
 	if err := json.Unmarshal([]byte(body), &doc); err != nil || len(doc) < 2 {
@@ -139,6 +143,9 @@ func worldBankLatest(body string) (float64, bool) {
 	if err := json.Unmarshal(doc[1], &points); err != nil {
 		return 0, false
 	}
+	// Latest "date" wins (World Bank dates are years or ISO dates, both sorting
+	// lexicographically). Sort descending so the newest point is first.
+	sort.Slice(points, func(i, j int) bool { return points[i].Date > points[j].Date })
 	for _, p := range points {
 		if p.Value.String() == "" {
 			continue

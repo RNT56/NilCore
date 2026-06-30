@@ -200,19 +200,27 @@ func (d *driver) observe(ctx context.Context, a desktopwire.Act, preSig string) 
 	window := activeWindow(ctx)
 	a11y, _ := parseA11y(mustDump(ctx))
 
-	stagnant := a.Op == desktopwire.OpClick && a.Ref > 0 && sigOf(window, len(a11y)) == preSig
-	dec := d.ladder.Decide(desktop.RungInput{Window: window, RefCount: len(a11y), Stagnant: stagnant, HasMarkableBoxes: true})
+	// Stagnation drives the 1→2 ladder downgrade. It is NOT ref-click-only: ANY mutating
+	// op (click/type/key/scroll, ref- or coordinate-based) whose post-act signature
+	// equals the pre-act one verifiably changed nothing — a tree that lies for typing
+	// must drop us off Rung 1 just like a lying ref-click does (mirrors desktopagent
+	// .isStagnant's "any non-observe op" scope, B7-cu.5).
+	postSig := sigOf(window, len(a11y))
+	stagnant := a.Op != desktopwire.OpObserve && a.Op != desktopwire.OpWait && postSig == preSig
 
 	obs := desktopwire.Observation{Version: d.ver, FocusedWindow: collapse(window), Title: collapse(window)}
 	d.idBox = map[int]desktopwire.Box{}
 
-	if dec.Rung == desktopwire.RungATSPI {
+	// First, decide whether Rung 1 (AT-SPI refs) is still trusted for this window. We
+	// pass HasMarkableBoxes=true here only to let Decide return Rung 1 vs "needs a
+	// screenshot"; the real 2-vs-3 choice is made below from the actual mark count.
+	if dec := d.ladder.Decide(desktop.RungInput{Window: window, RefCount: len(a11y), Stagnant: stagnant, HasMarkableBoxes: true}); dec.Rung == desktopwire.RungATSPI {
 		obs.Rung = desktopwire.RungATSPI
 		obs.Refs = a11y
 		for _, r := range a11y {
 			d.idBox[r.ID] = r.Box
 		}
-		d.lastSig = sigOf(window, len(a11y))
+		d.lastSig = postSig
 		return obs
 	}
 
@@ -220,6 +228,9 @@ func (d *driver) observe(ctx context.Context, a desktopwire.Act, preSig string) 
 	full, cerr := capture(ctx)
 	if cerr != nil || full == nil {
 		// No capture and (per the ladder) no usable refs — return what little we have.
+		// Drive the ladder's 2→3 transition explicitly with the real (zero) markable-box
+		// availability, so the per-window cache reflects reality (B7-cu.4).
+		d.ladder.Decide(desktop.RungInput{Window: window, RefCount: len(a11y), Stagnant: stagnant, HasMarkableBoxes: false})
 		obs.Rung = desktopwire.RungCoordinate
 		obs.Console = []string{"capture failed: " + errStr(cerr)}
 		d.lastSig = sigOf(window, 0)
@@ -230,7 +241,12 @@ func (d *driver) observe(ctx context.Context, a desktopwire.Act, preSig string) 
 	display, sx, sy := resizeNearest(full, imgMaxW, imgMaxH)
 	d.scaleX, d.scaleY = sx, sy
 
-	if len(marks) == 0 {
+	// Now that we know whether ANY markable box exists, drive the ladder's 2→3 decision
+	// from the truth instead of a hardcoded true: an empty mark set is the documented
+	// "neither AT-SPI nor CV yields a plausible mark" Rung-3 trigger (B7-cu.4).
+	dec := d.ladder.Decide(desktop.RungInput{Window: window, RefCount: len(a11y), Stagnant: stagnant, HasMarkableBoxes: len(marks) > 0})
+
+	if dec.Rung == desktopwire.RungCoordinate || len(marks) == 0 {
 		// Rung 3: raw screenshot, coordinate mode.
 		obs.Rung = desktopwire.RungCoordinate
 		obs.ScreenshotB64 = pngB64(display)

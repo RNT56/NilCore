@@ -71,6 +71,39 @@ func TestReferences(t *testing.T) {
 	}
 }
 
+// TestCallsSameNamedCallersMerge is the regression for the last-writer-wins bug:
+// two functions/methods that share a bare name must have their callee lists merged
+// (appended), not overwritten — otherwise the first declaration's outgoing calls
+// are silently lost before they reach the call graph.
+func TestCallsSameNamedCallersMerge(t *testing.T) {
+	src := `package p
+
+type A struct{}
+type B struct{}
+
+func (A) Validate() { alpha() }
+func (B) Validate() { beta() }
+
+func alpha() {}
+func beta()  {}
+`
+	p := filepath.Join(t.TempDir(), "p.go")
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calls, err := Calls(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, c := range calls["Validate"] {
+		got[c] = true
+	}
+	if !got["alpha"] || !got["beta"] {
+		t.Errorf("Validate callees = %v, want both alpha and beta (merged, not overwritten)", calls["Validate"])
+	}
+}
+
 func TestSymbolsParseError(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "bad.go")
 	if err := os.WriteFile(p, []byte("package x\nfunc ("), 0o644); err != nil {

@@ -87,8 +87,17 @@ func (m *Memory) Context(ctx context.Context, scope, project, keyword string, ma
 // Remember writes durable records after a task (P4-T05), deduping against what is
 // already stored (same scope/project/key/value) so noise doesn't accumulate. It
 // returns how many new records were written.
+//
+// The existing-records query is hoisted out of the per-record loop: each distinct
+// (scope, project) partition is read at most once and its (key,value) pairs are kept
+// in a set, so a batch of N records over an M-row partition costs one read per
+// partition plus O(1) lookups rather than N full-partition reads + N*M comparisons.
+// The set is updated as we write so two identical records in the same batch still
+// dedupe.
 func (m *Memory) Remember(ctx context.Context, recs []Record) (int, error) {
 	written := 0
+	// seen[partition][key\x00value] tracks what is already stored or just written.
+	seen := map[string]map[string]bool{}
 	for _, r := range recs {
 		if r.Key == "" || r.Value == "" {
 			continue // skip ephemeral/empty
@@ -96,23 +105,28 @@ func (m *Memory) Remember(ctx context.Context, recs []Record) (int, error) {
 		if r.Scope == "" {
 			r.Scope = ScopeProject
 		}
-		existing, err := m.Query(ctx, r.Scope, r.Project, "")
-		if err != nil {
-			return written, err
-		}
-		dup := false
-		for _, e := range existing {
-			if e.Key == r.Key && e.Value == r.Value {
-				dup = true
-				break
+		part := r.Scope + "\x00" + r.Project
+		set, ok := seen[part]
+		if !ok {
+			// First record for this partition: read it once and build the dup set.
+			existing, err := m.Query(ctx, r.Scope, r.Project, "")
+			if err != nil {
+				return written, err
 			}
+			set = make(map[string]bool, len(existing))
+			for _, e := range existing {
+				set[e.Key+"\x00"+e.Value] = true
+			}
+			seen[part] = set
 		}
-		if dup {
+		pair := r.Key + "\x00" + r.Value
+		if set[pair] {
 			continue
 		}
 		if err := m.Write(ctx, r); err != nil {
 			return written, err
 		}
+		set[pair] = true
 		written++
 	}
 	return written, nil

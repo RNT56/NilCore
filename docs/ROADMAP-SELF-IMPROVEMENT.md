@@ -18,11 +18,11 @@
 | Piece | Package | Role |
 |---|---|---|
 | frozen suite | `eval/self` | a content-hashed, immutable self-eval set — never mutated by the loop (C6: no eval-set self-modification) |
-| selfeval | `internal/flywheel/selfeval` | run the suite, fold to trust — **verifier-judged + chain-gated**, so a self-report can't inflate standing |
+| selfeval | `internal/flywheel/selfeval` | fold a verifier-judged eval report into trust standing — **verifier-judged + chain-gated**, so a self-report can't inflate standing. **Built, not yet wired** — see "Selfeval trust-fold: built, not yet wired" below |
 | distiller | `internal/flywheel/distiller` | mine recurring failure patterns (read-only, fail-closed; structural fields only — I7) |
 | measure | `internal/flywheel/measure` | the regression fence: a *measured* eval-delta, not a hunch |
 | loop | `internal/flywheel/loop` | the bounded standing cadence composing the four above |
-| flow | `internal/selfimprove` | the gated self-edit pipeline (scope-check → verified task → gate); optional measured-delta hook (SIF-T05) |
+| flow | `internal/selfimprove` | the gated self-edit pipeline (scope-check → verified task → gate); the measured-delta fence lives at the loop level (one fence, one guarantee) |
 | cmd | `cmd/nilcore/flywheel.go` | `nilcore flywheel [--once]` + the optional serve cadence |
 | auto-merge class | `internal/graapprove.SelfImproveGate` | the SEPARATE double opt-in (`NILCORE_SELFIMPROVE_AUTOAPPROVE`) |
 
@@ -49,3 +49,15 @@ NILCORE_FLYWHEEL=1 NILCORE_SELFIMPROVE_AUTOAPPROVE=1 nilcore serve …
 The loop's regression fence is now **candidate-aware**: an optional `loop.Config.ScoreCandidate` seam scores the frozen suite WITH the candidate edit *applied* — `cmd/nilcore`'s `scoreFlywheelCandidate` cuts a scratch worktree, runs the proposal there (`KeepBranch`), merges the verified edit, and re-scores against the edited tree, so the fence reads a true before/after rather than two scores of the unchanged state. It is **FAIL-CLOSED**: any error in that pipeline (worktree, an unverified edit, a merge conflict) yields an empty report, which the fence reads as "no improvement" → the candidate is dropped (it can then only ever merge via the human gate in `Propose`, never auto). So a flaw in the scorer can only ever be *conservative* — the verifier (I2) and the gate remain the sole ship authority regardless of the scorer's sensitivity.
 
 The seam is hermetically tested (the loop uses `ScoreCandidate` for the "after" score; an empty report drops the candidate); the **live** behaviour — does applying a prompt/skill edit measurably move the eval suite — is the field-validation step (the same posture the kernel/decompose recursive engine shipped under: opt-in + tested at the seam + proven in the field). When `ScoreCandidate` is unset the loop falls back to `RunSuite` (byte-identical to the prior conservative path).
+
+## Rotation vs. distillation (B5-autonomy.8)
+
+`serve` caps the live event log via `maint.RotateLog(logPath, serveLogMaxBytes)` (64 MiB): when the live log exceeds the cap it is renamed to `logPath+".1"` (single generation, replacing any prior `.1`) and a fresh, empty live log is recreated — which starts a **new genesis hash chain** (seq 0 / prev `""`), independently verifiable. The distiller previously replayed only the live log, so a recurring verifier-failure scar that *straddled* a rotation boundary could lose the occurrences that landed in `.1` and drop below `DefaultThreshold` (2), going silent exactly when it most needs surfacing.
+
+The miner now replays **across generations**: `distiller.DistillAcross(threshold, paths…)` clusters the failures from every passed generation into one Pattern set, chain-verifying **each generation independently** and **failing closed per file** (a tampered or corrupt generation erases the whole result — never forges a scar, I5; a missing generation is a clean skip). `distiller.Distill` is now a single-generation shorthand for `DistillAcross`. The standing loop threads the rotated generation through the new `loop.Config.RotatedLogPaths` (the cmd layer passes `logPath+".1"`), so a scar crossing the rotation boundary still clears the recurrence threshold. The interaction is single-generation by design (matching `maint.RotateLog`'s single `.1`); a host needing deeper retention raises `serveLogMaxBytes` so rotation is rarer, or extends `RotatedLogPaths`.
+
+## Selfeval trust-fold: built, not yet wired
+
+`internal/flywheel/selfeval` ships the safety-sensitive **trust fold**: `NewVerifierJudged` wraps an `eval.Report` produced by the harness (so only a verifier-judged report can fold — I2), and `Fold` verifies the event-log chain first (fail-closed — I5), folds into `trust.Ledger.FoldEvalReport`, and emits one metadata-only `selfeval_report` event. It is fully implemented and tested, but **has no production caller today**: the standing loop (`internal/flywheel/loop`) imports `distiller`/`measure`/`selfimprove` only, and `cmd/nilcore/flywheel.go` scores via `eval.Run` directly and feeds those pass-rates only into the regression *fence*, never the trust ledger. So self-eval outcomes do not yet fold into the agent's trust standing.
+
+This is **safety-conservative dead code**: `Fold` can only ever *raise* standing from a verifier-judged, chain-verified report, so leaving it unwired simply means the graduated-auto-approval envelope never gains from this signal — no functional bug. Wiring it is a small, deliberately-deferred change in the (contract-adjacent) cmd layer: in `cmd/nilcore/flywheel.go`'s `newFlywheelLoop`, thread the `*trust.Ledger` already available to `serve`, and after the baseline `RunSuite` produces the `eval.Report`, call `selfeval.Fold(ctx, logPath, selfeval.NewVerifierJudged(report), ledger, log)`. Until then the leaf stays built-and-tested but inert.

@@ -318,6 +318,39 @@ func TestGenerateWrappers(t *testing.T) {
 	}
 }
 
+// TestGenerateWrappersPrunesStale: a regenerate with a smaller tool set removes the
+// descriptor of a tool the server dropped (so it can't stay discoverable), while a
+// resources/ subdir is left untouched.
+func TestGenerateWrappersPrunesStale(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "mcp", "servers", "docs")
+	if err := GenerateWrappers(base, "docs", []Tool{
+		{Name: "search", Description: "s", InputSchema: json.RawMessage(`{}`)},
+		{Name: "delete", Description: "d", InputSchema: json.RawMessage(`{}`)},
+	}); err != nil {
+		t.Fatalf("first GenerateWrappers: %v", err)
+	}
+	if err := GenerateResourceWrappers(base, "docs", []Resource{{URI: "file://a.txt", Name: "A"}}); err != nil {
+		t.Fatalf("GenerateResourceWrappers: %v", err)
+	}
+	// Re-gen with "delete" removed: its descriptor must be pruned, "search" kept.
+	if err := GenerateWrappers(base, "docs", []Tool{
+		{Name: "search", Description: "s", InputSchema: json.RawMessage(`{}`)},
+	}); err != nil {
+		t.Fatalf("re-GenerateWrappers: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "delete.json")); !os.IsNotExist(err) {
+		t.Errorf("stale descriptor delete.json was not pruned (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "search.json")); err != nil {
+		t.Errorf("live descriptor search.json must survive: %v", err)
+	}
+	// The resources/ subdir must be untouched by the tool-descriptor prune.
+	if _, err := os.Stat(filepath.Join(dir, "resources")); err != nil {
+		t.Errorf("resources/ subdir must not be pruned by GenerateWrappers: %v", err)
+	}
+}
+
 func TestGenerateResourceAndPromptWrappers(t *testing.T) {
 	base := t.TempDir()
 	if err := GenerateResourceWrappers(base, "docs", []Resource{{URI: "file://a.txt", Name: "A"}}); err != nil {

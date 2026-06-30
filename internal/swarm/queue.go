@@ -346,7 +346,7 @@ func (q *Queue) emit(task, kind string, detail map[string]any) {
 }
 
 // ShardsByRun returns every shard row of THIS run, reconstructed into Shards, by
-// filtering all swarm-status rows by the "swarm/<runID>/" ID prefix in Go (no store
+// filtering all swarm-status rows by the "swarm-<runID>-" ID prefix in Go (no store
 // query change). It scans each shard status namespace so a run's shards are returned
 // regardless of their terminal disposition — the resume path needs the full set to
 // recompute which are already green.

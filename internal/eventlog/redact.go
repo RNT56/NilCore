@@ -27,7 +27,12 @@ var secretRe = regexp.MustCompile(strings.Join([]string{
 // The optional scheme group ((?:bearer|basic|token) ) keeps an auth scheme word
 // visible while masking only the credential after it, so `Authorization: Bearer XYZ`
 // becomes `Authorization: Bearer [redacted]` (not `Authorization: [redacted] XYZ`).
-var inlineSecretRe = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|authorization|auth[_-]?token|bearer)([ \t]*[=:][ \t]*|[ \t]+)((?:bearer|basic|token)[ \t]+)?("?)([^\s"']{4,})`)
+// The separator alternative tolerates an OPTIONAL intervening quote (["']?) before the
+// `=`/`:`, so a credential buried as a JSON string-in-a-string — e.g. a model-echoed
+// blob `{"api_key": "live_..."}` stored under a free-text field — is masked too. Without
+// it the closing quote after the key name sits between the key and the `:`, and neither
+// separator alternative matched (the credential leaked through).
+var inlineSecretRe = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|authorization|auth[_-]?token|bearer)(["']?[ \t]*[=:][ \t]*|[ \t]+)((?:bearer|basic|token)[ \t]+)?("?)([^\s"']{4,})`)
 
 // flagSecretRe catches a credential passed as a CLI flag value (e.g. `mysql -p s3cr3t`,
 // `curl --header 'Authorization: x'` is covered above; this covers `-p`, `--password`,

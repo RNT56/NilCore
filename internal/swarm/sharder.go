@@ -18,11 +18,12 @@ package swarm
 //     "nothing to do" and exit green over an unplanned goal). The plan's DependsOn
 //     edges become Shard.Deps so the runner's DAG honors the planned ordering.
 //
-//   - FailureSharder: a "fix the red tests" run. It runs verify.Detect once, executes
-//     the detected command in the sandbox once, parses the failing test names from the
-//     output, and emits ONE shard per failure — the "one test failure" granularity the
-//     swarm requeues against. When parsing yields nothing actionable it falls back to a
-//     single whole-suite shard (documented below) rather than a misleading empty set.
+//   - FailureSharder: the "fix the red tests" run (the `fix` preset). It runs
+//     verify.Detect once, executes the detected command in the sandbox once, parses the
+//     failing test names from the output, and emits ONE shard per failure — the "one test
+//     failure" granularity the swarm requeues against. When parsing yields nothing
+//     actionable it falls back to a single whole-suite shard (documented below) rather
+//     than a misleading empty set.
 //
 // Determinism. Every sharder emits shards in a stable order (list order, plan order,
 // detected-failure order) so a re-run plans the same set — meaningful for golden tests
@@ -43,7 +44,8 @@ import (
 )
 
 // Sharder is the goal→shards seam. runID namespaces the produced shard IDs
-// ("swarm/<runID>/<n>") so two runs over one store never collide. An implementation
+// ("swarm-<runID>-<n>", the dash-delimited form shardID emits) so two runs over one
+// store never collide. An implementation
 // that needs a model or a sandbox holds it as a field (PlanSharder/FailureSharder);
 // ListSharder needs neither.
 type Sharder interface {

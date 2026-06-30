@@ -54,6 +54,13 @@ type Step struct {
 // nil ⇒ no events emitted (byte-identical).
 type EventSink func(Step)
 
+// Approver is the human gate the tool routes an irreversible browser action through
+// (it mirrors policy.Approver). A *BrowseTool with a nil Approver fails CLOSED on an
+// irreversible action — a headless run never silently performs a purchase/payment.
+type Approver interface {
+	Approve(action string) bool
+}
+
 // BrowseTool is the stateful browse capability. It holds the live session and the
 // loop-discipline counters; register a *BrowseTool (pointer) so the state persists
 // across the task's many calls.
@@ -62,6 +69,7 @@ type BrowseTool struct {
 	MaxSteps    int       // hard per-session act budget (default browseDefaultMaxSteps)
 	MaxStagnant int       // consecutive no-op acts before the tool insists on a new approach (default 3)
 	EventSink   EventSink // optional trajectory sink (metadata only); nil ⇒ no events
+	Approver    Approver  // human gate for irreversible actions; nil ⇒ fail closed on one (I2)
 
 	mu       sync.Mutex
 	steps    int
@@ -152,6 +160,23 @@ func (b *BrowseTool) RunWithImage(ctx context.Context, _ string, input json.RawM
 		Op: in.Op, Ref: in.Ref, URL: in.URL, Text: in.Text, Key: in.Key,
 		Selector: in.Selector, Dir: in.Dir, Amount: in.Amount, MS: in.MS,
 	}
+
+	// Irreversible-action gate, ENFORCED IN CODE (ROADMAP §6.6/§10, I2): before
+	// dispatch, classify a click/select against the target's accessible name + role
+	// from the latest snapshot. A purchase/pay/transfer/delete/refund/consent/accept-
+	// terms/accept-cookies target routes through the human gate; a headless run (no
+	// Approver) fails CLOSED rather than silently performing it. This does NOT rely on
+	// the prompt instruction — a model that ignores the prompt still cannot act.
+	if sig := irreversibleTarget(act, b.Sess.Latest()); sig != "" {
+		if b.Approver == nil || !b.Approver.Approve("browser "+act.Op+" on irreversible target ("+sig+")") {
+			body := fmt.Sprintf("the %s on %q was BLOCKED by the irreversible-action gate (matched %q) — it was not performed. A human must approve it; report this and finish if you cannot proceed.", act.Op, sig, sig)
+			if b.EventSink != nil {
+				b.EventSink(Step{N: b.steps, Op: act.Op, URL: b.Sess.Latest().URL, Refs: len(b.Sess.Latest().Refs), Version: b.Sess.Latest().Version, Errored: true})
+			}
+			return guard.Wrap("browse gate", body), nil, nil
+		}
+	}
+
 	obs, actErr := b.Sess.Act(ctx, act)
 
 	// Render the observation as fenced, untrusted data. Even on an act error we
@@ -214,6 +239,59 @@ func (b *BrowseTool) isStagnant(op, sig string, errored bool) bool {
 // title. Two identical signatures across a mutating act ⇒ the act did nothing.
 func observationSignature(o browserwire.Observation) string {
 	return fmt.Sprintf("%s|%d|%s", o.URL, len(o.Refs), o.Title)
+}
+
+// irreversibleSignals are the browser action-semantic phrases that route a
+// click/select through the human gate (ROADMAP §6.6). They are intentionally
+// conservative — when a target's accessible name/value matches any of these, the
+// action is treated as consequential and must be approved. Matched on a normalized
+// (lowercased, whitespace-collapsed) substring of the target text: these are UI
+// labels ("Pay now", "Accept all cookies"), not shell commands, so a substring match
+// is the right granularity (unlike policy.Classify's word-boundary command matching).
+var irreversibleSignals = []string{
+	"purchase", "buy now", "place order", "checkout", "confirm order",
+	"pay", "pay now", "transfer", "send money", "delete", "remove",
+	"refund", "consent", "accept terms", "accept all", "accept cookies",
+	"i agree", "subscribe", "unsubscribe",
+}
+
+// irreversibleTarget reports the matched signal phrase when act is a consequential
+// click/select whose resolved target (the ref's accessible name/value, or a typed
+// submit-like text) names an irreversible action — "" when it is benign. Only
+// click/select are gated: observe/navigate/scroll/back/forward/wait/key are not
+// target-semantic mutations, and type just enters text (the SUBMIT click is gated).
+func irreversibleTarget(a browserwire.Act, latest browserwire.Observation) string {
+	switch a.Op {
+	case browserwire.OpClick, browserwire.OpSelect:
+	default:
+		return ""
+	}
+	var probe strings.Builder
+	if a.Ref > 0 {
+		for _, r := range latest.Refs {
+			if r.ID == a.Ref {
+				probe.WriteString(r.Name)
+				probe.WriteByte(' ')
+				probe.WriteString(r.Value)
+				break
+			}
+		}
+	}
+	// Selector/select-option text is also model-supplied target intent.
+	probe.WriteByte(' ')
+	probe.WriteString(a.Text)
+	probe.WriteByte(' ')
+	probe.WriteString(a.Selector)
+	hay := strings.Join(strings.Fields(strings.ToLower(probe.String())), " ")
+	if hay == "" {
+		return ""
+	}
+	for _, sig := range irreversibleSignals {
+		if strings.Contains(hay, sig) {
+			return sig
+		}
+	}
+	return ""
 }
 
 // renderObservation produces the compact, model-readable view: URL, title, the

@@ -205,22 +205,103 @@ func stringDetail(d map[string]any, key string) string {
 // folds as a failure; a missing or non-bool "passed" reads as a non-failure
 // (absent evidence is never a scar). No Result.SelfClaimed is consulted.
 func Distill(logPath string, threshold int) ([]Pattern, error) {
+	return DistillAcross(threshold, logPath)
+}
+
+// DistillAcross is Distill over MORE THAN ONE log generation: it clusters the
+// recurring verifier failures across every given path into one set of Patterns,
+// so a scar that straddles a log rotation (e.g. the live `events.jsonl` plus the
+// rotated `events.jsonl.1`) still clears the recurrence threshold instead of
+// resetting its Count at the rotation boundary (the B5-autonomy.8 fix —
+// maint.RotateLog renames the bulky live log to path+".1" and starts a fresh
+// genesis chain, which the single-generation Distill could not see).
+//
+// Each generation is an INDEPENDENT hash chain (rotation creates a fresh genesis,
+// so seq/prev restart at 0/""). So each path is chain-verified ON ITS OWN and
+// FAILS CLOSED per file: if ANY existing generation's chain does not link,
+// DistillAcross returns that file's error and NIL patterns — a tampered or corrupt
+// generation can only ERASE the whole result, never forge a scar (I5), exactly
+// like the single-file Distill. A MISSING generation is skipped cleanly (a not-yet
+// rotated host has no ".1"); only an EXISTING but unreadable/broken one errors.
+//
+// Paths are folded in the order given and clusters MERGE across them, so the
+// caller passes newest-first or oldest-first freely — the Pattern's FirstSeen /
+// LastSeen still bound the true recurrence window because they min/max over every
+// folded event regardless of file order. Passing a single path is byte-identical
+// to the old Distill.
+func DistillAcross(threshold int, logPaths ...string) ([]Pattern, error) {
 	if threshold <= 0 {
 		threshold = DefaultThreshold
 	}
 
+	clusters := map[clusterKey]*cluster{}
+	for _, logPath := range logPaths {
+		if logPath == "" {
+			continue
+		}
+		if err := scanGeneration(logPath, clusters); err != nil {
+			// Fail-closed per generation: a missing file is skipped inside
+			// scanGeneration (returns nil); any real error (parse, I/O, broken
+			// chain) drops EVERYTHING and surfaces, so no target is distilled from
+			// a tampered or unreadable log.
+			return nil, err
+		}
+	}
+
+	// A nil (not allocated-empty) result when nothing clears the threshold keeps the
+	// single-path Distill contract: a missing/empty/all-one-off log yields nil, never
+	// a non-nil zero-length slice.
+	var patterns []Pattern
+	for _, c := range clusters {
+		if c.fails < threshold {
+			continue // a one-off (sub-threshold) scar is not an improvement target
+		}
+		patterns = append(patterns, Pattern{
+			Kind:       Kind,
+			VerifierID: c.verifierID,
+			FailClass:  c.failClass,
+			Backend:    c.backend,
+			Count:      c.fails,
+			Sample:     c.sample,
+			FirstSeen:  c.first,
+			LastSeen:   c.last,
+		})
+	}
+	// Deterministic order: strongest recurrence first, then a stable tiebreak on
+	// the structural coordinate so callers and golden tests see a fixed sequence.
+	sort.Slice(patterns, func(i, j int) bool {
+		if patterns[i].Count != patterns[j].Count {
+			return patterns[i].Count > patterns[j].Count
+		}
+		if patterns[i].VerifierID != patterns[j].VerifierID {
+			return patterns[i].VerifierID < patterns[j].VerifierID
+		}
+		if patterns[i].FailClass != patterns[j].FailClass {
+			return patterns[i].FailClass < patterns[j].FailClass
+		}
+		return patterns[i].Backend < patterns[j].Backend
+	})
+	return patterns, nil
+}
+
+// scanGeneration replays ONE log generation read-only, folding its verifier
+// verdicts into the shared clusters map, then runs eventlog.Verify on that same
+// file LAST and fails closed on a broken chain (dropping nothing into the map is
+// the caller's concern — on a chain error the whole DistillAcross returns nil
+// patterns, so a partially-folded map is never returned). A MISSING file is a
+// clean no-op (a fresh install or a host with no rotated generation yet).
+func scanGeneration(logPath string, clusters map[clusterKey]*cluster) error {
 	f, err := os.Open(logPath)
 	if err != nil {
-		// No log yet ⇒ no history ⇒ no scars. Any other open error (permissions,
-		// a directory, an I/O fault) is a real failure to surface.
+		// No such generation ⇒ nothing to fold (a fresh install, or no ".1" yet).
+		// Any other open error (permissions, a directory, an I/O fault) is real.
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+			return nil
 		}
-		return nil, fmt.Errorf("opening event log: %w", err)
+		return fmt.Errorf("opening event log %q: %w", logPath, err)
 	}
 	defer f.Close()
 
-	clusters := map[clusterKey]*cluster{}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for n := 1; sc.Scan(); n++ {
@@ -230,7 +311,7 @@ func Distill(logPath string, threshold int) ([]Pattern, error) {
 		}
 		var e verifyEvent
 		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, fmt.Errorf("event %d: parsing line: %w", n, err)
+			return fmt.Errorf("event %d in %q: parsing line: %w", n, logPath, err)
 		}
 		if !isVerifyKind(e.Kind) {
 			continue // only verifier verdicts carry failure-pattern signal
@@ -264,46 +345,15 @@ func Distill(logPath string, threshold int) ([]Pattern, error) {
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("reading event log: %w", err)
+		return fmt.Errorf("reading event log %q: %w", logPath, err)
 	}
 
 	// Chain integrity is eventlog's authority: drop EVERYTHING we just folded if
-	// the chain does not link. A target distilled from a tampered log would let an
-	// attacker steer the flywheel, so we fail closed (no patterns over a broken
-	// chain), exactly like trust.Replay (internal/trust/replay.go:78).
+	// this generation's chain does not link. A target distilled from a tampered log
+	// would let an attacker steer the flywheel, so we fail closed (no patterns over
+	// a broken chain), exactly like trust.Replay (internal/trust/replay.go:78).
 	if err := eventlog.Verify(logPath); err != nil {
-		return nil, fmt.Errorf("verifying chain: %w", err)
+		return fmt.Errorf("verifying chain %q: %w", logPath, err)
 	}
-
-	patterns := make([]Pattern, 0, len(clusters))
-	for _, c := range clusters {
-		if c.fails < threshold {
-			continue // a one-off (sub-threshold) scar is not an improvement target
-		}
-		patterns = append(patterns, Pattern{
-			Kind:       Kind,
-			VerifierID: c.verifierID,
-			FailClass:  c.failClass,
-			Backend:    c.backend,
-			Count:      c.fails,
-			Sample:     c.sample,
-			FirstSeen:  c.first,
-			LastSeen:   c.last,
-		})
-	}
-	// Deterministic order: strongest recurrence first, then a stable tiebreak on
-	// the structural coordinate so callers and golden tests see a fixed sequence.
-	sort.Slice(patterns, func(i, j int) bool {
-		if patterns[i].Count != patterns[j].Count {
-			return patterns[i].Count > patterns[j].Count
-		}
-		if patterns[i].VerifierID != patterns[j].VerifierID {
-			return patterns[i].VerifierID < patterns[j].VerifierID
-		}
-		if patterns[i].FailClass != patterns[j].FailClass {
-			return patterns[i].FailClass < patterns[j].FailClass
-		}
-		return patterns[i].Backend < patterns[j].Backend
-	})
-	return patterns, nil
+	return nil
 }

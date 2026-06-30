@@ -281,3 +281,111 @@ func TestUnenrichedLogStillClusters(t *testing.T) {
 		t.Errorf("count = %d, want 3", got[0].Count)
 	}
 }
+
+// writeLogAt builds a real hash-chained log at an explicit path (the per-test dir is
+// the caller's, so a live log and its rotated ".1" sibling can share one directory the
+// way maint.RotateLog leaves them).
+func writeLogAt(t *testing.T, path string, events []eventlog.Event) {
+	t.Helper()
+	l, err := eventlog.Open(path)
+	if err != nil {
+		t.Fatalf("open log %q: %v", path, err)
+	}
+	for _, e := range events {
+		l.Append(e)
+	}
+	if err := l.Err(); err != nil {
+		t.Fatalf("log write %q failed: %v", path, err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("close log %q: %v", path, err)
+	}
+}
+
+// TestDistillAcrossClustersStraddlingRotation is the B5-autonomy.8 fix: a recurring
+// scar split one-and-one across a rotation boundary clears DefaultThreshold (2) only
+// when BOTH generations are replayed. With just the live log it is a sub-threshold
+// one-off and would never surface as an improvement target.
+func TestDistillAcrossClustersStraddlingRotation(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "events.jsonl")
+	rotated := live + ".1"
+
+	// The rotated generation (older, fresh-genesis chain of its own) holds one fail;
+	// the live generation holds the second fail of the SAME structural coordinate.
+	writeLogAt(t, rotated, []eventlog.Event{fail("go-test", "test", "native", "scar in gen .1")})
+	writeLogAt(t, live, []eventlog.Event{fail("go-test", "test", "native", "scar in live gen")})
+
+	// Live-only: one fail < DefaultThreshold(2) ⇒ no pattern (the rotation hid the scar).
+	if got, err := distiller.Distill(live, 0); err != nil || len(got) != 0 {
+		t.Fatalf("live-only Distill should surface nothing (sub-threshold), got %d err=%v", len(got), err)
+	}
+
+	// Across both generations: the two fails cluster ⇒ the scar surfaces.
+	got, err := distiller.DistillAcross(0, live, rotated)
+	if err != nil {
+		t.Fatalf("DistillAcross: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want the straddling scar to cluster across generations, got %d: %+v", len(got), got)
+	}
+	if got[0].VerifierID != "go-test" || got[0].Count != 2 {
+		t.Errorf("cross-generation cluster = %+v, want go-test Count=2", got[0])
+	}
+}
+
+// TestDistillAcrossMissingGenerationSkipped proves a not-yet-rotated host (no ".1")
+// is a clean skip, not an error: only the live generation is folded.
+func TestDistillAcrossMissingGenerationSkipped(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "events.jsonl")
+	writeLogAt(t, live, []eventlog.Event{
+		fail("go-vet", "lint", "native", "a"),
+		fail("go-vet", "lint", "native", "b"),
+	})
+
+	got, err := distiller.DistillAcross(0, live, live+".1") // ".1" does not exist
+	if err != nil {
+		t.Fatalf("a missing rotated generation must be skipped, got error: %v", err)
+	}
+	if len(got) != 1 || got[0].VerifierID != "go-vet" || got[0].Count != 2 {
+		t.Fatalf("only the live generation should fold, got %+v", got)
+	}
+}
+
+// TestDistillAcrossFailsClosedPerGeneration proves I5: if ANY existing generation's
+// hash chain is broken, DistillAcross drops everything and surfaces the error — a
+// tampered older generation can only erase the whole result, never forge a scar.
+func TestDistillAcrossFailsClosedPerGeneration(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "events.jsonl")
+	rotated := live + ".1"
+	writeLogAt(t, live, []eventlog.Event{
+		fail("go-test", "test", "native", "x"),
+		fail("go-test", "test", "native", "x"),
+	})
+	writeLogAt(t, rotated, []eventlog.Event{
+		fail("go-test", "test", "native", "x"),
+	})
+
+	// Tamper the ROTATED generation's chain.
+	data, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatalf("read rotated log: %v", err)
+	}
+	tampered := strings.Replace(string(data), `"go-test"`, `"go-tesT"`, 1)
+	if tampered == string(data) {
+		t.Fatal("tamper did not change the rotated file")
+	}
+	if err := os.WriteFile(rotated, []byte(tampered), 0o644); err != nil {
+		t.Fatalf("write tampered rotated log: %v", err)
+	}
+
+	got, err := distiller.DistillAcross(0, live, rotated)
+	if err == nil {
+		t.Fatal("a broken generation chain must fail closed, got nil error")
+	}
+	if got != nil {
+		t.Errorf("a tampered generation must yield NO patterns, got %+v", got)
+	}
+}

@@ -110,6 +110,11 @@ func (c *Container) Workdir() string { return c.HostDir }
 // (proxyURL, e.g. policy.ProxyURL(addr)). Without this, egress is denied entirely
 // (--network none). The proxy enforces the policy.Egress allowlist, so only
 // approved hosts are reachable even though the container now has a network.
+//
+// NOTE: allowlisted egress is a CONTAINER-backend capability only. The namespace
+// backend (Auto-preferred on Linux) has no equivalent — it is deny-all (see
+// namespace_linux.go). Callers that need web_fetch / a non-empty egress allowlist
+// must run on the container backend (`-sandbox container`).
 func (c *Container) AllowEgressVia(proxyURL string) {
 	c.Network = "bridge"
 	if c.Env == nil {

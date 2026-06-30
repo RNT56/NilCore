@@ -139,7 +139,14 @@ type anthropicResponse struct {
 func (ar anthropicResponse) toModel() model.Response {
 	out := model.Response{
 		StopReason: ar.StopReason,
-		Usage:      model.Usage{InputTokens: ar.Usage.InputTokens, OutputTokens: ar.Usage.OutputTokens},
+		Usage: model.Usage{
+			InputTokens:  ar.Usage.InputTokens,
+			OutputTokens: ar.Usage.OutputTokens,
+			// Cache reads are input tokens billed at the reduced cached rate; a meter
+			// reading CachedTokens now sees them for Anthropic calls too (parity with
+			// the OpenAI adapter). Absent ⇒ 0 ⇒ omitempty ⇒ byte-identical.
+			CachedTokens: ar.Usage.CacheReadInputTokens,
+		},
 	}
 	for _, b := range ar.Content {
 		switch b.Type {
@@ -184,9 +191,18 @@ type streamEvent struct {
 	} `json:"content_block"`
 }
 
+// anthropicUsage decodes the Messages-API usage object. InputTokens/OutputTokens
+// are the original frozen counts; the two cache fields are additive (Anthropic's
+// prompt-caching tallies). CacheReadInputTokens are input tokens served from the
+// cache (a billing discount), surfaced as model.Usage.CachedTokens;
+// CacheCreationInputTokens are tokens written INTO the cache this turn — kept for
+// completeness/observability but not folded into CachedTokens (which means "served
+// from cache"). Absent ⇒ zero ⇒ model.Usage is byte-identical to before.
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // streamBlock accumulates one content block as its deltas arrive. For tool_use
@@ -292,6 +308,9 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 		case "message_start":
 			out.Usage.InputTokens = ev.Message.Usage.InputTokens
 			out.Usage.OutputTokens = ev.Message.Usage.OutputTokens
+			// Cache reads ride message_start's usage (the input side is fixed at the
+			// turn's start); carry them onto CachedTokens for parity with Complete.
+			out.Usage.CachedTokens = ev.Message.Usage.CacheReadInputTokens
 
 		case "content_block_start":
 			if _, seen := blocks[ev.Index]; !seen {

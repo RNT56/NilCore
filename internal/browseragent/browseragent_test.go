@@ -145,3 +145,114 @@ func mustInput(op, url string) []byte {
 	b, _ := json.Marshal(map[string]any{"op": op, "url": url})
 	return b
 }
+
+// recordingApprover records each gated action and returns a fixed verdict.
+type recordingApprover struct {
+	verdict bool
+	asked   []string
+}
+
+func (r *recordingApprover) Approve(action string) bool {
+	r.asked = append(r.asked, action)
+	return r.verdict
+}
+
+func TestIrreversibleClickFailsClosedWithoutApprover(t *testing.T) {
+	fs := &fakeSession{}
+	// Seed the latest snapshot so the click ref resolves to a "Pay now" button.
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Role: "button", Name: "Pay now", Version: 1}}}
+	b := &BrowseTool{Sess: fs} // nil Approver ⇒ fail closed
+	in, _ := json.Marshal(map[string]any{"op": "click", "ref": 1})
+	out, _, err := b.RunWithImage(context.Background(), ".", in)
+	if err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if !strings.Contains(out, "BLOCKED") {
+		t.Fatalf("an irreversible click with no approver must be blocked, got %q", out)
+	}
+	if len(fs.got) != 0 {
+		t.Fatal("a blocked irreversible action must never reach the session")
+	}
+}
+
+func TestIrreversibleClickDeniedAtGate(t *testing.T) {
+	fs := &fakeSession{}
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 2, Role: "button", Name: "Delete account", Version: 1}}}
+	appr := &recordingApprover{verdict: false}
+	b := &BrowseTool{Sess: fs, Approver: appr}
+	in, _ := json.Marshal(map[string]any{"op": "click", "ref": 2})
+	out, _, err := b.RunWithImage(context.Background(), ".", in)
+	if err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if len(appr.asked) != 1 {
+		t.Fatalf("the approver must be consulted exactly once, got %d", len(appr.asked))
+	}
+	if !strings.Contains(out, "BLOCKED") || len(fs.got) != 0 {
+		t.Fatalf("a denied irreversible click must not be dispatched; out=%q sent=%d", out, len(fs.got))
+	}
+}
+
+func TestIrreversibleClickApprovedDispatches(t *testing.T) {
+	fs := &fakeSession{respFn: func(a browserwire.Act) (browserwire.Observation, error) {
+		return browserwire.Observation{Version: 2, URL: "http://x.test/paid"}, nil
+	}}
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 3, Role: "button", Name: "Confirm purchase", Version: 1}}}
+	appr := &recordingApprover{verdict: true}
+	b := &BrowseTool{Sess: fs, Approver: appr}
+	in, _ := json.Marshal(map[string]any{"op": "click", "ref": 3})
+	if _, _, err := b.RunWithImage(context.Background(), ".", in); err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if len(appr.asked) != 1 {
+		t.Fatalf("the approver must be consulted, got %d", len(appr.asked))
+	}
+	if len(fs.got) != 1 {
+		t.Fatal("an approved irreversible click must be dispatched to the session")
+	}
+}
+
+func TestBenignClickNotGated(t *testing.T) {
+	fs := &fakeSession{}
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Role: "link", Name: "Home", Version: 1}}}
+	appr := &recordingApprover{verdict: false}
+	b := &BrowseTool{Sess: fs, Approver: appr}
+	in, _ := json.Marshal(map[string]any{"op": "click", "ref": 1})
+	if _, _, err := b.RunWithImage(context.Background(), ".", in); err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if len(appr.asked) != 0 {
+		t.Fatal("a benign click must not consult the gate")
+	}
+	if len(fs.got) != 1 {
+		t.Fatal("a benign click must be dispatched")
+	}
+}
+
+func TestIrreversibleTargetMatching(t *testing.T) {
+	latest := browserwire.Observation{Version: 1, Refs: []browserwire.Ref{
+		{ID: 1, Role: "button", Name: "Pay now", Version: 1},
+		{ID: 2, Role: "button", Name: "Cancel", Version: 1},
+		{ID: 3, Role: "button", Name: "Accept all cookies", Version: 1},
+	}}
+	cases := []struct {
+		name string
+		act  browserwire.Act
+		want bool
+	}{
+		{"pay-button", browserwire.Act{Op: browserwire.OpClick, Ref: 1}, true},
+		{"benign-cancel", browserwire.Act{Op: browserwire.OpClick, Ref: 2}, false},
+		{"cookies", browserwire.Act{Op: browserwire.OpClick, Ref: 3}, true},
+		{"type-not-gated", browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "pay now"}, false},
+		{"navigate-not-gated", browserwire.Act{Op: browserwire.OpNavigate, URL: "http://pay.test"}, false},
+		{"selector-transfer", browserwire.Act{Op: browserwire.OpClick, Selector: "#transfer-funds"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := irreversibleTarget(tc.act, latest) != ""
+			if got != tc.want {
+				t.Fatalf("irreversibleTarget(%+v) = %v, want %v", tc.act, got, tc.want)
+			}
+		})
+	}
+}

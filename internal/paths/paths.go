@@ -48,18 +48,6 @@ func DataDir() (string, error) {
 	return filepath.Join(home, ".local", "share", app), nil
 }
 
-// CacheDir is where NilCore stores disposable caches.
-//
-//	Linux:  $XDG_CACHE_HOME/nilcore  (default ~/.cache/nilcore)
-//	macOS:  ~/Library/Caches/nilcore
-func CacheDir() (string, error) {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve cache dir: %w", err)
-	}
-	return filepath.Join(base, app), nil
-}
-
 // EnsureDir creates dir (and parents) with 0o700 perms and returns it, so callers
 // can do `dir, err := EnsureDir(ConfigDir())`-style chaining for a ready path.
 func EnsureDir(dir string, err error) (string, error) {
