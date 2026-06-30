@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -194,6 +196,107 @@ func TestCallToolFailureNotRetried(t *testing.T) {
 }
 
 func itoa(i int) string { b, _ := json.Marshal(i); return string(b) }
+
+// TestDeliveryFailedClassification pins the retry-safety contract: ONLY a send-side
+// failure (request never delivered) is errDeliveryFailed and thus retryable; a server-
+// received failure (HTTP non-2xx) is NOT — so the Manager never re-runs a call the
+// server may already have executed.
+func TestDeliveryFailedClassification(t *testing.T) {
+	// stdio send to a closed pipe → delivery failure (retryable).
+	cConn, _ := net.Pipe()
+	_ = cConn.Close()
+	st := newStdioTransport(cConn)
+	_, err := st.roundTrip(context.Background(), rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+	if !errors.Is(err, errDeliveryFailed) {
+		t.Fatalf("send to closed pipe must be errDeliveryFailed, got %v", err)
+	}
+
+	// HTTP non-2xx → server received it → NOT a delivery failure (not retryable).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	ht := newHTTPTransport(srv.URL, nil, srv.Client())
+	_, err = ht.roundTrip(context.Background(), rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+	if err == nil || errors.Is(err, errDeliveryFailed) {
+		t.Fatalf("HTTP 500 must error but NOT as errDeliveryFailed, got %v", err)
+	}
+}
+
+// TestManagerConcurrentSingleFlight: many concurrent first-calls to one server open the
+// connection exactly once (no double-spawn) and all succeed. Run under -race.
+func TestManagerConcurrentSingleFlight(t *testing.T) {
+	var inits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "initialize" {
+			atomic.AddInt32(&inits, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		res, _ := dispatch(req.Method)
+		payload, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": res})
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	// Route connect()'s HTTP through the httptest client.
+	old := httpClient
+	httpClient = srv.Client()
+	defer func() { httpClient = old }()
+
+	m := NewManager(Config{Servers: []ServerSpec{{Name: "remote", URL: srv.URL}}})
+	defer m.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if out, err := m.CallTool(context.Background(), "remote", "search", json.RawMessage(`{}`)); err != nil || out != "result-ok" {
+				t.Errorf("concurrent CallTool = %q, %v", out, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := atomic.LoadInt32(&inits); n != 1 {
+		t.Fatalf("server initialized %d times, want exactly 1 (single-flight)", n)
+	}
+}
+
+// TestHTTPProtocolVersionHeader: after the handshake, subsequent requests carry the
+// negotiated MCP-Protocol-Version (Streamable HTTP spec requirement).
+func TestHTTPProtocolVersionHeader(t *testing.T) {
+	var sawVersion string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     int    `json:"id"`
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "tools/call" {
+			sawVersion = r.Header.Get("MCP-Protocol-Version")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		res, _ := dispatch(req.Method)
+		payload, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": res})
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	c := NewClient("remote", newHTTPTransport(srv.URL, nil, srv.Client()))
+	defer c.Close()
+	ctx := context.Background()
+	if err := c.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if _, err := c.CallTool(ctx, "search", json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if sawVersion == "" {
+		t.Error("post-initialize request did not carry MCP-Protocol-Version")
+	}
+}
 
 func TestGenerateWrappers(t *testing.T) {
 	base := t.TempDir()

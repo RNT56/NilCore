@@ -26,6 +26,12 @@ import (
 type Manager struct {
 	cfg Config
 
+	// procCtx bounds every spawned subprocess to the MANAGER's lifetime, not a request's
+	// — so a connection opened (or reconnected) mid-task survives past that task. Only
+	// Close (via cancel) tears them down. The request ctx still bounds each round-trip.
+	procCtx context.Context
+	cancel  context.CancelFunc
+
 	mu    sync.Mutex
 	conns map[string]*conn
 }
@@ -33,40 +39,63 @@ type Manager struct {
 type conn struct {
 	client *Client
 	stop   func()
+	ready  chan struct{} // closed once client/stop (or err) are set — lets waiters block
+	err    error         // connect/init failure, surfaced to waiters
 }
 
 // NewManager builds a Manager over the configured servers. Connections are opened
-// lazily on first use.
+// lazily on first use and live until Close.
 func NewManager(cfg Config) *Manager {
-	return &Manager{cfg: cfg, conns: map[string]*conn{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Manager{cfg: cfg, procCtx: ctx, cancel: cancel, conns: map[string]*conn{}}
 }
 
 // Servers returns the configured server specs (read-only; for discovery wiring).
 func (m *Manager) Servers() []ServerSpec { return m.cfg.Servers }
 
-// get returns a live, initialized client for server, opening + caching it on first
-// use. fresh reports whether it was opened on THIS call (so a caller knows a retry is
-// pointless after a fresh open). The lock spans connect+initialize so two callers can
-// never double-spawn the same server.
+// get returns a live, initialized client for server, opening + caching it on first use.
+// fresh reports whether it was opened on THIS call (so a caller knows a retry is
+// pointless after a fresh open). Connect + initialize run OUTSIDE the lock behind a
+// single-flight reservation, so two callers for the same server never double-spawn while
+// callers for OTHER servers (and cache hits) never block on a slow handshake.
 func (m *Manager) get(ctx context.Context, server string) (*Client, bool, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if c, ok := m.conns[server]; ok {
+		m.mu.Unlock()
+		<-c.ready // a concurrent in-flight connect may still be completing
+		if c.err != nil {
+			return nil, false, c.err
+		}
 		return c.client, false, nil
 	}
 	spec, ok := m.cfg.Server(server)
 	if !ok {
+		m.mu.Unlock()
 		return nil, false, fmt.Errorf("unknown mcp server %q", server)
 	}
-	client, stop, err := connect(ctx, spec)
+	c := &conn{ready: make(chan struct{})} // reserve so concurrent callers wait, not race
+	m.conns[server] = c
+	m.mu.Unlock()
+
+	client, stop, err := connect(m.procCtx, spec) // subprocess bound to Manager lifetime
+	if err == nil {
+		if ierr := client.Initialize(ctx); ierr != nil { // request ctx bounds the handshake
+			stop()
+			err = fmt.Errorf("mcp init %q: %w", server, ierr)
+		}
+	}
 	if err != nil {
+		c.err = err
+		close(c.ready)
+		m.mu.Lock()
+		if cur, ok := m.conns[server]; ok && cur == c { // only drop our own reservation
+			delete(m.conns, server)
+		}
+		m.mu.Unlock()
 		return nil, false, err
 	}
-	if err := client.Initialize(ctx); err != nil {
-		stop()
-		return nil, false, fmt.Errorf("mcp init %q: %w", server, err)
-	}
-	m.conns[server] = &conn{client: client, stop: stop}
+	c.client, c.stop = client, stop
+	close(c.ready)
 	return client, true, nil
 }
 
@@ -84,16 +113,19 @@ func (m *Manager) evict(server string) {
 	}
 }
 
-// withRetry runs op against a (possibly reused) connection and, on a TRANSPORT error
-// from a reused connection, evicts + reconnects + retries once. A tool-LEVEL failure
-// (ErrToolFailed) is never retried — that would risk repeating a side effect.
+// withRetry runs op against a (possibly reused) connection and retries ONCE only when
+// the request was provably NOT delivered (errDeliveryFailed — e.g. a cached stdio
+// subprocess died between calls, so the send failed before the server saw anything) on a
+// REUSED connection. Every server-RECEIVED failure — a tool error (ErrToolFailed), a
+// JSON-RPC error, an HTTP non-2xx, or a dropped reply — is returned as-is and never
+// re-run, since the side effect may already have executed.
 func (m *Manager) withRetry(ctx context.Context, server string, op func(*Client) (string, error)) (string, error) {
 	c, fresh, err := m.get(ctx, server)
 	if err != nil {
 		return "", err
 	}
 	out, err := op(c)
-	if err == nil || fresh || errors.Is(err, ErrToolFailed) {
+	if err == nil || fresh || !errors.Is(err, errDeliveryFailed) {
 		return out, err
 	}
 	m.evict(server)
@@ -159,8 +191,12 @@ func (m *Manager) Discover(ctx context.Context, base string, withResources bool)
 	return errs
 }
 
-// Close tears down every live connection. Idempotent.
+// Close tears down every live connection. Idempotent. Cancelling procCtx also kills any
+// subprocess still mid-connect (so an in-flight reservation can never leak a process).
 func (m *Manager) Close() error {
+	if m.cancel != nil {
+		m.cancel()
+	}
 	m.mu.Lock()
 	conns := m.conns
 	m.conns = map[string]*conn{}

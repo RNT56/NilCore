@@ -94,16 +94,33 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 	return c.t.notify(ctx, rpcNotification{JSONRPC: "2.0", Method: method, Params: params})
 }
 
+// protocolVersion is the MCP revision we advertise. 2025-03-26 introduced the
+// Streamable HTTP transport (single endpoint + Mcp-Session-Id + JSON-or-SSE reply), so
+// we negotiate a version that includes it for remote servers; stdio servers negotiate
+// down as needed.
+const protocolVersion = "2025-06-18"
+
 // Initialize performs the MCP handshake.
 func (c *Client) Initialize(ctx context.Context) error {
-	var res json.RawMessage
+	var res struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
 	err := c.call(ctx, "initialize", map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "nilcore", "version": "0.1"},
 	}, &res)
 	if err != nil {
 		return err
+	}
+	// Echo the negotiated version on subsequent HTTP requests (a Streamable HTTP spec
+	// requirement); fall back to ours if the server omits it. No-op for stdio.
+	negotiated := res.ProtocolVersion
+	if negotiated == "" {
+		negotiated = protocolVersion
+	}
+	if vt, ok := c.t.(interface{ setProtocolVersion(string) }); ok {
+		vt.setProtocolVersion(negotiated)
 	}
 	return c.notify(ctx, "notifications/initialized", map[string]any{})
 }

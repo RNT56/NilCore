@@ -19,12 +19,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 )
+
+// errDeliveryFailed marks a round-trip that failed BEFORE the request could reach the
+// server (the send side) — e.g. writing to a dead stdio pipe. Only such a failure is
+// safe for the Manager to retry on a reconnected connection: the server never received
+// the call, so re-sending it cannot repeat a side effect. A failure on the RESPONSE
+// side (decode/EOF/non-2xx/JSON-RPC error) is NOT wrapped — the server may already have
+// executed the call, so it must never be auto-retried.
+var errDeliveryFailed = errors.New("mcp: request not delivered")
 
 // rpcRequest / rpcNotification / rpcResponse are the JSON-RPC 2.0 frames. A request
 // carries an id and expects a response; a notification has no id and no reply.
@@ -85,7 +94,8 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if err := t.enc.Encode(req); err != nil {
-		return rpcResponse{}, fmt.Errorf("mcp send %s: %w", req.Method, err)
+		// Send side: the request never reached the server ⇒ safe to retry (errDeliveryFailed).
+		return rpcResponse{}, fmt.Errorf("%w: send %s: %v", errDeliveryFailed, req.Method, err)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -128,6 +138,7 @@ type httpTransport struct {
 
 	mu        sync.Mutex
 	sessionID string
+	proto     string // negotiated protocol version, echoed as MCP-Protocol-Version
 }
 
 func newHTTPTransport(url string, headers map[string]string, client *http.Client) *httpTransport {
@@ -135,6 +146,14 @@ func newHTTPTransport(url string, headers map[string]string, client *http.Client
 		client = http.DefaultClient
 	}
 	return &httpTransport{url: url, client: client, headers: headers}
+}
+
+// setProtocolVersion records the version negotiated on initialize; subsequent requests
+// carry it as MCP-Protocol-Version (required by the Streamable HTTP spec, 2025-03-26+).
+func (t *httpTransport) setProtocolVersion(v string) {
+	t.mu.Lock()
+	t.proto = v
+	t.mu.Unlock()
 }
 
 func (t *httpTransport) post(ctx context.Context, body []byte) (*http.Response, error) {
@@ -148,10 +167,13 @@ func (t *httpTransport) post(ctx context.Context, body []byte) (*http.Response, 
 		req.Header.Set(k, v)
 	}
 	t.mu.Lock()
-	sid := t.sessionID
+	sid, proto := t.sessionID, t.proto
 	t.mu.Unlock()
 	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
+	}
+	if proto != "" {
+		req.Header.Set("MCP-Protocol-Version", proto)
 	}
 	return t.client.Do(req)
 }
@@ -201,6 +223,11 @@ func (t *httpTransport) notify(ctx context.Context, n rpcNotification) error {
 	defer resp.Body.Close()
 	t.captureSession(resp)
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	// A notification expects no body, but a non-2xx still signals rejection (auth, bad
+	// session) — surface it so a failed handshake notify doesn't read as success.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("mcp http notify %s: status %d", n.Method, resp.StatusCode)
+	}
 	return nil
 }
 
@@ -217,30 +244,36 @@ func readSSEResponse(body io.Reader, wantID int, method string) (rpcResponse, er
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	var data strings.Builder
-	flush := func() (rpcResponse, bool, error) {
+	var lastErr error // last decode failure, surfaced if no matching response is found
+	flush := func() (rpcResponse, bool) {
 		if data.Len() == 0 {
-			return rpcResponse{}, false, nil
+			return rpcResponse{}, false
 		}
 		raw := data.String()
 		data.Reset()
 		var resp rpcResponse
 		if err := json.Unmarshal([]byte(raw), &resp); err != nil {
-			return rpcResponse{}, false, nil // a non-response SSE event (e.g. a notification) — skip
+			lastErr = err               // remember it: a malformed payload is not silently lost
+			return rpcResponse{}, false // a non-response / malformed SSE event — skip
 		}
 		if resp.ID != wantID {
-			return rpcResponse{}, false, nil
+			return rpcResponse{}, false
 		}
-		return resp, true, nil
+		return resp, true
 	}
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" { // event boundary
-			if resp, ok, err := flush(); err != nil || ok {
-				return resp, err
+			if resp, ok := flush(); ok {
+				return resp, nil
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
+			// Per the SSE spec, multiple data: lines in one event join with '\n'.
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
 			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 		}
 		// `event:`/`id:`/comment lines are ignored — only the JSON-RPC payload matters.
@@ -249,8 +282,11 @@ func readSSEResponse(body io.Reader, wantID int, method string) (rpcResponse, er
 		return rpcResponse{}, fmt.Errorf("mcp sse %s: %w", method, err)
 	}
 	// Flush a trailing event with no final blank line.
-	if resp, ok, err := flush(); err != nil || ok {
-		return resp, err
+	if resp, ok := flush(); ok {
+		return resp, nil
+	}
+	if lastErr != nil {
+		return rpcResponse{}, fmt.Errorf("mcp sse %s: malformed response: %w", method, lastErr)
 	}
 	return rpcResponse{}, fmt.Errorf("mcp sse %s: stream ended without a response", method)
 }

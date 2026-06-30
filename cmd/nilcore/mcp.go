@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"nilcore/internal/guard"
 	"nilcore/internal/mcp"
 )
 
@@ -118,21 +120,34 @@ func (t *mcpTool) Run(ctx context.Context, _ string, input json.RawMessage) (str
 		if !mcpResourcesEnabled() {
 			return "", fmt.Errorf("mcp: resources are not enabled (set %s=1)", envMCPResources)
 		}
-		return t.mgr.ReadResource(ctx, in.Server, in.Resource)
+		return fenceMCPErr(t.mgr.ReadResource(ctx, in.Server, in.Resource))
 	case in.Prompt != "":
 		if !mcpResourcesEnabled() {
 			return "", fmt.Errorf("mcp: prompts are not enabled (set %s=1)", envMCPResources)
 		}
-		return t.mgr.GetPrompt(ctx, in.Server, in.Prompt, in.Args)
+		return fenceMCPErr(t.mgr.GetPrompt(ctx, in.Server, in.Prompt, in.Args))
 	case in.Tool != "":
 		args := in.Args
 		if len(args) == 0 {
 			args = json.RawMessage(`{}`)
 		}
-		return t.mgr.CallTool(ctx, in.Server, in.Tool, args)
+		return fenceMCPErr(t.mgr.CallTool(ctx, in.Server, in.Tool, args))
 	default:
 		return "", fmt.Errorf("mcp: provide 'tool' (or 'resource'/'prompt' when enabled)")
 	}
+}
+
+// fenceMCPErr fences an MCP call's ERROR text before it reaches the model. A server's
+// error (tool isError content, an HTTP body snippet, a JSON-RPC message) is
+// server-controlled and untrusted: the loop guard.Wraps the SUCCESS path, so the error
+// path must fence the same untrusted content (I7) — otherwise a malicious server could
+// smuggle instructions through a failed call. Harness validation errors above are not
+// routed here, so only server-originated text is wrapped.
+func fenceMCPErr(out string, err error) (string, error) {
+	if err != nil {
+		return "", errors.New(guard.Wrap("mcp error", err.Error()))
+	}
+	return out, nil
 }
 
 // mcpCallMain implements `nilcore mcp-call <server> <tool> ['<json-args>']` — the
