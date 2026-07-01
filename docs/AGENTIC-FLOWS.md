@@ -40,7 +40,7 @@ NilCore is **stdlib-only** (invariant I6 — no YAML module), so it consumes a f
 # Preflight: can NilCore consume this flow? (no execution; exit 1 if not)
 nilcore flows validate -flow flow.json
 
-# Run the flow's agent_task nodes through the verified decompose preset
+# Run the flow's agent_task DAG through the verified swarm code preset
 nilcore flows run -flow flow.json -dir ./repo
 ```
 
@@ -50,13 +50,15 @@ required capability is supported, the **worker-dispatch plan** (one subtask per
 `tool` node). It exits non-zero on an unconsumable flow, so it doubles as a CI/preflight
 gate.
 
-`run` composes the `agent_task` nodes into a goal and dispatches them through the proven
-[`decompose`](ROADMAP-KERNEL-V2.md) preset: each becomes a verified single-task run whose
-branch is integrated into one re-verified tip (a child that conflicts or turns the tree
-red is dropped — I2). It fails closed if the flow is not consumable. Node dependencies are
-derived from the flow's `produces`→`requires` dataflow; the subtasks are composed in
-**topological order**, so a task's dependencies precede it in the goal list and the
-integrator merges in that order (a dependency cycle is reported, not run).
+`run` lifts the `agent_task` nodes into a `planner.Tree` and dispatches it through the
+verified [`swarm`](SWARM.md) path with the **`code`** preset (`Shape=DAG`, `FanIn=merge`,
+`Role=implementer`, packs `software`+`code`). Swarm **honors the flow's DependsOn edges**:
+a dependent `agent_task` is coded on the **integrated tip** of its dependencies (a later
+pass), not against the original `HEAD` — so the flow's DAG *structure* survives, instead of
+being flattened into an unordered goal list. Each shard is pack-verified and the merged tip
+re-verified (a shard that conflicts or turns the tree red is dropped — I2). It fails closed
+if the flow is not consumable. Node dependencies are derived from the flow's
+`produces`→`requires` dataflow (a dependency cycle is reported, not run).
 
 ## What it deliberately does NOT do
 
@@ -75,6 +77,6 @@ integrator merges in that order (a dependency cycle is reported, not run).
 
 The adapter + `validate` are complete and tested (`validate` is exercised against real
 flows from the agentic-flows catalog). `run`'s end-to-end execution reuses the verified
-decompose engine. The agentic-flows contract is under active development, so the decoder
-ignores unknown fields (forward-compatible) and the capability set will grow as NilCore's
-worker surface does.
+swarm engine (DAG-honoring code preset). The agentic-flows contract is under active
+development, so the decoder ignores unknown fields (forward-compatible) and the capability
+set will grow as NilCore's worker surface does.

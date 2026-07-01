@@ -47,6 +47,7 @@ import (
 	"nilcore/internal/integrate"
 	"nilcore/internal/meter"
 	"nilcore/internal/paths"
+	"nilcore/internal/planner"
 	"nilcore/internal/policy"
 	"nilcore/internal/pool"
 	"nilcore/internal/roster"
@@ -171,18 +172,27 @@ func swarmMain(args []string) {
 	log := openLog(*sf.common.logPath)
 	defer log.Close()
 
-	asm, err := buildSwarm(swarmDeps{
+	swarmRun(swarmDeps{
 		flags: sf,
 		boot:  b,
 		log:   log,
 		dir:   mustAbs(*sf.common.dir),
 	})
+}
+
+// swarmRun assembles + drives a swarm run (buildSwarm → Controller → scoreboard + report)
+// and OWNS the process exit. Shared by swarmMain (a goal / --shard-file) and by
+// `nilcore flows run` (which injects a pre-built agentic-flows DAG via d.tree). It exits 0
+// iff the run converged with an empty worklist AND the report's chain verifies (so a
+// tampered log can never read green); otherwise os.Exit(1) after printing the scoreboard.
+func swarmRun(d swarmDeps) {
+	asm, err := buildSwarm(d)
 	if err != nil {
 		fatal(err)
 	}
 	defer asm.cleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), *sf.deadline)
+	ctx, cancel := context.WithTimeout(context.Background(), *d.flags.deadline)
 	defer cancel()
 
 	out, runErr := asm.run(ctx)
@@ -196,9 +206,6 @@ func swarmMain(args []string) {
 	rendered, exit := asm.renderReport()
 	fmt.Fprint(os.Stdout, rendered)
 
-	// Exit 0 iff the run converged with an empty worklist AND the report's chain
-	// verifies (so a tampered log can never read green). Either failing ⇒ exit 1; the
-	// scoreboard is already printed.
 	if out.Done && out.Remaining == 0 && exit == 0 {
 		return
 	}
@@ -227,6 +234,13 @@ type swarmDeps struct {
 	// store, when non-nil, overrides the durable queue's store (a test injects an
 	// in-memory store so the queue persists without a real data dir).
 	store *store.Store
+
+	// tree, when non-nil, is a PRE-BUILT plan the caller already knows (e.g. `nilcore
+	// flows run`, whose agentic-flows agent_task DAG IS the plan). When set, buildSwarm
+	// shards it via swarm.TreeSharder (no planner model call) instead of the preset's
+	// goal-based Sharder — so the caller's DependsOn edges become real Shard.Deps and the
+	// runner honors the DAG. nil (swarmMain) ⇒ the flag/preset-based sharder, unchanged.
+	tree *planner.Tree
 }
 
 // swarmAssembly is the assembled swarm run: the Controller and the initial shard set
@@ -860,6 +874,13 @@ func collateArtifact(collateRoot, wtPath, id string) {
 func buildInitialShards(ctx context.Context, d swarmDeps, sf swarmFlags, pre preset.Preset, del deliverableSet, packName string, pl *pool.Pool, runID string) ([]swarm.Shard, error) {
 	role := string(pre.Role)
 	goal := *sf.goal
+	// Pre-built plan (e.g. `nilcore flows run`): the caller already knows the DAG, so
+	// shard it via TreeSharder (no planner model call) — carrying the preset's routing
+	// fields exactly as the goal-based sharders do. This routes the flow's DependsOn edges
+	// onto real Shard.Deps so the runner honors the ordering instead of a flat goal list.
+	if d.tree != nil {
+		return swarm.TreeSharder{Tree: *d.tree, Kind: del.kind, Pack: packName, Role: role, Tier: pre.WorkerTier}.Shards(ctx, goal, runID)
+	}
 	var sh swarm.Sharder
 	switch pre.Sharder {
 	case preset.SharderList:
