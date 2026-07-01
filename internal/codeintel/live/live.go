@@ -31,12 +31,23 @@ func (ix *Index) Update(ctx context.Context, path string) error {
 	return ix.Graph.BuildFile(ctx, path)
 }
 
+// Remove drops a deleted or renamed-away file from the live graph (idempotent;
+// only that file's nodes/edges, including edges pointing into its symbols from
+// elsewhere, are touched). Update keeps a file's incoming edges because the file
+// still exists; Remove is for a path that is gone, so its symbols' incoming edges
+// would otherwise dangle. The caller signals deletes/renames it observes (the
+// structured delete path); a missing path is a clean no-op.
+func (ix *Index) Remove(ctx context.Context, path string) error {
+	return ix.Graph.RemoveFile(ctx, path)
+}
+
 // IndexDir seeds the graph from every supported-language source file under dir
 // (the initial state a fresh run needs before Update keeps it current
-// incrementally). Supported extensions come from ast.SupportedExtensions (Go and
-// Python today, D3-T02). Best-effort: a file that does not parse is skipped, .git
-// is pruned, and the walk is the only full pass — thereafter Update touches one
-// file at a time (P3-T16's "no full re-index").
+// incrementally). Supported extensions come from ast.SupportedExtensions (all 19
+// languages / 34 extensions the parser seam ships, not Go alone). Best-effort: a
+// file that does not parse is skipped, .git is pruned, and the walk is the only
+// full pass — thereafter Update touches one file at a time (P3-T16's "no full
+// re-index").
 func (ix *Index) IndexDir(ctx context.Context, dir string) error {
 	supported := map[string]bool{}
 	for _, e := range ast.SupportedExtensions() {

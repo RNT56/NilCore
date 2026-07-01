@@ -81,6 +81,14 @@ type Server struct {
 	// drive resumes from persisted state). nil ⇒ the waker never starts — byte-identical.
 	Wake *wake.Registry
 
+	// SuppressWaker, when true, keeps this server from starting its own waker even
+	// though Wake is set (the registry is still used for ARMING the `sleep` tool). It
+	// is set under NILCORE_AUTONOMY, where the autonomy daemon polls the SAME registry
+	// and owns wake delivery through the verified, headless-gated orchestrator — so the
+	// server must not also fire wakes (a double-delivery, and a gate bypass via a direct
+	// re-Turn). Default false ⇒ the server is the sole waker, exactly as before.
+	SuppressWaker bool
+
 	mu      sync.Mutex         // guards threads
 	threads map[string]*thread // threadID → conversation + its surface sink
 	wakerWG sync.WaitGroup     // tracks the background waker goroutine (joined at shutdown)
@@ -115,7 +123,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	// timer elapses. Started before the receive loop so a wake armed by a prior process
 	// (survivor in the store) re-fires on this boot; joined at shutdown (no leak). nil
 	// registry ⇒ never started (byte-identical).
-	if s.Wake != nil {
+	if s.Wake != nil && !s.SuppressWaker {
 		s.wakerWG.Add(1)
 		go s.runWaker(ctx)
 	}
@@ -420,8 +428,9 @@ func (s *Server) liveCounts() (threads, working int) {
 
 // wakePollInterval is how often the waker checks the durable registry for a due
 // timer. A wake fires within one interval of its time — ample for self-timers
-// measured in minutes/hours, and cheap (one store read per tick).
-const wakePollInterval = 30 * time.Second
+// measured in minutes/hours, and cheap (one store read per tick). A var (not const)
+// so tests can shorten it; production never reassigns it.
+var wakePollInterval = 30 * time.Second
 
 // runWaker polls the wake registry on wakePollInterval and re-engages threads whose
 // timer has elapsed, until ctx is cancelled. Background goroutine; joined by
@@ -466,12 +475,18 @@ func (s *Server) fireDueWakes(ctx context.Context, now time.Time) {
 			s.Log.Append(eventlog.Event{Kind: "wake_unroutable", Detail: map[string]any{"thread": w.ThreadID}})
 			continue
 		}
-		// Disarm BEFORE re-engaging (at-most-once: a fired wake must never re-fire). If
-		// the disarm itself fails, do NOT engage — engaging on a still-armed wake would
-		// re-fire it every tick (a re-drive loop); leave it for the next poll instead.
-		if err := s.Wake.Disarm(ctx, w.ThreadID); err != nil {
-			s.Log.Append(eventlog.Event{Kind: "wake_error", Detail: map[string]any{"thread": w.ThreadID, "op": "disarm", "error": err.Error()}})
+		// Claim BEFORE re-engaging (at-most-once: a fired wake must never re-fire). Claim
+		// atomically disarms the wake AND wins the single-fire race against any second
+		// poller sharing this registry — so even a misconfigured double-waker can never
+		// double-deliver. won==false ⇒ another poller already took it; a claim error ⇒ do
+		// NOT engage (engaging on a still-armed wake would re-fire it every tick).
+		won, err := s.Wake.Claim(ctx, w.ThreadID)
+		if err != nil {
+			s.Log.Append(eventlog.Event{Kind: "wake_error", Detail: map[string]any{"thread": w.ThreadID, "op": "claim", "error": err.Error()}})
 			continue
+		}
+		if !won {
+			continue // another poller already fired this wake
 		}
 		s.Log.Append(eventlog.Event{Kind: "wake_fired", Detail: map[string]any{"thread": w.ThreadID}})
 		_ = th.sess.Turn(ctx, "Your scheduled timer elapsed — "+w.Note+". Re-check progress and continue.")

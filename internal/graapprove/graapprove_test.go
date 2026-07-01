@@ -615,6 +615,43 @@ func TestApproveStructuredOverDollarCeiling(t *testing.T) {
 	assertDenyReason(t, sink, "over_ceiling")
 }
 
+// A clause that declares a positive $/day ceiling but has NO blast meter wired
+// (g.blast == nil, the default when -blast-radius is off) must FAIL CLOSED: the
+// ceiling cannot be charged, so the action is denied and delegated rather than
+// silently auto-approved with no dollar accounting. The action otherwise clears
+// every earlier gate (eligibility, scope, trust, rate).
+func TestApproveStructuredDollarCeilingUnmetered(t *testing.T) {
+	dir := t.TempDir()
+	path := writeLog(t, dir, greenRun("deploy", "staging", 3))
+
+	env := Envelope{Classes: []ClassClause{{
+		Type:          "deploy",
+		AllowBranches: []string{"staging"},
+		DenyBranches:  commonDeny,
+		Environments:  []string{"staging"},
+		MinSuccesses:  2,
+		MinSample:     2,
+		RecencyDays:   7,
+		MaxPerDay:     5,
+		MaxDollarsDay: 25, // positive ceiling, but no meter below
+	}}}
+
+	human := &recHuman{reply: false}
+	sink := &recSink{}
+	// nil blast meter — the unmetered case (-blast-radius off).
+	g := newGraded(human, env, path, nil,
+		WithSink(sink), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
+
+	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging"}
+	if g.ApproveStructured(deploy) {
+		t.Fatal("a positive $ ceiling with no wired meter must not auto-approve")
+	}
+	if !human.called {
+		t.Fatal("an unmetered $ ceiling must delegate to the human")
+	}
+	assertDenyReason(t, sink, "dollar_ceiling_unmetered")
+}
+
 // SIF-T07: the self-improve auto-approval CLASS is its OWN double opt-in.
 func TestSelfImproveGate(t *testing.T) {
 	humanAsked := false
@@ -646,6 +683,44 @@ func TestSelfImproveGate(t *testing.T) {
 	ev, ok := sink.last()
 	if !ok || ev.kind != "auto_approve_selfimprove" {
 		t.Fatalf("opted-in must emit an audited auto_approve_selfimprove event, got %+v", sink.events)
+	}
+}
+
+// SIF-T07 truthiness: only an EXPLICIT "1" enables the self-improve auto-approval,
+// mirroring the kill-switch. A "0"/"false"/empty value must NOT enable it — otherwise
+// an operator setting `=0` to DISABLE it would have inverted the intent and ENABLED a
+// free-text self-edit auto-approval.
+func TestSelfImproveGateTruthiness(t *testing.T) {
+	for _, tc := range []struct {
+		val      string
+		autoOK   bool // true ⇒ auto-approves (must not consult human); false ⇒ delegates
+		askHuman bool // whether the human must be consulted
+	}{
+		{val: "", autoOK: false, askHuman: true},
+		{val: "0", autoOK: false, askHuman: true},
+		{val: "false", autoOK: false, askHuman: true},
+		{val: "1", autoOK: true, askHuman: false},
+	} {
+		t.Run("val="+tc.val, func(t *testing.T) {
+			humanAsked := false
+			human := func(string) bool { humanAsked = true; return false }
+			sink := &recSink{}
+			g := SelfImproveGate(human, sink)
+
+			t.Setenv(EnvSelfImproveAutoApprove, tc.val)
+			got := g("self-edit: docs/PERSONA.md")
+
+			if got != tc.autoOK {
+				t.Fatalf("val=%q: gate returned %v, want %v", tc.val, got, tc.autoOK)
+			}
+			if humanAsked != tc.askHuman {
+				t.Fatalf("val=%q: humanAsked=%v, want %v", tc.val, humanAsked, tc.askHuman)
+			}
+			emitted := len(sink.events) != 0
+			if emitted != tc.autoOK {
+				t.Fatalf("val=%q: emitted auto_approve event=%v, want %v", tc.val, emitted, tc.autoOK)
+			}
+		})
 	}
 }
 

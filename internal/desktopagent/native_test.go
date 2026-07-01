@@ -3,6 +3,7 @@ package desktopagent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"nilcore/internal/desktopwire"
@@ -67,6 +68,49 @@ func TestNativeToolDispatch(t *testing.T) {
 		t.Fatalf("native click not translated to the driver: %+v", fs.got)
 	}
 	_ = out
+}
+
+// TestNativeStagnationNudge proves B7-cu.6: Path A now flags a run of no-op acts and
+// emits the same [harness] nudge Path B does, instead of spinning silently to the step
+// budget. The fake driver returns the SAME pixel-mode signature (window/rung/refs) for
+// every click, so repeated clicks are stagnant.
+func TestNativeStagnationNudge(t *testing.T) {
+	fs := &fakeSession{respFn: func(a desktopwire.Act) (desktopwire.Observation, error) {
+		return desktopwire.Observation{Version: 1, Rung: desktopwire.RungCoordinate, FocusedWindow: "App", ScreenshotB64: "QUJD"}, nil
+	}}
+	nt := &NativeComputerTool{Sess: fs, MaxStagnant: 2}
+	var last string
+	for i := 0; i < 4; i++ {
+		out, _, err := nt.RunWithImage(context.Background(), ".", json.RawMessage(`{"action":"left_click","coordinate":[10,20]}`))
+		if err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		last = out
+	}
+	if !strings.Contains(last, "changed nothing") {
+		t.Fatalf("expected a stagnation nudge after repeated no-op clicks, got %q", last)
+	}
+}
+
+// TestNativeStagnationResetsOnChange confirms a genuinely-changing screen never trips
+// the nudge (no false positives).
+func TestNativeStagnationResetsOnChange(t *testing.T) {
+	step := 0
+	fs := &fakeSession{respFn: func(a desktopwire.Act) (desktopwire.Observation, error) {
+		step++
+		// A different focused window each step ⇒ the signature changes ⇒ never stagnant.
+		return desktopwire.Observation{Version: uint64(step), Rung: desktopwire.RungCoordinate, FocusedWindow: "Win" + string(rune('A'+step)), ScreenshotB64: "QUJD"}, nil
+	}}
+	nt := &NativeComputerTool{Sess: fs, MaxStagnant: 2}
+	for i := 0; i < 4; i++ {
+		out, _, err := nt.RunWithImage(context.Background(), ".", json.RawMessage(`{"action":"left_click","coordinate":[1,1]}`))
+		if err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		if strings.Contains(out, "changed nothing") {
+			t.Fatalf("a changing screen must not trip the stagnation nudge: %q", out)
+		}
+	}
 }
 
 // The registry advertises the native tool as a builtin (the loop-dispatch wire).

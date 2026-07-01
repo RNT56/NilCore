@@ -1,8 +1,12 @@
 // Package lsp is a minimal Language Server Protocol client (P3-T12), SCIP-aligned
-// in spirit: where the ast/graph packages give us a Go-native structural view,
-// an LSP server gives us cross-language, compiler-grade definitions and
-// references. We speak just enough of the protocol to ask "where is this symbol
-// defined?" and "who references it?" — the two queries that anchor navigation.
+// in spirit: where the ast/graph packages give us a Go-native structural view, an
+// LSP server gives us cross-language, compiler-grade symbol resolution. We speak
+// just enough of the protocol to ask "where does this name resolve?" via
+// workspace/symbol — the position-free global query retrieval actually wires (the
+// precise entry point of the fusion pipeline). Position-based queries
+// (textDocument/definition|references) are intentionally not implemented: they
+// require a textDocument/didOpen handshake this client does not perform, and no
+// consumer needs them, so the surface stays honest about what ships.
 //
 // The wire format is JSON-RPC 2.0 over a byte stream with Content-Length
 // framing: each message is "Content-Length: N\r\n\r\n" followed by N bytes of
@@ -126,28 +130,6 @@ func (c *Client) Initialize(ctx context.Context, rootURI string) error {
 	return nil
 }
 
-// Definition resolves textDocument/definition at the given position. The server
-// may answer with a single Location object or an array of them; both are handled.
-func (c *Client) Definition(ctx context.Context, uri string, line, char int) ([]Location, error) {
-	raw, err := c.call(ctx, "textDocument/definition", textDocumentPosition(uri, line, char))
-	if err != nil {
-		return nil, fmt.Errorf("definition: %w", err)
-	}
-	return parseLocations(raw)
-}
-
-// References resolves textDocument/references at the given position. The
-// declaration itself is included (includeDeclaration: true).
-func (c *Client) References(ctx context.Context, uri string, line, char int) ([]Location, error) {
-	params := textDocumentPosition(uri, line, char)
-	params["context"] = map[string]any{"includeDeclaration": true}
-	raw, err := c.call(ctx, "textDocument/references", params)
-	if err != nil {
-		return nil, fmt.Errorf("references: %w", err)
-	}
-	return parseLocations(raw)
-}
-
 // SymbolHit is one workspace/symbol match: its name and resolved location.
 type SymbolHit struct {
 	Name     string
@@ -243,38 +225,6 @@ func (p *processRW) Close() error {
 		return werr
 	}
 	return rerr
-}
-
-func textDocumentPosition(uri string, line, char int) map[string]any {
-	return map[string]any{
-		"textDocument": map[string]any{"uri": uri},
-		"position":     map[string]any{"line": line, "character": char},
-	}
-}
-
-// parseLocations accepts a JSON-RPC result that is null, a single Location
-// object, or an array of Locations, and normalizes to []Location.
-func parseLocations(raw json.RawMessage) ([]Location, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" {
-		return nil, nil
-	}
-	if trimmed[0] == '[' {
-		var arr []lspLocation
-		if err := json.Unmarshal(raw, &arr); err != nil {
-			return nil, fmt.Errorf("decode locations array: %w", err)
-		}
-		out := make([]Location, 0, len(arr))
-		for _, l := range arr {
-			out = append(out, l.toLocation())
-		}
-		return out, nil
-	}
-	var single lspLocation
-	if err := json.Unmarshal(raw, &single); err != nil {
-		return nil, fmt.Errorf("decode location: %w", err)
-	}
-	return []Location{single.toLocation()}, nil
 }
 
 // --- transport: Content-Length framing ---

@@ -68,12 +68,19 @@ A **role is a configuration over the one `backend.Native` loop**, not a new code
 package roster
 
 type Role string
-const (
+const ( // five DEFAULT roster roles …
     RoleResearcher   Role = "researcher"   // web/doc research; read-only; egress = research allowlist
     RoleUnderstander Role = "understander" // map an existing repo; read-only; deny-all egress; codeintel tools
     RolePlanner      Role = "planner"      // contract-first task tree; read-only; deny-all egress
     RoleImplementer  Role = "implementer"  // write code in an isolated worktree; full write tools; registries-only egress
     RoleReviewer     Role = "reviewer"     // cross-model review of a diff; read-only; deny-all egress
+
+    // … plus three Phase-12 SWARM-PRESET roles (absent from the default roster,
+    // selected only by internal/swarm/preset). All three are WRITE-capable — each
+    // emits a verified spine Artifact JSON — so their Profiles set ReadOnly:false.
+    RoleTypedResearch Role = "typed-research" // evidence-verified research; writes the artifact (P11-T15)
+    RoleAuditor       Role = "auditor"        // verified audit/security report; writes the artifact (SW-T15)
+    RoleUI            Role = "ui"             // verified UI report; writes the artifact (SW-T15)
 )
 
 type Profile struct {
@@ -104,7 +111,8 @@ func NewWorker(p Profile, box sandbox.Sandbox, v verify.Verifier, log *eventlog.
 - **Tool sets reuse `internal/tools`:** read-only → `Read/Search/Git(status|diff|log)`; understander adds codeintel retrieval (`codeintel/retrieve`, `repomap`) as read tools; researcher adds a sandboxed `web_fetch` under its egress allowlist; implementer → `tools.Default()` + sandboxed `run`.
 - **Per-role egress (closes adversary R9 — exfiltration):** researcher=research allowlist, implementer=`DefaultEgress()` (registries), understander/planner/reviewer=deny-all (`Network:"none"`). Egress is `intersect(role, tree)` — a role can only narrow. The existing `EgressProxy` SSRF guard protects every role for free.
 - **Model tier** reuses the existing executor/advisor split via `provider.ResolveWith`: implementer/researcher/understander=executor (cheap); planner/reviewer=advisor (strong).
-- **Three of five roles are already-built behaviors re-exposed:** planner wraps `planner.Plan`; implementer is today's native worker; reviewer wraps `route.Review`. Only researcher and understander add new read-only wiring.
+- **Three of the five default roles are already-built behaviors re-exposed:** planner wraps `planner.Plan`; implementer is today's native worker; reviewer wraps `route.Review`. Only researcher and understander add new read-only wiring.
+- **Phase 12 adds three preset-only write roles** (`typed-research`/`auditor`/`ui`), absent from the default roster and selected only by `internal/swarm/preset`. Each writes a verified spine Artifact JSON, so its Profile sets `ReadOnly:false` — and the `Role.ReadOnly()` helper agrees (it excepts all four write roles), though `Profile.ReadOnly` read by `NewWorker` remains the structural source of truth for the write/read wiring decision.
 
 **Advisor concurrency fix (adversary major):** `advisor.Advisor.calls` is a non-atomic int; today `buildBackend` builds a fresh advisor per task so it is single-goroutine. Under fan-out the advisor must **not** be shared mutably. Rule: **each subagent gets its own `advisor.New(...)` instance** (per-ID ceiling, matching today's per-task pattern). The strong *provider* is shared (it is stateless and metered); the `*Advisor` wrapper that holds `calls` is per-subagent.
 

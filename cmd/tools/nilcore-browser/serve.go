@@ -276,7 +276,10 @@ func buildServeObservation(ctx context.Context, conn *cdp.Conn, version *uint64,
 	}
 	els, _ := conn.InteractiveSnapshot(ctx)
 	for _, e := range els {
-		obs.Refs = append(obs.Refs, browserwire.Ref{ID: e.Ref, Role: e.Role, Name: e.Name, Value: e.Value})
+		// Stamp each ref with this snapshot's version so the host-side Session.Act can
+		// reject a ref carried over from an earlier snapshot even when a re-render reused
+		// the same positional id (the Cancel→Delete defense — not membership-only).
+		obs.Refs = append(obs.Refs, browserwire.Ref{ID: e.Ref, Role: e.Role, Name: e.Name, Value: e.Value, Version: *version})
 	}
 	if len(obs.Refs) == 0 {
 		// No structured affordances → fall back to a screenshot so the model can

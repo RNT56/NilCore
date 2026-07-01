@@ -68,11 +68,32 @@ func experienceMain(args []string) {
 		reader = x
 	}
 
-	stands, _ := reader.BackendStanding(ctx, *class)
-	agg, _ := reader.Outcomes(ctx, *class)
+	// Fail closed on a read error like every other oversight verb (trust.go,
+	// lessons.go, report.go): on the -warm path these readers hit the store and a
+	// failed query must NOT be silently rendered as "no data" — an operator has to be
+	// able to tell "store read failed" from "no history yet".
+	stands, err := reader.BackendStanding(ctx, *class)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "experience: backend standing: %v\n", err)
+		os.Exit(1)
+	}
+	agg, err := reader.Outcomes(ctx, *class)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "experience: outcomes: %v\n", err)
+		os.Exit(1)
+	}
+	// The per-config eval rollup is part of the experience projection (folded by the
+	// store-backed reader; empty on the log-only reader), so surface it here too — the
+	// experience command is the operator view of the unified projection, not just the
+	// backend scoreboard.
+	configs, err := reader.ConfigStanding(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "experience: config standing: %v\n", err)
+		os.Exit(1)
+	}
 
 	if *format == "json" {
-		b, _ := json.MarshalIndent(map[string]any{"standings": stands, "outcomes": agg}, "", "  ")
+		b, _ := json.MarshalIndent(map[string]any{"standings": stands, "outcomes": agg, "configs": configs}, "", "  ")
 		fmt.Println(string(b))
 		return
 	}
@@ -89,6 +110,12 @@ func experienceMain(args []string) {
 	fmt.Println("per-backend standing (verifier-judged):")
 	for _, s := range stands {
 		fmt.Printf("  %-14s races=%-4d wins=%-4d pass-rate=%.2f\n", s.Backend, s.Races, s.Wins, s.PassRate)
+	}
+	if len(configs) > 0 {
+		fmt.Println("per-config standing (eval rollup):")
+		for _, c := range configs {
+			fmt.Printf("  %-20s pass-rate=%.2f cost=$%.4f cases=%d\n", c.Config, c.PassRate, c.TotalCost, c.Cases)
+		}
 	}
 }
 

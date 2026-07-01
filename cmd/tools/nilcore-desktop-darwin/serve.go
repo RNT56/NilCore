@@ -52,7 +52,15 @@ func runServe(ctx context.Context, control string, native bool) error {
 	runCtx, cancel := context.WithTimeout(ctx, serveHardTimeout)
 	defer cancel()
 
-	d := &driver{native: native, idBox: map[int]image.Rectangle{}, scaleX: 1, scaleY: 1, bscale: 2}
+	d := &driver{native: native, idBox: map[int]image.Rectangle{}, scaleX: 1, scaleY: 1, bscale: fallbackBackingScale}
+
+	// Host-mode honesty (ROADMAP-COMPUTER-USE-DARWIN §3): surface the recorded
+	// host-control limitations once at startup — before any synthetic input runs — so
+	// the operator knows the screenshot terminal-exclusion is fail-closed-only and that
+	// synthetic CGEvents are not yet source-userData-tagged (both need the signed helper).
+	for _, n := range hostModeNotes() {
+		fmt.Fprintln(os.Stderr, "nilcore-desktop-darwin [host-mode]:", n)
+	}
 
 	if err := atomicWrite(filepath.Join(control, readyMarker), []byte("1")); err != nil {
 		return err
@@ -133,7 +141,11 @@ func (d *driver) perform(ctx context.Context, a desktopwire.Act) error {
 		}
 		return runCliclick(ctx, cliclickKey(a.Key))
 	case desktopwire.OpScroll:
-		return runCliclick(ctx, cliclickScroll(a.Dir, a.Amount))
+		cmd, err := cliclickScroll(a.Dir, a.Amount)
+		if err != nil {
+			return err
+		}
+		return runCliclick(ctx, cmd)
 	case desktopwire.OpClick:
 		x, y, err := d.resolvePoint(a)
 		if err != nil {
@@ -178,13 +190,31 @@ func (d *driver) observe(ctx context.Context) desktopwire.Observation {
 	d.idBox = map[int]image.Rectangle{}
 	obs := desktopwire.Observation{Version: d.ver}
 
+	// Controlling-terminal exclusion (ROADMAP §0.3/§3): screencapture grabs the whole
+	// display and cannot subtract a window, so when the agent's own terminal is
+	// frontmost — where the human-gate prompt and any secrets are rendered — we REFUSE
+	// to capture rather than feed those pixels to the model (I3/I7). Fail closed.
+	if terminalIsFrontmost(ctx) {
+		obs.Rung = desktopwire.RungCoordinate
+		obs.Console = []string{"capture refused: the controlling terminal (" + controllingTerminal() + ") is frontmost — its contents (approval prompt / secrets) must not be sent to the model. Bring the target app forward and re-observe."}
+		return obs
+	}
+
 	full, err := capture(ctx)
 	if err != nil || full == nil {
 		obs.Rung = desktopwire.RungCoordinate
 		obs.Console = []string{"capture failed: " + errStr(err)}
 		return obs
 	}
-	d.bscale = backingScale(ctx, full.Bounds().Dx())
+	scale, determined := resolveBackingScale(ctx, full.Bounds().Dx())
+	d.bscale = scale
+	if !determined {
+		// The backing scale could not be determined (Automation TCC denied / Finder
+		// bounds unreadable) and NILCORE_MAC_SCALE is unset. We fell back to unity so a
+		// 1× display maps correctly; a Retina display will mis-click until the operator
+		// sets the deterministic override. Surface it so the failure is never silent.
+		obs.Console = append(obs.Console, "backing scale undetermined (no NILCORE_MAC_SCALE, osascript desktop-width probe failed) — assuming 1.0; set NILCORE_MAC_SCALE on a Retina display to avoid mis-clicks")
+	}
 	display, sx, sy := resizeNearest(full, imgMaxW, imgMaxH)
 	d.scaleX, d.scaleY = sx, sy
 

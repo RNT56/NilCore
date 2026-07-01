@@ -36,6 +36,8 @@ func TestWriterRendersKindStepText(t *testing.T) {
 		{"tool", Event{Kind: KindTool, Text: "about to run: go test ./...", Step: 3}, "→"},
 		{"verify", Event{Kind: KindVerify, Text: "verify passed", Step: 7}, "✓"},
 		{"steer_ack", Event{Kind: KindSteerAck, Text: "folding steer", Step: 4}, "!"},
+		{"ask", Event{Kind: KindAsk, Text: "which framework?", Step: 2}, "?"},
+		{"gate", Event{Kind: KindGate, Text: "merge to main", Step: 5}, "⛔"},
 		{"unknown kind", Event{Kind: "mystery", Text: "x", Step: 1}, "-"},
 	}
 	for _, tt := range tests {

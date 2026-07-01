@@ -194,6 +194,24 @@ func TestFinanceWorldBankAndIMF(t *testing.T) {
 		}
 	})
 
+	t.Run("worldbank ascending order => latest by DATE, not first", func(t *testing.T) {
+		// Response in ASCENDING order (e.g. the model's URL carried &sort=asc): the
+		// OLDEST point is first. We must still assert against the LATEST point (2023),
+		// not the first (2021) — proving the verdict does not depend on response order.
+		body := `[{"page":1},[{"value":100,"date":"2021"},{"value":200,"date":"2022"},{"value":300,"date":"2023"}]]`
+		st, _ := checkWorldBankIndicator(ctx, okBody(body),
+			claim(IDWorldBankIndicator, "gdp", "300", "https://api.worldbank.org/x?format=json&sort=asc"))
+		if st != artifact.StatusPass {
+			t.Fatalf("status = %q, want pass (latest-by-date 300, not first 100)", st)
+		}
+		// And a claim of the FIRST (oldest) point must now FAIL, since it is not the latest.
+		st2, _ := checkWorldBankIndicator(ctx, okBody(body),
+			claim(IDWorldBankIndicator, "gdp", "100", "https://api.worldbank.org/x?format=json&sort=asc"))
+		if st2 != artifact.StatusFail {
+			t.Fatalf("status = %q, want fail (100 is the oldest, not the latest)", st2)
+		}
+	})
+
 	t.Run("imf latest obs => Pass", func(t *testing.T) {
 		body := `{"CompactData":{"DataSet":{"Series":{"Obs":[
 			{"@TIME_PERIOD":"2022","@OBS_VALUE":"3.1"},
@@ -459,6 +477,19 @@ func TestFinanceTolerance(t *testing.T) {
 		{"1.0000020", 1.0, false, false}, // float just outside
 		{"abc", 1.0, false, false},       // non-numeric claim
 		{"", 1.0, false, false},          // empty claim
+
+		// Large-magnitude integer at the tolerance boundary, BOTH ways, to pin the
+		// documented asymmetry between the exact-int and tolerant-float paths:
+		//   - isInt=true  ⇒ exact: an off-by-one integer is a decisive mismatch even at
+		//     magnitude 1e9 (where the float window is 1e-6*1e9 = 1000 wide).
+		{"1000000001", 1e9, true, false},
+		//   - isInt=false ⇒ tolerant: the SAME off-by-one integer (1 apart, well within
+		//     the 1000-wide window) PASSES through the float path. This is exactly the
+		//     asymmetry the docstring warns about — a float-only caller (fred/market/
+		//     worldbank/imf, all isInt=false) cannot reject an adjacent large integer.
+		{"1000000001", 1e9, false, true},
+		// And a difference larger than the window still fails on the float path.
+		{"1000002000", 1e9, false, false},
 	}
 	for _, tc := range cases {
 		got, _ := numericMatch(tc.claimed, tc.fetched, tc.isInt)

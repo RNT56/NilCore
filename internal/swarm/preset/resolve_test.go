@@ -113,22 +113,22 @@ func TestResolvedEgressSpotChecks(t *testing.T) {
 	}
 }
 
-// The SW-T15 gotcha, exercised directly: every WRITE preset role must take its write
-// capability from Profile.ReadOnly==false — NOT the hardcoded Role.ReadOnly() helper. For
-// the two NEW roles (auditor, ui) the helper is (wrongly, for a write role) true, so this
-// test asserts the divergence so it can never silently regress into a read-only worker that
-// cannot emit its artifact. The two pre-existing write roles (implementer, typed-research)
-// have an already-false helper and are checked for self-consistency.
+// SW-T15 + B4-swarm.5, exercised directly: every WRITE preset role takes its write
+// capability from the STRUCTURAL Profile.ReadOnly==false field NewWorker reads — never a
+// role-name lookup. The Role.ReadOnly() helper used to DIVERGE for the two new roles
+// (auditor, ui), reporting them read-only; that latent footgun is now closed — the helper
+// AGREES with the Profile for every write role. This test pins both: Profile.ReadOnly==false
+// (the source of truth) AND Role.ReadOnly()==false (the helper now agrees), so neither a
+// regression of the helper NOR a flip of the structural field can pass silently.
 func TestWriteRolesRelyOnProfileNotHelper(t *testing.T) {
 	cases := []struct {
-		preset     string
-		role       roster.Role
-		helperTrue bool // Role.ReadOnly() value — true is the divergent (gotcha) case
+		preset string
+		role   roster.Role
 	}{
-		{"audit", roster.RoleAuditor, true},     // NEW role: helper says read-only, Profile says writable
-		{"ui", roster.RoleUI, true},             // NEW role: same gotcha
-		{"code", roster.RoleImplementer, false}, // pre-existing write role: helper already false
-		{"research", roster.RoleTypedResearch, false},
+		{"audit", roster.RoleAuditor},          // formerly the divergent (gotcha) role — now agrees
+		{"ui", roster.RoleUI},                  // formerly the divergent (gotcha) role — now agrees
+		{"code", roster.RoleImplementer},       // pre-existing write role
+		{"research", roster.RoleTypedResearch}, // pre-existing write role
 	}
 	for _, tc := range cases {
 		t.Run(tc.preset, func(t *testing.T) {
@@ -143,17 +143,9 @@ func TestWriteRolesRelyOnProfileNotHelper(t *testing.T) {
 			if p.Profile.ReadOnly {
 				t.Errorf("preset %q: Profile.ReadOnly = true — the write role cannot emit its artifact", tc.preset)
 			}
-			// The documented divergence: for the new roles the hardcoded helper disagrees.
-			if got := tc.role.ReadOnly(); got != tc.helperTrue {
-				t.Errorf("preset %q: Role.ReadOnly() = %v, want %v (gotcha invariant)", tc.preset, got, tc.helperTrue)
-			}
-			// For the two new roles, assert the exact gotcha pairing the spec names:
-			// Profile.ReadOnly==false AND Role.ReadOnly()==true.
-			if tc.helperTrue {
-				if p.Profile.ReadOnly || !tc.role.ReadOnly() {
-					t.Errorf("preset %q: expected Profile.ReadOnly==false AND Role.ReadOnly()==true, got Profile.ReadOnly=%v Role.ReadOnly()=%v",
-						tc.preset, p.Profile.ReadOnly, tc.role.ReadOnly())
-				}
+			// The helper now AGREES (no more divergence): a write role reports !ReadOnly.
+			if tc.role.ReadOnly() {
+				t.Errorf("preset %q: Role.ReadOnly() = true — helper disagrees with the write Profile (footgun regressed)", tc.preset)
 			}
 		})
 	}
@@ -207,4 +199,45 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestFixPresetSelectsFailureSharder is the B4-swarm.2 wire guard: the "fix" preset is
+// the catalog entry that makes SharderFailure reachable (before this it was a defined-but-
+// unselectable enum value). It must resolve to a runnable, write-capable bundle whose
+// Sharder is SharderFailure and whose FanIn merges (fix shards make real edits that land
+// as one verified tree), and it must be the ONLY preset selecting that sharder.
+func TestFixPresetSelectsFailureSharder(t *testing.T) {
+	p, reg, err := Resolve("fix")
+	if err != nil {
+		t.Fatalf("Resolve(fix): %v", err)
+	}
+	if reg == nil {
+		t.Fatal("Resolve(fix) returned a nil registry")
+	}
+	if p.Sharder != SharderFailure {
+		t.Errorf("fix preset Sharder = %q, want %q (the failure-driven flow)", p.Sharder, SharderFailure)
+	}
+	if p.FanIn != FanInMerge {
+		t.Errorf("fix preset FanIn = %q, want merge (its fix branches must integrate)", p.FanIn)
+	}
+	if p.Role != roster.RoleImplementer {
+		t.Errorf("fix preset Role = %q, want implementer (it edits code)", p.Role)
+	}
+	if p.Profile.ReadOnly {
+		t.Error("fix preset Profile.ReadOnly = true — a fix worker cannot edit the tree")
+	}
+	// Exactly one preset selects SharderFailure; the enum is no longer dead.
+	var failurePresets []string
+	for _, name := range Names() {
+		q, _, err := Resolve(name)
+		if err != nil {
+			t.Fatalf("Resolve(%q): %v", name, err)
+		}
+		if q.Sharder == SharderFailure {
+			failurePresets = append(failurePresets, name)
+		}
+	}
+	if len(failurePresets) != 1 || failurePresets[0] != "fix" {
+		t.Errorf("SharderFailure selected by %v, want exactly [fix]", failurePresets)
+	}
 }

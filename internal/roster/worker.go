@@ -269,7 +269,7 @@ func AuditorProfile(model model.Provider, egress policy.Egress) Profile {
 		Model:         model,
 		Egress:        egress,
 		WantsWebFetch: true,
-		ReadOnly:      false, // write-capable: see the gotcha note above (NOT Role.ReadOnly())
+		ReadOnly:      false, // write-capable: this STRUCTURAL field is the source of truth NewWorker reads (not the role name)
 		MaxSteps:      60,
 	}
 }
@@ -277,7 +277,7 @@ func AuditorProfile(model model.Provider, egress policy.Egress) Profile {
 // UIProfile builds the write-capable UI profile (RoleUI). It carries the full write
 // registry (it emits a spine Artifact JSON) and web_fetch (the ui preset's claims target
 // a live site reached in-box; the browser verifier is CI-only and fails closed). Same
-// ReadOnly:false gotcha as AuditorProfile.
+// write-capable wiring as AuditorProfile: ReadOnly:false is the structural source of truth.
 func UIProfile(model model.Provider, egress policy.Egress) Profile {
 	return Profile{
 		System:        uiSystem,
@@ -285,7 +285,7 @@ func UIProfile(model model.Provider, egress policy.Egress) Profile {
 		Model:         model,
 		Egress:        egress,
 		WantsWebFetch: true,
-		ReadOnly:      false, // write-capable: see the gotcha note above (NOT Role.ReadOnly())
+		ReadOnly:      false, // write-capable: this STRUCTURAL field is the source of truth NewWorker reads (not the role name)
 		MaxSteps:      60,
 	}
 }

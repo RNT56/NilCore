@@ -146,14 +146,22 @@ func (s *Session) do(ctx context.Context, a browserwire.Act) (browserwire.Observ
 	return resp.Observation, nil
 }
 
-// validateRef rejects a ref-based act whose ref is absent from the latest snapshot
-// (the page changed) — the host-side half of the version-stamped staleness defense.
+// validateRef rejects a ref-based act whose ref is absent from the latest snapshot,
+// OR whose stamped Version differs from the latest observation's — the host-side,
+// version-stamped staleness defense. The Version compare is the Cancel→Delete fix
+// (ROADMAP §3 Pillar 2): a re-render that swaps an element but reuses the same
+// positional id would pass a pure membership check, but its refs carry the OLD
+// snapshot version, so a model still referencing them fails closed here rather than
+// acting on a different node. The model must re-observe after any mutation.
 func (s *Session) validateRef(a browserwire.Act) error {
 	if a.Ref <= 0 {
 		return nil // selector-based or non-ref act
 	}
 	for _, r := range s.latest.Refs {
 		if r.ID == a.Ref {
+			if r.Version != s.latest.Version {
+				return fmt.Errorf("ref %d is stale (stamped version %d, current snapshot version %d) — re-observe before acting (stale-ref guard)", a.Ref, r.Version, s.latest.Version)
+			}
 			return nil
 		}
 	}

@@ -13,8 +13,10 @@ package main
 //   - FileSource    — files dropped in the -autonomy-signals dir (reactive; the same
 //     "drop a goal, it runs" funnel as `nilcore watch`, but on the unified queue).
 //   - WakeSource    — durable self-timers (the `sleep` tool's wakes) that come due.
-//     Before this, serve armed wakes but NEVER fired them; the wake feeder closes
-//     that gap, re-engaging each due wake's note through the queue.
+//     Serve's own runWaker also fires wakes; under NILCORE_AUTONOMY it is SUPPRESSED
+//     (server.SuppressWaker) so this feeder is the sole firer and every due wake is
+//     re-engaged through the verified, headless-gated queue rather than the server's
+//     direct re-Turn (no double-delivery, no gate bypass).
 // (CronSource and the webhook push path feed the same queue and remain available;
 // cron needs a configured job set — the `nilcore schedule` verb's domain — so it is
 // not auto-wired here.)

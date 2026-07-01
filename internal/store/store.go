@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
@@ -80,7 +81,133 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("add tasks.detail: %w", err)
 		}
 	}
+	if err := s.migrateMemoryUnique(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// migrateMemoryUnique brings a pre-UNIQUE memory table up to the (scope, project,
+// mkey) uniqueness contract. CREATE TABLE IF NOT EXISTS never alters an existing
+// table and SQLite cannot ADD a UNIQUE constraint in place, so a DB created before
+// the constraint is rebuilt: collapse duplicate keys (keep the newest row per logical
+// key) into a fresh table that carries the constraint, then swap it in. The detection
+// is the presence of the auto-named UNIQUE index SQLite creates for the constraint —
+// absent ⇒ this is a legacy table. A fresh DB already has it (schema.sql), so this is
+// a no-op there, keeping Open idempotent.
+func (s *Store) migrateMemoryUnique(ctx context.Context) error {
+	has, err := s.hasMemoryUnique(ctx)
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	// Rebuild in a transaction so a crash mid-migration leaves the original intact.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("migrate memory: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmts := []string{
+		`CREATE TABLE memory_new (
+			id      INTEGER PRIMARY KEY AUTOINCREMENT,
+			scope   TEXT NOT NULL,
+			project TEXT NOT NULL DEFAULT '',
+			mkey    TEXT NOT NULL,
+			mvalue  TEXT NOT NULL,
+			created TEXT NOT NULL,
+			UNIQUE (scope, project, mkey)
+		)`,
+		// Keep the newest row per (scope, project, mkey): the max(id) wins, carrying
+		// the latest value/created — the same "changed value replaces" semantics the
+		// new upsert enforces going forward.
+		`INSERT INTO memory_new (id, scope, project, mkey, mvalue, created)
+		 SELECT id, scope, project, mkey, mvalue, created FROM memory
+		 WHERE id IN (SELECT max(id) FROM memory GROUP BY scope, project, mkey)`,
+		`DROP TABLE memory`,
+		`ALTER TABLE memory_new RENAME TO memory`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, project)`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("migrate memory: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate memory: commit: %w", err)
+	}
+	return nil
+}
+
+// hasMemoryUnique reports whether the memory table already carries a UNIQUE index
+// over (scope, project, mkey) — the marker that the table is at the current schema.
+func (s *Store) hasMemoryUnique(ctx context.Context) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA index_list(memory)`)
+	if err != nil {
+		return false, fmt.Errorf("index_list(memory): %w", err)
+	}
+	// Collect the candidate UNIQUE-constraint index names FIRST, then close this
+	// cursor BEFORE issuing the per-index PRAGMA in indexCoversMemoryKey. The store
+	// runs on a single SQLite connection, so querying while this cursor is still open
+	// would wait forever for the connection the cursor holds (a pool self-deadlock).
+	// PRAGMA index_list columns: seq, name, unique, origin, partial.
+	var candidates []string
+	for rows.Next() {
+		var seq, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("scan index_list: %w", err)
+		}
+		// origin "u" marks an index created for a UNIQUE constraint (vs "c" CREATE
+		// INDEX or "pk" primary key).
+		if unique == 1 && origin == "u" {
+			candidates = append(candidates, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, err
+	}
+	rows.Close()
+	for _, name := range candidates {
+		if s.indexCoversMemoryKey(ctx, name) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// indexCoversMemoryKey reports whether the named index is exactly the (scope,
+// project, mkey) constraint, so a future unrelated unique index can't be mistaken
+// for it.
+func (s *Store) indexCoversMemoryKey(ctx context.Context, index string) bool {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA index_info(`+quoteIdent(index)+`)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var seqno, cid int
+		var name string
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return false
+		}
+		cols = append(cols, name)
+	}
+	if len(cols) != 3 {
+		return false
+	}
+	return cols[0] == "scope" && cols[1] == "project" && cols[2] == "mkey"
+}
+
+// quoteIdent double-quotes a SQLite identifier so an auto-generated index name
+// (e.g. "sqlite_autoindex_memory_1") is safe to interpolate into a PRAGMA, which
+// cannot take a bound parameter.
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // hasColumn reports whether table already has a column of the given name. It uses
@@ -154,18 +281,34 @@ type Memory struct {
 	Created time.Time
 }
 
-// PutMemory inserts a memory record and returns its id.
+// PutMemory inserts or updates a memory record keyed by (scope, project, mkey),
+// returning the affected row's id. The "key" is a real key: a changed value for an
+// existing (scope, project, mkey) REPLACES the row (ON CONFLICT) rather than leaving
+// a stale duplicate behind, so recall never surfaces both the old and current value
+// for the same key. LastInsertId is only meaningful on a fresh insert, so on an
+// update path we look the row's id up to return it.
 func (s *Store) PutMemory(ctx context.Context, m Memory) (int64, error) {
 	if m.Created.IsZero() {
 		m.Created = time.Now().UTC()
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO memory (scope, project, mkey, mvalue, created) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO memory (scope, project, mkey, mvalue, created) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(scope, project, mkey) DO UPDATE SET mvalue=excluded.mvalue, created=excluded.created`,
 		m.Scope, m.Project, m.Key, m.Value, m.Created.UTC().Format(tsFmt))
 	if err != nil {
 		return 0, fmt.Errorf("put memory: %w", err)
 	}
-	return res.LastInsertId()
+	if id, err := res.LastInsertId(); err == nil && id > 0 {
+		return id, nil
+	}
+	// Update path: no new row, so resolve the existing id by its logical key.
+	var id int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM memory WHERE scope=? AND project=? AND mkey=?`,
+		m.Scope, m.Project, m.Key).Scan(&id); err != nil {
+		return 0, fmt.Errorf("put memory: resolve id: %w", err)
+	}
+	return id, nil
 }
 
 // QueryMemory returns memory for a scope (and project, for project scope).

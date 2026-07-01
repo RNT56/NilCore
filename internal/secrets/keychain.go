@@ -12,6 +12,12 @@ import (
 // backend — the OS guards the secrets at rest.
 type KeychainStore struct {
 	Service string // keychain service/collection label; defaults to "nilcore"
+
+	// run is the exec seam, injected only in tests so the get/set/delete
+	// round-trip is exercisable without touching the real OS keychain. nil (the
+	// default) uses the real platform CLI, so production behaviour is unchanged.
+	// It receives the CLI name, its args, and optional stdin, and returns stdout.
+	run func(name string, args []string, stdin string) (string, error)
 }
 
 // Name identifies the backend.
@@ -22,6 +28,21 @@ func (k KeychainStore) service() string {
 		return k.Service
 	}
 	return "nilcore"
+}
+
+// exec runs the CLI through the injected seam (tests) or the real os/exec path.
+// stdin, when non-empty, is fed on the command's standard input (the secret-tool
+// store path passes the value this way so it never reaches argv).
+func (k KeychainStore) exec(name string, args []string, stdin string) (string, error) {
+	if k.run != nil {
+		return k.run(name, args, stdin)
+	}
+	cmd := exec.Command(name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.Output()
+	return string(out), err
 }
 
 // keychainAvailable reports whether this host has a usable keychain CLI.
@@ -42,19 +63,21 @@ func keychainAvailable() bool {
 func (k KeychainStore) Get(name string) (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := exec.Command("security", "find-generic-password",
-			"-s", k.service(), "-a", name, "-w").Output()
+		out, err := k.exec("security",
+			[]string{"find-generic-password", "-s", k.service(), "-a", name, "-w"}, "")
 		if err != nil {
 			return "", fmt.Errorf("secret %q: %w", name, ErrNotFound)
 		}
-		return strings.TrimRight(string(out), "\n"), nil
+		return strings.TrimRight(out, "\n"), nil
 	case "linux":
-		out, err := exec.Command("secret-tool", "lookup",
-			"service", k.service(), "account", name).Output()
+		out, err := k.exec("secret-tool",
+			[]string{"lookup", "service", k.service(), "account", name}, "")
 		if err != nil || len(out) == 0 {
 			return "", fmt.Errorf("secret %q: %w", name, ErrNotFound)
 		}
-		return string(out), nil
+		// secret-tool emits no trailing newline, but trim to match the macOS path
+		// so the value round-trips identically across platforms.
+		return strings.TrimRight(out, "\n"), nil
 	default:
 		return "", fmt.Errorf("keychain unsupported on %s", runtime.GOOS)
 	}
@@ -66,15 +89,14 @@ func (k KeychainStore) Set(name, value string) error {
 	case "darwin":
 		// -U updates if present. (security reads the value from argv; that is the
 		// documented path. NilCore never logs it.)
-		cmd := exec.Command("security", "add-generic-password",
-			"-U", "-s", k.service(), "-a", name, "-w", value)
-		return runQuiet(cmd, "keychain set")
+		_, err := k.exec("security",
+			[]string{"add-generic-password", "-U", "-s", k.service(), "-a", name, "-w", value}, "")
+		return wrapQuiet(err, "keychain set")
 	case "linux":
 		// secret-tool reads the value from stdin — never argv.
-		cmd := exec.Command("secret-tool", "store",
-			"--label", "nilcore:"+name, "service", k.service(), "account", name)
-		cmd.Stdin = strings.NewReader(value)
-		return runQuiet(cmd, "keychain set")
+		_, err := k.exec("secret-tool",
+			[]string{"store", "--label", "nilcore:" + name, "service", k.service(), "account", name}, value)
+		return wrapQuiet(err, "keychain set")
 	default:
 		return fmt.Errorf("keychain unsupported on %s", runtime.GOOS)
 	}
@@ -84,19 +106,21 @@ func (k KeychainStore) Set(name, value string) error {
 func (k KeychainStore) Delete(name string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		cmd := exec.Command("security", "delete-generic-password", "-s", k.service(), "-a", name)
-		return runQuiet(cmd, "keychain delete")
+		_, err := k.exec("security",
+			[]string{"delete-generic-password", "-s", k.service(), "-a", name}, "")
+		return wrapQuiet(err, "keychain delete")
 	case "linux":
-		cmd := exec.Command("secret-tool", "clear", "service", k.service(), "account", name)
-		return runQuiet(cmd, "keychain delete")
+		_, err := k.exec("secret-tool",
+			[]string{"clear", "service", k.service(), "account", name}, "")
+		return wrapQuiet(err, "keychain delete")
 	default:
 		return fmt.Errorf("keychain unsupported on %s", runtime.GOOS)
 	}
 }
 
-// runQuiet runs cmd, wrapping any failure (without echoing stdin/argv values).
-func runQuiet(cmd *exec.Cmd, what string) error {
-	if err := cmd.Run(); err != nil {
+// wrapQuiet wraps a CLI failure (without echoing stdin/argv values).
+func wrapQuiet(err error, what string) error {
+	if err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	return nil

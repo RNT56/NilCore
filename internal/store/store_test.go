@@ -77,6 +77,115 @@ func TestMemoryRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMemoryUpsertReplaces proves PutMemory is keyed by (scope, project, mkey): a
+// second write for the same logical key REPLACES the value in place (no stale
+// duplicate row) and returns the same row id.
+func TestMemoryUpsertReplaces(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	id1, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "task:1", Value: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "task:1", Value: "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 != id2 {
+		t.Errorf("upsert kept the row: ids %d vs %d", id1, id2)
+	}
+	got, err := s.QueryMemory(ctx, "project", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Value != "new" {
+		t.Fatalf("upsert must replace, got %+v", got)
+	}
+	// A different key under the same scope/project is independent.
+	if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "task:2", Value: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := s.QueryMemory(ctx, "project", "p"); len(g) != 2 {
+		t.Errorf("distinct key must add a row, got %d", len(g))
+	}
+}
+
+// TestMemoryUniqueMigration is the legacy-DB path: a memory table created WITHOUT the
+// UNIQUE(scope,project,mkey) constraint, holding duplicate-key rows, must on Open be
+// rebuilt to carry the constraint and collapse duplicates to the newest row per key —
+// without erroring on a re-Open (idempotent).
+func TestMemoryUniqueMigration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy_mem.db")
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-constraint memory table: no UNIQUE.
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE memory (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL,
+		project TEXT NOT NULL DEFAULT '', mkey TEXT NOT NULL,
+		mvalue TEXT NOT NULL, created TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// Two rows for the SAME logical key (the stale-duplicate bug) plus one distinct key.
+	for _, row := range []struct{ k, v, c string }{
+		{"task:1", "stale", "2026-01-01T00:00:00Z"},
+		{"task:1", "fresh", "2026-01-02T00:00:00Z"},
+		{"task:2", "other", "2026-01-01T00:00:00Z"},
+	} {
+		if _, err := legacy.ExecContext(ctx,
+			`INSERT INTO memory (scope, project, mkey, mvalue, created) VALUES ('project','p',?,?,?)`,
+			row.k, row.v, row.c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open of legacy memory DB (migration): %v", err)
+	}
+	got, err := s.QueryMemory(ctx, "project", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("migration must collapse duplicate keys, got %d rows: %+v", len(got), got)
+	}
+	// The surviving task:1 row keeps the NEWEST value (max id wins).
+	var task1 string
+	for _, g := range got {
+		if g.Key == "task:1" {
+			task1 = g.Value
+		}
+	}
+	if task1 != "fresh" {
+		t.Errorf("migration kept stale value, task:1 = %q want fresh", task1)
+	}
+	// Post-migration the constraint is live: a same-key write replaces.
+	if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "task:1", Value: "newest"}); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := s.QueryMemory(ctx, "project", "p"); len(g) != 2 {
+		t.Errorf("post-migration upsert must not add a row, got %d", len(g))
+	}
+	s.Close()
+
+	// Re-Open is a no-op migration (already at current schema).
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-Open after memory migration (idempotency): %v", err)
+	}
+	t.Cleanup(func() { s2.Close() })
+	if g, _ := s2.QueryMemory(ctx, "project", "p"); len(g) != 2 {
+		t.Errorf("after re-Open memory rows = %d, want 2 preserved", len(g))
+	}
+}
+
 func TestTaskUpsert(t *testing.T) {
 	s := openTemp(t)
 	ctx := context.Background()

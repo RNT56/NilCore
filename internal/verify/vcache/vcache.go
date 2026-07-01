@@ -42,6 +42,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sync"
 
 	"nilcore/internal/eventlog"
 	"nilcore/internal/verify"
@@ -51,6 +52,14 @@ import (
 // distinct from the backend's own "verify" event so the cache reads only verdicts
 // IT produced (each carrying a cache_key), never another producer's verify event.
 const kindCachePass = "verify_cache"
+
+// kindCacheCorrupt is the one-time DIAGNOSTIC event emitted when the lookup scan hits
+// an unparseable line in the log. Such a line makes the scan (and eventlog.Verify
+// itself) fail-closed, so the cache silently degrades to a PERMANENT recompute with no
+// other signal. Emitting one diagnostic lets an operator notice a poisoned-cache
+// condition rather than puzzle over a cache that never hits. It changes no verdict (a
+// corrupt log still recomputes); it is observability only.
+const kindCacheCorrupt = "verify_cache_corrupt"
 
 // detailFieldDigest / detailFieldPassed are the structural Detail fields a cache
 // event carries. Only these decide a hit — never any free-text output.
@@ -116,6 +125,10 @@ type Config struct {
 // Check), which is what keeps the feature byte-identical when unwired.
 type Cache struct {
 	cfg Config
+	// corruptOnce guards the one-time poisoned-cache diagnostic (kindCacheCorrupt), so a
+	// repeatedly-scanned corrupt log emits a single signal, never a flood of identical
+	// events. It is presentational/observability only — it never affects a verdict.
+	corruptOnce sync.Once
 }
 
 // New builds a Cache from cfg, validating that every field a live cache needs is

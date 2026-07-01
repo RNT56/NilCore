@@ -33,10 +33,11 @@ func ShellSingleQuote(s string) string {
 // 20–50× cheaper than a screenshot. Role and Name are the accessibility role and
 // accessible name; both are page-controlled and therefore UNTRUSTED (I7).
 type Ref struct {
-	ID    int    `json:"id"`
-	Role  string `json:"role"`            // a11y role: button, link, textbox, … (UNTRUSTED)
-	Name  string `json:"name"`            // accessible name (UNTRUSTED)
-	Value string `json:"value,omitempty"` // current value for inputs (UNTRUSTED)
+	ID      int    `json:"id"`
+	Role    string `json:"role"`              // a11y role: button, link, textbox, … (UNTRUSTED)
+	Name    string `json:"name"`              // accessible name (UNTRUSTED)
+	Value   string `json:"value,omitempty"`   // current value for inputs (UNTRUSTED)
+	Version uint64 `json:"version,omitempty"` // snapshot version this ref was stamped in; Session.Resolve rejects a Ref whose Version != the latest Observation's (the Cancel→Delete / same-id-after-re-render defense, host-enforced — not membership-only)
 }
 
 // Tab is one open browser target (page/tab) in a session.

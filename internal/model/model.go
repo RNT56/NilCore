@@ -70,10 +70,19 @@ type Tool struct {
 }
 
 // Response is the model's reply: the content blocks, why it stopped, and usage.
+//
+// ServedModel is the id of the model that ACTUALLY served the call, when the
+// provider reports it (e.g. OpenRouter echoes the top-level "model" field, which
+// can differ from the requested id when a models[] fallback chain routes to a
+// later entry). It is purely additive and omitempty: a provider that does not
+// report a served id leaves it empty, so the JSON is byte-identical to before and
+// every existing consumer is unchanged. A meter MAY price the served id rather than
+// the requested one when this is set.
 type Response struct {
-	Content    []Block `json:"content"`
-	StopReason string  `json:"stop_reason"`
-	Usage      Usage   `json:"usage"`
+	Content     []Block `json:"content"`
+	StopReason  string  `json:"stop_reason"`
+	Usage       Usage   `json:"usage"`
+	ServedModel string  `json:"served_model,omitempty"`
 }
 
 // Usage reports token counts (and, where a vendor reports it, cost) for the call.

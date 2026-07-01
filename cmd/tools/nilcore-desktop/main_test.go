@@ -200,6 +200,52 @@ func TestPerformCoordinateRescale(t *testing.T) {
 	}
 }
 
+// TestObserveDrivesLadder2to3FromRealMarkability proves B7-cu.4: a window with NO
+// a11y refs and a BLANK screenshot (no CV boxes) drives the ladder's 2→3 transition
+// with the REAL HasMarkableBoxes=false, so the per-window ladder cache records Rung 3,
+// not a hardcoded-true Rung 2. We confirm by querying the ladder directly afterward.
+func TestObserveDrivesLadder2to3FromRealMarkability(t *testing.T) {
+	restore := withSeams(t, `[]`, boxedImage(300, 200), "BlankCanvas", nil)
+	defer restore()
+	d := newDriver()
+	obs := d.observe(context.Background(), desktopwire.Act{Op: desktopwire.OpObserve}, "")
+	if obs.Rung != desktopwire.RungCoordinate {
+		t.Fatalf("blank canvas → rung %d, want 3", obs.Rung)
+	}
+	// The ladder itself must have been told markable=false for this window: a follow-up
+	// Decide with the same (no-ref, no-mark) input still yields Rung 3 rather than the
+	// Rung-2 a hardcoded HasMarkableBoxes:true would have produced.
+	dec := d.ladder.Decide(desktop.RungInput{Window: "BlankCanvas", RefCount: 0, HasMarkableBoxes: false})
+	if dec.Rung != desktopwire.RungCoordinate {
+		t.Fatalf("ladder 2→3 not driven by real markability: got rung %d (%s)", dec.Rung, dec.Reason)
+	}
+}
+
+// TestObserveStagnationDowngradesOnType proves B7-cu.5: a TYPE op (not a ref-click)
+// that leaves the post-act signature equal to the pre-act one downgrades the window
+// off Rung 1, just like a lying ref-click. A pre-fix driver only downgraded on
+// ref-clicks, so a tree that lied for typing stayed latched on Rung 1.
+func TestObserveStagnationDowngradesOnType(t *testing.T) {
+	a11y := `[{"role":"entry","name":"Field","box":{"x":5,"y":5,"w":100,"h":24}}]`
+	restore := withSeams(t, a11y, boxedImage(300, 200, image.Rect(40, 40, 120, 80)), "LyingTree", nil)
+	defer restore()
+	d := newDriver()
+
+	// First observe establishes Rung 1 and records lastSig = sig("LyingTree", 1).
+	first := d.observe(context.Background(), desktopwire.Act{Op: desktopwire.OpObserve}, "")
+	if first.Rung != desktopwire.RungATSPI {
+		t.Fatalf("first observe → rung %d, want 1", first.Rung)
+	}
+	preSig := d.lastSig
+
+	// A TYPE op whose post-act signature equals preSig (same window, same ref count) is
+	// a verified no-op → the tree lied → drop off Rung 1 to a marked screenshot (Rung 2).
+	after := d.observe(context.Background(), desktopwire.Act{Op: desktopwire.OpType, Text: "x"}, preSig)
+	if after.Rung == desktopwire.RungATSPI {
+		t.Fatalf("a stagnant TYPE must downgrade off rung 1, got rung %d", after.Rung)
+	}
+}
+
 func TestObserveNative_RawScreenshot(t *testing.T) {
 	// In native mode (Path A) observe skips the a11y/SoM ladder and returns a raw
 	// fixed-size screenshot with no refs — pixel-mode for Anthropic's native tool.

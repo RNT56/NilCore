@@ -137,6 +137,84 @@ func TestAnthropicCompleteTypedAPIError(t *testing.T) {
 	}
 }
 
+// TestAnthropicCachedTokens proves the adapter now decodes Anthropic's
+// prompt-cache tallies: cache_read_input_tokens maps to model.Usage.CachedTokens
+// on both the non-stream and stream paths (parity with the OpenAI adapter, which a
+// budget/meter reading CachedTokens relies on). A response without the cache fields
+// leaves CachedTokens zero (byte-identical to before).
+func TestAnthropicCachedTokens(t *testing.T) {
+	t.Run("non-stream", func(t *testing.T) {
+		const body = `{
+			"content":[{"type":"text","text":"hi"}],
+			"stop_reason":"end_turn",
+			"usage":{"input_tokens":12,"output_tokens":7,"cache_read_input_tokens":90,"cache_creation_input_tokens":5}
+		}`
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		defer srv.Close()
+		a := NewAnthropic("k", "claude-x")
+		a.baseURL = srv.URL
+		resp, err := a.Complete(context.Background(), "sys",
+			[]model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "go"}}}}, nil, 100)
+		if err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		if resp.Usage.CachedTokens != 90 {
+			t.Errorf("CachedTokens = %d, want 90 (cache_read_input_tokens)", resp.Usage.CachedTokens)
+		}
+		if resp.Usage.InputTokens != 12 || resp.Usage.OutputTokens != 7 {
+			t.Errorf("base usage = %+v, want input 12 output 7", resp.Usage)
+		}
+	})
+
+	t.Run("non-stream-absent", func(t *testing.T) {
+		const body = `{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":12,"output_tokens":7}}`
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+		defer srv.Close()
+		a := NewAnthropic("k", "claude-x")
+		a.baseURL = srv.URL
+		resp, err := a.Complete(context.Background(), "sys",
+			[]model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "go"}}}}, nil, 100)
+		if err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		if resp.Usage.CachedTokens != 0 {
+			t.Errorf("CachedTokens = %d, want 0 (no cache fields ⇒ prior shape)", resp.Usage.CachedTokens)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		// cache_read_input_tokens rides message_start's usage; assert it survives to
+		// the assembled Response alongside the message_delta output-token update.
+		frames := "event: message_start\n" +
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1,"cache_read_input_tokens":77}}}` + "\n\n" +
+			"event: content_block_start\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}` + "\n\n" +
+			"event: content_block_delta\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}` + "\n\n" +
+			"event: message_stop\n" +
+			`data: {"type":"message_stop"}` + "\n\n"
+
+		resp, err := assembleAnthropicStream(context.Background(), strings.NewReader(frames), nil)
+		if err != nil {
+			t.Fatalf("assembleAnthropicStream: %v", err)
+		}
+		if resp.Usage.CachedTokens != 77 {
+			t.Errorf("stream CachedTokens = %d, want 77", resp.Usage.CachedTokens)
+		}
+		if resp.Usage.OutputTokens != 9 {
+			t.Errorf("stream OutputTokens = %d, want 9 (message_delta)", resp.Usage.OutputTokens)
+		}
+	})
+}
+
 func TestAnthropicStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") != "k" {

@@ -98,6 +98,48 @@ func TestDecodeUsageNonStream(t *testing.T) {
 	})
 }
 
+// TestDecodeServedModel covers the served-model id decode: the top-level "model"
+// field of the response is surfaced on model.Response.ServedModel (so a meter can
+// price the model that actually served, e.g. when OpenRouter routes through a
+// models[] fallback). A response that omits "model" leaves ServedModel empty —
+// byte-identical to before for every consumer that ignores the field.
+func TestDecodeServedModel(t *testing.T) {
+	t.Run("non-stream-present", func(t *testing.T) {
+		const body = `{"model":"anthropic/claude-sonnet-4","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+		if got := completeWithBody(t, body).ServedModel; got != "anthropic/claude-sonnet-4" {
+			t.Errorf("ServedModel = %q, want anthropic/claude-sonnet-4", got)
+		}
+	})
+	t.Run("non-stream-absent", func(t *testing.T) {
+		const body = `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+		if got := completeWithBody(t, body).ServedModel; got != "" {
+			t.Errorf("ServedModel = %q, want empty (no model field)", got)
+		}
+	})
+	t.Run("stream-present", func(t *testing.T) {
+		// The served-model id rides each frame; the assembler keeps the last seen.
+		frames := strings.Join([]string{
+			`data: {"model":"openrouter/fallback-x","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}`,
+			`data: {"model":"openrouter/fallback-x","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n") + "\n\n"
+		if got := streamWithFrames(t, frames).ServedModel; got != "openrouter/fallback-x" {
+			t.Errorf("stream ServedModel = %q, want openrouter/fallback-x", got)
+		}
+	})
+	t.Run("stream-absent", func(t *testing.T) {
+		frames := strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n") + "\n\n"
+		if got := streamWithFrames(t, frames).ServedModel; got != "" {
+			t.Errorf("stream ServedModel = %q, want empty", got)
+		}
+	})
+}
+
 // TestDecodeUsageStream covers the stream usage decode: the trailing usage-only
 // frame's nested detail fields populate the new Usage fields, and a usage frame
 // without them yields exactly the prior Usage.

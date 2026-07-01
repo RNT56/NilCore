@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"reflect"
+	"strings"
 	"testing"
 
 	"nilcore/internal/desktopwire"
@@ -38,8 +39,20 @@ func TestCliclickBuilders(t *testing.T) {
 	if got := cliclickKey("Return"); !reflect.DeepEqual(got, []string{"kp:return"}) {
 		t.Fatalf("Return = %v", got)
 	}
-	if got := cliclickScroll("up", 2); !reflect.DeepEqual(got, []string{"kp:page-up", "kp:page-up"}) {
-		t.Fatalf("scroll = %v", got)
+	got, err := cliclickScroll("up", 2)
+	if err != nil || !reflect.DeepEqual(got, []string{"kp:page-up", "kp:page-up"}) {
+		t.Fatalf("scroll up = %v (err %v)", got, err)
+	}
+	if got, err := cliclickScroll("", 1); err != nil || !reflect.DeepEqual(got, []string{"kp:page-down"}) {
+		t.Fatalf("default scroll = %v (err %v)", got, err)
+	}
+	// Horizontal scroll has no faithful page-key substitute → fail closed, never a
+	// silent page-down that misleads the model.
+	if _, err := cliclickScroll("left", 1); err == nil {
+		t.Fatal("horizontal (left) scroll must fail closed, not silently page-down")
+	}
+	if _, err := cliclickScroll("right", 3); err == nil {
+		t.Fatal("horizontal (right) scroll must fail closed")
 	}
 }
 
@@ -59,21 +72,120 @@ func TestCoords(t *testing.T) {
 	if bx != 60 || by != 55 {
 		t.Fatalf("pixelCenterToPoint = (%d,%d), want (60,55)", bx, by)
 	}
+
+	// 1× display (the non-Retina external-monitor case the old bscale=2 fallback
+	// silently halved): backing 1.0 means pixel == point, so a resized coordinate maps
+	// 1:1 once the resize factor is undone — no halving.
+	x1, y1 := resizedToPoint(50, 25, 1, 1, 1, 0, 0)
+	if x1 != 50 || y1 != 25 {
+		t.Fatalf("1× resizedToPoint = (%d,%d), want (50,25)", x1, y1)
+	}
+	// A box centre on a 1× display is its raw pixel centre (no /2).
+	bx1, by1 := pixelCenterToPoint(image.Rect(100, 100, 140, 120), 1, 0, 0) // centre px (120,110)
+	if bx1 != 120 || by1 != 110 {
+		t.Fatalf("1× pixelCenterToPoint = (%d,%d), want (120,110)", bx1, by1)
+	}
+	// The same box on a 2× display halves to (60,55) — the two scales must DIFFER, which
+	// is exactly why a wrong 2.0 fallback on a 1× display mis-clicks.
+	if bx1 == bx || by1 == by {
+		t.Fatalf("1× and 2× box centres must differ: 1×=(%d,%d) 2×=(%d,%d)", bx1, by1, bx, by)
+	}
 }
 
-// withSeams swaps the live macOS seams for fakes.
+func TestResolveBackingScale(t *testing.T) {
+	restore := func() func() {
+		oo := osascriptDesktopWidth
+		return func() { osascriptDesktopWidth = oo }
+	}()
+	defer restore()
+
+	// Env override wins and short-circuits the probe.
+	t.Setenv("NILCORE_MAC_SCALE", "1")
+	osascriptDesktopWidth = func(context.Context) int { t.Fatal("env override must short-circuit the osascript probe"); return 0 }
+	if s, known := resolveBackingScale(context.Background(), 3024); !known || s != 1 {
+		t.Fatalf("env override = (%v,%v), want (1,true)", s, known)
+	}
+
+	// No env, osascript yields a 2× Retina display (3024 px / 1512 pt).
+	t.Setenv("NILCORE_MAC_SCALE", "")
+	osascriptDesktopWidth = func(context.Context) int { return 1512 }
+	if s, known := resolveBackingScale(context.Background(), 3024); !known || s != 2 {
+		t.Fatalf("Retina derivation = (%v,%v), want (2,true)", s, known)
+	}
+
+	// No env, osascript yields a 1× external display (1920 px / 1920 pt) — must derive
+	// 1.0, NOT fall back to 2.0.
+	osascriptDesktopWidth = func(context.Context) int { return 1920 }
+	if s, known := resolveBackingScale(context.Background(), 1920); !known || s != 1 {
+		t.Fatalf("1× derivation = (%v,%v), want (1,true)", s, known)
+	}
+
+	// No env and osascript fails (Automation denied) → the conservative unity fallback,
+	// reported as undetermined so the caller can warn (NOT the old silent 2.0).
+	osascriptDesktopWidth = func(context.Context) int { return 0 }
+	if s, known := resolveBackingScale(context.Background(), 1920); known || s != fallbackBackingScale {
+		t.Fatalf("fallback = (%v,%v), want (%v,false)", s, known, fallbackBackingScale)
+	}
+}
+
+func TestProbeWarnsOnUndeterminedScale(t *testing.T) {
+	oc, oo, op := capture, osascriptDesktopWidth, lookPath
+	defer func() { capture, osascriptDesktopWidth, lookPath = oc, oo, op }()
+	capture = func(context.Context) (image.Image, error) { return boxedImage(1920, 1080), nil }
+	osascriptDesktopWidth = func(context.Context) int { return 0 } // Automation denied
+	lookPath = func(string) (string, error) { return "/usr/local/bin/cliclick", nil }
+	t.Setenv("NILCORE_MAC_SCALE", "")
+
+	r := probePermissions(context.Background())
+	if r.BackingScaleKnown {
+		t.Fatal("scale must be reported undetermined when osascript fails and no env override")
+	}
+	joined := r.String()
+	if !containsAny(joined, "Backing scale could NOT be determined", "NILCORE_MAC_SCALE") {
+		t.Fatalf("probe must warn about the undetermined scale; got:\n%s", joined)
+	}
+}
+
+func containsAny(hay string, needles ...string) bool {
+	for _, n := range needles {
+		if !strings.Contains(hay, n) {
+			return false
+		}
+	}
+	return true
+}
+
+// withSeams swaps the live macOS seams for fakes. It fakes the osascript desktop-width
+// probe too (observe() now resolves the backing scale via resolveBackingScale, which
+// would otherwise shell the REAL osascript and hang on a TCC prompt): a scale s and a
+// 1000-px capture imply a fake point-width of 1000/s so resolveBackingScale derives s.
 func withSeams(t *testing.T, img image.Image, scale float64, rec *[][]string) func() {
 	t.Helper()
-	oc, ob, ox := capture, backingScale, runCliclick
+	t.Setenv("NILCORE_MAC_SCALE", "") // force the probe path, not the env override
+	t.Setenv("TERM_PROGRAM", "")      // no controlling-terminal exclusion in observe tests
+	oc, ob, ox, oo, of := capture, backingScale, runCliclick, osascriptDesktopWidth, frontmostApp
 	capture = func(context.Context) (image.Image, error) { return img, nil }
 	backingScale = func(context.Context, int) float64 { return scale }
+	frontmostApp = func(context.Context) string { return "TargetApp" } // not a terminal
+	pixelW := 0
+	if img != nil {
+		pixelW = img.Bounds().Dx()
+	}
+	osascriptDesktopWidth = func(context.Context) int {
+		if pixelW <= 0 || scale <= 0 {
+			return 0
+		}
+		return int(float64(pixelW) / scale)
+	}
 	runCliclick = func(_ context.Context, args []string) error {
 		if rec != nil {
 			*rec = append(*rec, args)
 		}
 		return nil
 	}
-	return func() { capture, backingScale, runCliclick = oc, ob, ox }
+	return func() {
+		capture, backingScale, runCliclick, osascriptDesktopWidth, frontmostApp = oc, ob, ox, oo, of
+	}
 }
 
 func boxedImage(w, h int, boxes ...image.Rectangle) *image.RGBA {

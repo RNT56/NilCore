@@ -24,12 +24,15 @@ import (
 // (+ beta header). The driver runs in --native mode (raw screenshots, fixed display
 // dims), so the model grounds from pixels exactly as in Anthropic's reference loop.
 type NativeComputerTool struct {
-	Sess      Session
-	MaxSteps  int
-	EventSink EventSink
+	Sess        Session
+	MaxSteps    int
+	MaxStagnant int // consecutive no-op acts before the harness nudges (default defaultMaxStagnant)
+	EventSink   EventSink
 
-	mu    sync.Mutex
-	steps int
+	mu       sync.Mutex
+	steps    int
+	stagnant int
+	lastSig  string
 }
 
 func (*NativeComputerTool) Name() string { return "computer" }
@@ -76,8 +79,18 @@ func (n *NativeComputerTool) RunWithImage(ctx context.Context, _ string, input j
 	n.steps++
 
 	obs, actErr := n.Sess.Act(ctx, act)
+
+	// Never-retry stagnation detection (the discipline the package doc demands and that
+	// must live in code, B7-cu.6): Path A previously had only the step budget, so a
+	// model looping on an ineffective coordinate click got no nudge until the budget was
+	// exhausted. We fingerprint the post-act observation (pixel-mode: window + ref count
+	// + rung + version) and flag a run of no-ops, mirroring Path-B's ComputerTool.
+	sig := nativeSignature(obs)
+	stagnant := n.isStagnant(act.Op, sig, actErr != nil)
+	n.lastSig = sig
+
 	if n.EventSink != nil {
-		n.EventSink(Step{N: n.steps, Op: act.Op, Window: obs.FocusedWindow, Rung: obs.Rung, Refs: len(obs.Refs), Version: obs.Version, Errored: actErr != nil})
+		n.EventSink(Step{N: n.steps, Op: act.Op, Window: obs.FocusedWindow, Rung: obs.Rung, Refs: len(obs.Refs), Version: obs.Version, Stagnant: stagnant, Errored: actErr != nil})
 	}
 
 	// Path A is pixel-mode: the screenshot IS the observation. Keep any text minimal
@@ -88,11 +101,49 @@ func (n *NativeComputerTool) RunWithImage(ctx context.Context, _ string, input j
 	} else if t := strings.TrimSpace(obs.FocusedWindow); t != "" {
 		body = "focused window: " + t
 	}
+	if stagnant {
+		maxStag := n.MaxStagnant
+		if maxStag <= 0 {
+			maxStag = defaultMaxStagnant
+		}
+		if n.stagnant >= maxStag {
+			body += fmt.Sprintf("\n\n[harness] the last %d actions changed nothing — try a FUNDAMENTALLY different approach (a different coordinate/element, keyboard navigation, or finish if blocked).", n.stagnant)
+		}
+	}
 	out := guard.Wrap("computer observation", body)
 	if obs.ScreenshotB64 != "" {
 		return out, &tools.Image{MediaType: "image/png", Base64: obs.ScreenshotB64}, nil
 	}
 	return out, nil, nil
+}
+
+// nativeSignature fingerprints a Path-A (pixel-mode) observation for stagnation. The
+// native driver does not richly populate Refs/Title, so the stable signal is the
+// focused window + the rung + the ref count. Version is deliberately EXCLUDED: the
+// driver bumps it on every observe, so it would make two states never compare equal
+// and stagnation would never fire.
+func nativeSignature(o desktopwire.Observation) string {
+	return fmt.Sprintf("%s|%d|%d", o.FocusedWindow, o.Rung, len(o.Refs))
+}
+
+// isStagnant updates and reports the consecutive-no-op counter (Path A). An observe is
+// never counted (it is expected not to change the screen); an errored act that left the
+// same signature also counts. Mirrors ComputerTool.isStagnant.
+func (n *NativeComputerTool) isStagnant(op, sig string, errored bool) bool {
+	if op == desktopwire.OpObserve {
+		n.stagnant = 0
+		return false
+	}
+	if sig != "" && sig == n.lastSig {
+		n.stagnant++
+		return true
+	}
+	if errored {
+		n.stagnant++
+		return true
+	}
+	n.stagnant = 0
+	return false
 }
 
 // translateNative maps an Anthropic native `computer` action input to a

@@ -217,6 +217,49 @@ func TestChargesViaPriceUsage(t *testing.T) {
 	}
 }
 
+// TestTokenTallyIncludesReasoning pins the report-accuracy fix: the token meter
+// counts input+output+reasoning, the SAME token set the dollar pricer bills (reasoning
+// at the output rate), so the token report no longer under-counts for extended-thinking
+// models. Covered on both the Complete and Stream paths.
+func TestTokenTallyIncludesReasoning(t *testing.T) {
+	const id = "claude-opus-4-8"
+	// 1000 in + 1000 visible out + 500 reasoning out.
+	usage := model.Usage{InputTokens: 1000, OutputTokens: 1000, ReasoningTokens: 500}
+	wantTokens := 1000 + 1000 + 500
+	// Dollars: opus input 0.005/1k, output (visible+reasoning) at 0.025/1k → 0.005 + 1500/1000*0.025.
+	wantDollars := 0.005 + 1.5*0.025
+
+	t.Run("complete", func(t *testing.T) {
+		led := budget.New()
+		p := &Provider{Inner: &fakeProvider{id: id, usage: usage}, Ledger: led, Task: "t", Price: NewTable()}
+		if _, err := p.Complete(context.Background(), "sys", nil, nil, 100); err != nil {
+			t.Fatalf("Complete: %v", err)
+		}
+		tokens, dollars := led.Total()
+		if tokens != wantTokens {
+			t.Errorf("Complete tokens = %d, want %d (input+output+reasoning)", tokens, wantTokens)
+		}
+		if !almostEqualDollars(dollars, wantDollars) {
+			t.Errorf("Complete dollars = %v, want %v", dollars, wantDollars)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		led := budget.New()
+		p := &Provider{Inner: &streamingProvider{id: id, usage: usage, deltas: []string{"x"}}, Ledger: led, Task: "t", Price: NewTable()}
+		if _, err := p.Stream(context.Background(), "sys", nil, nil, 100, nil); err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+		tokens, dollars := led.Total()
+		if tokens != wantTokens {
+			t.Errorf("Stream tokens = %d, want %d", tokens, wantTokens)
+		}
+		if !almostEqualDollars(dollars, wantDollars) {
+			t.Errorf("Stream dollars = %v, want %v", dollars, wantDollars)
+		}
+	})
+}
+
 // TestModelDelegates asserts Model() passes through unchanged so tier/pricer
 // resolution sees the real model id.
 func TestModelDelegates(t *testing.T) {

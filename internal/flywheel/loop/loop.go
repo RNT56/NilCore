@@ -84,10 +84,11 @@ var (
 // WHETHER and WHICH to propose; this func owns the actual verify+gate.
 //
 // merged reports whether the edit actually shipped (verifier-green AND
-// human-approved AND — when wired — past selfimprove's own measured-delta
-// fence). The loop treats a false merged as a perfectly normal outcome (the
-// human declined, or the verifier failed): it is NOT an error, and the loop
-// continues its bounded cadence.
+// human-approved). The measured-delta fence already ran at THIS loop level
+// (step 3 below) before Propose is ever called, so the gated flow it wraps owns
+// only the verifier + human gate. The loop treats a false merged as a perfectly
+// normal outcome (the human declined, or the verifier failed): it is NOT an
+// error, and the loop continues its bounded cadence.
 type ProposeFunc func(ctx context.Context, p selfimprove.Proposal) (merged bool, err error)
 
 // RunSuiteFunc scores the FROZEN self-eval suite under the agent and returns the
@@ -108,6 +109,16 @@ type Config struct {
 	// recurring verifier-failure targets. REQUIRED: an empty path is refused
 	// (the distiller must have a chain to verify, fail-closed — I5).
 	LogPath string
+
+	// RotatedLogPaths are PRIOR log generations (e.g. the maint.RotateLog output
+	// LogPath+".1") the distiller should ALSO replay, so a recurring scar that
+	// straddles a rotation boundary still clears the recurrence threshold instead
+	// of resetting its Count when the live log was rotated to a fresh genesis
+	// chain (the B5-autonomy.8 fix). Each generation is its own hash chain, so the
+	// distiller chain-verifies each independently and fails closed per file. Empty
+	// or missing generations are skipped cleanly; an empty slice (the zero value)
+	// is byte-identical to mining only LogPath.
+	RotatedLogPaths []string
 
 	// RunSuite scores the frozen self-eval suite (injected; REQUIRED). See
 	// RunSuiteFunc.
@@ -312,11 +323,13 @@ func (l *Loop) cycle(ctx context.Context, sum *Summary) (more bool, err error) {
 		return false, fmt.Errorf("running baseline self-eval: %w", err)
 	}
 
-	// (2) DISTILL: mine recurring verifier-failure targets from the event log.
-	// Fail-closed on a broken chain (distiller runs eventlog.Verify and returns
-	// an error + nil patterns over a tampered log — I5), so the loop earns no
-	// target from forged evidence.
-	patterns, err := distiller.Distill(l.cfg.LogPath, l.cfg.DistillThreshold)
+	// (2) DISTILL: mine recurring verifier-failure targets from the event log AND
+	// any prior rotated generations, so a scar that straddles a log rotation still
+	// clusters (B5-autonomy.8). Fail-closed per generation on a broken chain
+	// (DistillAcross chain-verifies each file and returns an error + nil patterns
+	// over a tampered one — I5), so the loop earns no target from forged evidence.
+	gens := append([]string{l.cfg.LogPath}, l.cfg.RotatedLogPaths...)
+	patterns, err := distiller.DistillAcross(l.cfg.DistillThreshold, gens...)
 	if err != nil {
 		return false, fmt.Errorf("distilling improvement targets: %w", err)
 	}

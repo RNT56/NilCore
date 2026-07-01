@@ -144,6 +144,71 @@ func TestMaxTokensStreamPathToo(t *testing.T) {
 	}
 }
 
+// TestReasoningModelAutoSelectsMaxCompletionTokens is the regression for the
+// HIGH-severity gap: an OpenAI reasoning-model id (gpt-5.x / o-series) must
+// auto-select "max_completion_tokens" — those models reject "max_tokens" with a
+// terminal 400 — while a non-reasoning id keeps the default "max_tokens", and an
+// explicit WithMaxTokensField always wins over the auto-detection.
+func TestReasoningModelAutoSelectsMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		name      string
+		modelID   string
+		opts      []Option
+		wantField string
+	}{
+		{"gpt-5", "gpt-5", nil, "max_completion_tokens"},
+		{"gpt-5.1", "gpt-5.1", nil, "max_completion_tokens"},
+		{"gpt-5-mini", "gpt-5-mini", nil, "max_completion_tokens"},
+		{"o1", "o1", nil, "max_completion_tokens"},
+		{"o3", "o3", nil, "max_completion_tokens"},
+		{"o3-mini", "o3-mini", nil, "max_completion_tokens"},
+		{"o4-mini", "o4-mini", nil, "max_completion_tokens"},
+		{"openrouter-namespaced-o3", "openai/o3-mini", nil, "max_completion_tokens"},
+		// Non-reasoning ids keep the default — gpt-4o must NOT be swept in.
+		{"gpt-4o", "gpt-4o", nil, "max_tokens"},
+		{"gpt-4o-mini", "gpt-4o-mini", nil, "max_tokens"},
+		{"gpt-4-turbo", "gpt-4-turbo", nil, "max_tokens"},
+		{"non-openai", "meta-llama/llama-3.1-70b", nil, "max_tokens"},
+		// An explicit option always overrides the auto-detection in either direction.
+		{"explicit-override-on-reasoning", "gpt-5", []Option{WithMaxTokensField("max_tokens")}, "max_tokens"},
+		{"explicit-set-on-plain", "gpt-4o", []Option{WithMaxTokensField("max_completion_tokens")}, "max_completion_tokens"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			opts := append([]Option{WithKey("k")}, c.opts...)
+			o := NewOpenAICompatible(c.modelID, opts...)
+			if o.maxTokensField != c.wantField {
+				t.Errorf("maxTokensField = %q, want %q", o.maxTokensField, c.wantField)
+			}
+			// Prove the chosen key reaches the wire as exactly one of the two.
+			body := captureBody(t, o, 100, false)
+			hasMT, hasMC := keysPresent(t, body)
+			wantMC := c.wantField == "max_completion_tokens"
+			if hasMT == wantMC || hasMC != wantMC {
+				t.Errorf("body keys (max_tokens=%v max_completion=%v) do not match field %q: %s",
+					hasMT, hasMC, c.wantField, body)
+			}
+		})
+	}
+}
+
+// TestIsReasoningModelID unit-tests the id classifier directly so the prefix rules
+// (and the gpt-4o false-positive guard) are pinned independent of construction.
+func TestIsReasoningModelID(t *testing.T) {
+	reasoning := []string{"gpt-5", "GPT-5", "gpt-5.1", "gpt-5-mini", "o1", "o1-preview", "o3", "o3-mini", "o4-mini", "openai/o3", "  o3-mini  "}
+	for _, id := range reasoning {
+		if !isReasoningModelID(id) {
+			t.Errorf("isReasoningModelID(%q) = false, want true", id)
+		}
+	}
+	plain := []string{"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", "claude-x", "meta-llama/llama-3.1-70b", "o", "", "moonshot-o3"}
+	for _, id := range plain {
+		if isReasoningModelID(id) {
+			t.Errorf("isReasoningModelID(%q) = true, want false", id)
+		}
+	}
+}
+
 // TestOaiRequestZeroValueRoundTrip guards the byte-identity safety net: a
 // zero-value oaiRequest (empty maxTokensField) must marshal with the default
 // "max_tokens" key when a cap is set, never panicking on the empty field name.

@@ -593,3 +593,163 @@ func (h *harness) recomputeOpen(runID string) []Shard {
 	}
 	return out
 }
+
+// posOf returns the index of id in order, or -1. Used by the topo tests to assert
+// "dependent merges AFTER dependency" without coupling to the exact interleaving.
+func posOf(order []integrate.MergeItem, id string) int {
+	for i, it := range order {
+		if it.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestMergeOrderTopologicalNotLexical is the direct guard on the B4-swarm.1 fix: with
+// >=10 shards whose ids are the DASH form the real sharder emits ("swarm-run-<n>",
+// sharder.go) and real Deps edges, mergeOrder must fold each dependent AFTER every
+// dependency it was coded on top of. The pre-fix sort.Strings(ids) put "swarm-run-10"
+// before "swarm-run-2" (lexical), so a dependent could be folded before its dependency;
+// this test fails against that code and passes against the topological emit.
+func TestMergeOrderTopologicalNotLexical(t *testing.T) {
+	// 11 shards (0..10) so the lexical-vs-numeric divergence is real ("swarm-run-10" <
+	// "swarm-run-2" lexically). Chain a dependency so the only valid order is numeric:
+	// every shard n>=1 depends on the PRIOR even index, plus shard 10 depends on shard 2.
+	const n = 11
+	passed := make(map[string]spawn.Result, n)
+	deps := make(map[string][]string, n)
+	id := func(i int) string { return fmt.Sprintf("swarm-run-%d", i) }
+	for i := 0; i < n; i++ {
+		passed[id(i)] = spawn.Result{ID: id(i), Passed: true, Branch: "task/" + id(i)}
+	}
+	// Edges: 1<-0, 2<-1, ... n-1<-n-2 (a strict chain), and additionally 10<-2.
+	for i := 1; i < n; i++ {
+		deps[id(i)] = []string{id(i - 1)}
+	}
+	deps[id(10)] = append(deps[id(10)], id(2))
+
+	order := mergeOrder(passed, deps)
+	if len(order) != n {
+		t.Fatalf("order has %d items, want %d (every green shard with a branch)", len(order), n)
+	}
+
+	// The defining assertions: swarm-run-10 must merge AFTER swarm-run-2 AND after its
+	// direct chain dependency swarm-run-9 — the exact case lexical sort got wrong.
+	if p10, p2 := posOf(order, id(10)), posOf(order, id(2)); p10 < p2 {
+		t.Errorf("%s at %d merged before its dependency %s at %d (lexical-sort bug)", id(10), p10, id(2), p2)
+	}
+	// Every chain edge n -> n-1 must hold (dependent after dependency).
+	for i := 1; i < n; i++ {
+		if posOf(order, id(i)) < posOf(order, id(i-1)) {
+			t.Errorf("%s merged before its dependency %s", id(i), id(i-1))
+		}
+	}
+	// Belt-and-suspenders: every declared edge is respected.
+	for child, parents := range deps {
+		for _, p := range parents {
+			if posOf(order, child) < posOf(order, p) {
+				t.Errorf("edge violated: %s merged before dependency %s", child, p)
+			}
+		}
+	}
+}
+
+// TestMergeOrderSkipsBranchlessAndDeterministic asserts mergeOrder (a) drops a passed
+// shard with no Branch (a verified non-code artifact contributes no MergeItem) and (b)
+// is deterministic among independent ready nodes (lexical tie-break), so the fold order
+// is stable run-to-run.
+func TestMergeOrderSkipsBranchlessAndDeterministic(t *testing.T) {
+	passed := map[string]spawn.Result{
+		"swarm-run-0": {ID: "swarm-run-0", Passed: true, Branch: "task/a"},
+		"swarm-run-1": {ID: "swarm-run-1", Passed: true}, // no Branch: report-only, skipped
+		"swarm-run-2": {ID: "swarm-run-2", Passed: true, Branch: "task/c"},
+	}
+	deps := map[string][]string{} // all independent
+	first := mergeOrder(passed, deps)
+	if len(first) != 2 {
+		t.Fatalf("order has %d items, want 2 (branchless shard dropped)", len(first))
+	}
+	// Independent ready nodes emit in lexical id order: 0 then 2.
+	if first[0].ID != "swarm-run-0" || first[1].ID != "swarm-run-2" {
+		t.Errorf("order = %v, want [swarm-run-0 swarm-run-2] (deterministic)", []string{first[0].ID, first[1].ID})
+	}
+	// Determinism across repeated calls (map iteration is randomized; the sort fixes it).
+	for i := 0; i < 20; i++ {
+		again := mergeOrder(passed, deps)
+		if again[0].ID != first[0].ID || again[1].ID != first[1].ID {
+			t.Fatalf("non-deterministic order on iteration %d: %v vs %v", i, again, first)
+		}
+	}
+}
+
+// shardSetWithDeps builds a green-on-pass-1 shard set carrying real Deps, for the
+// end-to-end integration-order test. Each shard's Goal is trivial; the deps map is
+// id -> dependency ids.
+func shardSetWithDeps(deps map[string][]string, ids ...string) []Shard {
+	out := make([]Shard, len(ids))
+	for i, id := range ids {
+		out[i] = Shard{ID: id, Goal: "g", Kind: artifact.KindReport, State: ShardQueued, Deps: deps[id]}
+	}
+	return out
+}
+
+// TestControllerIntegrateRespectsDeps drives a full Run through the Controller and
+// asserts the order the IntegrateFunc receives folds dependents after dependencies —
+// the B4-swarm.1 fix observed end-to-end (not just on the helper). Ten shards with a
+// dash-form id (matching the real sharder) and a chain of Deps prove the integrator
+// never sees swarm-run-10 before swarm-run-2.
+func TestControllerIntegrateRespectsDeps(t *testing.T) {
+	h := newHarness(t)
+	const n = 11
+	id := func(i int) string { return fmt.Sprintf("swarm-run-%d", i) }
+	ids := make([]string, n)
+	plan := map[string][]artifact.Status{}
+	for i := 0; i < n; i++ {
+		ids[i] = id(i)
+		plan[id(i)] = []artifact.Status{artifact.StatusPass} // all green pass 1
+	}
+	deps := map[string][]string{}
+	for i := 1; i < n; i++ {
+		deps[id(i)] = []string{id(i - 1)}
+	}
+	deps[id(10)] = append(deps[id(10)], id(2))
+
+	fn := h.fnFromStatusPlan(plan)
+	var lastOrder []integrate.MergeItem
+	integFn := func(ctx context.Context, baseRef string, order []integrate.MergeItem) (string, []integrate.MergeResult, error) {
+		lastOrder = order
+		var results []integrate.MergeResult
+		for _, it := range order {
+			results = append(results, integrate.MergeResult{ID: it.ID, Branch: it.Branch,
+				Merged: true, Verified: true, SHA: "tip"})
+		}
+		return "integrate/x", results, nil
+	}
+
+	c := &Controller{
+		Runner:    &Runner{Concurrency: 3, Fn: fn},
+		Queue:     h.q,
+		Worktree:  h.worktree,
+		Policy:    PassPolicy{UntilClean: true, MaxPasses: 3},
+		Integrate: integFn,
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shardSetWithDeps(deps, ids...))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done || out.Reason != ReasonConverged {
+		t.Fatalf("out = %+v, want Done converged", out)
+	}
+	if len(lastOrder) != n {
+		t.Fatalf("integrate order has %d items, want %d", len(lastOrder), n)
+	}
+	// The dependent must merge after BOTH its chain dep (9) and its extra dep (2).
+	if posOf(lastOrder, id(10)) < posOf(lastOrder, id(2)) {
+		t.Errorf("%s merged before dependency %s in the integrator's order", id(10), id(2))
+	}
+	for i := 1; i < n; i++ {
+		if posOf(lastOrder, id(i)) < posOf(lastOrder, id(i-1)) {
+			t.Errorf("%s merged before dependency %s in the integrator's order", id(i), id(i-1))
+		}
+	}
+}

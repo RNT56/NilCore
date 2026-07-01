@@ -295,6 +295,7 @@ func checkVarianceBounded(_ context.Context, _ sandbox.Sandbox, c artifact.Claim
 // is path-validated (no traversal, no metacharacters) before it is shelled.
 const (
 	runnerGoBench   = "go-bench"   // "go test -bench=. -run='^$' -benchmem ./..." in the workdir
+	runnerGoBenchAt = "go-bench:"  // "go-bench:<relpath>" — scope the go-bench to one package, path-validated
 	runnerMakeBench = "make-bench" // "make bench"
 	runnerScript    = "script:"    // "script:<relpath>" — a declared worktree script, path-validated
 )
@@ -310,6 +311,19 @@ func resolveRunner(method, workdir string) (string, error) {
 		// A pure benchmark pass: run only benchmarks (-run '^$' excludes tests), report
 		// alloc stats. Fixed shape; nothing model-authored is interpolated.
 		return "go test -bench=. -run='^$' -benchmem ./...", nil
+	case strings.HasPrefix(method, runnerGoBenchAt):
+		// Same fixed go-bench shape, but SCOPED to one package so the re-measure loop
+		// does not run every benchmark across the whole tree (spec.Runs times). The
+		// model supplies only a DATA package path, validated by the SAME discipline as a
+		// script path (relative, no "..", no shell metacharacter) and single-quoted, so
+		// it stays one argument and can never inject a command (I4). The "/..." suffix
+		// keeps it a recursive package selector under that one package.
+		rel := strings.TrimSpace(strings.TrimPrefix(method, runnerGoBenchAt))
+		safe, err := validateScriptPath(rel)
+		if err != nil {
+			return "", err
+		}
+		return "go test -bench=. -run='^$' -benchmem './" + safe + "/...'", nil
 	case method == runnerMakeBench:
 		return "make bench", nil
 	case strings.HasPrefix(method, runnerScript):
@@ -325,8 +339,8 @@ func resolveRunner(method, workdir string) (string, error) {
 		_ = workdir // runner runs with the box's own working directory; kept for clarity
 		return "sh './" + safe + "'", nil
 	default:
-		return "", fmt.Errorf("runner %q is not pack-allowlisted (want %q, %q, or %q<relpath>)",
-			clip(method), runnerGoBench, runnerMakeBench, runnerScript)
+		return "", fmt.Errorf("runner %q is not pack-allowlisted (want %q, %q<relpath>, %q, or %q<relpath>)",
+			clip(method), runnerGoBench, runnerGoBenchAt, runnerMakeBench, runnerScript)
 	}
 }
 

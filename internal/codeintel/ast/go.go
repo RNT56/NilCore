@@ -100,7 +100,12 @@ func (goParser) calls(path string) (map[string][]string, error) {
 			}
 			return true
 		})
-		out[fd.Name.Name] = called
+		// Append rather than assign: two FuncDecls with the same bare name (e.g. a
+		// method on two receivers, or a method shadowing a free function) hash to
+		// the same key, and a plain assignment would let the second silently drop
+		// the first's callees. Appending merges them so no outgoing call is lost;
+		// the graph dedups identical edges via its UNIQUE(from_id,to_id,kind).
+		out[fd.Name.Name] = append(out[fd.Name.Name], called...)
 	}
 	return out, nil
 }

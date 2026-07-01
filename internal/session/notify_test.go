@@ -40,6 +40,58 @@ func TestNotifyOnTerminalWorkDrive(t *testing.T) {
 	}
 }
 
+// A slow Notify push must NOT delay drive()'s Done(): Wait() returns the instant the
+// drive folds, decoupling conversation teardown from a (possibly wedged) channel push.
+// The push still happens — just off the drive goroutine.
+func TestNotifyDoesNotBlockWait(t *testing.T) {
+	drv := newFakeDriver(DriveResult{
+		Summary:  summarize.ContextSummary{Goal: "ship it"},
+		Branch:   "work-1",
+		Verified: true,
+	})
+	close(drv.release)
+	s := New("chat-local", "local", "/repo", nil)
+	s.Router = &fakeRouter{route: RouteNative}
+	s.Drivers = Drivers{Native: drv}
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	s.Notify = func(Notification) {
+		close(entered)
+		<-release // wedge the push until the test lets it go
+		close(done)
+	}
+
+	if err := s.Turn(context.Background(), "fix the typo"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	// Wait() must return while Notify is still wedged — the push is off the drive
+	// goroutine, so Done() already fired.
+	waited := make(chan struct{})
+	go func() { s.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		// good: teardown is not coupled to the push
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait() blocked on a slow Notify push (should be decoupled)")
+	}
+
+	// The push is genuinely in flight (decoupled, not skipped); let it finish.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Notify was never invoked")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Notify did not complete after release")
+	}
+}
+
 // A plain chat reply is streamed live and must NOT fire a terminal push (it would be
 // redundant noise to the thread).
 func TestNotifyNotCalledForChat(t *testing.T) {

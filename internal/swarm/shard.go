@@ -49,14 +49,16 @@ const (
 )
 
 // Shard is one unit of swarm work. ID is the stable, run-spanning identity in the
-// canonical form "swarm/<runID>/<n>" (the prefix is the run-isolation key the
-// durable queue filters on, SW-T10). Input/Goal/Statement-like fields are the
+// canonical form "swarm-<runID>-<n>" (the prefix is the run-isolation key the
+// durable queue filters on, SW-T10; the separator is a dash, not a slash, because a
+// shard id must be a valid single-component artifact id — see shardID in sharder.go).
+// Input/Goal/Statement-like fields are the
 // MODEL-FACING task description; Kind/Pack/Tier/Role are HARNESS routing metadata
 // that selects the verifier and the provider stack but must never leak into the
 // backend unit (see toSubtask). Deps names the shard IDs whose verified work this
 // shard builds on; State/Attempt/Branch are the runner's bookkeeping.
 type Shard struct {
-	ID      string        // "swarm/<runID>/<n>"
+	ID      string        // "swarm-<runID>-<n>"
 	Input   string        // the source/seed material for the shard (model-facing)
 	Goal    string        // the task the worker is asked to satisfy (model-facing)
 	Kind    artifact.Kind // typed artifact shape the shard must produce (routing)

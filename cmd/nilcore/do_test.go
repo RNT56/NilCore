@@ -33,6 +33,12 @@ func TestResolvePreset(t *testing.T) {
 			t.Fatalf("resolvePreset(-as ' SWARM ') = (%q,%v), want (swarm,nil)", p, err)
 		}
 	})
+	t.Run("-as decompose is a valid forced preset", func(t *testing.T) {
+		p, by, err := resolvePreset("decompose", "a and b and c")
+		if err != nil || p != router.Decompose || by != "forced" {
+			t.Fatalf("resolvePreset(-as decompose) = (%q,%q,%v), want (decompose,forced,nil)", p, by, err)
+		}
+	})
 	t.Run("-as with an unknown preset fails closed", func(t *testing.T) {
 		if _, _, err := resolvePreset("teleport", "anything"); err == nil {
 			t.Fatal("resolvePreset(-as teleport) = nil error, want an error")
@@ -50,9 +56,10 @@ func TestPresetArgs(t *testing.T) {
 	}{
 		{"run carries goal+dir", router.Run, "do a thing", "./repo", "", []string{"-goal", "do a thing", "-dir", "./repo"}},
 		{"build carries goal+dir", router.Build, "make it", ".", "", []string{"-goal", "make it", "-dir", "."}},
-		{"swarm carries just goal by default", router.Swarm, "audit all", ".", "", []string{"-goal", "audit all"}},
-		{"swarm adds -preset when given", router.Swarm, "audit all", ".", "research", []string{"-goal", "audit all", "-preset", "research"}},
-		{"swarm ignores a blank -preset", router.Swarm, "audit all", ".", "   ", []string{"-goal", "audit all"}},
+		{"swarm forwards -dir too", router.Swarm, "audit all", "./other", "", []string{"-goal", "audit all", "-dir", "./other"}},
+		{"swarm adds -preset when given", router.Swarm, "audit all", ".", "research", []string{"-goal", "audit all", "-dir", ".", "-preset", "research"}},
+		{"swarm ignores a blank -preset", router.Swarm, "audit all", ".", "   ", []string{"-goal", "audit all", "-dir", "."}},
+		{"decompose carries goal+dir", router.Decompose, "a and b", "./repo", "", []string{"-goal", "a and b", "-dir", "./repo"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

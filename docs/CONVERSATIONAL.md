@@ -110,7 +110,7 @@ Decided under `s.mu`:
 1. **`Phase == Working`** — append the user turn to `History`, log `session_followup{mode,phase}`, `s.Inbox.Push(userMsg, classifyInterrupt(text))`. The running loop drains it. `Turn` returns immediately; the drive continues.
 2. **`Phase == Idle`** — `route := s.Router.Route(ctx, text, s.State)`; log `session_route`; launch the chosen driver in a goroutine bound to the drive context, `Inbox` wired in; `Phase = Working`. On completion the driver folds its terminal result into `s.State` (via `summarize`) and sets `Phase = Idle`.
 
-`classifyInterrupt` (queue-vs-steer) is a **local default-QUEUE rule, no LLM round-trip** — STEER only when the message is prefix-marked (`!` / `/steer`) or a Telegram Steer button. Immediacy is the whole point of steering. `Router.Route` (which machine, for a NEW drive) and `classifyInterrupt` (queue-vs-steer, for an IN-FLIGHT drive) never run on the same message.
+`classifyInterrupt` (queue-vs-steer) is a **local default-QUEUE rule, no LLM round-trip** — STEER only when the message is prefix-marked (`!` / `/steer`) (a Telegram inline Steer button is a planned enhancement, not yet built). Immediacy is the whole point of steering. `Router.Route` (which machine, for a NEW drive) and `classifyInterrupt` (queue-vs-steer, for an IN-FLIGHT drive) never run on the same message.
 
 ### 3.4 The Router
 
@@ -318,7 +318,7 @@ On accept, immediately emit `KindStatus`: `queued: "<text>" (delivered after thi
 
 ### 5.4 Serve channels (Telegram / Slack)
 
-Normal message = **QUEUE**; `!`/`/steer` prefix **or** a Telegram inline "🛑 Steer" button (reusing the existing inline-keyboard + authorized-callback plumbing) = **STEER**. The channel Emitter sink is a thin adapter over `Channel.Update`, coalesced.
+Normal message = **QUEUE**; an `!`/`/steer` **prefix** = **STEER** (the shipped trigger). The channel Emitter sink is a thin adapter over `Channel.Update`, coalesced. _(A Telegram inline "🛑 Steer" button — reusing the existing inline-keyboard + authorized-callback plumbing to arm steer on a thread's next message — is a planned enhancement, not yet built; the prefix trigger is the live path.)_
 
 **Per-message authorization in a dedicated intake goroutine (adv #5 — load-bearing):** today `Authorized.Receive` (authorized.go:43) is a blocking one-at-a-time loop consumed by `server.Serve`'s outer loop (server.go:35), which is busy inside `Run` for the whole current task and not calling `Receive` again — so it **cannot** deliver a mid-task message. The new design therefore:
 1. Runs a **separate per-thread intake goroutine** that reads the channel and calls `Authorized.Permit(req.Sender)` on **every** message (queue AND steer) before `Inbox.Push`. An unauthorized message is dropped + logged `unauthorized_steer`/`unauthorized_command` and never reaches the loop. The intake goroutine owns a `Permit`-based filter — it does **not** reuse `Authorized.Receive` (that would steal requests from the outer loop).

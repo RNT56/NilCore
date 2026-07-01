@@ -74,15 +74,19 @@ func firstText(blocks []model.Block) string {
 	return ""
 }
 
-// parse extracts the first JSON object from s and unmarshals it.
+// parse extracts the first complete JSON object from s and unmarshals it. It scans
+// to the first '{' and decodes ONE value with a json.Decoder, which stops at the end
+// of that object — so trailing prose after the object (including a code snippet that
+// itself contains a '}') no longer over-captures the span and fails the unmarshal,
+// the way a naive first-'{' / last-'}' slice did.
 func parse(s string) (ContextSummary, bool) {
 	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end <= start {
+	if start < 0 {
 		return ContextSummary{}, false
 	}
+	dec := json.NewDecoder(strings.NewReader(s[start:]))
 	var cs ContextSummary
-	if err := json.Unmarshal([]byte(s[start:end+1]), &cs); err != nil {
+	if err := dec.Decode(&cs); err != nil {
 		return ContextSummary{}, false
 	}
 	return cs, true

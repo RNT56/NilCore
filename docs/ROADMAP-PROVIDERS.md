@@ -76,7 +76,7 @@ A sandboxed, `guard.Wrap`'d **client-side web search/fetch** already ships
 | Prompt-caching accounting | OpenAI (auto), OpenRouter | ❌ `cached_tokens` dropped → over-charges | decode + meter at reduced rate | high |
 | Reasoning-token accounting | OpenAI/OpenRouter | ❌ folded into output count | `Usage.ReasoningTokens` | high |
 | OpenRouter provider routing | OpenRouter/compat | ❌ no `provider` object | typed `order/allow_fallbacks/require_parameters/data_collection/zdr/sort/max_price` | medium |
-| OpenRouter `models[]` fallback + served-model id | OpenRouter | ❌ missing; `response.model` not decoded | server-side single-call failover; meter prices the model that served | medium |
+| OpenRouter `models[]` fallback + served-model id | OpenRouter | 🟡 served-model id NOW decoded (`response.model` → `model.Response.ServedModel`, non-stream + stream); `models[]` fallback wiring still pending | server-side single-call failover; meter prices the model that served | medium |
 | Attribution headers (`HTTP-Referer`/`X-Title`) | OpenRouter | ❌ never sent | static config strings (never the key) | low |
 | `tool_choice` / `service_tier` / `parallel_tool_calls` | OpenAI/OpenRouter | ❌ always auto/default; read-side multi-tool works but untested | force/suppress tools, flex economics, disable parallel | low–med |
 | Typed error envelope + `Retry-After` | all | ✅ **WIRED** — both adapters build `model.APIError` from a non-2xx response (key-free); `resilience.go` fast-fails a terminal 4xx and honours a 429/5xx `Retry-After` (was: raw body tail, retry-everything) | `model.APIError` → terminal vs retryable, honour `Retry-After` | high |
@@ -136,13 +136,19 @@ Two paths, **mutually exclusive**, with exactly one `web_search` advertised to t
    `$NILCORE_SEARCH_KEY` never in command/log/prompt (**I3**), results `guard.Wrap`'d (**I7**), host
    auto-allowlisted. Selected automatically for any endpoint with no native search.
 
-**The I7 fence (P15-T08).** Provider-returned citation snippets are **attacker-influenceable web content** — a
-trusted TLS transport does not make the *content* trusted. They are **never** decoded into a
-`Block{Type:"text"}` (which would re-enter conversation history *and* the agent's own `emitReasoning` channel
-un-fenced). Instead the adapter `guard.Wrap`s the payload at the decode boundary into a distinct
-`Block{Type:"web_search_result"}`; `native.go` runs `guard.Suspicious`, emits `injection_flagged` (parity with
-the shell path), and appends it as **fenced DATA only** — never via `emitReasoning`; `textBlocks` already drops
-non-text blocks. This mirrors the client-fetch fence exactly.
+**The I7 fence (P15-T08, as shipped — drop-on-decode).** Provider-returned citation snippets are
+**attacker-influenceable web content** — a trusted TLS transport does not make the *content* trusted. They are
+**never** decoded into a `Block{Type:"text"}` (which would re-enter conversation history *and* the agent's own
+`emitReasoning` channel un-fenced). The shipped design holds I7 **by construction at the decode boundary**: the
+Anthropic adapter decodes the response *tolerantly* and keeps ONLY the blocks the loop consumes — `text` and
+`tool_use` — silently **dropping** the `server_tool_use` / `web_search_tool_result` server-tool blocks
+(`internal/provider/anthropic.go`, the `anthropicResponse` struct + `toModel()`; the streaming assembler does
+the same). The model's own synthesized text answer already folds in the search findings, so no raw provider
+result block ever re-enters the conversation as trusted text. OpenAI is identical in spirit — its web results
+arrive as the model's own text. (Earlier drafts of this file described a distinct `Block{Type:"web_search_result"}`
+that `native.go` would run `guard.Suspicious` over; that block type and handler were **not** shipped — the
+drop-on-decode fence replaced them. `native.go`'s only `guard.Suspicious` site fences sandboxed shell output.)
+The client-side fetch path keeps its own `guard.Wrap` fence as before.
 
 **The capability switch (P15-T09)** guarantees native and client are mutually exclusive, so the model can never
 emit a `web_search` tool_use with no handler (which would leave a tool_use without its required tool_result and
@@ -170,7 +176,7 @@ independently. Sequence the web-search waves after the `BuiltinTool` foundation 
 | **T05** | SOTA request fields + widened usage/model decode | `provider/openai.go` (+tests) | T01,T03,T04 | L |
 | **T06** | OpenRouter typed extras (routing, `models[]`, transforms, headers) | `provider/openrouter_extras.go` (+test) | T05 | M |
 | **T07** | Web-search `BuiltinTool` variant + adapter render *(needs BuiltinTool in main)* | `model/builtin.go`, `provider/openai_websearch.go` (+tests) | T05 | M |
-| **T08** | 🔒 I7 fence: `web_search_result` block + `guard.Wrap` + native.go handler | `model/model.go`, `provider/openai.go`, `backend/native.go` (+tests) | T05,T07 | L |
+| **T08** | 🔒 I7 fence: drop-on-decode of server-tool blocks (`server_tool_use` / `web_search_tool_result`) in the adapter; keep only `text` / `tool_use`. *(Shipped this way; the originally-planned distinct `web_search_result` block + native.go handler was not built — see §4.)* | `provider/anthropic.go` (+tests) | T05,T07 | L |
 | **T09** | Exactly-one-web-tool capability switch | `cmd/nilcore/webcap.go` (+test) | T07,T08 | M |
 | **T10** | Onboarding config + wizard for compat vendor | `internal/onboard/*` (+tests) | T02 | M |
 | **T11** | Metering/pricing for new ids + authoritative `usage.cost` | `meter/pricer.go` (+test) | T03 | M |

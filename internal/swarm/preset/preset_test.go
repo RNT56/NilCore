@@ -7,7 +7,7 @@ import (
 	"nilcore/internal/roster"
 )
 
-// wantPreset is the per-name expectation for the five shipped bundles (SWARM.md §8.1).
+// wantPreset is the per-name expectation for the shipped bundles (SWARM.md §8.1).
 // It pins every static fact a Resolve must reproduce so a future edit to the catalog that
 // silently changes a Kind/Role/shape is caught.
 type wantPreset struct {
@@ -35,6 +35,14 @@ var wantPresets = map[string]wantPreset{
 		fanIn:   FanInMerge,
 		shape:   ShapeDAG,
 		sharder: SharderPlan,
+	},
+	"fix": {
+		kind:    artifact.KindSpec,
+		role:    roster.RoleImplementer,
+		packs:   []string{"software", "code"},
+		fanIn:   FanInMerge,
+		shape:   ShapeFlat,
+		sharder: SharderFailure,
 	},
 	"audit": {
 		kind:    artifact.KindReport,
@@ -106,10 +114,10 @@ func TestResolveEachPreset(t *testing.T) {
 	}
 }
 
-// The catalog has exactly the five documented presets, no more, no fewer.
-func TestNamesAreTheFivePresets(t *testing.T) {
+// The catalog has exactly the documented presets, no more, no fewer.
+func TestNamesAreTheDocumentedPresets(t *testing.T) {
 	got := Names()
-	want := []string{"audit", "benchmark", "code", "research", "ui"} // Names() is sorted
+	want := []string{"audit", "benchmark", "code", "fix", "research", "ui"} // Names() is sorted
 	if !equalStrings(got, want) {
 		t.Errorf("Names() = %v, want %v", got, want)
 	}

@@ -178,8 +178,23 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	// shared meter (never a second counter). On a breach, roll back the irreversible
 	// slot we just took (CreditIrreversible) so a denied action consumes nothing, then
 	// deny and delegate. A zero ceiling charges nothing.
+	//
+	// Fail-CLOSED when a positive $ ceiling has no meter to enforce it: if a clause
+	// declares MaxDollarsDay>0 but no blast meter is wired (g.blast==nil, the default
+	// when -blast-radius is off), the ceiling cannot be charged and would silently admit
+	// the action with NO dollar accounting at all. Rather than honor a $ ceiling we can't
+	// enforce, deny and delegate to the human (reason dollar_ceiling_unmetered) so the
+	// operator's intended ceiling is never a no-op. (A zero/absent ceiling needs no meter
+	// and stays byte-identical.)
 	dollars := clause.MaxDollarsDay
-	if dollars > 0 && g.blast != nil {
+	if dollars > 0 {
+		if g.blast == nil {
+			g.blast.CreditIrreversible(1) // release the slot we took (no-op on a nil meter)
+			g.emitDeny("dollar_ceiling_unmetered", typ, scope, map[string]any{
+				"max_dollars_day": dollars,
+			})
+			return g.human.Approve(a.Describe())
+		}
 		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, dollars); cerr != nil {
 			g.blast.CreditIrreversible(1) // this action did not proceed — release its slot
 			g.emitDeny("over_ceiling", typ, scope, map[string]any{

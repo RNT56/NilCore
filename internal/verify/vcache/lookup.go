@@ -41,8 +41,15 @@ func (c *Cache) lookup(key string) bool {
 		// fault) is also fail-closed: we recompute rather than guess a hit.
 		return false
 	}
-	matched := scanForKey(f, key)
+	matched, corrupt := scanForKey(f, key)
 	f.Close()
+	if corrupt {
+		// An unparseable line aborts the scan (and eventlog.Verify would reject the same
+		// log), so the cache will permanently recompute. Emit ONE diagnostic so an operator
+		// notices a poisoned-cache condition rather than a silent perpetual miss. This
+		// changes no verdict — we still fall through to recompute below.
+		c.emitCorruptDiagnostic()
+	}
 	if !matched {
 		return false
 	}
@@ -61,8 +68,10 @@ func (c *Cache) lookup(key string) bool {
 // scanForKey reports whether the log stream carries an original cache PASS for key.
 // It reads read-only and tolerates nothing silently: an unparseable line aborts the
 // scan as a no-match (fail-closed) rather than skipping to a later, possibly
-// attacker-positioned, matching line.
-func scanForKey(f *os.File, key string) bool {
+// attacker-positioned, matching line. The second return value (corrupt) is true when
+// the scan aborted on an unparseable line, so the caller can emit a one-time
+// poisoned-cache diagnostic — it never changes the match result.
+func scanForKey(f *os.File, key string) (matched, corrupt bool) {
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -75,19 +84,41 @@ func scanForKey(f *os.File, key string) bool {
 			// A corrupt line means we cannot trust our read of the file; do not keep
 			// scanning for a "good" match past it. eventlog.Verify would reject this
 			// log anyway, but failing the scan here is the same fail-closed posture.
-			return false
+			// Surface the corruption so the caller can emit a one-time diagnostic.
+			return false, true
 		}
 		if r.Kind != kindCachePass {
 			continue
 		}
 		if recordMatches(r.Detail, key) {
-			return true
+			return true, false
 		}
 	}
 	// No matching line. A scan error (e.g. an over-long line) lands here too, which
 	// is the correct fail-closed posture: no confirmed match, and eventlog.Verify
 	// would reject the same log anyway.
-	return false
+	return false, false
+}
+
+// emitCorruptDiagnostic appends ONE kindCacheCorrupt event (guarded by corruptOnce) so
+// an operator notices a poisoned/permanent-recompute cache. It is fire-and-forget
+// through the nil-safe Append; a nil Log records nothing. The detail carries only
+// structural metadata (the verifier id / toolchain) — never raw log bytes (I7).
+func (c *Cache) emitCorruptDiagnostic() {
+	if c == nil || c.cfg.Log == nil {
+		return
+	}
+	c.corruptOnce.Do(func() {
+		c.cfg.Log.Append(eventlog.Event{
+			Task: c.cfg.Task,
+			Kind: kindCacheCorrupt,
+			Detail: map[string]any{
+				"reason":      "unparseable cache line; cache will recompute until the log is repaired",
+				"verifier_id": c.cfg.VerifierID,
+				"toolchain":   c.cfg.Toolchain,
+			},
+		})
+	})
 }
 
 // recordMatches reports whether a cache event's Detail is an ORIGINAL pass for key.

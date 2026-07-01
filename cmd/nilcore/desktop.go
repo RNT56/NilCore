@@ -188,7 +188,7 @@ func desktopMain(args []string) {
 			fatal(perr)
 		}
 		emitEgressProfile(log, prof, egressBackendLabel(*df.sandboxPref))
-		egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, prof.Tree.Allowed, nil)
+		egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, prof.Tree.Allowed, nil, proxyBindAddr(*df.sandboxPref, *df.runtime))
 		defer stopProxy()
 
 		box = selectSandbox(*df.sandboxPref, *df.runtime, *df.image, absDir)

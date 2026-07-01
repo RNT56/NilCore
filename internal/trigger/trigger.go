@@ -27,7 +27,10 @@ type Trigger struct {
 }
 
 // Handle acts on a signal. Reversible work auto-starts; irreversible work must
-// pass the gate first. It returns whether a task was started.
+// pass the gate first. It returns whether a task was started — which is true
+// only when a runnable Start was invoked, so a nil Start returns (false, nil)
+// and emits no trigger_start event (the bool and the audit trail never claim
+// work that did not begin).
 func (t *Trigger) Handle(ctx context.Context, sig Signal) (started bool, err error) {
 	if !t.Enabled {
 		return false, nil
@@ -42,10 +45,15 @@ func (t *Trigger) Handle(ctx context.Context, sig Signal) (started bool, err err
 		}
 	}
 
+	// Nothing runs without a runnable Start. Returning started=true with a nil
+	// Start would claim work began when none did and emit a misleading
+	// trigger_start audit event — so guard BEFORE the event so the bool and the
+	// audit trail both reflect reality.
+	if t.Start == nil {
+		return false, nil
+	}
+
 	t.Log.Append(eventlog.Event{Kind: "trigger_start",
 		Detail: map[string]any{"source": sig.Source, "goal": action}})
-	if t.Start == nil {
-		return true, nil
-	}
 	return true, t.Start(ctx, action)
 }

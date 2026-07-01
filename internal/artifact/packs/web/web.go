@@ -51,10 +51,12 @@ const (
 // flood the parse. The header probe is capped by curl's own --head (headers only).
 const maxBody = 1 << 20 // 1 MiB
 
-// defaultMaxAge is the freshness window web.not_stale applies when a claim does not
-// override it. It is deliberately generous — staleness here only DEMOTES a source
-// whose server timestamp is older than the window; it can never be the basis to
-// PASS a claim (I2).
+// defaultMaxAge is the single, fixed freshness window web.not_stale applies (there is
+// no per-claim override — a claim carries no max-age field). It is deliberately generous
+// — staleness here only DEMOTES a source whose server timestamp is older than the
+// window; it can never be the basis to PASS a claim (I2). (The artifact-level
+// evverify.ArtifactVerifier.MaxAge is a SEPARATE, demote-only gate and does not feed
+// this pack's internal window.)
 const defaultMaxAge = 30 * 24 * time.Hour
 
 // RegisterAll binds this pack's four verifier-ids into r. It is the one seam the

@@ -9,6 +9,11 @@
 //     (which symbols each failing/passing test executed), rank symbols by how
 //     selectively the failures touch them, using the Ochiai suspiciousness
 //     metric. This points a debugging agent at the likely culprit first.
+//     Localize is an AVAILABLE API, not yet wired: nothing in the loop collects
+//     per-test symbol coverage to feed it, so it ships dark. Wiring it means a
+//     post-failure step that gathers coverage (e.g. from a per-test run of the
+//     affected tests) and ranks suspects — until then ImpactSet/AffectedTests are
+//     the live half of this package.
 //
 // Reverse reachability is done in Go (BFS over g.Callers) rather than a CTE so
 // the package stays a thin, testable layer over the graph's stable query API.

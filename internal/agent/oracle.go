@@ -70,9 +70,12 @@ type TrustOracle interface {
 //     hot path of a runnable backend).
 //   - otherwise                ⇒ the oracle's RoutePlan, verbatim.
 //
-// The returned bool reports whether an oracle plan was actually applied (the
-// candidates differ from the static input by the oracle's choice), so the caller
-// can log "by": "trust" vs the configured order without re-deriving it.
+// The returned bool reports whether a non-nil oracle was CONSULTED — not whether
+// it changed anything. It is true for any non-nil oracle (even a degenerate one
+// that returns the candidates unchanged) and false only for a nil oracle, so the
+// caller can log "by": "trust" vs the configured order without re-deriving it. (It
+// is deliberately NOT "the candidates differ": a non-nil oracle that returns its
+// input verbatim still counts as consulted.)
 func PlanRoute(ctx context.Context, o TrustOracle, taskClass string, candidates []string) (RoutePlan, bool) {
 	if o == nil {
 		return RoutePlan{Candidates: candidates}, false

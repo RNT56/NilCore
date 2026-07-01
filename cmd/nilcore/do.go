@@ -26,20 +26,21 @@ import (
 func doMain(args []string) {
 	fs := flag.NewFlagSet("do", flag.ExitOnError)
 	goal := fs.String("goal", "", "the task, in plain language — the agent picks how to work")
-	dir := fs.String("dir", ".", "git repo to work in (used when routed to run or build)")
+	dir := fs.String("dir", ".", "git repo to work in (forwarded to whichever preset the goal routes to)")
 	swarmPreset := fs.String("preset", "", "swarm preset to use if routed to swarm (empty = swarm's own default)")
-	as := fs.String("as", "", "force a preset (run|build|swarm), bypassing the router")
+	as := fs.String("as", "", "force a preset (run|build|swarm|decompose), bypassing the router")
 	dryRun := fs.Bool("dry-run", false, "print the routing decision and exit without dispatching")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `nilcore do — one entry; the agent picks how to work.
 
 It routes the goal to the cheapest preset that fits and dispatches to that machine:
-  run    a single task (the default for ordinary work)
-  build  a whole-project / scaffold goal, driven over -dir
-  swarm  a breadth / parallel objective
+  run        a single task (the default for ordinary work)
+  build      a whole-project / scaffold goal, driven over -dir
+  swarm      a breadth / parallel objective
+  decompose  split into independent sub-goals, run each, integrate (force with -as decompose)
 
 Usage:
-  nilcore do -goal "<task>" [-dir ./repo] [-preset <swarm-preset>] [-as run|build|swarm] [-dry-run]
+  nilcore do -goal "<task>" [-dir ./repo] [-preset <swarm-preset>] [-as run|build|swarm|decompose] [-dry-run]
 
 For flags beyond these, call the chosen command directly (e.g. nilcore build -new ./svc).
 `)
@@ -88,7 +89,7 @@ func resolvePreset(as, goal string) (router.Preset, string, error) {
 	if strings.TrimSpace(as) != "" {
 		p := router.Preset(strings.ToLower(strings.TrimSpace(as)))
 		if !p.Valid() {
-			return "", "", fmt.Errorf("unknown preset %q for -as (want run|build|swarm)", as)
+			return "", "", fmt.Errorf("unknown preset %q for -as (want run|build|swarm|decompose)", as)
 		}
 		return p, "forced", nil
 	}
@@ -97,20 +98,17 @@ func resolvePreset(as, goal string) (router.Preset, string, error) {
 	return p, by, nil
 }
 
-// presetArgs synthesizes the argument slice for the chosen preset's entrypoint. run and
-// build operate on -dir; swarm takes -goal and an optional -preset (empty ⇒ swarm's own
-// default). It is pure so the synthesis is unit-tested. `do` intentionally forwards only
+// presetArgs synthesizes the argument slice for the chosen preset's entrypoint. Every
+// preset's entrypoint accepts -dir (swarm via registerCommon), so -dir is always
+// forwarded — a `do -dir ./repo` that routes to swarm must still run against ./repo,
+// never silently fall back to cwd. swarm additionally takes an optional -preset (empty
+// ⇒ swarm's own default). It is pure so the synthesis is unit-tested. `do` forwards only
 // the common flags — richer flags (greenfield -new, budgets, backends) belong to the
 // explicit command.
 func presetArgs(p router.Preset, goal, dir, swarmPreset string) []string {
-	switch p {
-	case router.Swarm:
-		a := []string{"-goal", goal}
-		if strings.TrimSpace(swarmPreset) != "" {
-			a = append(a, "-preset", swarmPreset)
-		}
-		return a
-	default: // run, build
-		return []string{"-goal", goal, "-dir", dir}
+	a := []string{"-goal", goal, "-dir", dir}
+	if p == router.Swarm && strings.TrimSpace(swarmPreset) != "" {
+		a = append(a, "-preset", swarmPreset)
 	}
+	return a
 }

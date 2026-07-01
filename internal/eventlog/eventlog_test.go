@@ -60,6 +60,58 @@ func TestResumeAfterTornFinalLine(t *testing.T) {
 	}
 }
 
+// TestVerifyRecoversAfterTornFinalLine proves that a torn/short write does NOT
+// permanently break Verify. Open heals the torn tail by TRUNCATING the partial
+// bytes (which never durably became a committed event), so after reopen+append the
+// whole chain — the good prefix plus the new record — verifies end to end. Before
+// the fix, the heal appended a newline that turned the partial into a standalone
+// unparseable line, making Verify fail forever ("unexpected end of JSON input").
+func TestVerifyRecoversAfterTornFinalLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn-verify.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Append(Event{Kind: "a"}) // seq 0
+	log.Append(Event{Kind: "b"}) // seq 1
+	_ = log.Close()
+
+	// Simulate a crash mid-write: append a partial JSON record with no trailing newline.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"kind":"c","seq":2,"prev":"x"`); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	// Open heals the torn tail; appending a fresh record continues the chain.
+	log2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log2.Append(Event{Kind: "c"}) // resumes at seq 2
+	_ = log2.Close()
+
+	// The torn partial line must be gone (truncated), not left as a corrupt line.
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), `"prev":"x"`) {
+		t.Fatalf("torn partial line was not truncated; still present:\n%s", data)
+	}
+
+	// And the whole chain must verify — the heal must not leave a permanent break.
+	if err := Verify(path); err != nil {
+		t.Fatalf("Verify must recover after a torn-write heal, got: %v", err)
+	}
+
+	// The resumed record is on its own line at seq 2, and there are exactly 3 events.
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want 3 events after heal+append, got %d:\n%s", len(lines), data)
+	}
+}
+
 func TestOnAppendHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hook.jsonl")
 	log, err := Open(path)
@@ -311,18 +363,22 @@ func TestRedactionInlineSecrets(t *testing.T) {
 		"flag":    "mysql -p s3cr3tpw -h db",
 		"longopt": "deploy --token=abc123def456 --env prod",
 		"auth":    "curl -H 'Authorization: Bearer zzzTOPSECRETzzz' https://x",
-		"keep":    "the password is set elsewhere",
+		// A credential buried as JSON string-in-a-string under a free-text field (e.g. a
+		// model-echoed blob): the closing quote after the key sits between key and ':'.
+		"jsonstr":   `model said {"api_key": "live_secretvaluehere"}`,
+		"jsonstrns": `{"api_key":"live_nospacesecret"}`,
+		"keep":      "the password is set elsewhere",
 	}
 	redact(d)
 	blob, _ := json.Marshal(d)
 	s := string(blob)
-	for _, leak := range []string{"hunter2longvalue", "s3cr3tpw", "abc123def456", "zzzTOPSECRETzzz"} {
+	for _, leak := range []string{"hunter2longvalue", "s3cr3tpw", "abc123def456", "zzzTOPSECRETzzz", "live_secretvaluehere", "live_nospacesecret"} {
 		if strings.Contains(s, leak) {
 			t.Errorf("inline secret leaked through redaction: %q present in %s", leak, s)
 		}
 	}
 	// The field names / structure must survive so the audit line stays meaningful.
-	for _, keep := range []string{"DB_PASSWORD", "--token", "Authorization"} {
+	for _, keep := range []string{"DB_PASSWORD", "--token", "Authorization", "api_key"} {
 		if !strings.Contains(s, keep) {
 			t.Errorf("redaction destroyed structure: %q missing from %s", keep, s)
 		}

@@ -51,11 +51,12 @@ required capability is supported, the **worker-dispatch plan** (one subtask per
 gate.
 
 `run` composes the `agent_task` nodes into a goal and dispatches them through the proven
-[`decompose`](ROADMAP-KERNEL-V2.md) preset: each becomes an independent verified
-single-task run whose branch is integrated into one re-verified tip (a child that
-conflicts or turns the tree red is dropped — I2). It fails closed if the flow is not
-consumable. Node dependencies are derived from the flow's `produces`→`requires`
-dataflow.
+[`decompose`](ROADMAP-KERNEL-V2.md) preset: each becomes a verified single-task run whose
+branch is integrated into one re-verified tip (a child that conflicts or turns the tree
+red is dropped — I2). It fails closed if the flow is not consumable. Node dependencies are
+derived from the flow's `produces`→`requires` dataflow; the subtasks are composed in
+**topological order**, so a task's dependencies precede it in the goal list and the
+integrator merges in that order (a dependency cycle is reported, not run).
 
 ## What it deliberately does NOT do
 
@@ -63,8 +64,12 @@ dataflow.
   gated external infra).
 - It does not interpret flow text as control instructions — a flow's goals are inert
   data executed through the normal verified path (I7).
-- It does not pre-execute `tool`/`verify`/`approval` nodes itself — those are honored by
-  the run machinery (the sandbox, the verifier, the human gate) during `run`.
+- It does not pre-execute `tool`/`verify`/`approval` nodes itself. `validate` lists the
+  `tool` nodes for visibility, but `run` does not invoke a flow-level tool executor: a
+  tool a flow needs is reached transitively as a model-emitted command inside an
+  `agent_task`, which then passes through the sandbox / verifier / human gate like any
+  other command. A flow whose work lives ENTIRELY in `tool` nodes (no `agent_task`) is
+  reported as having nothing for `run` to dispatch (fail-closed), not silently no-op'd.
 
 ## Status
 

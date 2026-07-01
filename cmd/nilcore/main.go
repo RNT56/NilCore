@@ -1214,7 +1214,7 @@ func serveMain(args []string) {
 	// auto-approval $/rate/irreversible axes (BR-T04/GAA-T07). Minted once here, threaded
 	// to the egress proxy + serveDeps. nil when -blast-radius is off ⇒ unfenced.
 	serveBlast := mintBlastBudget(*c.blastRadius, log)
-	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow, serveBlast)
+	egress, proxyAddr, stopProxy, _ := startEgressProxy(ctx, webAllow, serveBlast, proxyBindAddr(*c.sandboxPref, *c.runtime))
 	defer stopProxy()
 	if egress.Empty() {
 		fmt.Fprintln(os.Stderr, "nilcore serve: web access off (default-deny)")
@@ -1257,6 +1257,7 @@ func serveMain(args []string) {
 	// earned boundary inside the operator envelope + the shared blast fence — I3). The
 	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
 	// names. An empty backlog emits nothing, so this is inert until objectives exist.
+	autonomyOwnsWakes := false
 	if os.Getenv("NILCORE_AUTONOMY") != "" && serveStore != nil {
 		// Reuse serve's already-opened persistence (mem/ckpt + serveStore) — the daemon
 		// shares the one *sql.DB for both its orchestrator and the objective backlog, so
@@ -1264,9 +1265,12 @@ func serveMain(args []string) {
 		autoOrch := buildRunOrchestratorWith(c, b, log, absDir, d.blast, mem, ckpt)
 		makeHeadlessBackground(autoOrch, b.cfg, *c.logPath, log, d.blast)
 		// The daemon drains the unified queue: standing objectives + dropped file signals
-		// (-autonomy-signals) + due durable wakes (wakeReg, which serve otherwise never
-		// fires) — all through the verified, headless-gated orchestrator.
+		// (-autonomy-signals) + due durable wakes — all through the verified,
+		// headless-gated orchestrator. The server ALSO has its own runWaker over the same
+		// registry, so under autonomy we suppress it (below) and let the gated daemon own
+		// wakes: a wake must not bypass the headless gate via the server's direct re-Turn.
 		go runAutonomyDaemon(ctx, autoOrch, log, serveStore, gate.idle, wakeReg, *autonomySignals)
+		autonomyOwnsWakes = wakeReg != nil
 	}
 
 	// Durable resume: re-drive any native task a prior process left running or
@@ -1285,7 +1289,7 @@ func serveMain(args []string) {
 		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"))
 	}
 
-	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot, Wake: wakeReg}
+	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot, Wake: wakeReg, SuppressWaker: autonomyOwnsWakes}
 	fmt.Fprintf(os.Stderr, "nilcore serve: listening on the %s channel (Ctrl-C to stop)\n", chName)
 	serveErr := srv.Serve(ctx)
 
@@ -1676,7 +1680,14 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if d.webEnabled() {
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
-			if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+			// web_search — EXACTLY ONE path (Phase 15 capability switch), now at PARITY
+			// with chat: Path A (provider-native server-side search) when
+			// NILCORE_WEB_SEARCH_NATIVE is opted in and the provider supports it, ELSE
+			// Path B (the sandboxed, egress-confined client tool). Never both — a second
+			// web_search would leave a tool_use without its tool_result.
+			if nativeWS := selectNativeWebSearch(modelSpec(os.Getenv("NILCORE_MODEL"), d.boot.cfg.Executor)); nativeWS != nil {
+				reg.Register(nativeWS)
+			} else if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
 			// browser_view (P9-T02): opt-in via NILCORE_BROWSER, same as chat.
@@ -1729,16 +1740,19 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 // serveSuperviseRun / serveProjectRun assemble the multi-agent stack for one serve
 // drive via buildStack, pinning the thread's shared conversation ledger (§6) and the
 // channel approver (the single human promote routes back over chat). Like the chat
-// path, the planner's own Inbox/Out wiring is a documented follow-on; the supervised/
-// project drive itself runs bounded, verifier-gated, and charged against the per-
-// conversation wall, and its outcome folds back exactly like a native drive.
+// path, the planner's steer/queue Inbox and live Out are wired to this thread's seams,
+// so a supervised serve drive streams its intent over the channel and folds queued
+// turns in at round boundaries; the drive itself runs bounded, verifier-gated, and
+// charged against the per-conversation wall, and its outcome folds back exactly like a
+// native drive. (Seeding the planner with prior HISTORY/SUMMARY stays a deeper
+// follow-on — super.Run takes only a goal — so those params are not yet consumed.)
 func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunSuperviseFunc {
 	taskID := superviseTaskID(threadID)
 	// The session gate (last param) is intentionally unused here: serve already passes
 	// its CHANNEL approver (parks AwaitingGate and routes the prompt over the transport),
 	// which is the proven path — there is no stdin to race, so AU-T05b's REPL fix does not
 	// apply. Keeping serve on its channel approver leaves the serve gate byte-identical.
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, _ emit.Emitter, ask session.AskerHandle, _ policy.Approver) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ []model.Message, in session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle, _ policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -1747,6 +1761,9 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 		// supervisor's ask_user to this thread's ask box (headless resume builds no
 		// Session, so ask stays nil there).
 		stack.sup.AskUser = superAskFunc(ask)
+		// Steer/queue + live stream parity with the native serve loop.
+		stack.sup.Inbox = in
+		stack.sup.Out = outEmitter
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
@@ -1762,12 +1779,13 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 
 func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunProjectFunc {
 	taskID := superviseTaskID(threadID)
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, _ emit.Emitter, _ policy.Approver) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter, _ policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
-		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
+		stack.sup.Out = outEmitter // stream the project planner's intent back over the channel
+		defer stack.cleanup()      // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -1823,6 +1841,24 @@ func serveBuildDeps(d serveDeps, ledger *budget.Ledger, approver policy.Approver
 // chat/serve conversation indefinitely.
 const modelCallTimeout = 10 * time.Minute
 
+// tuningFromConfig maps the operator's onboard.Config provider knobs onto a
+// provider.Tuning so resolved providers honor them (reasoning_effort, service_tier,
+// prompt_cache_key, parallel_tool_calls, the OpenAI max-tokens field, and the
+// OpenRouter attribution headers). A zero Config yields a zero Tuning, which the
+// resolver treats as a byte-identical pass-through — so the default path is
+// unchanged. The API key is NEVER carried here (I3): only static routing strings.
+func tuningFromConfig(cfg onboard.Config) provider.Tuning {
+	return provider.Tuning{
+		ReasoningEffort:   cfg.ReasoningEffort,
+		MaxTokensField:    cfg.MaxTokensField,
+		ServiceTier:       cfg.Routing.ServiceTier,
+		PromptCacheKey:    cfg.Routing.PromptCacheKey,
+		ParallelToolCalls: cfg.Routing.ParallelToolCalls,
+		OpenRouterReferer: cfg.OpenRouterReferer,
+		OpenRouterTitle:   cfg.OpenRouterTitle,
+	}
+}
+
 // the backend name + required secret up front. The model spec is NILCORE_MODEL,
 // else the configured executor, else the built-in default; the key resolves
 // environment-first then SecretStore via b.cred. A missing key is reported with
@@ -1831,7 +1867,7 @@ func resolveProvider(backendName string, b boot) (model.Provider, error) {
 	switch backendName {
 	case "native":
 		spec := modelSpec(os.Getenv("NILCORE_MODEL"), b.cfg.Executor)
-		p, err := provider.ResolveWith(spec, b.cred)
+		p, err := provider.ResolveWithTuning(spec, b.cred, tuningFromConfig(b.cfg))
 		if err != nil {
 			if env := providerEnv(vendorOf(spec)); env != "" {
 				return nil, fmt.Errorf("%w; run `nilcore init` to store the key, or set %s in the environment", err, env)
@@ -1891,7 +1927,7 @@ func guiModelSpec(flag, env string) string {
 // provider, mirroring resolveProvider's native path but without the NILCORE_MODEL /
 // executor-config lookup.
 func resolveNativeSpec(spec string, b boot) (model.Provider, error) {
-	p, err := provider.ResolveWith(spec, b.cred)
+	p, err := provider.ResolveWithTuning(spec, b.cred, tuningFromConfig(b.cfg))
 	if err != nil {
 		if env := providerEnv(vendorOf(spec)); env != "" {
 			return nil, fmt.Errorf("%w; run `nilcore init` to store the key, or set %s in the environment", err, env)
@@ -1935,7 +1971,7 @@ func resolveAdvisor(backendName string, b boot, c commonFlags) advisorCfg {
 	if spec == "" {
 		return adv
 	}
-	p, err := provider.ResolveWith(spec, b.cred)
+	p, err := provider.ResolveWithTuning(spec, b.cred, tuningFromConfig(b.cfg))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "advisor disabled: %v\n", err)
 		return adv
@@ -2025,6 +2061,38 @@ func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
 		c.Blast = b
 	}
 	return box
+}
+
+// proxyBindAddr picks the egress-proxy listen address for the sandbox backend that
+// selectSandbox will resolve for (prefer, runtime). Only a BRIDGED CONTAINER consumes
+// the proxy — it reaches the host-side listener across the runtime bridge via the
+// host-gateway alias, so the listener must bind all interfaces (0.0.0.0). Every other
+// backend leaves the proxy UNUSED (the namespace sandbox runs in an empty net
+// namespace; host-local callers use loopback), so it binds 127.0.0.1 and the guarded
+// proxy is never needlessly exposed to the LAN. Resolution mirrors selectSandbox
+// exactly (prefer, then NILCORE_SANDBOX, then auto→namespace-if-available-else-container)
+// so the bind can never disagree with the box actually chosen.
+func proxyBindAddr(prefer, runtime string) string {
+	if prefer == "" || prefer == string(sandbox.Auto) {
+		if env := os.Getenv("NILCORE_SANDBOX"); env != "" {
+			prefer = env
+		}
+	}
+	// An explicit container always needs the proxy reachable across the runtime bridge.
+	if sandbox.Backend(prefer) == sandbox.ContainerBackend {
+		return "0.0.0.0:0"
+	}
+	// namespace (explicit) OR auto/empty: the namespace backend never uses the proxy and
+	// needs only loopback — BUT selectSandbox DEGRADES an unsatisfiable request (an
+	// explicit `-sandbox namespace`, or auto, on a host where the namespace backend is
+	// unavailable, e.g. macOS) to a *sandbox.Container, which DOES need the proxy across
+	// the bridge. So bind loopback only when the namespace backend is actually available;
+	// otherwise fall through to the container default — mirroring selectSandbox's fallback
+	// so the bind can never disagree with the box actually chosen.
+	if ns, _, _ := sandbox.Available(runtime); ns {
+		return "127.0.0.1:0"
+	}
+	return "0.0.0.0:0"
 }
 
 // envFactory builds the per-worktree backend+verifier factory. The optional blast
@@ -2215,11 +2283,27 @@ func setupPersistence(log *eventlog.Log, logPath string) (*memory.Memory, *agent
 // the env unset no hook is installed and Append is byte-identical. The projection is
 // also (re)derivable on demand via `nilcore experience --rebuild`.
 func wireExperience(log *eventlog.Log, s *store.Store) {
-	if os.Getenv("NILCORE_EXPERIENCE") == "" {
+	if !envOptIn("NILCORE_EXPERIENCE") {
 		return
 	}
 	proj := experience.NewProjector(s)
 	log.OnAppend(func(e eventlog.Event) { _ = proj.Fold(context.Background(), e) })
+}
+
+// envOptIn reports whether a boolean opt-in environment variable is AFFIRMATIVELY
+// enabled. Unset, empty, and the explicit negatives ("0"/"false"/"no"/"off") read as
+// OFF; any other non-empty value is ON. This mirrors the killswitch/self-improve
+// convention and avoids the footgun where NILCORE_EXPERIENCE=0 (meaning "off")
+// silently enabled the projection because the old gate only checked != "". Note: this
+// is for BOOLEAN flags only — value-carrying vars (e.g. NILCORE_LOG_HMAC_KEY, whose
+// presence-or-absence IS the semantics) keep their own non-empty check.
+func envOptIn(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "", "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 // memWriteBack persists a durable record after a verified task (P4-T05).

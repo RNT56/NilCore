@@ -45,29 +45,48 @@ func captureScreencapture(ctx context.Context) (image.Image, error) {
 	return png.Decode(f)
 }
 
-// backingScale resolves the display's Retina backing-scale factor (pixel/point):
-// NILCORE_MAC_SCALE env first, then a best-effort osascript probe (desktop point
-// width vs the captured pixel width), then 2.0 (the Apple-Silicon Retina default).
-// It is a var so the live osascript path can be faked in tests.
-var backingScale = func(ctx context.Context, pixelW int) float64 {
+// fallbackBackingScale is used ONLY when neither NILCORE_MAC_SCALE nor the osascript
+// point-width probe yields a scale. It is 1.0 (NOT the old Apple-Silicon 2.0 guess):
+// a 1× external display is the case the old default silently halved every click on,
+// and unity scaling maps a 1× display correctly while a true Retina display merely
+// needs the (loudly-warned) NILCORE_MAC_SCALE override — a wrong-by-2× click is far
+// worse than a recoverable scale the operator is told to set deterministically.
+const fallbackBackingScale = 1.0
+
+// resolveBackingScale resolves the display's backing-scale (pixel/point) and reports
+// HOW it was determined, so the caller can warn when it fell back. Order: the explicit
+// NILCORE_MAC_SCALE override, then a per-display pixel-width-vs-CGDisplay-point-width
+// derivation (captured pixel width ÷ osascript desktop point width), then the
+// conservative unity fallback. Pure given pixelW + the osascript seam; unit-tested.
+func resolveBackingScale(ctx context.Context, pixelW int) (scale float64, determined bool) {
 	if v := strings.TrimSpace(os.Getenv("NILCORE_MAC_SCALE")); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 1 && f <= 4 {
-			return f
+			return f, true
 		}
 	}
 	if pointW := osascriptDesktopWidth(ctx); pointW > 0 && pixelW > 0 {
 		s := float64(pixelW) / float64(pointW)
 		if s >= 1 && s <= 4 {
-			return s
+			return s, true
 		}
 	}
-	return 2.0
+	return fallbackBackingScale, false
+}
+
+// backingScale resolves the display's backing-scale factor (pixel/point). It is a var
+// so the live osascript path can be faked in tests; callers that need to know whether
+// the value was actually determined use resolveBackingScale directly.
+var backingScale = func(ctx context.Context, pixelW int) float64 {
+	s, _ := resolveBackingScale(ctx, pixelW)
+	return s
 }
 
 // osascriptDesktopWidth reads the desktop point width via AppleScript (no CGO). It
 // may require Automation permission; on failure it returns 0 and the caller falls
-// back. The output looks like "0, 0, 1512, 982" → the 3rd value is the width.
-func osascriptDesktopWidth(ctx context.Context) int {
+// back. It is a var so the live osascript path can be faked in tests (the derivation
+// arithmetic in resolveBackingScale is then exercised hermetically).
+var osascriptDesktopWidth = func(ctx context.Context) int {
+	// The output looks like "0, 0, 1512, 982" → the 3rd value is the point width.
 	out, err := exec.CommandContext(ctx, "osascript", "-e", "tell application \"Finder\" to get bounds of window of desktop").Output()
 	if err != nil {
 		return 0

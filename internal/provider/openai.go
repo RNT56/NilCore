@@ -26,9 +26,12 @@ import (
 // appends only "/chat/completions". The auth descriptor names the header and its
 // value prefix (default "authorization" / "Bearer "; Azure uses "api-key" with no
 // prefix; an empty key emits no auth header at all, for keyless local servers).
-// maxTokensField records the JSON field name for the token cap so a later task can
-// switch it per backend — it is stored but not yet read by the marshaller, so the
-// request body stays byte-identical to today.
+// maxTokensField records the JSON field name for the token cap. It IS read by the
+// custom MarshalJSON in openai_maxtokens.go, which emits the cap under exactly this
+// key (defaulting to "max_tokens"). NewOpenAICompatible auto-selects
+// "max_completion_tokens" for reasoning-model ids (gpt-5.x / o-series); an explicit
+// WithMaxTokensField always wins. The body stays byte-identical to today only in the
+// default case ("max_tokens").
 type OpenAI struct {
 	key            string
 	model          string
@@ -36,7 +39,11 @@ type OpenAI struct {
 	authHeader     string
 	authPrefix     string
 	maxTokensField string
-	http           *http.Client
+	// maxTokensFieldSet records that WithMaxTokensField ran, so an explicit choice
+	// (even one equal to the "max_tokens" default) suppresses the reasoning-model
+	// auto-detection in NewOpenAICompatible. An explicit option always wins.
+	maxTokensFieldSet bool
+	http              *http.Client
 
 	// SOTA Chat-Completions request fields (P15-T05). All opt-in: a zero value
 	// for every one of these leaves the corresponding oaiRequest field at its
@@ -88,7 +95,10 @@ func WithAuth(headerName, valuePrefix string) Option {
 // "max_tokens"). The value is stored for a later task; the body marshals
 // unchanged for now.
 func WithMaxTokensField(field string) Option {
-	return func(o *OpenAI) { o.maxTokensField = field }
+	return func(o *OpenAI) {
+		o.maxTokensField = field
+		o.maxTokensFieldSet = true
+	}
 }
 
 // WithKey sets the API key. The key is held only to set a per-request header
@@ -160,6 +170,18 @@ func NewOpenAICompatible(model string, opts ...Option) *OpenAI {
 	for _, opt := range opts {
 		opt(o)
 	}
+	// Auto-select the token-cap key for OpenAI reasoning models. gpt-5.x / o-series
+	// REJECT a body carrying "max_tokens" (they require "max_completion_tokens", and
+	// reject a body carrying both), so a request to one of these ids with the default
+	// "max_tokens" key fails with a terminal 400 (model/apierror.go classifies a 400
+	// as non-retryable). We detect the id by prefix and flip the field — but ONLY when
+	// the operator did not already set it via WithMaxTokensField (maxTokensFieldSet):
+	// an explicit option always wins, even one that names the "max_tokens" default. A
+	// non-reasoning id leaves the default "max_tokens" untouched, so the body stays
+	// byte-identical to today.
+	if !o.maxTokensFieldSet && isReasoningModelID(o.model) {
+		o.maxTokensField = "max_completion_tokens"
+	}
 	// Infer the OpenRouter base from the configured URL host so the compat path
 	// (NILCORE_COMPAT_BASE_URL pointed at OpenRouter, P15-T02) also gates the typed
 	// extras + attribution headers. NewOpenRouter sets isOpenRouter explicitly; this
@@ -185,6 +207,35 @@ func hostIsOpenRouter(baseURL string) bool {
 	// like https://OpenRouter.ai/... still gates the extras.
 	host := strings.ToLower(u.Hostname())
 	return host == "openrouter.ai" || strings.HasSuffix(host, ".openrouter.ai")
+}
+
+// isReasoningModelID reports whether modelID names an OpenAI reasoning model that
+// requires "max_completion_tokens" instead of "max_tokens". OpenAI's reasoning
+// families are gpt-5.x and the o-series (o1/o3/o4); the match is on the bare model
+// name, after trimming any "provider/" namespace an OpenRouter id carries (e.g.
+// "openai/o3-mini"). The check is a documented prefix set, not a substring scan, so
+// a non-reasoning id like "gpt-4o" (which contains "o4"-like substrings only by
+// coincidence) is never mis-classified.
+func isReasoningModelID(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	// OpenRouter ids carry a "provider/" prefix; the cap-key rule keys off the bare
+	// model name, so compare the last path segment.
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	// gpt-5, gpt-5.1, gpt-5-mini, … all require max_completion_tokens.
+	if strings.HasPrefix(id, "gpt-5") {
+		return true
+	}
+	// o-series: o1 / o3 / o4 (and their dated/-mini variants), but NOT gpt-4o (which
+	// starts with "gpt-"). Require the id to START with the bare "oN" token so a
+	// chat model that merely contains an "o3" substring is not swept in.
+	for _, p := range []string{"o1", "o3", "o4"} {
+		if id == p || strings.HasPrefix(id, p+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 // NewOpenAI returns an OpenAI Chat Completions provider.
@@ -324,6 +375,11 @@ type oaiRequest struct {
 }
 
 type oaiResponse struct {
+	// Model is the id the provider reports as having served the call. OpenRouter
+	// echoes it here and it can differ from the requested id when a models[] fallback
+	// chain routes elsewhere; OpenAI echoes the (possibly dated) concrete id. Absent ⇒
+	// empty, so a provider that omits it leaves model.Response.ServedModel empty.
+	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
 			Content   string        `json:"content"`
@@ -600,6 +656,9 @@ func toOpenAITools(tools []model.Tool) []oaiTool {
 // an empty choices array. Only the fields the assembler reads are decoded; the
 // frame is parsed as data, never executed (invariant I7).
 type oaiStreamChunk struct {
+	// Model is the served-model id, echoed on each frame; the assembler keeps the
+	// last non-empty value. Absent ⇒ empty, leaving model.Response.ServedModel empty.
+	Model   string `json:"model"`
 	Choices []struct {
 		Delta struct {
 			Content   string             `json:"content"`
@@ -669,12 +728,13 @@ func (o *OpenAI) Stream(ctx context.Context, system string, msgs []model.Message
 // split out from Stream so it is unit-testable against any io.Reader.
 func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(model.Chunk)) (model.Response, error) {
 	var (
-		out       model.Response
-		textBuf   []byte
-		hasText   bool
-		finish    string
-		toolCalls = map[int]*oaiStreamToolCall{}
-		toolOrder []int // tool-call indices in first-seen order, for stable assembly
+		out         model.Response
+		textBuf     []byte
+		hasText     bool
+		finish      string
+		servedModel string // last non-empty top-level "model" seen across frames
+		toolCalls   = map[int]*oaiStreamToolCall{}
+		toolOrder   []int // tool-call indices in first-seen order, for stable assembly
 	)
 
 	assemble := func() model.Response {
@@ -693,6 +753,7 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 		}
 		r.StopReason = stopReasonFromFinish(finish)
 		r.Usage = out.Usage
+		r.ServedModel = servedModel
 		return r
 	}
 
@@ -728,6 +789,11 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 			return assemble(), fmt.Errorf("decode stream chunk: %w", err)
 		}
 
+		// The served-model id rides every frame (including the trailing usage-only
+		// frame); keep the last non-empty one for the assembled Response.
+		if chunk.Model != "" {
+			servedModel = chunk.Model
+		}
 		// The trailing usage-only frame carries no choices.
 		if chunk.Usage != nil {
 			out.Usage = chunk.Usage.toModelUsage()
@@ -782,6 +848,9 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 
 func fromOpenAI(r oaiResponse) model.Response {
 	var out model.Response
+	// Surface the served-model id whenever the provider reports one, even on an
+	// otherwise empty choices array, so a meter can price the model that served.
+	out.ServedModel = r.Model
 	if len(r.Choices) == 0 {
 		return out
 	}

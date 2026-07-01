@@ -4,12 +4,10 @@
 package agenticflows
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sort"
 
-	"nilcore/internal/sandbox"
 	"nilcore/internal/spawn"
 	"nilcore/internal/summarize"
 )
@@ -47,16 +45,16 @@ type Edge struct {
 }
 
 // ToolSandboxPlan is the trusted host-side decision to execute a tool node
-// through NilCore's sandbox boundary.
+// through NilCore's sandbox boundary. It is INSPECTION metadata: `flows validate`
+// surfaces it so an operator can see which tool nodes would need the sandbox. The
+// flow's tool nodes are not pre-executed by the flows command — a tool a flow
+// invokes is reached transitively as a model-emitted command inside an agent_task,
+// which hits the sandbox (I4) like any other command.
 type ToolSandboxPlan struct {
 	NodeID          string
 	Tool            string
 	RequiresSandbox bool
 }
-
-// ToolCommandFunc maps a trusted sandbox plan to the bounded command NilCore
-// should execute inside its sandbox boundary.
-type ToolCommandFunc func(ToolSandboxPlan) (string, error)
 
 // UnsupportedCapabilities returns required flow capabilities that NilCore has
 // not explicitly advertised for this adapter invocation.
@@ -81,7 +79,12 @@ func SupportsNilCore(flow Flow) bool {
 	return false
 }
 
-// AgentTaskSubtasks converts agent_task nodes into NilCore spawn subtasks.
+// AgentTaskSubtasks converts agent_task nodes into NilCore spawn subtasks, returned
+// in TOPOLOGICAL order (a dependency always precedes the tasks that require it). The
+// edges are the derived produces→requires dataflow, so a downstream consumer (the
+// `flows run` path, which flattens the subtasks into an ordered goal list) honors the
+// dependency sequence rather than running children in arbitrary node-declaration order.
+// A dependency cycle is reported rather than silently dropped.
 func AgentTaskSubtasks(flow Flow, base summarize.ContextSummary) ([]spawn.Subtask, error) {
 	if !SupportsNilCore(flow) {
 		return nil, fmt.Errorf("agentic flow %s@%s does not list nilcore as a supported core", flow.ID, flow.Version)
@@ -130,7 +133,54 @@ func AgentTaskSubtasks(flow Flow, base summarize.ContextSummary) ([]spawn.Subtas
 	if len(subtasks) == 0 {
 		return nil, errors.New("agentic flow has no agent_task nodes to dispatch")
 	}
-	return subtasks, nil
+	return topoSortSubtasks(subtasks)
+}
+
+// topoSortSubtasks returns subs in dependency order: every subtask appears after the
+// subtasks it DependsOn. Ties (independent tasks) keep their original relative order,
+// so a flow with no inter-task edges is returned byte-identically. A cycle (no
+// dependency-free task remains) is an error — the flow's dataflow is contradictory.
+func topoSortSubtasks(subs []spawn.Subtask) ([]spawn.Subtask, error) {
+	byID := make(map[string]spawn.Subtask, len(subs))
+	indeg := make(map[string]int, len(subs))
+	order := make([]string, 0, len(subs)) // stable original order
+	for _, s := range subs {
+		byID[s.ID] = s
+		order = append(order, s.ID)
+	}
+	// Count only deps that reference a real agent_task subtask (a dangling DependsOn
+	// is ignored, never a phantom blocker).
+	dependents := make(map[string][]string, len(subs))
+	for _, s := range subs {
+		for _, d := range s.DependsOn {
+			if _, ok := byID[d]; !ok {
+				continue
+			}
+			indeg[s.ID]++
+			dependents[d] = append(dependents[d], s.ID)
+		}
+	}
+
+	out := make([]spawn.Subtask, 0, len(subs))
+	emitted := make(map[string]bool, len(subs))
+	for len(out) < len(subs) {
+		progressed := false
+		for _, id := range order { // stable: scan in original order each round
+			if emitted[id] || indeg[id] != 0 {
+				continue
+			}
+			out = append(out, byID[id])
+			emitted[id] = true
+			progressed = true
+			for _, dep := range dependents[id] {
+				indeg[dep]--
+			}
+		}
+		if !progressed {
+			return nil, errors.New("agentic flow has a dependency cycle among agent_task nodes")
+		}
+	}
+	return out, nil
 }
 
 // ToolSandboxPlans converts tool nodes into sandbox-required execution plans.
@@ -153,39 +203,4 @@ func ToolSandboxPlans(flow Flow) ([]ToolSandboxPlan, error) {
 		return nil, errors.New("agentic flow has no tool nodes to sandbox")
 	}
 	return plans, nil
-}
-
-// RunToolSandboxPlans executes every tool plan through NilCore's sandbox
-// boundary. It refuses host-side shortcuts by requiring each plan to be marked
-// sandboxed and by accepting only a sandbox.Sandbox executor.
-func RunToolSandboxPlans(ctx context.Context, box sandbox.Sandbox, plans []ToolSandboxPlan, commandFor ToolCommandFunc) ([]sandbox.Result, error) {
-	if box == nil {
-		return nil, errors.New("agentic flow tool execution requires a sandbox")
-	}
-	if commandFor == nil {
-		return nil, errors.New("agentic flow tool execution requires a command mapper")
-	}
-	if len(plans) == 0 {
-		return nil, errors.New("agentic flow has no tool plans to run")
-	}
-
-	results := make([]sandbox.Result, 0, len(plans))
-	for _, plan := range plans {
-		if !plan.RequiresSandbox {
-			return nil, fmt.Errorf("tool node %s is not marked for sandbox execution", plan.NodeID)
-		}
-		cmd, err := commandFor(plan)
-		if err != nil {
-			return nil, fmt.Errorf("tool node %s command: %w", plan.NodeID, err)
-		}
-		if cmd == "" {
-			return nil, fmt.Errorf("tool node %s command is empty", plan.NodeID)
-		}
-		result, err := box.Exec(ctx, cmd)
-		if err != nil {
-			return nil, fmt.Errorf("tool node %s sandbox exec: %w", plan.NodeID, err)
-		}
-		results = append(results, result)
-	}
-	return results, nil
 }

@@ -476,13 +476,22 @@ func (s *Session) drive(ctx context.Context, drv Driver, in DriveInput) {
 	// drive — the "tell me when it's done / stopped / errored" push. A plain chat
 	// reply is streamed live and needs no terminal push, so it is skipped. nil Notify
 	// ⇒ no-op (attached terminal/chat). The wired closure owns its own ctx/timeout.
+	//
+	// Fired on its own goroutine so a slow channel push (a wedged Telegram/Slack send,
+	// bounded only by the closure's own timeout) does NOT delay drive()'s deferred
+	// Done(): Cancel/Wait/drainShutdown block on s.drives, and conversation teardown
+	// must not be coupled to an external HTTP push the design intended to be fully
+	// non-blocking. The terminal State fold is already committed above, so the snapshot
+	// the push reads is stable.
 	if s.Notify != nil && in.Route != RouteChat {
-		s.Notify(Notification{
+		notify := s.Notify
+		n := Notification{
 			Verified: err == nil && res.Verified,
 			Failed:   err != nil,
 			Summary:  res.Summary.String(),
 			Branch:   res.Branch,
-		})
+		}
+		go notify(n)
 	}
 }
 

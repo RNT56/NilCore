@@ -13,9 +13,9 @@
 // hermetically against an in-memory fake.
 //
 // OPERATOR-ONLY BY CONSTRUCTION (review I7-adjacent fix, XC-T06): this package exposes
-// no model-facing surface. Its CRUD (Put/Get/List/Disable, plus MarkRun) is wired to an
-// operator-only host verb (`nilcore objective`, AUTO-T07) — NEVER registered as a
-// sandboxed model tool. A model must not be able to enqueue, edit, or re-prioritize its
+// no model-facing surface. Its CRUD (Put/Get/List/Disable, plus MarkAttempt/MarkSuccess)
+// is wired to an operator-only host verb (`nilcore objective`, AUTO-T07) — NEVER
+// registered as a sandboxed model tool. A model must not be able to enqueue, edit, or re-prioritize its
 // own standing objectives; it may only *do the work* one selected objective names, and
 // every irreversible step still passes the gate. Objective.Goal is operator-authored
 // text; this package treats every field as inert data (it never interprets Goal as
@@ -31,36 +31,75 @@ import (
 
 // Objective is one standing operator intent the agent self-services when idle.
 //
-//   - ID         stable operator-chosen key (used for Get/MarkRun/Disable).
-//   - Goal       operator-authored intent text handed to the orchestrator as the
+//   - ID          stable operator-chosen key (used for Get/MarkAttempt/MarkSuccess/Disable).
+//   - Goal        operator-authored intent text handed to the orchestrator as the
 //     drive goal. Inert data here — never interpreted as instructions (I7).
-//   - Priority   higher runs first among due, enabled objectives. Ties break by ID
+//   - Priority    higher runs first among due, enabled objectives. Ties break by ID
 //     (deterministic, so selection never depends on map/slice order).
-//   - Enabled    disabled objectives are inert: never selected, but retained (an
+//   - Enabled     disabled objectives are inert: never selected, but retained (an
 //     operator can re-enable). A disabled objective is a paused intent, not a delete.
-//   - MinPeriod  the minimum spacing between runs of THIS objective. An objective is
-//     "due" only once MinPeriod has elapsed since LastRun (zero LastRun ⇒ never run ⇒
-//     always due). A zero MinPeriod means "always due" once enabled.
-//   - LastRun    when the objective last began a verified run (advanced by MarkRun).
+//   - MinPeriod   the minimum spacing between SUCCESSFUL runs of THIS objective. Once a
+//     run verifies, the objective is "due" again only after MinPeriod elapses since
+//     LastSuccess. A zero MinPeriod means "always due" once enabled.
+//   - RetryPeriod the (typically shorter) spacing applied when the LAST attempt did NOT
+//     verify — so a standing objective like "keep CI green" is re-serviced sooner after
+//     a failed/gate-denied run instead of waiting a full MinPeriod with no progress. A
+//     zero RetryPeriod falls back to MinPeriod (no separate retry cadence). It still
+//     debounces (the attempt advances LastRun), so a perpetually-failing objective
+//     cannot hot-loop — it just re-arms after RetryPeriod rather than MinPeriod.
+//   - LastRun     when the objective last BEGAN a run (advanced by MarkAttempt at
+//     selection — a debounce clock, NOT a completion claim).
+//   - LastSuccess when the objective last completed a VERIFIED run (advanced by
+//     MarkSuccess). The success-aware due gate keys off this, so a selected-but-failed
+//     objective is not deferred a full MinPeriod.
 type Objective struct {
-	ID        string
-	Goal      string
-	Priority  int
-	Enabled   bool
-	MinPeriod time.Duration
-	LastRun   time.Time
+	ID          string
+	Goal        string
+	Priority    int
+	Enabled     bool
+	MinPeriod   time.Duration
+	RetryPeriod time.Duration
+	LastRun     time.Time
+	LastSuccess time.Time
 }
 
-// due reports whether o may run at `now`: enabled and at least MinPeriod past LastRun.
-// A zero LastRun is "never run", which is always due. A zero MinPeriod is always due.
+// succeededSinceLastRun reports whether the most recent attempt verified — i.e. the
+// objective ran (LastRun set) and a success landed at or after that attempt began.
+// A never-run objective and one whose last attempt failed both read as "not yet
+// succeeded since the last run", which is what makes the retry cadence apply.
+func (o Objective) succeededSinceLastRun() bool {
+	if o.LastRun.IsZero() {
+		return false
+	}
+	return !o.LastSuccess.IsZero() && !o.LastSuccess.Before(o.LastRun)
+}
+
+// spacing returns the cadence the due gate applies: the (shorter) RetryPeriod when the
+// last attempt has NOT yet verified, otherwise MinPeriod. A zero RetryPeriod falls back
+// to MinPeriod so objectives that never opt into a retry cadence behave exactly as before.
+func (o Objective) spacing() time.Duration {
+	if !o.succeededSinceLastRun() && o.RetryPeriod > 0 {
+		return o.RetryPeriod
+	}
+	return o.MinPeriod
+}
+
+// due reports whether o may run at `now`: enabled and at least one spacing interval past
+// LastRun. A zero LastRun is "never run", which is always due. A zero spacing is always
+// due. The spacing is success-aware: a selected-but-not-yet-verified objective re-arms
+// after RetryPeriod (when set), so a failed run is not silently deferred a full MinPeriod.
 func (o Objective) due(now time.Time) bool {
 	if !o.Enabled {
 		return false
 	}
-	if o.LastRun.IsZero() || o.MinPeriod <= 0 {
+	if o.LastRun.IsZero() {
 		return true
 	}
-	return !now.Before(o.LastRun.Add(o.MinPeriod))
+	spacing := o.spacing()
+	if spacing <= 0 {
+		return true
+	}
+	return !now.Before(o.LastRun.Add(spacing))
 }
 
 // Store is the narrow durable seam this package needs, satisfied later by *store.Store
@@ -180,12 +219,40 @@ func (b *Backlog) NextIdle(ctx context.Context, now time.Time) (Objective, bool,
 	return Objective{}, false, nil
 }
 
-// MarkRun records that the objective `id` began a run at `when`, advancing its LastRun
-// so MinPeriod debounces the next selection. It is a read-modify-write through the
-// narrow Store (the seam exposes no partial update), preserving every other field.
-// ErrNotFound if the objective is absent. `when` is supplied by the caller (the daemon
-// passes the verified-run timestamp) so the advance is deterministic, never wall-clock.
+// MarkAttempt records that the objective `id` BEGAN a run at `when`, advancing only its
+// LastRun. This is the selection-time DEBOUNCE clock — it is NOT a completion claim: it
+// stops the same objective from being re-emitted on the very next idle poll before its
+// run has a chance to start. Because LastSuccess is untouched, a run that then fails or
+// is gate-denied re-arms after the (shorter) RetryPeriod rather than a full MinPeriod, so
+// a standing objective is not silently parked for a whole period after an unverified run.
+// Read-modify-write through the narrow Store (no partial update), preserving every other
+// field; ErrNotFound if absent. `when` is caller-supplied so the advance is deterministic.
+func (b *Backlog) MarkAttempt(ctx context.Context, id string, when time.Time) error {
+	return b.mark(ctx, id, when, false)
+}
+
+// MarkSuccess records that the objective `id` completed a VERIFIED run at `when`,
+// advancing BOTH LastRun and LastSuccess. Only after a success does the full MinPeriod
+// cadence apply, so the daemon's handler calls this exactly when the orchestrator
+// reports a verified outcome (the deferred one-line cmd wiring). It never marks work
+// "done" in the I2 sense — the verifier already decided that; this only records the
+// timestamp the debounce/cadence reads. ErrNotFound if absent.
+func (b *Backlog) MarkSuccess(ctx context.Context, id string, when time.Time) error {
+	return b.mark(ctx, id, when, true)
+}
+
+// MarkRun is the legacy debounce-only mark, retained for callers that record a run
+// without a verified/failed outcome. It is identical to MarkAttempt.
+//
+// Deprecated: use MarkAttempt at selection and MarkSuccess on a verified outcome so the
+// success-aware retry cadence (RetryPeriod) can re-service a failed objective sooner.
 func (b *Backlog) MarkRun(ctx context.Context, id string, when time.Time) error {
+	return b.MarkAttempt(ctx, id, when)
+}
+
+// mark is the shared read-modify-write: it advances LastRun always, and LastSuccess only
+// when success is true, preserving every other field through the narrow Store seam.
+func (b *Backlog) mark(ctx context.Context, id string, when time.Time, success bool) error {
 	if b.store == nil {
 		return nil
 	}
@@ -197,6 +264,9 @@ func (b *Backlog) MarkRun(ctx context.Context, id string, when time.Time) error 
 		return err
 	}
 	o.LastRun = when.UTC()
+	if success {
+		o.LastSuccess = when.UTC()
+	}
 	return b.store.Put(ctx, o)
 }
 

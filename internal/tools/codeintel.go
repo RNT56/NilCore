@@ -28,8 +28,9 @@ import (
 //
 // It is SAFE by construction and carries NO write surface:
 //
-//   - Host-side and read-only: it walks the worktree for Go source and parses
-//     each file (go/parser, via codeintel/ast) into an EPHEMERAL in-memory graph
+//   - Host-side and read-only: it walks the worktree for source files (every
+//     language ast.SupportedExtensions covers) and parses each (via codeintel/ast)
+//     into an EPHEMERAL in-memory graph
 //     (graph.Open(":memory:")). It never writes a file, never mutates the tree,
 //     and never persists anything — the graph dies with the call.
 //   - No execution: nothing here runs a model-emitted command. Parsing is pure
@@ -56,7 +57,7 @@ func (CodeintelTool) Schema() json.RawMessage {
 // one — enough to orient without flooding the model's context.
 const defaultBundleBudget = 20
 
-// maxIndexedFiles caps how many Go files the tool parses for a single call, so a
+// maxIndexedFiles caps how many source files the tool parses for a single call, so a
 // pathologically large tree can never turn one query into an unbounded parse. The
 // walk is deterministic (sorted) so the cap selects a stable prefix.
 const maxIndexedFiles = 2000
@@ -261,7 +262,7 @@ func symbolBody(lines []string, start, end int) string {
 // before it ever reaches the model's context (I7).
 func renderBundle(workdir, query string, indexed int, b retrieve.Bundle) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "code-intelligence bundle for %q (indexed %d Go file(s))\n", query, indexed)
+	fmt.Fprintf(&sb, "code-intelligence bundle for %q (indexed %d source file(s))\n", query, indexed)
 	if len(b.Items) == 0 {
 		sb.WriteString("no relevant symbols found — try a different query or a known symbol name.")
 		return sb.String()

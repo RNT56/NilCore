@@ -169,7 +169,7 @@ func chatMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*cf.common.sandboxPref))
 	warnNamespaceEgress(prof, *cf.common.sandboxPref)
 	allow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, *cf.allowEgress, searchKey)
-	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console)
+	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console, proxyBindAddr(*cf.common.sandboxPref, *cf.common.runtime))
 	defer stopProxy()
 
 	sess, err := buildChatSession(chatDeps{
@@ -383,12 +383,12 @@ func resolveWeb(cfg onboard.Config, profileHosts []string, flagAllow, searchKey 
 // the allowlist proxy bound to ctx. It returns the resolved Egress, the proxy's
 // bound host:port (empty when egress is off), and an idempotent stop func (a no-op
 // when off). Default-deny is preserved: an empty/blank allowlist yields no proxy,
-// no network, and no web_fetch tool. The proxy binds to 0.0.0.0 so a bridged
-// sandbox container can reach it across the bridge; it only ever forwards to the
-// allowlisted hosts and refuses private/loopback destinations (the SSRF guard), so
-// it is never an open relay.
-func startEgress(ctx context.Context, hosts []string, con *termui.Console) (policy.Egress, string, func()) {
-	egress, addr, stop, ok := startEgressProxy(ctx, hosts, nil)
+// no network, and no web_fetch tool. bindAddr (from proxyBindAddr) scopes the proxy
+// listener to the chosen sandbox backend — loopback unless a bridged container needs
+// it across the bridge; either way it only ever forwards to the allowlisted hosts and
+// refuses private/loopback destinations (the SSRF guard), so it is never an open relay.
+func startEgress(ctx context.Context, hosts []string, con *termui.Console, bindAddr string) (policy.Egress, string, func()) {
+	egress, addr, stop, ok := startEgressProxy(ctx, hosts, nil, bindAddr)
 	switch {
 	case len(hosts) == 0:
 		// default-deny; nothing to announce.
@@ -406,17 +406,23 @@ func startEgress(ctx context.Context, hosts []string, con *termui.Console) (poli
 // by chat (startEgress) and serve. Returns the egress policy, the proxy host:port,
 // an idempotent stop, and ok=false (with a no-op result) when hosts is empty or the
 // proxy cannot bind — fail-closed: a bind failure runs with no egress, not an open
-// sandbox. It binds 0.0.0.0 so a bridged container can reach it; the proxy only ever
-// forwards to the allowlisted hosts and refuses private/loopback (the SSRF guard).
-func startEgressProxy(ctx context.Context, hosts []string, blast *blastbudget.Budget) (policy.Egress, string, func(), bool) {
+// sandbox. bindAddr scopes the listener to the sandbox backend (proxyBindAddr):
+// 0.0.0.0 only for a bridged container that must reach it across the runtime bridge,
+// 127.0.0.1 otherwise so the guarded proxy is not exposed to the LAN. Either way the
+// proxy only forwards to the allowlisted hosts and refuses private/loopback (the SSRF
+// guard), so it is never an open relay.
+func startEgressProxy(ctx context.Context, hosts []string, blast *blastbudget.Budget, bindAddr string) (policy.Egress, string, func(), bool) {
 	if len(hosts) == 0 {
 		return policy.Egress{}, "", func() {}, false
+	}
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1:0" // safe default: loopback-only
 	}
 	egress := policy.Egress{Allowed: hosts}
 	// BR-T02: the optional blast-radius budget fences the distinct-egress-host axis at
 	// the proxy. nil (no -blast-radius preset, the default) ⇒ unfenced, byte-identical.
 	proxy := &policy.EgressProxy{Egress: egress, Blast: blast}
-	addr, stop, err := proxy.Start(ctx, "0.0.0.0:0")
+	addr, stop, err := proxy.Start(ctx, bindAddr)
 	if err != nil {
 		return policy.Egress{}, "", func() {}, false
 	}
@@ -863,16 +869,16 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 // the supervisor. The shared ledger is injected so the supervised drive charges
 // the SAME conversation ceiling as every other drive (§6).
 //
-// A supervised drive is a multi-agent fan-out: the steer/queue Inbox and the live
-// Emitter are first-class on the NATIVE loop (the primary conversational path),
-// whereas the supervisor's spawn/code/integrate work is bounded by the rails and
-// gated by the verifier (I2) and the single human promote. Wiring the planner's
-// own Inbox/Out is a documented follow-on (it needs buildStack to expose the
-// supervisor it constructs); here the supervised drive runs to a verifier-green
-// tree under the conversation budget, and its outcome folds back into the
-// conversation exactly like a native drive.
+// A supervised drive is a multi-agent fan-out: the planner's steer/queue Inbox and
+// its live Emitter are wired to the SAME conversation seams the native loop uses, so
+// a multi-agent chat drive streams its reasoning back and folds queued user turns in
+// at each round boundary (super.Inbox.Drain/Steer). The supervisor's
+// spawn/code/integrate work stays bounded by the rails and gated by the verifier (I2)
+// and the single human promote; its outcome folds back into the conversation exactly
+// like a native drive. (Seeding the planner with prior conversation HISTORY remains a
+// deeper follow-on — super.Run takes only a goal — so that param is not yet consumed.)
 func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFunc {
-	return func(ctx context.Context, goal string, _ []model.Message, _ session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle, gate policy.Approver) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ []model.Message, in session.InboxHandle, outEmitter emit.Emitter, ask session.AskerHandle, gate policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal, gate))
 		if err != nil {
 			return session.DriveOutcome{}, err
@@ -880,6 +886,11 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 		// Attended: wire the supervisor's ask_user to the SAME session ask box the native
 		// loop uses, so a multi-agent chat drive can pose a human question between waves.
 		stack.sup.AskUser = superAskFunc(ask)
+		// Steer/queue + live stream parity with the native loop: the session's inbox
+		// (identical method set to super.Inbox) lets the planner fold queued turns in at
+		// round boundaries, and Out streams its intent back to this conversation.
+		stack.sup.Inbox = in
+		stack.sup.Out = outEmitter
 		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
@@ -894,15 +905,18 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 // assembles the whole-project stack (via buildStack) for this drive's goal and runs
 // the project loop to a verifier-green tree. The shared ledger keeps the project
 // drive on the one conversation ceiling (§6). Like the supervised drive, the
-// planner's Inbox/Out wiring is a documented follow-on; the drive itself runs
-// bounded, verifier-gated, and charged against the conversation wall.
+// planner's live Out stream is wired here too; the drive itself runs bounded,
+// verifier-gated, and charged against the conversation wall. (Seeding the project loop
+// with the prior context SUMMARY remains a deeper follow-on, so that param is not yet
+// consumed — the loop runs the whole-project goal fresh and folds its outcome back.)
 func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal, gate))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
-		defer stack.cleanup() // tear down the supervisor's live read worktree per drive
+		stack.sup.Out = outEmitter // stream the project planner's intent back to this conversation
+		defer stack.cleanup()      // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
 		if err != nil {
 			return session.DriveOutcome{}, err

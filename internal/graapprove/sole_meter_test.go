@@ -11,8 +11,11 @@ package graapprove
 //   - a budget already AT its ceiling overrides the (otherwise-granted) P5
 //     decision and forces fall-through to the human (min(P5, blast); a blast
 //     breach is final),
-//   - the default path (nil budget) is byte-identical to today: no charge, same
-//     decision, same audit evidence — the feature is off unless a budget is wired.
+//   - a clause with a POSITIVE $/day ceiling but NO wired meter FAILS CLOSED:
+//     the ceiling cannot be charged, so the action is denied + delegated rather
+//     than silently auto-approved with no dollar accounting (B3-audit-verify.4).
+//     A clause with no $ ceiling (MaxDollarsDay==0) needs no meter and stays a
+//     byte-identical no-op when the budget is nil.
 //
 // SCOPE NOTE (current seam): the GradedApprover routes ONLY the per-day DOLLAR axis
 // through blast (graded.go step 5b → ChargeAutoApprovalDollars). The per-day RATE
@@ -70,23 +73,51 @@ func chargedDollars(t *testing.T, ev recEvent) float64 {
 	return v
 }
 
-// TestBlastBudgetIsSoleDollarMeter_GoldenDefaultPath is the golden test for the
-// DEFAULT (unwired) path required by the task: with a nil *blastbudget.Budget the
-// GradedApprover must behave byte-identically to today — it still auto-approves a
-// fully-earned action, no charge is metered anywhere, and the emitted evidence is
-// identical to the wired-but-not-yet-charged case. A nil budget is a pure no-op.
-func TestBlastBudgetIsSoleDollarMeter_GoldenDefaultPath(t *testing.T) {
+// TestBlastBudgetUnmeteredDollarCeilingFailsClosed pins the DEFAULT (unwired) path:
+// with a nil *blastbudget.Budget but a clause that declares a POSITIVE $/day ceiling,
+// the GradedApprover must NOT silently auto-approve (that would enforce no dollar
+// accounting at all). It fails closed — deny + delegate to the human with reason
+// dollar_ceiling_unmetered — so an operator's intended $ ceiling is never a no-op
+// (B3-audit-verify.4). A $-free clause (covered separately) stays a byte-identical
+// no-op when the budget is nil.
+func TestBlastBudgetUnmeteredDollarCeilingFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
 	path := writeLog(t, dir, greenRun("deploy", "staging", 3))
 
+	human := &recHuman{reply: false}
+	sink := &recSink{}
+	g := newGraded(human, deployEnv(), path, nil, // <-- nil budget, but the clause has $25/day
+		WithSink(sink), WithClock(fixedClock(now)), WithRoot(dir))
+
+	if g.ApproveStructured(deployStaging()) {
+		t.Fatal("an unmetered positive $ ceiling must not auto-approve")
+	}
+	if !human.called {
+		t.Fatal("an unmetered $ ceiling must fall through to the human")
+	}
+	assertDenyReason(t, sink, "dollar_ceiling_unmetered")
+}
+
+// TestBlastBudgetNoDollarCeilingNilBudgetIsNoOp proves the byte-identical default for
+// a clause WITHOUT a $ ceiling: a nil budget is a pure no-op — the fully-earned action
+// still auto-approves, the human is not consulted, and the full evidence object is
+// emitted (charged $0). Only a positive ceiling demands a meter; a zero ceiling does not.
+func TestBlastBudgetNoDollarCeilingNilBudgetIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	path := writeLog(t, dir, greenRun("deploy", "staging", 3))
+
+	env := deployEnv()
+	env.Classes[0].MaxDollarsDay = 0 // no $ ceiling ⇒ no meter required
+
 	human := &recHuman{reply: false} // must NOT be consulted on a pass
 	sink := &recSink{}
-	g := newGraded(human, deployEnv(), path, nil, // <-- nil budget: default-off seam
+	g := newGraded(human, env, path, nil, // <-- nil budget: default-off seam
 		WithSink(sink), WithClock(fixedClock(now)), WithRoot(dir))
 
 	if !g.ApproveStructured(deployStaging()) {
-		t.Fatal("default path (nil budget) must still auto-approve a fully-earned action")
+		t.Fatal("default path (nil budget, no $ ceiling) must still auto-approve a fully-earned action")
 	}
 	if human.called {
 		t.Fatal("default path must not consult the human on an auto-approval")
@@ -96,16 +127,13 @@ func TestBlastBudgetIsSoleDollarMeter_GoldenDefaultPath(t *testing.T) {
 	if !ok || ev.kind != "auto_approve" {
 		t.Fatalf("expected an auto_approve event, got %+v", sink.events)
 	}
-	// Golden evidence shape: the full object is present and the dollars sub-object
-	// records what WOULD be charged (the clause ceiling) even though nothing was
-	// metered (no budget wired). This is the byte-identical contract for the seam.
 	for _, k := range []string{"green", "total", "last_green", "bar", "rate", "dollars", "chain_ok"} {
 		if _, ok := ev.detail[k]; !ok {
 			t.Errorf("auto_approve evidence missing %q: %+v", k, ev.detail)
 		}
 	}
-	if got := chargedDollars(t, ev); got != 25 {
-		t.Fatalf("evidence dollars.charged = %v, want the clause ceiling 25", got)
+	if got := chargedDollars(t, ev); got != 0 {
+		t.Fatalf("evidence dollars.charged = %v, want 0 (no ceiling)", got)
 	}
 }
 

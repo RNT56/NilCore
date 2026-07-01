@@ -8,8 +8,15 @@ import (
 	"io/fs"
 	"os"
 
+	"nilcore/eval"
 	"nilcore/internal/eventlog"
 )
+
+// maxSelfevalCases bounds the case count Replay will allocate for from a
+// selfeval_report event's Detail["cases"], so a forged/corrupt count cannot panic the
+// slice allocation before the chain check rejects the log. Far above any real frozen
+// self-eval suite (dozens of cases), so a legitimate report is never skipped.
+const maxSelfevalCases = 100000
 
 // raceEvent mirrors only the fields of an on-disk eventlog.Event that a
 // race_outcome carries trust signal in: the Backend that raced, the verifier's
@@ -59,21 +66,47 @@ func Replay(logPath string) (*Ledger, error) {
 		if err := json.Unmarshal(line, &e); err != nil {
 			return nil, fmt.Errorf("event %d: parsing line: %w", n, err)
 		}
-		if e.Kind != "race_outcome" {
-			continue // only verifier-judged race outcomes carry routing signal
+		switch e.Kind {
+		case "race_outcome":
+			// Detail["passed"] is the verifier's verdict, written as a JSON bool by
+			// route.Race. A missing or non-bool value reads as a non-pass (fail-safe:
+			// absent evidence never counts as a win).
+			passed, _ := e.Detail["passed"].(bool)
+			// Detail["class"] / Detail["cost"] are the Phase-16 routing dimensions.
+			// Both are OPTIONAL: a pre-Phase-16 race_outcome carries neither, so class
+			// reads as "" (folding into the global-view cell exactly as before) and
+			// cost reads as 0. JSON decodes numbers as float64, so a present cost lands
+			// directly. A missing or wrong-typed value is the zero value (fail-safe).
+			class, _ := e.Detail["class"].(string)
+			cost, _ := e.Detail["cost"].(float64)
+			l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
+		case "selfeval_report":
+			// A verifier-judged self-eval report (emitted by flywheel selfeval.Fold ONLY
+			// over a verified chain, I5, and only for a verifier-judged report, I2) folds
+			// into the per-config EVIDENCE view (l.configs) — NOT the routing standings,
+			// which only race_outcome feeds. So a self-eval pass-rate informs the operator
+			// ("which config earned its standing") without ever steering backend choice.
+			// The wire literal is used (not a constant) to keep trust from importing the
+			// flywheel/selfeval package, which imports trust (an import cycle).
+			cfg, _ := e.Detail["config"].(string)
+			if cfg == "" {
+				continue // no config key ⇒ nothing to attribute (FoldEvalReport ignores it)
+			}
+			casesF, _ := e.Detail["cases"].(float64)
+			// Guard the slice allocation against a forged/corrupt count. The chain Verify
+			// below would reject a tampered log, but `make([]Result, int(casesF))` runs
+			// FIRST — a negative, NaN, or absurdly large count would panic ("makeslice: len
+			// out of range") and crash trust.Replay, the routing hot path, before the
+			// fail-closed check fires. The condition is written so NaN (all comparisons
+			// false) is skipped too. A real self-eval report's case count is small.
+			if !(casesF >= 0 && casesF <= maxSelfevalCases) {
+				continue
+			}
+			passRate, _ := e.Detail["pass_rate"].(float64)
+			l.FoldEvalReport(eval.Report{Config: cfg, PassRate: passRate, Results: make([]eval.Result, int(casesF))})
+		default:
+			continue // every other event kind carries no trust signal
 		}
-		// Detail["passed"] is the verifier's verdict, written as a JSON bool by
-		// route.Race. A missing or non-bool value reads as a non-pass (fail-safe:
-		// absent evidence never counts as a win).
-		passed, _ := e.Detail["passed"].(bool)
-		// Detail["class"] / Detail["cost"] are the Phase-16 routing dimensions.
-		// Both are OPTIONAL: a pre-Phase-16 race_outcome carries neither, so class
-		// reads as "" (folding into the global-view cell exactly as before) and
-		// cost reads as 0. JSON decodes numbers as float64, so a present cost lands
-		// directly. A missing or wrong-typed value is the zero value (fail-safe).
-		class, _ := e.Detail["class"].(string)
-		cost, _ := e.Detail["cost"].(float64)
-		l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("reading event log: %w", err)

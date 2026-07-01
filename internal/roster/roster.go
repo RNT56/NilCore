@@ -21,10 +21,14 @@ import (
 	"nilcore/internal/tools"
 )
 
-// Role names the five subagent specializations (docs/MULTI-AGENT.md §2). Three
-// of the five wrap behaviors that already exist (planner→planner.Plan,
-// reviewer→route.Review, implementer→the native worker); researcher and
-// understander are the only new read-only wiring.
+// Role names the subagent specializations (docs/MULTI-AGENT.md §2): five DEFAULT
+// roster roles plus three swarm-preset roles. The default five — researcher,
+// understander, planner, implementer, reviewer — are the standard roster
+// (NewDefault); three of them wrap behaviors that already exist (planner→planner.Plan,
+// reviewer→route.Review, implementer→the native worker), while researcher and
+// understander are the only new read-only wiring. The three Phase-12 swarm-preset
+// roles — typed-research, auditor, ui — are write-capable evidence roles selected by
+// internal/swarm/preset, absent from the default roster.
 type Role string
 
 const (
@@ -53,19 +57,19 @@ const (
 	// Claims each reproduce a finding (a file:line the audit pack re-checks in-box, or
 	// a fact a web check resolves) — so its Profile sets ReadOnly:false. It is NOT a
 	// member of the default five-role roster; it is a swarm preset role, built by
-	// AuditorProfile and selected by internal/swarm/preset. The hardcoded Role.ReadOnly()
-	// helper still reports true for it (it only excepts RoleImplementer/RoleTypedResearch),
-	// which is exactly the documented gotcha SW-T15 closes by trusting the Profile's
-	// ReadOnly field — not the role-name helper — for the write/read wiring decision.
+	// AuditorProfile and selected by internal/swarm/preset. The Role.ReadOnly() helper
+	// now agrees (it excepts auditor), but the structural source of truth for the
+	// write/read wiring decision remains the Profile's ReadOnly field — not the role
+	// name — read by NewWorker (I7: capability is wiring, never a name).
 	RoleAuditor Role = "auditor"
 
 	// RoleUI produces a verified UI Report (Phase 12, SW-T15) — a browser/visual flow
 	// whose Claims are checked by the ui pack and (CI-only) the browser verifier. Like
 	// RoleAuditor it is WRITE-capable (it writes the spine Artifact JSON) so its Profile
 	// sets ReadOnly:false. It too is a swarm preset role (built by UIProfile, selected by
-	// internal/swarm/preset), absent from the default five, and it shares the same
-	// Role.ReadOnly()==true gotcha: capability is taken from Profile.ReadOnly, never the
-	// hardcoded helper.
+	// internal/swarm/preset), absent from the default five. The Role.ReadOnly() helper
+	// now agrees (it excepts ui); capability is still taken structurally from
+	// Profile.ReadOnly, never from the role name.
 	RoleUI Role = "ui"
 )
 
@@ -151,10 +155,19 @@ func (r *Roster) Roles() []Role {
 }
 
 // ReadOnly reports whether role is a structural read-only role (no write tools).
-// The two write-capable roles are the implementer (writes code) and typed-research
-// (writes a spine Artifact JSON, P11-T15); every other role is read-only.
+// The write-capable roles are the implementer (writes code), typed-research,
+// auditor, and ui (each writes a spine Artifact JSON — P11-T15 / SW-T15); every
+// other role is read-only. This helper agrees with the Profiles' ReadOnly field for
+// every catalog/preset role, so it is a safe convenience — but the STRUCTURAL source
+// of truth for the write/read wiring decision is still Profile.ReadOnly (read by
+// NewWorker), never the role name (I7: capability is a property of wiring).
 func (role Role) ReadOnly() bool {
-	return role != RoleImplementer && role != RoleTypedResearch
+	switch role {
+	case RoleImplementer, RoleTypedResearch, RoleAuditor, RoleUI:
+		return false
+	default:
+		return true
+	}
 }
 
 // readToolset returns the read-only structured tool set: read + search ONLY. The

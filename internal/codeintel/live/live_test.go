@@ -52,6 +52,64 @@ func TestLiveIncrementalWorktreeEdit(t *testing.T) {
 	}
 }
 
+// TestLiveRemoveDropsDeletedFile proves the deletion/rename path: after Remove,
+// the gone file's symbols, its outgoing edges, AND the edges pointing into it from
+// another (surviving) file are all dropped — no stale or dangling state lingers.
+func TestLiveRemoveDropsDeletedFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	gonePath := filepath.Join(dir, "gone.go")
+	keepPath := filepath.Join(dir, "keep.go")
+	if err := os.WriteFile(gonePath, []byte("package p\nfunc Gone() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// keep.go calls Gone, so there is an edge keep:User -> Gone INTO the gone file.
+	if err := os.WriteFile(keepPath, []byte("package p\nfunc User() { Gone() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ix := &live.Index{Graph: openGraph(t)}
+	if err := ix.Update(ctx, gonePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Update(ctx, keepPath); err != nil {
+		t.Fatal(err)
+	}
+	if callees, _ := ix.Graph.Callees(ctx, "User"); len(callees) != 1 || callees[0] != "Gone" {
+		t.Fatalf("pre-remove User callees = %v, want [Gone]", callees)
+	}
+
+	// Delete gone.go and signal the removal.
+	if err := os.Remove(gonePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Remove(ctx, gonePath); err != nil {
+		t.Fatal(err)
+	}
+
+	// The Gone node is gone...
+	nodes, _ := ix.Graph.Nodes(ctx)
+	for _, n := range nodes {
+		if n.ID == "Gone" {
+			t.Errorf("removed file's symbol 'Gone' still present: %+v", n)
+		}
+	}
+	// ...and the incoming edge from the surviving file no longer dangles.
+	if callees, _ := ix.Graph.Callees(ctx, "User"); len(callees) != 0 {
+		t.Errorf("post-remove User callees = %v, want [] (dangling edge into deleted file pruned)", callees)
+	}
+	// User itself (in the surviving file) is untouched.
+	var sawUser bool
+	for _, n := range nodes {
+		if n.ID == "User" {
+			sawUser = true
+		}
+	}
+	if !sawUser {
+		t.Error("surviving file's symbol 'User' was wrongly removed")
+	}
+}
+
 func TestLiveMemoryFusion(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
