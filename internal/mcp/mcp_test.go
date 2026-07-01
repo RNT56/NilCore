@@ -13,7 +13,74 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// TestStdioRoundTripHonorsCtxOnStalledRead: a stdio server that reads the request but
+// never replies must NOT wedge roundTrip (which holds the per-server mutex) — the request
+// ctx must unblock the blocking Decode. Regression for the boot/cross-session deadlock.
+func TestStdioRoundTripHonorsCtxOnStalledRead(t *testing.T) {
+	cConn, sConn := net.Pipe()
+	defer sConn.Close()
+	// Server side drains the request (so Encode's pipe write completes) then never replies.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := sConn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	st := newStdioTransport(cConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.roundTrip(ctx, rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("stalled stdio read must return context.Canceled on cancel, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("roundTrip did not honor ctx cancellation on a stalled read (hang)")
+	}
+}
+
+// TestGenerateWrappersSanitizesTraversalToolName: an UNTRUSTED tool name (server output)
+// containing path traversal must be confined — the descriptor stays inside the server dir
+// and the JSON keeps the original name so the model still invokes the right tool.
+func TestGenerateWrappersSanitizesTraversalToolName(t *testing.T) {
+	base := t.TempDir()
+	evil := "../../../../etc/evil"
+	if err := GenerateWrappers(base, "docs", []Tool{
+		{Name: evil, Description: "x", InputSchema: json.RawMessage(`{}`)},
+	}); err != nil {
+		t.Fatalf("GenerateWrappers: %v", err)
+	}
+	dir := filepath.Join(base, "mcp", "servers", "docs")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 {
+		t.Fatalf("want exactly 1 descriptor in the server dir, got %d: %v", len(ents), ents)
+	}
+	name := ents[0].Name()
+	if strings.ContainsAny(name, `/\`) || name == ".." || strings.HasPrefix(name, "../") {
+		t.Fatalf("filename not sanitized against traversal: %q", name)
+	}
+	abs := filepath.Join(dir, name)
+	if !strings.HasPrefix(abs, dir+string(filepath.Separator)) {
+		t.Fatalf("descriptor %q escaped the server dir %q", abs, dir)
+	}
+	b, _ := os.ReadFile(abs)
+	if !strings.Contains(string(b), evil) {
+		t.Errorf("descriptor must keep the ORIGINAL tool name %q so the model invokes it: %s", evil, b)
+	}
+}
 
 // dispatch is the shared mock MCP handler: it answers initialize, tools/list,
 // tools/call, resources/*, and prompts/*. It returns (resultObject, ok); ok=false for

@@ -53,7 +53,7 @@ func runTestDaemon(args []string) {
 			os.Exit(0)
 		}
 		obs := desktopwire.Observation{Version: uint64(seq), Rung: desktopwire.RungSoM,
-			Refs: []desktopwire.Ref{{ID: 1, Role: "element"}}}
+			Refs: []desktopwire.Ref{{ID: 1, Role: "element", Version: uint64(seq)}}}
 		b, _ := json.Marshal(desktopwire.SessionResponse{Seq: seq, Observation: obs})
 		_ = atomicWrite(filepath.Join(control, respPrefix+itoaT(seq)+jsonSuffix), b)
 		_ = os.Remove(reqPath)

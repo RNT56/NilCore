@@ -52,7 +52,7 @@ func watchMain(args []string) {
 	// envelope is configured; with none it is the console approver unchanged
 	// (byte-identical default-off). Free-text gates still go to the human; only a
 	// structured OpenPR can auto-approve, within the earned-trust + envelope bar.
-	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast)
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, absDir, *c.logPath, log, blast)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,

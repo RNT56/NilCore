@@ -43,6 +43,12 @@ func Run(ctx context.Context, cases []Case, config string, run Runner) Report {
 	rep := Report{Config: config}
 	passed := 0
 	for _, c := range cases {
+		// Honor cancellation between cases: a cancelled suite stops promptly rather
+		// than running (and scoring as failed) every remaining case. PassRate then
+		// reflects only the cases actually attempted.
+		if ctx.Err() != nil {
+			break
+		}
 		start := time.Now()
 		ok, cost := run(ctx, c)
 		rep.Results = append(rep.Results, Result{
@@ -53,8 +59,12 @@ func Run(ctx context.Context, cases []Case, config string, run Runner) Report {
 			passed++
 		}
 	}
-	if len(cases) > 0 {
-		rep.PassRate = float64(passed) / float64(len(cases))
+	// Divide by the cases actually ATTEMPTED, not the full suite length: on a
+	// cancelled run the two differ, and scoring against the full length would report
+	// a spuriously low pass rate for cases that never ran. On the normal (fully-run)
+	// path len(rep.Results) == len(cases), so this is byte-identical there.
+	if len(rep.Results) > 0 {
+		rep.PassRate = float64(passed) / float64(len(rep.Results))
 	}
 	return rep
 }

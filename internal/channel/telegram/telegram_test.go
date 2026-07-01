@@ -200,6 +200,56 @@ func TestTelegramConcurrentReceiveAndAsk(t *testing.T) {
 	}
 }
 
+// TestIntakeRestartsAfterStarterCtxCancelled proves the review fix: if a gate Ask is the
+// FIRST caller to start the poller and its (per-drive) ctx is then cancelled, the poller
+// stops AND unlatches, so a subsequent Receive on a fresh, long-lived ctx revives it and
+// still delivers messages. Before the fix the sole poller latched to the drive ctx and
+// never restarted, wedging all future intake.
+func TestIntakeRestartsAfterStarterCtxCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getUpdates") {
+			_, _ = io.WriteString(w, `{"ok":true,"result":[{"update_id":5,"message":{"from":{"id":42},"chat":{"id":99},"text":"do it"}}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	b := New("t")
+	b.baseURL = srv.URL
+
+	// A gate Ask starts the poller under a per-drive ctx, then that ctx is cancelled.
+	driveCtx, driveCancel := context.WithCancel(context.Background())
+	b.startIntake(driveCtx) // stand in for Ask's startIntake with the drive ctx
+	driveCancel()
+
+	// Wait for the poller to observe cancellation and unlatch (intakeStarted → false).
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		b.smu.Lock()
+		started := b.intakeStarted
+		b.smu.Unlock()
+		if !started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("poller never unlatched after its starting ctx was cancelled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A fresh Receive on a live ctx must revive the poller and deliver the message.
+	ctx, cancel := ctx5(t)
+	defer cancel()
+	tr, err := b.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive after restart: %v", err)
+	}
+	if tr.Goal != "do it" {
+		t.Fatalf("got %+v, want goal 'do it' after poller restart", tr)
+	}
+}
+
 func waitGate(t *testing.T, b *Bot, id string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

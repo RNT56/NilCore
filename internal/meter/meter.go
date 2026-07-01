@@ -24,6 +24,14 @@ import (
 	"nilcore/internal/model"
 )
 
+// chargeCtx is the context used for the POST-call accounting charge. The tokens it
+// bills were already produced by a completed (or partially completed) inner call,
+// so they must be recorded regardless of whether ctx was cancelled in the window
+// between the call returning and the charge landing. context.WithoutCancel keeps
+// any values on ctx (for a ledger that reads them) while stripping cancellation, so
+// budget.Ledger.Charge never refuses an already-earned charge on a stale ctx.
+func chargeCtx(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
+
 // Provider is a model.Provider decorator that charges a shared budget.Ledger for
 // every Complete it forwards. It is the single seam that makes the budget
 // ceiling enforceable: wrap every provider handed to the supervisor and each
@@ -75,8 +83,11 @@ func (p *Provider) reportUsage(u model.Usage) {
 // token report and the dollar wall agree for o-series/extended-thinking models. The
 // dollar figure comes from Price.PriceUsage over the inner provider's model id and
 // the full resp.Usage, so an authoritative vendor cost (Usage.CostUSD) and the
-// cached-input discount feed the dollar ceiling. ctx is threaded into Charge so a
-// cancelled context refuses the charge rather than recording it.
+// cached-input discount feed the dollar ceiling. The charge uses chargeCtx (a
+// cancellation-stripped ctx): the tokens were already produced, so a ctx that is
+// cancelled in the window between the call returning and the charge landing must
+// NOT drop the charge — under-metering a completed call would let spend escape the
+// wall. A ceiling breach still surfaces as budget.ErrCeiling.
 func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
 	resp, err := p.Inner.Complete(ctx, system, msgs, tools, maxTokens)
 	if err != nil {
@@ -88,9 +99,10 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens + resp.Usage.ReasoningTokens
 	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
-	if cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars); cerr != nil {
-		// ErrCeiling (and any ctx error from Charge) propagates so the caller
-		// aborts. The response is returned for completeness but the non-nil
+	if cerr := p.Ledger.Charge(chargeCtx(ctx), p.Task, tokens, dollars); cerr != nil {
+		// The charge ran on a cancellation-stripped ctx, so cerr is a real ceiling
+		// breach (budget.ErrCeiling), never a stale ctx error. It propagates so the
+		// caller aborts; the response is returned for completeness but the non-nil
 		// error tells the caller not to proceed.
 		return resp, cerr
 	}
@@ -116,15 +128,17 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 //     text, just delivered as one big chunk). The Response is then charged.
 //
 // Charging mirrors Complete: tokens = input+output+reasoning and the PriceUsage
-// dollar cost of resp.Usage, charged under p.Task with ctx threaded into Charge.
-// ErrCeiling (or a ctx error from Charge) propagates so the orchestrating loop aborts.
+// dollar cost of resp.Usage, charged under p.Task on chargeCtx (a
+// cancellation-stripped ctx). ErrCeiling propagates so the orchestrating loop aborts.
 //
 // Partial-on-cancel: if the inner stream is cut short (ctx cancelled mid-stream),
 // Inner.Stream returns the partial Response together with ctx.Err(); we STILL
-// charge whatever Usage came back — the tokens already produced are billable —
-// and then surface the inner error. The inner transport/cancel error takes
-// precedence over a ceiling breach in that case; a ceiling breach only surfaces
-// when the inner call itself succeeded.
+// charge whatever Usage came back — the tokens already produced are billable — and
+// then surface the inner error. Because the post-call charge runs on chargeCtx,
+// the cancellation that cut the stream short does NOT also make the ledger refuse
+// the produced tokens (which would under-meter and defeat this rule). The inner
+// transport/cancel error takes precedence over a ceiling breach in that case; a
+// ceiling breach only surfaces when the inner call itself succeeded.
 func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, onChunk func(model.Chunk)) (model.Response, error) {
 	var (
 		resp    model.Response
@@ -143,11 +157,13 @@ func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Messa
 	}
 
 	// Charge whatever usage came back — including a partial-on-cancel response —
-	// because the tokens it reports were genuinely produced and are billable.
+	// because the tokens it reports were genuinely produced and are billable. The
+	// cancellation-stripped chargeCtx guarantees a mid-stream cancel cannot make the
+	// ledger drop these already-produced tokens.
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens + resp.Usage.ReasoningTokens
 	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
-	cerr := p.Ledger.Charge(ctx, p.Task, tokens, dollars)
+	cerr := p.Ledger.Charge(chargeCtx(ctx), p.Task, tokens, dollars)
 
 	if callErr != nil {
 		// The inner call already failed (transport fault or partial-on-cancel);
@@ -155,8 +171,9 @@ func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Messa
 		return resp, callErr
 	}
 	if cerr != nil {
-		// Inner call succeeded but the charge breached a ceiling (or ctx is done):
-		// propagate so the caller aborts; the response must not be used.
+		// Inner call succeeded but the charge breached a ceiling: propagate so the
+		// caller aborts; the response must not be used. (cerr is a real ceiling
+		// breach, not a stale ctx error — chargeCtx stripped cancellation.)
 		return resp, cerr
 	}
 	return resp, nil

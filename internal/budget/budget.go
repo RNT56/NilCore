@@ -71,10 +71,20 @@ func (l *Ledger) SetGlobalCeiling(dollars float64) {
 	l.gceiling = dollars
 }
 
-// Charge records tokens and dollars against task and the global total. It
-// honors ctx cancellation. If the charge would push the task or the global
-// total past its ceiling, it records nothing and returns ErrCeiling. A
-// negative token or dollar amount is rejected with an error and not recorded.
+// Charge records tokens and dollars against task and the global total. If the
+// charge would push the task or the global total past its ceiling, it records
+// nothing and returns ErrCeiling. A negative token or dollar amount is rejected
+// with an error and not recorded.
+//
+// The leading ctx.Err() check is a PRE-flight guard: it lets a caller who has not
+// yet done any billable work skip a charge whose surrounding operation is already
+// cancelled. It is deliberately NOT a promise that a cancelled context erases an
+// earned charge — a caller that HAS already produced billable tokens (the meter
+// decorator after a completed or partially completed model call) must record them
+// regardless of cancellation, and does so by passing a cancellation-stripped
+// context (context.WithoutCancel) so this check is a no-op. Post-production
+// accounting therefore always records the produced tokens; only a pre-work,
+// still-cancellable charge is refused here.
 func (l *Ledger) Charge(ctx context.Context, task string, tokens int, dollars float64) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -64,6 +64,7 @@ type Ref struct {
 	Value   string   `json:"value,omitempty"`   // current value for editable nodes (UNTRUSTED)
 	Box     Box      `json:"box"`               // on-screen extent (true display pixels)
 	Actions []string `json:"actions,omitempty"` // AT-SPI actions available (DoAction targets)
+	Version uint64   `json:"version,omitempty"` // snapshot version this ref was stamped in; desktopsession.validateRef rejects a Ref whose Version != the latest Observation's (the same-id-after-re-render swap defense, host-enforced — mirrors browserwire.Ref, not membership-only)
 }
 
 // Rung names which perception rung produced an Observation (set-of-marks ladder).

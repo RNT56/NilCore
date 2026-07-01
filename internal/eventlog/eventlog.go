@@ -51,8 +51,35 @@ type Log struct {
 	// event lands, so OverStore stays warm without a full replay. nil (the default) is a
 	// no-op, so an unwired log is byte-identical.
 	onAppend func(e Event)
-	err      error // first write failure, if any (a broken audit trail is loud)
+
+	// The onAppend hook runs on a SINGLE background drainer goroutine, not inside
+	// Append's critical section: the projector's Fold does several SQLite round-trips on
+	// a single-connection DB (busy_timeout 5s), so calling it under l.mu would couple the
+	// authoritative log's write latency to derived-projection I/O under contention. The
+	// drainer preserves ORDER (Fold's high-water mark skips seq <= watermark, so
+	// out-of-order folding would LOSE events) and Append's send is non-blocking, so a slow
+	// fold never stalls the log — the projection is derived + rebuildable, droppable under
+	// sustained overload. nil hookCh ⇒ no hook wired (byte-identical).
+	hookCh   chan hookMsg
+	hookDone chan struct{}  // closed by Close to stop the drainer
+	hookWG   sync.WaitGroup // tracks the drainer goroutine (joined by Close)
+	dropOnce sync.Once      // one-time "projection behind" warning
+
+	err error // first write failure, if any (a broken audit trail is loud)
 }
+
+// hookMsg carries either an event to fold or a flush barrier. A non-nil flush chan is a
+// barrier: the drainer closes it after processing everything enqueued before it (FIFO),
+// so Flush can synchronize with the async projection without exposing the channel.
+type hookMsg struct {
+	e     Event
+	flush chan struct{}
+}
+
+// hookBuffer bounds the drainer's queue. A burst up to this size is absorbed without
+// touching the log write path; beyond it, folds are dropped (rebuildable via
+// `nilcore experience --rebuild`) rather than blocking the authoritative writer.
+const hookBuffer = 1024
 
 // logKey reads the optional chain HMAC key from the environment (invariant I3:
 // secrets from the environment only). An empty value leaves the chain unkeyed.
@@ -94,6 +121,72 @@ func (l *Log) OnAppend(fn func(e Event)) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.onAppend = fn
+	// Start the single drainer once, on first non-nil hook. It invokes fn IN ORDER off
+	// the append critical section, so a slow/contended fold never stalls the log writer.
+	if fn != nil && l.hookCh == nil {
+		l.hookCh = make(chan hookMsg, hookBuffer)
+		l.hookDone = make(chan struct{})
+		l.hookWG.Add(1)
+		// Pass the done channel by value: the drainer must select on THIS channel, not on
+		// the l.hookDone field (which Close nils out), or a receive on nil would block it.
+		go l.drainHooks(fn, l.hookDone)
+	}
+}
+
+// drainHooks is the single background consumer of the OnAppend queue. It invokes fn for
+// each event in FIFO order (preserving the projector's watermark ordering) and closes a
+// flush barrier when it reaches one. A panic in a buggy projector is RECOVERED (and
+// surfaced) so it can never take down the drainer or affect the durable log.
+func (l *Log) drainHooks(fn func(e Event), done <-chan struct{}) {
+	defer l.hookWG.Done()
+	fold := func(m hookMsg) {
+		if m.flush != nil {
+			close(m.flush)
+			return
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "nilcore: experience fold hook panicked: %v\n", r)
+			}
+		}()
+		fn(m.e)
+	}
+	for {
+		select {
+		case <-done:
+			// Clean shutdown: drain everything already enqueued (so a Close does not lose
+			// folds the Appends before it produced), then exit.
+			for {
+				select {
+				case m := <-l.hookCh:
+					fold(m)
+				default:
+					return
+				}
+			}
+		case m := <-l.hookCh:
+			fold(m)
+		}
+	}
+}
+
+// Flush blocks until every event enqueued for the OnAppend hook so far has been folded.
+// Production never needs it (the derived projection is eventually-consistent); it lets a
+// test or an operator command synchronize with the async drainer. No-op when no hook is
+// wired.
+func (l *Log) Flush() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	ch := l.hookCh
+	l.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	done := make(chan struct{})
+	ch <- hookMsg{flush: done} // blocking send: the barrier must not be dropped
+	<-done
 }
 
 // Open opens (creating if needed) the log at path, continuing the hash chain and
@@ -189,21 +282,20 @@ func (l *Log) Append(e Event) {
 		}
 	}
 
-	// Phase-16 experience seam: fold the now-durable event into the derived projection
-	// (EXP-T03). Best-effort and after the authoritative write — the projection is
-	// rebuildable from the log, so a fold failure degrades only the warm cache, never
-	// the audit trail. A panic in a buggy projector is RECOVERED (and surfaced) rather
-	// than allowed to take down the audit-log writer; the event is already durable.
-	// nil hook ⇒ no-op (byte-identical).
-	if l.onAppend != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Fprintf(os.Stderr, "nilcore: experience fold hook panicked: %v\n", r)
-				}
-			}()
-			l.onAppend(e)
-		}()
+	// Phase-16 experience seam: hand the now-durable event to the async drainer, which
+	// folds it into the derived projection (EXP-T03) OFF this critical section. The send
+	// is NON-BLOCKING: a slow/contended fold can never stall the authoritative log writer
+	// — if the drainer falls behind (buffer full) we DROP the fold (the projection is
+	// rebuildable via `nilcore experience --rebuild`) and warn once. nil hookCh ⇒
+	// byte-identical no-op.
+	if l.hookCh != nil {
+		select {
+		case l.hookCh <- hookMsg{e: e}:
+		default:
+			l.dropOnce.Do(func() {
+				fmt.Fprintln(os.Stderr, "nilcore: experience projection is behind — dropping folds; rebuild with `nilcore experience --rebuild`")
+			})
+		}
 	}
 }
 
@@ -243,6 +335,17 @@ func (l *Log) Path() string {
 func (l *Log) Close() error {
 	if l == nil {
 		return nil
+	}
+	// Stop the hook drainer (if any) before closing the file: signal it to exit and join
+	// it. It finishes its current fold then returns; any still-buffered folds are dropped
+	// (the projection is rebuildable). Idempotent — hookDone is nil'd after the first close.
+	l.mu.Lock()
+	done := l.hookDone
+	l.hookDone = nil
+	l.mu.Unlock()
+	if done != nil {
+		close(done)
+		l.hookWG.Wait()
 	}
 	return l.f.Close()
 }

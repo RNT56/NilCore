@@ -85,6 +85,21 @@ func flywheelMain(args []string) {
 // auto only under NILCORE_SELFIMPROVE_AUTOAPPROVE — SIF-T07), and whose Scope denies
 // the verifier of record and every contract file. Constructing the loop does NOTHING;
 // only Run drives a cycle (default-off).
+// rotatedLogGenerations returns the existing rotated generation(s) of logPath so the
+// flywheel distiller mines scars that straddle a rotation boundary. serve rotates via
+// maint.RotateLog, which renames the live log to "<path>.1" (a single generation kept).
+// Returns nil when nothing has rotated yet — DistillAcross skips missing paths cleanly.
+func rotatedLogGenerations(logPath string) []string {
+	if logPath == "" {
+		return nil
+	}
+	rotated := logPath + ".1"
+	if _, err := os.Stat(rotated); err != nil {
+		return nil
+	}
+	return []string{rotated}
+}
+
 func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string, maxIter int, interval time.Duration) *loop.Loop {
 	runSuite := func(ctx context.Context, cases []eval.Case) (eval.Report, error) {
 		report := eval.Run(ctx, cases, "flywheel", func(ctx context.Context, cse eval.Case) (bool, float64) {
@@ -119,8 +134,14 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 		Log:  log,
 	}
 	return loop.New(loop.Config{
-		LogPath:  logPath,
-		RunSuite: runSuite,
+		LogPath: logPath,
+		// Mine ACROSS log rotations: serve rotates the live log at 64 MiB (maint.RotateLog
+		// renames it to <path>.1 and starts a fresh genesis chain), so without the rotated
+		// generation the distiller would reset a recurring verifier-failure scar's count on
+		// every rotation. os.Stat-gated so a not-yet-rotated host passes nothing (DistillAcross
+		// skips missing generations cleanly). This makes the B5-autonomy.8 fix actually bite.
+		RotatedLogPaths: rotatedLogGenerations(logPath),
+		RunSuite:        runSuite,
 		// Candidate-aware "after" score: apply the proposal in a scratch worktree and
 		// score the suite against the edited tree (a true before/after). Fail-closed —
 		// any error ⇒ empty report ⇒ the fence drops the candidate (never auto-accepts).

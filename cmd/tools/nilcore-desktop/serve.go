@@ -216,6 +216,11 @@ func (d *driver) observe(ctx context.Context, a desktopwire.Act, preSig string) 
 	// screenshot"; the real 2-vs-3 choice is made below from the actual mark count.
 	if dec := d.ladder.Decide(desktop.RungInput{Window: window, RefCount: len(a11y), Stagnant: stagnant, HasMarkableBoxes: true}); dec.Rung == desktopwire.RungATSPI {
 		obs.Rung = desktopwire.RungATSPI
+		// Stamp each AT-SPI ref with this observation's version so a stale (reused-id)
+		// ref fails closed in the host-side guard — mirrors the browser tier's reject.
+		for i := range a11y {
+			a11y[i].Version = d.ver
+		}
 		obs.Refs = a11y
 		for _, r := range a11y {
 			d.idBox[r.ID] = r.Box
@@ -272,7 +277,9 @@ func (d *driver) observe(ctx context.Context, a desktopwire.Act, preSig string) 
 
 // buildMarks combines AT-SPI extents (with role/name) and classical-CV proposals
 // into a numbered mark list (refs) plus the id→true-box map. AT-SPI boxes come first
-// (they carry semantics); CV boxes fill the rest, capped by detect's own cap.
+// (they carry semantics); CV boxes fill the rest, capped by detect's own cap. Every ref
+// is stamped with the current observation version (d.ver) so the host-side stale-ref
+// guard fails closed on a positional id reused by a later re-render.
 func (d *driver) buildMarks(full image.Image, a11y []desktopwire.Ref) ([]desktopwire.Ref, map[int]desktopwire.Box) {
 	refs := make([]desktopwire.Ref, 0, len(a11y))
 	boxes := map[int]desktopwire.Box{}
@@ -280,13 +287,14 @@ func (d *driver) buildMarks(full image.Image, a11y []desktopwire.Ref) ([]desktop
 	for _, r := range a11y {
 		nr := r
 		nr.ID = id
+		nr.Version = d.ver
 		refs = append(refs, nr)
 		boxes[id] = r.Box
 		id++
 	}
 	for _, rect := range desktop.Detect(full, desktop.DefaultDetectOptions()) {
 		b := desktopwire.Box{X: rect.Min.X, Y: rect.Min.Y, W: rect.Dx(), H: rect.Dy()}
-		refs = append(refs, desktopwire.Ref{ID: id, Role: "element", Box: b})
+		refs = append(refs, desktopwire.Ref{ID: id, Role: "element", Box: b, Version: d.ver})
 		boxes[id] = b
 		id++
 	}

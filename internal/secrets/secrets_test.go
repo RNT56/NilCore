@@ -179,6 +179,63 @@ func TestExternalStoreEmptyIsNotFound(t *testing.T) {
 	}
 }
 
+// A keychain CLI that exits 0 but returns an empty / whitespace-only value must
+// NOT yield an empty secret — fail closed (I3). Keychain sits FIRST in the resolver
+// chain, so an empty value here would short-circuit the file-vault / env fallback
+// that holds the real credential; it must resolve as ErrNotFound and fall through.
+// Mirrors TestExternalStoreEmptyIsNotFound. GOOS-gated like the other keychain tests
+// and driven through the injected exec seam — the real OS keychain is never touched.
+func TestKeychainStoreEmptyIsNotFound(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("keychain backend unsupported on %s", runtime.GOOS)
+	}
+	for _, tc := range []struct {
+		name    string
+		payload string // exact stdout the CLI emits on a zero-exit lookup
+	}{
+		{"empty", ""},
+		{"newline-only", "\n"},
+		{"whitespace-only", "  \n"},
+		{"tabs-and-spaces", "\t \t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Injected seam: the lookup exits 0 (nil err) but hands back only the
+			// blank payload, exercising the fail-closed check on both platforms.
+			k := KeychainStore{
+				Service: "nilcore-test-throwaway",
+				run: func(name string, args []string, stdin string) (string, error) {
+					return tc.payload, nil
+				},
+			}
+			got, err := k.Get("API")
+			if !errors.Is(err, ErrNotFound) {
+				t.Fatalf("empty keychain value: Get = %q, %v, want ErrNotFound", got, err)
+			}
+			if got != "" {
+				t.Errorf("empty keychain value should yield no value, got %q", got)
+			}
+		})
+	}
+
+	// A real value at the same seam must still come back (proving the check does not
+	// swallow legitimate secrets).
+	const real = "sk-real-value-not-empty"
+	k := KeychainStore{
+		Service: "nilcore-test-throwaway",
+		run: func(name string, args []string, stdin string) (string, error) {
+			// mimic the macOS trailing newline; Get must trim then return the value.
+			return real + "\n", nil
+		},
+	}
+	got, err := k.Get("API")
+	if err != nil {
+		t.Fatalf("real value: Get = %v, want nil", err)
+	}
+	if got != real {
+		t.Fatalf("real value: Get = %q, want %q", got, real)
+	}
+}
+
 // fakeKeychain is an in-memory stand-in for the OS keychain CLI, keyed by
 // (service, account). It lets the round-trip test exercise KeychainStore.Get/Set/
 // Delete on the active platform's code path without ever touching the real keychain.

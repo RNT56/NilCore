@@ -260,7 +260,7 @@ func (l *Loop) Run(ctx context.Context) (Outcome, error) {
 			// A planning failure does not abort: the reflect ladder decides whether to
 			// narrow, switch approach, or stop-and-ask. It climbs a rung per consecutive
 			// hard failure (narrow → switch → stop) and never returns an error.
-			act := l.reflect(ctx, st, fmt.Sprintf("planning failed: %v", err), failRung)
+			act := l.reflect(ctx, &st, fmt.Sprintf("planning failed: %v", err), failRung)
 			failRung++
 			if act == ladderStop {
 				return l.finish(st, false, ReasonNoProgress, l.unmet(ctx, st)), nil
@@ -278,7 +278,7 @@ func (l *Loop) Run(ctx context.Context) (Outcome, error) {
 			if errors.Is(err, budget.ErrCeiling) {
 				return l.finish(st, false, ReasonBudget, l.unmet(ctx, st)), nil
 			}
-			act := l.reflect(ctx, st, fmt.Sprintf("slice failed: %v", err), failRung)
+			act := l.reflect(ctx, &st, fmt.Sprintf("slice failed: %v", err), failRung)
 			failRung++
 			if act == ladderStop {
 				return l.finish(st, false, ReasonNoProgress, l.unmet(ctx, st)), nil

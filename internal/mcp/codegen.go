@@ -63,7 +63,12 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 			"invoke": fmt.Sprintf(
 				`call the "mcp" tool: {"server":%q,"tool":%q,"args":{…match inputSchema…}}`, server, t.Name),
 		}
-		fname := t.Name + ".json"
+		// t.Name is UNTRUSTED server output (tools/list) — treat it as data (I7). slug()
+		// strips every path separator (→ '_'), so the filename can never traverse out of
+		// dir (mirrors the resource/prompt paths below; the operator-trusted registry name
+		// is hardened the same way via singleSegment). The descriptor's "tool" field keeps
+		// the ORIGINAL name so the model still invokes the correct tool.
+		fname := slug(t.Name, t.Name) + ".json"
 		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}

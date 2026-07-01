@@ -256,33 +256,74 @@ var irreversibleSignals = []string{
 }
 
 // irreversibleTarget reports the matched signal phrase when act is a consequential
-// click/select whose resolved target (the ref's accessible name/value, or a typed
-// submit-like text) names an irreversible action — "" when it is benign. Only
-// click/select are gated: observe/navigate/scroll/back/forward/wait/key are not
-// target-semantic mutations, and type just enters text (the SUBMIT click is gated).
+// action whose resolved target names an irreversible operation — "" when it is benign.
+// Click/select are gated on the ref's accessible name/value (or model-supplied
+// selector/option text). An Enter/Return key is ALSO gated (Enter submits the focused
+// form — cdp.TypeKey dispatches keyCode 13 with text "\r", firing the form's default
+// submit), but only when the current page carries an irreversible signal: a checkout
+// form submitted by pressing Enter is just as consequential as clicking "Pay now", so it
+// must not bypass the human gate. Non-Enter keys, and observe/navigate/scroll/back/
+// forward/wait/type, are not target-semantic mutations and stay ungated.
 func irreversibleTarget(a browserwire.Act, latest browserwire.Observation) string {
 	switch a.Op {
 	case browserwire.OpClick, browserwire.OpSelect:
+		var probe strings.Builder
+		if a.Ref > 0 {
+			for _, r := range latest.Refs {
+				if r.ID == a.Ref {
+					probe.WriteString(r.Name)
+					probe.WriteByte(' ')
+					probe.WriteString(r.Value)
+					break
+				}
+			}
+		}
+		// Selector/select-option text is also model-supplied target intent.
+		probe.WriteByte(' ')
+		probe.WriteString(a.Text)
+		probe.WriteByte(' ')
+		probe.WriteString(a.Selector)
+		return irreversibleSignal(probe.String())
+	case browserwire.OpKey:
+		// Only Enter/Return submits a form; any other key (Tab, arrows, Escape, …) is a
+		// benign navigation keystroke and stays ungated.
+		if !isSubmitKey(a.Key) {
+			return ""
+		}
+		// The key carries no target of its own, so gate on the current page's own
+		// irreversible signals: the refs' names/values plus the page text/title. If the
+		// page the model is about to submit names a purchase/pay/consent/… action, the
+		// Enter-to-submit is consequential and routes through the gate.
+		var probe strings.Builder
+		for _, r := range latest.Refs {
+			probe.WriteString(r.Name)
+			probe.WriteByte(' ')
+			probe.WriteString(r.Value)
+			probe.WriteByte(' ')
+		}
+		probe.WriteString(latest.Title)
+		probe.WriteByte(' ')
+		probe.WriteString(latest.Text)
+		return irreversibleSignal(probe.String())
 	default:
 		return ""
 	}
-	var probe strings.Builder
-	if a.Ref > 0 {
-		for _, r := range latest.Refs {
-			if r.ID == a.Ref {
-				probe.WriteString(r.Name)
-				probe.WriteByte(' ')
-				probe.WriteString(r.Value)
-				break
-			}
-		}
+}
+
+// isSubmitKey reports whether key names the Enter/Return keypress that fires a form's
+// default submit. Case-insensitive; whitespace-trimmed.
+func isSubmitKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "enter", "return":
+		return true
 	}
-	// Selector/select-option text is also model-supplied target intent.
-	probe.WriteByte(' ')
-	probe.WriteString(a.Text)
-	probe.WriteByte(' ')
-	probe.WriteString(a.Selector)
-	hay := strings.Join(strings.Fields(strings.ToLower(probe.String())), " ")
+	return false
+}
+
+// irreversibleSignal returns the first irreversibleSignals phrase found in text, matched
+// on a normalized (lowercased, whitespace-collapsed) substring, or "" when none match.
+func irreversibleSignal(text string) string {
+	hay := strings.Join(strings.Fields(strings.ToLower(text)), " ")
 	if hay == "" {
 		return ""
 	}

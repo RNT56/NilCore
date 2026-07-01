@@ -210,9 +210,13 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 			wantCmd: "go test -- './internal/foo'",
 		},
 		{
-			name: "go-bare-suite-pass", extract: "go", value: "",
+			// EMPTY selector ⇒ the WHOLE suite. For go this MUST recurse ("./..."):
+			// a bare `go test` tests only the current dir and would green with the
+			// suite never running when tests live in subpackages (the I2 laundering
+			// vector). See TestGoEmptySelectorRunsWholeSuiteRecursively below.
+			name: "go-whole-suite-pass", extract: "go", value: "",
 			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusPass,
-			wantCmd: "go test",
+			wantCmd: "go test ./...",
 		},
 		{
 			name: "npm-selector-pass", extract: "npm", value: "unit",
@@ -228,7 +232,7 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 			name: "sandbox-error-unverifiable", extract: "go", value: "",
 			box: &fakeBox{exec: func(string) (sandbox.Result, error) {
 				return sandbox.Result{}, errors.New("box exploded")
-			}}, want: artifact.StatusUnverifiable, wantCmd: "go test",
+			}}, want: artifact.StatusUnverifiable, wantCmd: "go test ./...",
 		},
 		{
 			name: "unknown-runner-unverifiable-no-box", extract: "rake", value: "x",
@@ -345,6 +349,98 @@ func TestGoRunnerSelectorIsPackagePath(t *testing.T) {
 	}
 	if strings.Contains(nameCmd, "-run") {
 		t.Fatalf("cmd = %q, the go runner must never emit a -run flag for a selector", nameCmd)
+	}
+}
+
+// TestGoEmptySelectorRunsWholeSuiteRecursively pins the fix for the empty-selector
+// laundering vector: an empty go selector MUST recurse over the whole module ("./..."),
+// never emit a bare `go test`. A bare `go test` tests only the current directory's
+// package; in a worktree whose tests live in subpackages it compiles/runs nothing,
+// prints "[no test files]", and exits 0 — a green with the suite never running (I2).
+func TestGoEmptySelectorRunsWholeSuiteRecursively(t *testing.T) {
+	cmd, err := buildTestCommand(claim(IDTestPasses, "go", ""))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cmd != "go test ./..." {
+		t.Fatalf("cmd = %q, want the recursive whole-suite form %q (a bare 'go test' launders a green)", cmd, "go test ./...")
+	}
+	// Guard the exact laundering shape explicitly: the empty selector must NEVER be the
+	// current-dir-only bare command.
+	if cmd == "go test" {
+		t.Fatalf("cmd = %q — a bare 'go test' tests only the current dir and launders a green (I2)", cmd)
+	}
+}
+
+// TestEmptySelectorWholeSuiteFormsPerRunner documents the whole-suite command each
+// allowlisted runner emits for an empty selector. Each MUST exercise the whole module,
+// never a no-op that could exit 0 without running the suite.
+func TestEmptySelectorWholeSuiteFormsPerRunner(t *testing.T) {
+	want := map[string]string{
+		"go":     "go test ./...",
+		"npm":    "npm test",
+		"pytest": "pytest",
+	}
+	for token, wantCmd := range want {
+		cmd, err := buildTestCommand(claim(IDTestPasses, token, ""))
+		if err != nil {
+			t.Fatalf("runner %q empty selector: unexpected error: %v", token, err)
+		}
+		if cmd != wantCmd {
+			t.Fatalf("runner %q empty selector: cmd = %q, want %q (whole-suite form)", token, cmd, wantCmd)
+		}
+	}
+}
+
+// TestFailingSubpackageReddensEmptyGoSelector is the discriminating end-to-end proof of
+// the fix. The stub box returns a failing exit for the recursive whole-suite command
+// ("go test ./...") — modeling a red test in a SUBPACKAGE — but exit 0 for a bare
+// `go test` (current-dir only, "[no test files]"). Because the fixed pack emits the
+// recursive form, the claim now REDDENS (Fail); the pre-fix bare command would have run
+// the current dir, found no tests, exited 0, and forged a green (StatusPass).
+func TestFailingSubpackageReddensEmptyGoSelector(t *testing.T) {
+	box := &fakeBox{exec: func(cmd string) (sandbox.Result, error) {
+		if cmd == "go test ./..." {
+			// A subpackage test fails: the whole suite is red.
+			return sandbox.Result{ExitCode: 1, Stderr: "--- FAIL: TestSub"}, nil
+		}
+		// The pre-fix bare `go test`: current dir has no tests ⇒ a spurious green.
+		return sandbox.Result{ExitCode: 0, Stderr: "?   x  [no test files]"}, nil
+	}}
+	status, _ := checkTestPasses(context.Background(), box, claim(IDTestPasses, "go", ""))
+	if status != artifact.StatusFail {
+		t.Fatalf("status = %q, want Fail — a failing subpackage test must redden the whole-suite claim (I2)", status)
+	}
+	if len(box.calls) != 1 || box.calls[0] != "go test ./..." {
+		t.Fatalf("ran %v, want exactly the recursive whole-suite command 'go test ./...'", box.calls)
+	}
+}
+
+// TestUnverifiableRunnerWithNoWholeSuiteForm proves the fail-closed branch: if a runner
+// is registered with no whole-suite form, an empty selector must yield Unverifiable (an
+// error before any box call), never a bare Pass — so a no-op can never launder a green.
+// It exercises the branch directly via a temporary registry entry so the guard is
+// covered even while every shipped runner defines a whole-suite form.
+func TestUnverifiableRunnerWithNoWholeSuiteForm(t *testing.T) {
+	const token = "noWholeSuite"
+	testRunners[token] = testRunner{selected: "fake test %s"} // wholeSuite left empty
+	defer delete(testRunners, token)
+
+	if _, err := buildTestCommand(claim(IDTestPasses, token, "")); err == nil {
+		t.Fatalf("empty selector on a runner with no whole-suite form = nil error, want an error (fail closed)")
+	}
+	// End-to-end: the check must be Unverifiable and reach no box.
+	box := &fakeBox{exec: exit(0, "")}
+	status, _ := checkTestPasses(context.Background(), box, claim(IDTestPasses, token, ""))
+	if status != artifact.StatusUnverifiable {
+		t.Fatalf("status = %q, want Unverifiable for an empty selector with no whole-suite form", status)
+	}
+	if len(box.calls) != 0 {
+		t.Fatalf("expected no box call (fail-closed before exec), got %v", box.calls)
+	}
+	// A NON-empty selector on the same runner still works (only the empty case is gated).
+	if _, err := buildTestCommand(claim(IDTestPasses, token, "pkg")); err != nil {
+		t.Fatalf("non-empty selector on the same runner: unexpected error %v", err)
 	}
 }
 

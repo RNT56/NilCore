@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -895,5 +896,124 @@ func TestCountAutoApprovalsToday(t *testing.T) {
 	}
 	if n, err := countAutoApprovalsToday(dir+"/missing.log", "open-pr", "feat/x", today); err != nil || n != 0 {
 		t.Errorf("a missing log = (0, nil), got (%d, %v)", n, err)
+	}
+}
+
+// safeHuman / safeSink are mutex-guarded test doubles for the concurrency test below
+// (recHuman/recSink touch fields without a lock, which -race would flag when the human
+// fall-through runs on two goroutines at once).
+type safeHuman struct {
+	mu     sync.Mutex
+	called int
+	reply  bool
+}
+
+func (h *safeHuman) Approve(string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.called++
+	return h.reply
+}
+
+func (h *safeHuman) calls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.called
+}
+
+type safeSink struct {
+	mu     sync.Mutex
+	kinds  map[string]int
+	denies map[string]int // reason -> count
+}
+
+func newSafeSink() *safeSink {
+	return &safeSink{kinds: map[string]int{}, denies: map[string]int{}}
+}
+
+func (s *safeSink) Emit(kind string, detail map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kinds[kind]++
+	if kind == "auto_deny" {
+		if r, _ := detail["reason"].(string); r != "" {
+			s.denies[r]++
+		}
+	}
+}
+
+func (s *safeSink) count(kind string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kinds[kind]
+}
+
+func (s *safeSink) denyReason(r string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.denies[r]
+}
+
+// TestApproveStructuredRateCapConcurrent proves the per-day rate cap is ATOMIC: two
+// concurrent ApproveStructured calls for the SAME (type,scope) with MaxPerDay=1 result
+// in EXACTLY ONE auto-approval; the other falls through to the human on the rate gate.
+// Without the in-process check-and-increment authority both would read rate=0 from the
+// read-only log scan, both pass, and the cap is exceeded (the TOCTOU this test guards).
+// Run under -race to also catch unsynchronized access to the counter.
+func TestApproveStructuredRateCapConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC() // real day so the trust-log greens count as recent
+	// Clear the bar (MinSuccesses/MinSample=2) and leave the rate window empty.
+	path := writeLog(t, dir, greenRun("open-pr", "feat/x", 3))
+
+	env := Envelope{Classes: []ClassClause{{
+		Type:          "open-pr",
+		AllowBranches: []string{"feat/*"},
+		DenyBranches:  commonDeny,
+		MinSuccesses:  2,
+		MinSample:     2,
+		RecencyDays:   7,
+		MaxPerDay:     1, // exactly one auto-approval allowed today
+	}}}
+
+	human := &safeHuman{reply: false}
+	sink := newSafeSink()
+	g := newGraded(human, env, path, nil,
+		WithSink(sink), WithClock(fixedClock(now)), WithRoot(dir))
+
+	const n = 2
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		approvals int
+	)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release both goroutines together to maximize overlap
+			if g.ApproveStructured(openPR("feat/x")) {
+				mu.Lock()
+				approvals++
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if approvals != 1 {
+		t.Fatalf("concurrent decisions auto-approved %d times, want exactly 1 (rate cap MaxPerDay=1)", approvals)
+	}
+	if got := sink.count("auto_approve"); got != 1 {
+		t.Fatalf("emitted %d auto_approve events, want 1", got)
+	}
+	// The loser must fall through to the human via the rate gate.
+	if got := human.calls(); got != n-1 {
+		t.Fatalf("human consulted %d times, want %d (the non-approved decision)", got, n-1)
+	}
+	if got := sink.denyReason("rate_exceeded"); got != n-1 {
+		t.Fatalf("rate_exceeded denies = %d, want %d", got, n-1)
 	}
 }

@@ -61,11 +61,20 @@ func (s autoApproveSink) Emit(kind string, detail map[string]any) {
 // default — so the run is unfenced). A nil human (e.g. the swarm approver, which
 // never auto-approves) is returned as-is so we never construct a graded approver
 // around a missing human.
-func wrapAutoApprove(human policy.Approver, cfg onboard.Config, logPath string, log *eventlog.Log, blast *blastbudget.Budget) policy.Approver {
+func wrapAutoApprove(human policy.Approver, cfg onboard.Config, root, logPath string, log *eventlog.Log, blast *blastbudget.Budget) policy.Approver {
 	if human == nil || cfg.AutoApprove.Empty() {
 		return human
 	}
-	return graapprove.MaybeWrap(human, cfg.AutoApprove, logPath, blast, graapprove.WithSink(autoApproveSink{log}))
+	opts := []graapprove.Option{graapprove.WithSink(autoApproveSink{log})}
+	// Resolve the kill-switch sentinel (.nilcore/AUTOAPPROVE_OFF) against the RUN root, not
+	// the process CWD — the daemon/build/swarm process runs in the parent repo while tasks
+	// execute in disposable per-task worktrees, so an operator dropping the sentinel where
+	// the docs (ARCHITECTURE §0 / ROADMAP-CLOSED-LOOP) say must actually trip it. Empty
+	// root (tests) ⇒ the graapprove default (CWD-relative), byte-identical.
+	if root != "" {
+		opts = append(opts, graapprove.WithRoot(root))
+	}
+	return graapprove.MaybeWrap(human, cfg.AutoApprove, logPath, blast, opts...)
 }
 
 // emitBoundaryOutcome records that a verifier-judged boundary (promote-to-base /

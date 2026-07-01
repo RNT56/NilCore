@@ -37,7 +37,7 @@ func TestSecretSubstitution(t *testing.T) {
 		}
 		return "", false
 	})
-	s.latest = desktopwire.Observation{Version: 1, Refs: []desktopwire.Ref{{ID: 1, Role: "entry"}}}
+	s.latest = desktopwire.Observation{Version: 1, Refs: []desktopwire.Ref{{ID: 1, Role: "entry", Version: 1}}}
 	if _, err := s.Act(context.Background(), desktopwire.Act{Op: desktopwire.OpType, Ref: 1, Text: "x={{secret:pw}}"}); err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestSecretSubstitution(t *testing.T) {
 func TestSecretMissingFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, func(string) (string, bool) { return "", false })
-	s.latest = desktopwire.Observation{Version: 1, Refs: []desktopwire.Ref{{ID: 1}}}
+	s.latest = desktopwire.Observation{Version: 1, Refs: []desktopwire.Ref{{ID: 1, Version: 1}}}
 	if _, err := s.Act(context.Background(), desktopwire.Act{Op: desktopwire.OpType, Ref: 1, Text: "{{secret:nope}}"}); err == nil {
 		t.Fatal("expected an error for an unresolved secret")
 	}
@@ -68,6 +68,38 @@ func TestStaleRefFailsClosed(t *testing.T) {
 	}
 	if len(ft.got) != 0 {
 		t.Fatal("a stale-ref act must never reach the transport")
+	}
+}
+
+// TestStaleRefVersionMismatchFailsClosed mirrors the browser tier's swap defense: a ref
+// whose ID is still present in the latest snapshot but whose stamped Version is older (a
+// re-render reused the positional CV/AT-SPI id) must fail closed host-side. A pure
+// membership check would have actuated a DIFFERENT element on the real desktop.
+func TestStaleRefVersionMismatchFailsClosed(t *testing.T) {
+	ft := &fakeTransport{}
+	s := newSession(ft, nil)
+	// Snapshot is at version 6 but ref 1 still carries version 5.
+	s.latest = desktopwire.Observation{Version: 6, Refs: []desktopwire.Ref{{ID: 1, Version: 5}}}
+	_, err := s.Act(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Ref: 1})
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("expected a stale-ref version guard error, got %v", err)
+	}
+	if len(ft.got) != 0 {
+		t.Fatal("a version-stale-ref act must never reach the transport")
+	}
+}
+
+// TestRefVersionMatchPasses confirms a ref stamped with the current snapshot version
+// validates and reaches the transport (the guard does not over-reject).
+func TestRefVersionMatchPasses(t *testing.T) {
+	ft := &fakeTransport{}
+	s := newSession(ft, nil)
+	s.latest = desktopwire.Observation{Version: 6, Refs: []desktopwire.Ref{{ID: 1, Version: 6}}}
+	if _, err := s.Act(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Ref: 1}); err != nil {
+		t.Fatalf("a current-version ref must validate, got %v", err)
+	}
+	if len(ft.got) != 1 {
+		t.Fatalf("expected the act to reach the transport, sent %d", len(ft.got))
 	}
 }
 
@@ -125,7 +157,7 @@ func (f *fakeDaemonBox) Exec(ctx context.Context, cmd string) (sandbox.Result, e
 			return sandbox.Result{}, nil
 		}
 		obs := desktopwire.Observation{Version: uint64(seq), Rung: desktopwire.RungATSPI,
-			FocusedWindow: "app-" + req.Act.Op, Refs: []desktopwire.Ref{{ID: 1, Role: "push button", Name: "Go"}}}
+			FocusedWindow: "app-" + req.Act.Op, Refs: []desktopwire.Ref{{ID: 1, Role: "push button", Name: "Go", Version: uint64(seq)}}}
 		b, _ := json.Marshal(desktopwire.SessionResponse{Seq: seq, Observation: obs})
 		_ = atomicWrite(filepath.Join(control, respPrefix+digit(seq)+jsonSuffix), b)
 		_ = os.Remove(reqPath)

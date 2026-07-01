@@ -301,6 +301,14 @@ func (c *Client) readResponse() (response, error) {
 	return resp, nil
 }
 
+// maxLSPMessage caps the byte length readResponse will allocate for one message
+// body. Content-Length is attacker-controlled data (I7): a buggy or wedged
+// language server can emit an absurd value, and make([]byte, n) on it would force
+// an arbitrarily large allocation (host OOM/DoS). A few megabytes is far above any
+// real workspace/symbol response, so exceeding it is a protocol error, not a
+// message we should try to hold.
+const maxLSPMessage = 8 << 20 // 8 MiB
+
 // readContentLength consumes the header block and returns the byte length of the
 // following JSON body. Header lines end in CRLF; an empty line ends the block.
 func (c *Client) readContentLength() (int, error) {
@@ -327,6 +335,9 @@ func (c *Client) readContentLength() (int, error) {
 	}
 	if length < 0 {
 		return 0, fmt.Errorf("missing Content-Length header")
+	}
+	if length > maxLSPMessage {
+		return 0, fmt.Errorf("Content-Length %d exceeds max message size %d", length, maxLSPMessage)
 	}
 	return length, nil
 }

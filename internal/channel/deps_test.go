@@ -25,6 +25,7 @@ func TestChannelDoesNotImportOrchestrator(t *testing.T) {
 		"nilcore/internal/super":   "orchestrator (super)",
 		"nilcore/internal/project": "orchestrator (project)",
 		"nilcore/internal/swarm":   "orchestrator (swarm)",
+		"nilcore/internal/kernel":  "orchestration kernel", // parity with backend's guard
 	}
 	for _, d := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if reason, bad := forbidden[strings.TrimSpace(d)]; bad {

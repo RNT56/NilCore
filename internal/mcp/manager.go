@@ -62,7 +62,14 @@ func (m *Manager) get(ctx context.Context, server string) (*Client, bool, error)
 	m.mu.Lock()
 	if c, ok := m.conns[server]; ok {
 		m.mu.Unlock()
-		<-c.ready // a concurrent in-flight connect may still be completing
+		// A concurrent in-flight connect may still be completing. Honor OUR ctx while we
+		// wait: a slow server stuck on `initialize` (bound to the FIRST caller's ctx) must
+		// not make every subsequent caller block on <-c.ready past its own deadline.
+		select {
+		case <-c.ready:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 		if c.err != nil {
 			return nil, false, c.err
 		}
@@ -155,6 +162,18 @@ func (m *Manager) GetPrompt(ctx context.Context, server, name string, args json.
 	return m.withRetry(ctx, server, func(c *Client) (string, error) {
 		return c.GetPrompt(ctx, name, args)
 	})
+}
+
+// ListTools returns a configured server's advertised tools (name, description,
+// inputSchema), reusing the live connection. It backs the model's `list` discovery
+// action: the descriptors GenerateWrappers writes live in the base repo, which the
+// model's worktree-rooted file tools cannot see, so discovery must go through the tool.
+func (m *Manager) ListTools(ctx context.Context, server string) ([]Tool, error) {
+	c, _, err := m.get(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+	return c.ListTools(ctx)
 }
 
 // Discover lists each configured server's tools (and, when withResources, its
