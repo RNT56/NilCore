@@ -155,6 +155,45 @@ func (ix *Index) Add(ctx context.Context, id, text string) error {
 	return nil
 }
 
+// IDs returns every document id currently stored, sorted ascending. It exists so
+// a persistent index can be reconciled against the live symbol set: an id present
+// here but absent from the live set is stale (a renamed/deleted symbol) and can be
+// pruned via Delete, keeping the cross-run index from growing unbounded.
+func (ix *Index) IDs(ctx context.Context) ([]string, error) {
+	rows, err := ix.db.QueryContext(ctx, `SELECT id FROM docs ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list ids: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ids: %w", err)
+	}
+	return ids, nil
+}
+
+// Delete removes the document stored under id (a no-op if none exists). Deleting a
+// row changes the doc set, so the vector graph is marked stale and rebuilds on the
+// next vector Search — mirroring Add's dirty-set, under the same lock so a
+// concurrent Search either predates the delete or rebuilds without the row.
+func (ix *Index) Delete(ctx context.Context, id string) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	if _, err := ix.db.ExecContext(ctx, `DELETE FROM docs WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete %q: %w", id, err)
+	}
+	ix.dirty = true
+	return nil
+}
+
 // cachedVector returns the stored vector JSON for id when the row's stored hash
 // equals newHash and a non-null vector exists, signalling Add can skip Embed.
 // ok is false (no error) when there is no row, no stored hash, a hash mismatch,

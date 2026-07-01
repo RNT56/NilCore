@@ -11,7 +11,10 @@
 //     stale snapshot fails closed rather than acting on a re-rendered node;
 //   - {{secret:NAME}} substitution — a typed secret is resolved from the host
 //     SecretStore at send time and NEVER placed in the model context or the event
-//     log (I3); the model only ever sees the placeholder.
+//     log (I3); the model only ever sees the placeholder. Every returned observation
+//     is then scrubbed host-side of any typed secret value, so a secret entered into a
+//     non-password field cannot reflow back to the model as plaintext on the next
+//     snapshot (the in-sandbox snapshot masks only password-type inputs).
 //
 // The browser run itself is CI-only (no Chromium in unit tests); the Session logic
 // (ref checks, secret substitution, act/observation marshaling, error handling) is
@@ -24,6 +27,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"nilcore/internal/browserwire"
 	"nilcore/internal/sandbox"
@@ -49,7 +53,19 @@ type Session struct {
 	secrets SecretResolver
 	latest  browserwire.Observation
 	closed  bool
+
+	// typedSecrets is the set of RESOLVED secret VALUES this session has typed into the
+	// page. Every observation returned to the model is scrubbed of any occurrence of one
+	// of these values (I3): a {{secret:NAME}} the model typed via OpType reflows back as
+	// plaintext on the next auto-snapshot (Observation.Text + Ref.Name/Value) if the field
+	// is not a password input — the in-sandbox snapshot only masks password-type fields.
+	// This host-side redaction is field-type-independent and closes that reflow.
+	typedSecrets map[string]struct{}
 }
+
+// secretSentinel is the fixed replacement for a scrubbed secret value in a returned
+// observation. It is the only thing the model ever sees where a typed secret would be.
+const secretSentinel = "«secret»"
 
 const defaultDriver = "nilcore-browser"
 
@@ -139,11 +155,14 @@ func (s *Session) do(ctx context.Context, a browserwire.Act) (browserwire.Observ
 	if err != nil {
 		return browserwire.Observation{}, err
 	}
-	s.latest = resp.Observation
+	// Host-side secret scrub (I3): redact any typed secret value that reflowed into the
+	// observation before it becomes the model's view or is recorded as latest.
+	obs := s.scrubObservation(resp.Observation)
+	s.latest = obs
 	if resp.Error != "" {
-		return resp.Observation, fmt.Errorf("browser act %q failed: %s", a.Op, resp.Error)
+		return obs, fmt.Errorf("browser act %q failed: %s", a.Op, resp.Error)
 	}
-	return resp.Observation, nil
+	return obs, nil
 }
 
 // validateRef rejects a ref-based act whose ref is absent from the latest snapshot,
@@ -188,6 +207,7 @@ func (s *Session) substituteSecrets(a browserwire.Act) (browserwire.Act, error) 
 			missing = name
 			return m
 		}
+		s.rememberSecret(v) // scrub this value from every future observation (I3)
 		return v
 	})
 	if missing != "" {
@@ -195,6 +215,63 @@ func (s *Session) substituteSecrets(a browserwire.Act) (browserwire.Act, error) 
 	}
 	a.Text = out
 	return a, nil
+}
+
+// rememberSecret records a resolved secret value so scrubObservation can redact it from
+// every subsequent observation. A trivially short value is ignored — scrubbing a 1–2
+// char value would corrupt unrelated page text for no security gain (a real secret is
+// never that short); empty values are likewise skipped.
+func (s *Session) rememberSecret(v string) {
+	if len(v) < 3 {
+		return
+	}
+	if s.typedSecrets == nil {
+		s.typedSecrets = make(map[string]struct{})
+	}
+	s.typedSecrets[v] = struct{}{}
+}
+
+// scrubObservation replaces every occurrence of a previously-typed secret value in the
+// observation (Text, Title, Console, and every Ref Name/Value) with secretSentinel,
+// before the observation is recorded as latest and returned to the model. This is the
+// host-side backstop for secret reflow (I3): it is independent of the field's input type,
+// so a secret typed into a text/textarea/API-key/TOTP field — which the in-sandbox
+// snapshot does NOT mask (only password inputs) — never reaches the model as plaintext.
+func (s *Session) scrubObservation(o browserwire.Observation) browserwire.Observation {
+	if len(s.typedSecrets) == 0 {
+		return o
+	}
+	scrub := func(in string) string {
+		if in == "" {
+			return in
+		}
+		out := in
+		for v := range s.typedSecrets {
+			if strings.Contains(out, v) {
+				out = strings.ReplaceAll(out, v, secretSentinel)
+			}
+		}
+		return out
+	}
+	o.Text = scrub(o.Text)
+	o.Title = scrub(o.Title)
+	if len(o.Console) > 0 {
+		cs := make([]string, len(o.Console))
+		for i, c := range o.Console {
+			cs[i] = scrub(c)
+		}
+		o.Console = cs
+	}
+	if len(o.Refs) > 0 {
+		rs := make([]browserwire.Ref, len(o.Refs))
+		for i, r := range o.Refs {
+			r.Name = scrub(r.Name)
+			r.Value = scrub(r.Value)
+			rs[i] = r
+		}
+		o.Refs = rs
+	}
+	return o
 }
 
 // newID returns a short random session id used for the control-dir path.

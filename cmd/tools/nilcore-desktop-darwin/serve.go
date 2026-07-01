@@ -91,13 +91,13 @@ func runServe(ctx context.Context, control string, native bool) error {
 		var req desktopwire.SessionRequest
 		if jerr := json.Unmarshal(data, &req); jerr != nil {
 			_ = writeResp(control, seq, desktopwire.SessionResponse{Seq: seq, Error: "bad request json: " + jerr.Error()})
-			_ = os.Remove(reqPath)
+			_ = shredFile(reqPath)
 			seq++
 			continue
 		}
 		if req.Act.Op == desktopwire.OpClose {
 			_ = writeResp(control, seq, desktopwire.SessionResponse{Seq: seq})
-			_ = os.Remove(reqPath)
+			_ = shredFile(reqPath)
 			return nil
 		}
 
@@ -109,7 +109,7 @@ func runServe(ctx context.Context, control string, native bool) error {
 		if werr := writeResp(control, seq, resp); werr != nil {
 			return werr
 		}
-		_ = os.Remove(reqPath)
+		_ = shredFile(reqPath)
 		seq++
 	}
 }
@@ -239,7 +239,10 @@ func (d *driver) observe(ctx context.Context) desktopwire.Observation {
 	for _, r := range cvBoxes {
 		marks = append(marks, som.Mark{ID: id, Box: scaleRectToResized(r, sx, sy), Role: "element"})
 		d.idBox[id] = r
-		obs.Refs = append(obs.Refs, desktopwire.Ref{ID: id, Role: "element",
+		// Stamp each ref with this observation's version so the host-side stale-ref guard
+		// (desktopsession.validateRef) fails closed on a ref whose positional id was reused
+		// by a later re-render — mirrors the browser tier's version-reject.
+		obs.Refs = append(obs.Refs, desktopwire.Ref{ID: id, Role: "element", Version: d.ver,
 			Box: desktopwire.Box{X: r.Min.X, Y: r.Min.Y, W: r.Dx(), H: r.Dy()}})
 		id++
 	}
@@ -273,6 +276,30 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// shredFile best-effort overwrites a request file's bytes with zeros before removing it.
+//
+// The host-control transport (internal/desktopsession/hosttransport.go) writes each Act —
+// which may carry a host-side-resolved {{secret:NAME}} value — as plaintext JSON to a real
+// /tmp file, so I3 ("secrets never on-disk plaintext") is DELIBERATELY STRESSED on this
+// tier. That is a recorded, accepted residual of the native-macOS host-control relaxation
+// (docs/ROADMAP-COMPUTER-USE-DARWIN.md §0/§3 — the tier that drives the operator's real
+// desktop behind the louder host gate). Shredding is cheap defense-in-depth, NOT a fix:
+// zeroing the bytes before unlink means a crash between processing and removal leaves less
+// secret material recoverable on disk. It is best-effort — a fsync-less overwrite on a
+// journaling/COW filesystem is not a guarantee — so failures are ignored and we still
+// remove the file.
+func shredFile(path string) error {
+	if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+		if f, oerr := os.OpenFile(path, os.O_WRONLY, 0o600); oerr == nil { //nolint:gosec // control path we created
+			zeros := make([]byte, fi.Size())
+			_, _ = f.WriteAt(zeros, 0)
+			_ = f.Sync()
+			_ = f.Close()
+		}
+	}
+	return os.Remove(path)
 }
 
 func sleepCtx(ctx context.Context, ms int) error {

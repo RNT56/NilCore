@@ -783,17 +783,21 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	// guarantee even in the read-only Discuss/Plan modes. Without -allow-egress it is
 	// never advertised, so the tool surface stays honest (a fetch would fail closed).
 	if d.webEnabled() {
+		// web_search — EXACTLY ONE path (Phase 15 capability switch). Path A (native): when
+		// NILCORE_WEB_SEARCH_NATIVE is opted in and the provider supports it, the search
+		// runs PROVIDER-SIDE (no in-box fetch), so it needs no sandbox — register it
+		// regardless of the box type. (Gating it on a Container, as before, silently gave a
+		// namespace/non-container box no web_search at all despite the opt-in.)
+		nativeWS := selectNativeWebSearch(d.execModelSpec)
+		if nativeWS != nil {
+			reg.Register(nativeWS)
+		}
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
-			// web_search — EXACTLY ONE path (Phase 15 capability switch). Path A: when
-			// NILCORE_WEB_SEARCH_NATIVE is opted in and the provider supports it, the
-			// model gets the provider-native server-side tool (no in-box fetch). Path B
-			// (else): the sandboxed, egress-confined, guard.Wrap'd client tool, when the
-			// backend is on and its host is allowlisted. Never both — a second web_search
-			// would leave a tool_use without its tool_result.
-			if nativeWS := selectNativeWebSearch(d.execModelSpec); nativeWS != nil {
-				reg.Register(nativeWS)
-			} else if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+			// Path B: the sandboxed, egress-confined, guard.Wrap'd client tool — advertised
+			// ONLY when Path A did not already claim web_search (never both, or a tool_use is
+			// orphaned) and only on a container box (it fetches in-box).
+			if nativeWS == nil && d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
 			// browser_view (P9-T02) is opt-in via NILCORE_BROWSER (the in-sandbox

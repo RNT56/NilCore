@@ -59,7 +59,7 @@ func scheduleMain(args []string) {
 	}
 	// Graduated auto-approval when an envelope is configured; else the console
 	// approver unchanged (byte-identical default-off). See watch.go.
-	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast)
+	gate := wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, absDir, *c.logPath, log, blast)
 	trig := &trigger.Trigger{
 		Enabled: *enabled,
 		Gate:    gate.Approve,

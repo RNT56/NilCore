@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"nilcore/internal/guard"
 	"nilcore/internal/mcp"
@@ -62,13 +63,24 @@ func setupMCP(workdir string) *mcp.Manager {
 		return nil
 	}
 	mgr := mcp.NewManager(cfg)
-	for _, e := range mgr.Discover(context.Background(), workdir, mcpResourcesEnabled()) {
+	// Bound discovery so a stdio server that starts but STALLS on `initialize` cannot hang
+	// process boot (serve/run/chat) indefinitely — Discover connects+initializes each
+	// server, and the transport now honors this ctx on its blocking read. A server that
+	// misses the window is logged and skipped; its connection still opens lazily on first
+	// tool call. Generous, per-boot total cap.
+	dctx, dcancel := context.WithTimeout(context.Background(), mcpDiscoverTimeout)
+	defer dcancel()
+	for _, e := range mgr.Discover(dctx, workdir, mcpResourcesEnabled()) {
 		fmt.Fprintf(os.Stderr, "nilcore: skipping mcp server %v\n", e)
 	}
 	mcpMgr = mgr
-	fmt.Fprintf(os.Stderr, "nilcore: mcp ready (%d server(s)); descriptors under %s/mcp/servers/\n", len(cfg.Servers), workdir)
+	fmt.Fprintf(os.Stderr, "nilcore: mcp ready (%d server(s)); call the mcp tool with just {\"server\":\"<name>\"} to list a server's tools\n", len(cfg.Servers))
 	return mgr
 }
+
+// mcpDiscoverTimeout bounds the per-boot MCP discovery (connect + initialize + list) so a
+// single unresponsive operator-configured server cannot wedge process startup.
+const mcpDiscoverTimeout = 30 * time.Second
 
 // mcpClose tears down the Manager's live server connections. nil-safe.
 func mcpClose(m *mcp.Manager) {
@@ -90,8 +102,10 @@ func newMCPTool(mgr *mcp.Manager) *mcpTool { return &mcpTool{mgr: mgr} }
 func (t *mcpTool) Name() string { return "mcp" }
 
 func (t *mcpTool) Description() string {
-	d := "Call a configured MCP server's tool. Discover servers + tools by reading " +
-		"./mcp/servers/<server>/<tool>.json. Input: {\"server\":\"<name>\",\"tool\":\"<tool>\",\"args\":{…}}."
+	d := "Call a configured MCP server's tool. DISCOVER a server's tools by calling this " +
+		"tool with just {\"server\":\"<name>\"} (no tool) — it returns the live catalog " +
+		"(tool names, descriptions, arg schemas). Then call " +
+		"{\"server\":\"<name>\",\"tool\":\"<tool>\",\"args\":{…}}."
 	if mcpResourcesEnabled() {
 		d += " Resources/prompts are enabled: also {\"server\",\"resource\":\"<uri>\"} or " +
 			"{\"server\",\"prompt\":\"<name>\",\"args\":{…}} (descriptors under .../resources|prompts/)."
@@ -144,8 +158,28 @@ func (t *mcpTool) Run(ctx context.Context, _ string, input json.RawMessage) (str
 		}
 		return fenceMCPErr(t.mgr.CallTool(ctx, in.Server, in.Tool, args))
 	default:
-		return "", fmt.Errorf("mcp: provide 'tool' (or 'resource'/'prompt' when enabled)")
+		// Discovery: {"server":"x"} with no tool/resource/prompt returns the server's
+		// live tool catalog, so the model discovers what to call WITHOUT a filesystem read
+		// (the codegen descriptors live in the base repo, not the disposable run worktree
+		// the model's file tools are rooted at).
+		return t.listCatalog(ctx, in.Server)
 	}
+}
+
+// listCatalog renders a server's live tool catalog (name · description · arg schema) as
+// text. The names/descriptions/schemas are SERVER-controlled untrusted data (I7), so the
+// whole rendered block is guard.Wrap-fenced — symmetric with the success/error paths.
+func (t *mcpTool) listCatalog(ctx context.Context, server string) (string, error) {
+	tools, err := t.mgr.ListTools(ctx, server)
+	if err != nil {
+		return fenceMCPErr("", err)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "MCP server %q exposes %d tool(s):\n", server, len(tools))
+	for _, tl := range tools {
+		fmt.Fprintf(&b, "- %s — %s\n  args schema: %s\n", tl.Name, tl.Description, string(tl.InputSchema))
+	}
+	return guard.Wrap("mcp tool catalog", b.String()), nil
 }
 
 // fenceMCPErr fences an MCP call's ERROR text before it reaches the model. A server's

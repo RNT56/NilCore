@@ -80,12 +80,24 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 	}
 
 	// 1b. Entry points: semantic search, else lexical over node names.
+	//
+	// The semantic index is PERSISTENT across runs, so a renamed/deleted symbol's
+	// row can linger and Search can return a name absent from the current tree. The
+	// graph, by contrast, is rebuilt fresh from the live source, so its node set is
+	// ground truth. A hit whose id resolves to no graph node (fileOf lookup misses)
+	// is such a phantom: including it would render "- OldName (?) [semantic]" — dead
+	// code shown as current. Drop those hits here (the correctness guard); the index
+	// itself is separately reconciled at build time so it does not grow unbounded.
 	var leads []string
 	if r.Semantic != nil {
 		if hits, serr := r.Semantic.Search(ctx, need, 5); serr == nil {
 			for _, h := range hits {
+				file, live := fileOf[h.ID]
+				if !live {
+					continue // phantom: stale index row with no live graph node
+				}
 				leads = append(leads, h.ID)
-				add(h.ID, fileOf[h.ID], "semantic", "matches the query", h.Score)
+				add(h.ID, file, "semantic", "matches the query", h.Score)
 			}
 		}
 	}

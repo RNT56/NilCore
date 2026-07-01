@@ -2,6 +2,7 @@ package graapprove
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"nilcore/internal/blastbudget"
@@ -30,6 +31,19 @@ type GradedApprover struct {
 	now func() time.Time
 	// root resolves the kill-switch sentinel (normally the worktree).
 	root string
+
+	// rateMu guards rateCount. It makes the per-day rate cap ATOMIC across
+	// concurrent decisions (the autonomy daemon / swarm can share one approver over
+	// one log): the log replay (countAutoApprovalsToday) is only the restart-recovery
+	// SEED, and this in-process counter is the authority — two concurrent decisions
+	// for the same (type,scope,day) can never both slip past a MaxPerDay cap.
+	rateMu sync.Mutex
+	// rateCount maps a per-(type|scope|yyyy-mm-dd) key to the count of auto-approvals
+	// granted (or seeded from the log) for that window. A key that is present has been
+	// seeded from the durable log exactly once (lazily, on first access), so a restart
+	// recovers the day's prior approvals; a key absent from a new day is seeded fresh
+	// (the window rolls at midnight UTC because the day is part of the key).
+	rateCount map[string]int
 }
 
 // Option configures a GradedApprover.
@@ -47,7 +61,7 @@ func WithRoot(root string) Option { return func(g *GradedApprover) { g.root = ro
 // newGraded constructs a GradedApprover. Callers go through MaybeWrap so the
 // default-off (return-human-unchanged) discipline is enforced in one place.
 func newGraded(human policy.Approver, env Envelope, logPath string, blast *blastbudget.Budget, opts ...Option) *GradedApprover {
-	g := &GradedApprover{human: human, env: env, logPath: logPath, blast: blast, now: time.Now}
+	g := &GradedApprover{human: human, env: env, logPath: logPath, blast: blast, now: time.Now, rateCount: map[string]int{}}
 	for _, o := range opts {
 		o(g)
 	}
@@ -152,12 +166,17 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	}
 
 	// (5) Rate — per-UTC-day auto_approve count for (type,scope) must be < MaxPerDay.
-	// Rebuilt from the durable log so a restart never resets the window.
+	// reserveRate is the ATOMIC authority: under a lock it seeds the in-process count
+	// from the durable log once per window (so a restart never resets it), then does a
+	// single check-and-increment so two concurrent decisions cannot both slip past the
+	// cap. It returns the count observed BEFORE the reservation (for the evidence
+	// object) and reserved=true only when a slot was taken. A seed read fault fails
+	// closed (reserved=false, a non-nil error) rather than silently under-counting.
 	today := dayKey(now)
-	rate, rerr := countAutoApprovalsToday(g.logPath, typ, scope, today)
-	if rerr != nil || rate >= clause.MaxPerDay {
+	rate, reserved, rerr := g.reserveRate(typ, scope, today, clause.MaxPerDay)
+	if !reserved {
 		g.emitDeny("rate_exceeded", typ, scope, map[string]any{
-			"rate": rate, "max_per_day": clause.MaxPerDay,
+			"rate": rate, "max_per_day": clause.MaxPerDay, "seed_error": rerr != nil,
 		})
 		return g.human.Approve(a.Describe())
 	}
@@ -170,6 +189,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	// irreversible axis bites only when an operator sets a ceiling).
 	ctx := context.Background()
 	if cerr := g.blast.ChargeIrreversible(ctx, 1); cerr != nil {
+		g.releaseRate(typ, scope, today) // this action did not proceed — release its rate slot
 		g.emitDeny("blast_radius", typ, scope, map[string]any{"axis": "irreversible"})
 		return g.human.Approve(a.Describe())
 	}
@@ -189,14 +209,16 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	dollars := clause.MaxDollarsDay
 	if dollars > 0 {
 		if g.blast == nil {
-			g.blast.CreditIrreversible(1) // release the slot we took (no-op on a nil meter)
+			g.blast.CreditIrreversible(1)    // release the slot we took (no-op on a nil meter)
+			g.releaseRate(typ, scope, today) // release the rate slot too — nothing proceeded
 			g.emitDeny("dollar_ceiling_unmetered", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})
 			return g.human.Approve(a.Describe())
 		}
 		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, dollars); cerr != nil {
-			g.blast.CreditIrreversible(1) // this action did not proceed — release its slot
+			g.blast.CreditIrreversible(1)    // this action did not proceed — release its slot
+			g.releaseRate(typ, scope, today) // …and its rate slot
 			g.emitDeny("over_ceiling", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})
@@ -232,4 +254,66 @@ func (g *GradedApprover) emit(kind string, detail map[string]any) {
 		return
 	}
 	g.sink.Emit(kind, detail)
+}
+
+// rateKey renders the per-window counter key: (type|scope|yyyy-mm-dd). The day is
+// part of the key, so the window rolls at midnight UTC by construction and a stale
+// day's count is simply never read again.
+func rateKey(typ, scope, today string) string {
+	return typ + "|" + scope + "|" + today
+}
+
+// reserveRate is the atomic authority for the per-day rate cap. Under rateMu it
+// lazily SEEDS the in-process count for the (type,scope,day) window from the durable
+// log exactly once (on first access of the key), then does a single
+// check-and-increment: if the effective count is already at/over maxPerDay it grants
+// nothing (reserved=false), otherwise it increments and reserves a slot
+// (reserved=true). It returns the count observed BEFORE any increment (for the
+// evidence/deny object). A maxPerDay of 0 means UNCAPPED — every call reserves. A
+// seed read fault fails closed (reserved=false, non-nil error) so a transient log
+// error denies rather than silently under-counting.
+//
+// Holding the mutex is the whole point: two concurrent decisions for the same window
+// serialize here, so they observe each other's increment and cannot both pass a cap
+// of 1. The log's auto_approve event (emitted on a full pass) remains the durable
+// record that re-seeds this counter after a restart.
+func (g *GradedApprover) reserveRate(typ, scope, today string, maxPerDay int) (before int, reserved bool, err error) {
+	if maxPerDay <= 0 {
+		return 0, true, nil // uncapped: never blocks, never seeds (preserves prior behavior)
+	}
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+
+	key := rateKey(typ, scope, today)
+	cur, seeded := g.rateCount[key]
+	if !seeded {
+		// First access of this window this process — seed from the durable log so a
+		// restart recovers the day's prior approvals. A read/parse fault fails closed.
+		seed, serr := countAutoApprovalsToday(g.logPath, typ, scope, today)
+		if serr != nil {
+			return seed, false, serr
+		}
+		cur = seed
+		g.rateCount[key] = cur // record the seed so we never re-scan this window
+	}
+	if cur >= maxPerDay {
+		return cur, false, nil // window exhausted — no slot
+	}
+	g.rateCount[key] = cur + 1 // reserve atomically under the lock
+	return cur, true, nil
+}
+
+// releaseRate returns a reserved slot to its window. It is called only when a
+// decision that already reserved a rate slot later falls through to the human (a
+// blast-radius or dollar-ceiling breach), so a denied action consumes nothing and the
+// in-process counter stays consistent with the durable log (which only records
+// auto_approve on a full pass). A maxPerDay==0 window never reserved, so a missing key
+// is a safe no-op (guarded so the count can never go negative).
+func (g *GradedApprover) releaseRate(typ, scope, today string) {
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+	key := rateKey(typ, scope, today)
+	if n := g.rateCount[key]; n > 0 {
+		g.rateCount[key] = n - 1
+	}
 }

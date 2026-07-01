@@ -46,3 +46,32 @@ func TestRunEmpty(t *testing.T) {
 		t.Errorf("empty suite report = %+v", rep)
 	}
 }
+
+// A cancelled suite must stop between cases, not grind through (and score as failed)
+// every remaining case. PassRate then reflects only the cases actually attempted.
+func TestRunCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cases := []Case{{Name: "a", Goal: "x"}, {Name: "b", Goal: "y"}, {Name: "c", Goal: "z"}}
+
+	var ran int
+	run := func(_ context.Context, _ Case) (bool, float64) {
+		ran++
+		cancel() // cancel right after the first case runs
+		return true, 1.0
+	}
+	rep := Run(ctx, cases, "cfg", run)
+
+	if ran != 1 {
+		t.Fatalf("run invoked %d times, want 1 (loop should stop after cancellation)", ran)
+	}
+	if len(rep.Results) != 1 {
+		t.Fatalf("results = %d, want 1 (fewer than %d cases)", len(rep.Results), len(cases))
+	}
+	// PassRate scores only the attempted case, not the whole (mostly-unrun) suite.
+	if rep.PassRate != 1.0 {
+		t.Errorf("pass rate = %v, want 1.0 over the single attempted case", rep.PassRate)
+	}
+	if rep.TotalCost != 1.0 {
+		t.Errorf("total cost = %v, want 1.0", rep.TotalCost)
+	}
+}

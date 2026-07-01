@@ -495,6 +495,67 @@ func TestStreamPartialOnCancelStillCharges(t *testing.T) {
 	}
 }
 
+// TestCompletePostCallCancelStillCharges is the Finding-3 acceptance for the
+// Complete path: a call that COMPLETED (produced tokens) must be charged even if
+// ctx is cancelled in the window between the inner call returning and the charge
+// landing. The decorator charges on a cancellation-stripped ctx, so the produced
+// tokens are recorded rather than silently dropped (which would under-meter and
+// let spend escape the wall).
+func TestCompletePostCallCancelStillCharges(t *testing.T) {
+	// fakeProvider.Complete ignores ctx and always returns usage, so a cancelled
+	// ctx models "inner call succeeded, then ctx got cancelled before the charge."
+	inner := &fakeProvider{id: "claude-opus-4-8", usage: model.Usage{InputTokens: 1000, OutputTokens: 1000}}
+	led := budget.New()
+	p := &Provider{Inner: inner, Ledger: led, Task: "t1", Price: NewTable()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the charge would run
+
+	resp, err := p.Complete(ctx, "sys", nil, nil, 100)
+	if err != nil {
+		t.Fatalf("Complete: post-call cancel must not fail a completed call, got %v", err)
+	}
+	if resp.Usage.InputTokens != 1000 {
+		t.Fatalf("resp lost its usage: %+v", resp.Usage)
+	}
+	// The completed call's tokens were recorded despite the cancelled ctx.
+	tokens, dollars := led.Total()
+	if tokens != 2000 || !almostEqualDollars(dollars, 0.030) {
+		t.Errorf("post-cancel charge recorded (%d, %v), want (2000, 0.030)", tokens, dollars)
+	}
+}
+
+// TestStreamPartialOnCancelChargeRecordedDespiteCancel is the Finding-3 acceptance
+// for the Stream path: a partial-on-cancel stream (inner returns usage + a ctx
+// error) must still RECORD the produced tokens, not just attempt the charge. Before
+// the fix the charge ran on the cancelled ctx and budget.Ledger.Charge refused it
+// before recording, so the partial's tokens vanished. The cancellation-stripped
+// charge context guarantees they land.
+func TestStreamPartialOnCancelChargeRecordedDespiteCancel(t *testing.T) {
+	inner := &streamingProvider{
+		id:     "claude-opus-4-8",
+		usage:  model.Usage{InputTokens: 1000, OutputTokens: 1000},
+		deltas: []string{"par", "tial"},
+		err:    context.Canceled, // cut short mid-stream
+	}
+	led := budget.New()
+	p := &Provider{Inner: inner, Ledger: led, Task: "t1", Price: NewTable()}
+
+	// An already-cancelled parent ctx: the old code's Charge(ctx,...) would refuse
+	// before recording; the fix charges on a stripped ctx and records the tokens.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := p.Stream(ctx, "sys", nil, nil, 100, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled surfaced", err)
+	}
+	tokens, dollars := led.Total()
+	if tokens != 2000 || !almostEqualDollars(dollars, 0.030) {
+		t.Errorf("partial-on-cancel charge recorded (%d, %v), want (2000, 0.030) despite cancelled ctx", tokens, dollars)
+	}
+}
+
 // TestStreamConcurrentSharedLedger is the -race acceptance criterion for the
 // streaming path: many metered streamers (distinct task keys) sharing ONE ledger
 // must charge it concurrently without a data race, with exact totals.

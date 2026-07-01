@@ -204,7 +204,7 @@ func buildMain(args []string) {
 		// wrapped with graduated auto-approval ONLY when an operator envelope is
 		// configured; with none, this returns the console approver unchanged
 		// (byte-identical default-off). The SAME blast meter fences the gate + sandboxes.
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.logPath, log, blast),
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *bf.dir, *bf.logPath, log, blast),
 	})
 	if err != nil {
 		fatal(err)
@@ -779,16 +779,17 @@ func buildSpawnFunc(d buildDeps, repo string, exec model.Provider, rost *roster.
 		// env.Verifier unchanged and the result is byte-identical. hasEvidence is true only
 		// when the typed-research evidence verifier was composed, gating the post-run projection.
 		gov, hasEvidence := typedResearchVerifier(spec, env, d.log)
-		// Egress (P11-T28, the single audited toggle): the role's allowlist is
-		// intersected with the build tree. By default d.egress is empty ⇒ every role's
-		// intersected egress is empty and the sandbox stays --network none. When the
-		// operator opts into a Pillar-5 profile, d.egress is the sanctioned widen-tree:
-		// EgressFor still NARROWS each role against it (never widens, R9) — a deny-all
-		// role (empty Profile.Egress) intersects to empty and keeps --network none,
-		// while the researcher's profile allowlist yields the intersection. We compute
-		// the narrowing here so a future operator who widens the roster cannot
-		// accidentally hand a role a SUPERSET of the tree.
-		_ = roster.EgressFor(prof, d.egress)
+		// Egress on the multi-agent BUILD path: workers stay deny-all (--network none).
+		// Unlike chat/serve/browse, buildMain starts NO egress proxy and buildDeps carries
+		// no proxy address, so there is no host-side allowlist proxy to route a worker's box
+		// through — and roster.NewWorker never reads Profile.Egress to configure the box
+		// (only applyContainerEgress/Container.AllowEgressVia does, which build does not
+		// call). So a researcher role's web_fetch fails closed here regardless of a
+		// -egress-profile opt-in: research egress is a serve/chat/browse capability, not a
+		// build-path one. (Earlier this line computed roster.EgressFor and DISCARDED it,
+		// falsely implying the box was widened — removed so the behavior is not
+		// misrepresented. Wiring real per-worker egress would require build to stand up an
+		// egress proxy and thread its address here, the same way the interactive paths do.)
 
 		// The worker's bus peer: registers exactly the three subagent tools so a
 		// blocking ask_supervisor resolves against the supervisor's reader goroutine.

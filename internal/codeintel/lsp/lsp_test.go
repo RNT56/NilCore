@@ -155,6 +155,29 @@ func TestSymbol(t *testing.T) {
 	}
 }
 
+// TestReadContentLengthCap proves an oversized Content-Length (attacker-controlled
+// per I7: a buggy/wedged server) is rejected with an error rather than triggering
+// an arbitrarily large make([]byte, n). A length just under the cap is accepted.
+func TestReadContentLengthCap(t *testing.T) {
+	read := func(header string) (int, error) {
+		c := &Client{r: bufio.NewReader(strings.NewReader(header))}
+		return c.readContentLength()
+	}
+
+	// Well over the cap: must error, and must not report a usable length.
+	if n, err := read(fmt.Sprintf("Content-Length: %d\r\n\r\n", int64(maxLSPMessage)+1)); err == nil {
+		t.Fatalf("oversized Content-Length accepted (n=%d), want error", n)
+	}
+
+	// At the cap boundary: still accepted (the body read, not attempted here, is
+	// what would fail on a short stream — the length itself is legal).
+	if n, err := read(fmt.Sprintf("Content-Length: %d\r\n\r\n", maxLSPMessage)); err != nil {
+		t.Fatalf("Content-Length at cap rejected: %v", err)
+	} else if n != maxLSPMessage {
+		t.Fatalf("Content-Length at cap = %d, want %d", n, maxLSPMessage)
+	}
+}
+
 // TestSpawnMissingCommand proves Spawn degrades cleanly (clear error, no hang) for
 // a missing binary or empty command, so the codeintel tool falls back gracefully.
 func TestSpawnMissingCommand(t *testing.T) {

@@ -93,6 +93,12 @@ func (t *hostTransport) send(ctx context.Context, req desktopwire.SessionRequest
 	if err != nil {
 		return desktopwire.SessionResponse{}, err
 	}
+	// I3 relaxation (RECORDED): the Act's JSON may carry a host-side-resolved
+	// {{secret:NAME}} value, and on this host-control tier it is written to a real /tmp
+	// file (no /work bind-mount, no sandbox). This is the accepted residual documented in
+	// docs/ROADMAP-COMPUTER-USE-DARWIN.md §0/§3 — the tier reached only behind the louder
+	// host gate. Defense-in-depth: the driver shredFile()s (zero-then-unlink) this request
+	// after processing, so a crash leaves less secret material recoverable on disk.
 	reqPath := filepath.Join(t.controlAbs, fmt.Sprintf("%s%d%s", reqPrefix, seq, jsonSuffix))
 	if err := atomicWrite(reqPath, body); err != nil {
 		return desktopwire.SessionResponse{}, err

@@ -106,6 +106,74 @@ func (f *streamingFakeProvider) callCount() int {
 	return f.calls
 }
 
+// liveProbeProvider proves live-vs-buffered forwarding: after emitting each delta
+// it records, via seenAfterEmit, how many chunks the CALLER's onChunk had already
+// observed at that instant. With live forwarding the count rises in lockstep with
+// production (1, 2, 3, …); with buffer-and-flush-on-success it would stay 0 until
+// the whole attempt returns (one end-of-stream burst). It always succeeds.
+type liveProbeProvider struct {
+	model         string
+	deltas        []string
+	seen          func() int // reads the caller-side count of chunks seen so far
+	seenAfterEmit []int      // caller-side count captured right after each emit
+}
+
+func (f *liveProbeProvider) Complete(ctx context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
+	return f.Stream(ctx, "", nil, nil, 0, nil)
+}
+
+func (f *liveProbeProvider) Stream(_ context.Context, _ string, _ []Message, _ []Tool, _ int, onChunk func(Chunk)) (Response, error) {
+	var b strings.Builder
+	for _, d := range f.deltas {
+		b.WriteString(d)
+		if onChunk != nil {
+			onChunk(Chunk{Text: d})
+		}
+		if f.seen != nil {
+			f.seenAfterEmit = append(f.seenAfterEmit, f.seen())
+		}
+	}
+	return Response{
+		Content:    []Block{{Type: "text", Text: b.String()}},
+		StopReason: "end_turn",
+		Usage:      Usage{InputTokens: 1, OutputTokens: 1},
+	}, nil
+}
+
+func (f *liveProbeProvider) Model() string { return f.model }
+
+// partialCancelProvider models anthropic.go's assembleAnthropicStream on ctx
+// cancel: it forwards its deltas, then returns the PARTIAL assembled Response
+// together with a context error — the behavior the wrapper must preserve instead
+// of discarding the partial.
+type partialCancelProvider struct {
+	model   string
+	deltas  []string
+	partial string // text of the partial assembled Response
+	err     error  // the ctx error to return (e.g. context.Canceled)
+}
+
+func (f *partialCancelProvider) Complete(ctx context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
+	return f.Stream(ctx, "", nil, nil, 0, nil)
+}
+
+func (f *partialCancelProvider) Stream(_ context.Context, _ string, _ []Message, _ []Tool, _ int, onChunk func(Chunk)) (Response, error) {
+	for _, d := range f.deltas {
+		if onChunk != nil {
+			onChunk(Chunk{Text: d})
+		}
+	}
+	// Return the partial assembled reply alongside the ctx error, exactly as the
+	// real Anthropic stream assembler does on cancel.
+	return Response{
+		Content:    []Block{{Type: "text", Text: f.partial}},
+		StopReason: "",
+		Usage:      Usage{InputTokens: 1, OutputTokens: 1},
+	}, f.err
+}
+
+func (f *partialCancelProvider) Model() string { return f.model }
+
 // compile-time assertion: Resilient is itself a Streamer, so the loop sees a
 // streamer through the resilience wrapper (ST-T05).
 var _ Streamer = (*Resilient)(nil)
@@ -401,8 +469,9 @@ func TestBackoff_JitterWithinBounds(t *testing.T) {
 
 // TestStream_RetrySucceedsNoDoubleEmit is the core streaming acceptance: a
 // provider that fails its first two attempts then succeeds must (a) recover via
-// retry and (b) emit ONLY the winning attempt's chunks — the discarded attempts'
-// deltas never reach onChunk, so no double-emit.
+// retry and (b) emit each delta EXACTLY ONCE. The walk's first attempt streams
+// live ("Hel","lo"); the two retries (including the winning one) buffer-and-
+// discard, so those same deltas are never re-emitted — no double-emit.
 func TestStream_RetrySucceedsNoDoubleEmit(t *testing.T) {
 	p := &streamingFakeProvider{model: "p", failUntil: 2, deltas: []string{"Hel", "lo"}}
 	r := newTestResilient(t, []Provider{p}, Options{
@@ -421,16 +490,99 @@ func TestStream_RetrySucceedsNoDoubleEmit(t *testing.T) {
 	if p.callCount() != 3 {
 		t.Fatalf("calls = %d, want 3", p.callCount())
 	}
-	// Two failed attempts each pushed 2 deltas to their buffers; only the winning
-	// attempt's 2 deltas may have been committed.
+	// The first attempt streamed "Hel","lo" live; the retries are discarded, so the
+	// caller sees each delta exactly once — no double-emit across the 3 attempts.
 	if strings.Join(got, "|") != "Hel|lo" {
 		t.Fatalf("emitted %q, want exactly \"Hel|lo\" (no double-emit)", strings.Join(got, "|"))
 	}
 }
 
-// TestStream_FailoverNoDoubleEmit asserts that on failover only the winning
-// (fallback) provider's chunks are emitted — the failed primary's deltas are
-// discarded.
+// TestStream_ForwardsChunksLiveNotBuffered is the Finding-1 acceptance: on the
+// single-provider / no-retry path the wrapper must forward each delta LIVE as it
+// arrives, not buffer them into one end-of-stream burst. The probe provider records
+// the caller-side chunk count right after producing each delta; live forwarding
+// makes that count climb in lockstep (1, 2, 3), while the old buffer-then-flush
+// would have left it at 0 for every delta until the attempt returned.
+func TestStream_ForwardsChunksLiveNotBuffered(t *testing.T) {
+	var got []string
+	p := &liveProbeProvider{
+		model:  "p",
+		deltas: []string{"a", "b", "c"},
+		seen:   func() int { return len(got) },
+	}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  3,
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if resp.Content[0].Text != "abc" {
+		t.Fatalf("assembled = %q, want abc", resp.Content[0].Text)
+	}
+	if strings.Join(got, "|") != "a|b|c" {
+		t.Fatalf("emitted %q, want \"a|b|c\"", strings.Join(got, "|"))
+	}
+	// The load-bearing assertion: the caller had ALREADY seen delta i at the moment
+	// the provider finished producing it. Buffered-then-flushed would record [0,0,0].
+	want := []int{1, 2, 3}
+	if len(p.seenAfterEmit) != len(want) {
+		t.Fatalf("seenAfterEmit = %v, want %v (live, incremental)", p.seenAfterEmit, want)
+	}
+	for i, w := range want {
+		if p.seenAfterEmit[i] != w {
+			t.Fatalf("after emit %d caller had seen %d chunks, want %d (chunks are buffered, not live)", i, p.seenAfterEmit[i], w)
+		}
+	}
+}
+
+// TestStream_CtxCancelReturnsPartial is the Finding-2 acceptance: when the inner
+// provider returns a PARTIAL assembled Response together with a ctx error (exactly
+// what anthropic.go does on mid-stream cancel), the wrapper must treat cancellation
+// as terminal and return that partial resp alongside the error — not discard it
+// into a zeroed Response{}. That preserves the partial reasoning for a steer.
+func TestStream_CtxCancelReturnsPartial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &partialCancelProvider{
+		model:   "p",
+		deltas:  []string{"par", "tial"},
+		partial: "partial reasoning",
+		err:     context.Canceled,
+	}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  5, // ample budget — a ctx cancel must still NOT retry
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	// Cancel before the call so the wrapper's post-attempt ctx.Err() check fires.
+	cancel()
+
+	var got []string
+	resp, err := r.Stream(ctx, "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err == nil {
+		t.Fatal("want a context error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want wrapped context.Canceled", err)
+	}
+	// The partial assembled Response is preserved, not discarded.
+	if len(resp.Content) == 0 || resp.Content[0].Text != "partial reasoning" {
+		t.Fatalf("partial resp = %+v, want the assembled partial text preserved", resp)
+	}
+	// The walk's first (and only) attempt streamed its deltas live.
+	if strings.Join(got, "|") != "par|tial" {
+		t.Fatalf("emitted %q, want \"par|tial\" (first attempt streams live)", strings.Join(got, "|"))
+	}
+}
+
+// TestStream_FailoverNoDoubleEmit asserts the live-forward contract across a
+// failover: the walk's VERY FIRST attempt streams live, so the primary's first
+// attempt emits its deltas as they arrive; every attempt after that (the primary's
+// retry and the whole fallback stream) buffers-and-discards. The winning
+// fallback's chunks are therefore NOT re-emitted — no double-emit — even though
+// the primary's first-attempt deltas did reach the caller live.
 func TestStream_FailoverNoDoubleEmit(t *testing.T) {
 	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"X", "Y"}}
 	fallback := &streamingFakeProvider{model: "fallback", deltas: []string{"a", "b"}}
@@ -450,9 +602,11 @@ func TestStream_FailoverNoDoubleEmit(t *testing.T) {
 	if primary.callCount() != 2 { // initial + 1 retry, both failed
 		t.Fatalf("primary calls = %d, want 2", primary.callCount())
 	}
-	// Only the fallback's deltas — none of the primary's failed "X","Y".
-	if strings.Join(got, "|") != "a|b" {
-		t.Fatalf("emitted %q, want exactly \"a|b\" (primary's discarded)", strings.Join(got, "|"))
+	// The walk's first attempt (primary attempt 0) streamed live: "X","Y". The
+	// primary retry and the fallback stream are all buffered-and-discarded, so the
+	// fallback's "a","b" are NOT re-emitted — that is the no-double-emit guarantee.
+	if strings.Join(got, "|") != "X|Y" {
+		t.Fatalf("emitted %q, want exactly \"X|Y\" (first attempt live, later attempts discarded)", strings.Join(got, "|"))
 	}
 }
 
@@ -481,7 +635,9 @@ func TestStream_NonStreamerFallbackOneChunk(t *testing.T) {
 }
 
 // TestStream_AllProvidersFail asserts an all-down streaming run surfaces the
-// wrapped errFail and emits nothing.
+// wrapped errFail. The walk's first attempt streams live before it fails, so its
+// deltas reach the caller; every later (failed-over / retried) attempt is
+// discarded, so nothing after the first attempt is emitted.
 func TestStream_AllProvidersFail(t *testing.T) {
 	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"x"}}
 	fallback := &streamingFakeProvider{model: "fallback", alwaysFail: true, deltas: []string{"y"}}
@@ -490,13 +646,15 @@ func TestStream_AllProvidersFail(t *testing.T) {
 		BaseBackoff: time.Millisecond,
 	}, nil)
 
-	var emitted int
-	_, err := r.Stream(context.Background(), "", nil, nil, 16, func(Chunk) { emitted++ })
+	var got []string
+	_, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
 	if err == nil || !errors.Is(err, errFail) {
 		t.Fatalf("err = %v, want wrapped errFail", err)
 	}
-	if emitted != 0 {
-		t.Fatalf("emitted %d chunks on total failure, want 0", emitted)
+	// Only the first attempt (primary attempt 0) streamed live: "x". The fallback's
+	// "y" is discarded (it is not the walk's first attempt).
+	if strings.Join(got, "|") != "x" {
+		t.Fatalf("emitted %q, want exactly \"x\" (first attempt live, fallback discarded)", strings.Join(got, "|"))
 	}
 }
 

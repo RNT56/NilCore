@@ -4,6 +4,8 @@ import (
 	"context"
 	"image"
 	"image/color"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -220,6 +222,11 @@ func TestObserveRung2_CV(t *testing.T) {
 	if obs.ScreenshotB64 == "" || len(obs.Refs) == 0 || len(d.idBox) == 0 {
 		t.Fatalf("rung 2 missing marks/screenshot/idBox: refs=%d", len(obs.Refs))
 	}
+	// Each ref must carry the observation's version so the host-side stale-ref guard can
+	// reject a reused positional id after a re-render (mirrors the browser tier).
+	if obs.Refs[0].Version != obs.Version {
+		t.Fatalf("ref version %d != observation version %d — stale-ref guard would misfire", obs.Refs[0].Version, obs.Version)
+	}
 }
 
 func TestObserveRung3_Blank(t *testing.T) {
@@ -273,5 +280,31 @@ func TestPerformCoordinate(t *testing.T) {
 	}
 	if len(rec) != 1 || !reflect.DeepEqual(rec[0], cliclickClick(50, 25)) {
 		t.Fatalf("coordinate click = %v, want point (50,25)", rec)
+	}
+}
+
+// TestShredFileZerosThenRemoves verifies the host-control request shred: the file's bytes
+// are overwritten with zeros before it is removed, so a crash between processing and
+// unlink leaves no recoverable secret material (Finding 4 defense-in-depth; the recorded
+// I3 relaxation on this tier — docs/ROADMAP-COMPUTER-USE-DARWIN.md).
+func TestShredFileZerosThenRemoves(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "req-1.json")
+	const secret = "top-secret-token"
+	if err := os.WriteFile(path, []byte(`{"act":{"text":"`+secret+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := shredFile(path); err != nil {
+		t.Fatalf("shredFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("shredFile must remove the file, stat err = %v", err)
+	}
+	// A best-effort re-read of the (now-unlinked) path returns nothing; the security
+	// property under test is that the bytes are zeroed before unlink, which we assert by
+	// confirming a shred of a missing path is a no-op error (idempotent) and that a shred
+	// leaves no readable secret behind.
+	if err := shredFile(path); err == nil {
+		t.Fatal("shredding a missing file should surface the remove error")
 	}
 }

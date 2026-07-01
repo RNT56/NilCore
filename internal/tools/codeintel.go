@@ -201,6 +201,10 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 	if err != nil {
 		return nil
 	}
+	// Track every symbol name added from the live tree so the persistent index can
+	// be reconciled below: a renamed/deleted symbol's row would otherwise linger
+	// across runs (Add is INSERT OR REPLACE only) and resurface as a phantom hit.
+	live := map[string]bool{}
 	for _, path := range files {
 		if ctx.Err() != nil {
 			break
@@ -231,7 +235,23 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 			if body == "" || len(body) > maxEmbedBytes {
 				continue
 			}
+			live[s.Name] = true
 			_ = ix.Add(ctx, s.Name, body)
+		}
+	}
+	// Reconcile the persistent index against the live symbol set: prune any stored
+	// id no longer present so a renamed/deleted symbol cannot resurface as a phantom
+	// hit and the cross-run DB does not grow unbounded. Only reconcile when the walk
+	// completed (ctx not cancelled) — a partial `live` set could otherwise prune
+	// symbols that simply were not reached yet. Best-effort: prune errors are
+	// tolerated, like the per-symbol Add above.
+	if ctx.Err() == nil {
+		if ids, ierr := ix.IDs(ctx); ierr == nil {
+			for _, id := range ids {
+				if !live[id] {
+					_ = ix.Delete(ctx, id)
+				}
+			}
 		}
 	}
 	return ix

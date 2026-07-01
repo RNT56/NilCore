@@ -97,18 +97,42 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 		// Send side: the request never reached the server ⇒ safe to retry (errDeliveryFailed).
 		return rpcResponse{}, fmt.Errorf("%w: send %s: %v", errDeliveryFailed, req.Method, err)
 	}
+	// A json.Decoder read over the subprocess pipe is a BLOCKING call with no ctx
+	// awareness, so each decode runs in a goroutine and we select on ctx.Done(). Without
+	// this, a server that accepts the request but never replies (or never answers
+	// `initialize`) would wedge this call — and, because roundTrip holds t.mu, EVERY other
+	// caller of this shared per-server connection — indefinitely (a boot / cross-session
+	// deadlock). On cancellation we CLOSE the connection: the read goroutine's Decode then
+	// returns over the torn-down pipe, and the next call's Encode fails errDeliveryFailed,
+	// so the Manager evicts + reconnects (self-heal). The ch is buffered so the goroutine
+	// never leaks even after we have already returned on ctx.Done().
+	type frame struct {
+		resp rpcResponse
+		err  error
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return rpcResponse{}, err
 		}
-		var resp rpcResponse
-		if err := t.dec.Decode(&resp); err != nil {
-			return rpcResponse{}, fmt.Errorf("mcp recv %s: %w", req.Method, err)
+		ch := make(chan frame, 1)
+		go func() {
+			var resp rpcResponse
+			err := t.dec.Decode(&resp)
+			ch <- frame{resp, err}
+		}()
+		select {
+		case <-ctx.Done():
+			_ = t.Close() // tear down the poisoned reader; Manager reconnects on the next call
+			return rpcResponse{}, ctx.Err()
+		case f := <-ch:
+			if f.err != nil {
+				return rpcResponse{}, fmt.Errorf("mcp recv %s: %w", req.Method, f.err)
+			}
+			if f.resp.ID != req.ID {
+				continue // a notification or an unrelated message — read the next frame
+			}
+			return f.resp, nil
 		}
-		if resp.ID != req.ID {
-			continue // a notification or an unrelated message — skip it
-		}
-		return resp, nil
 	}
 }
 

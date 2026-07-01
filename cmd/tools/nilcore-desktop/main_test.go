@@ -106,6 +106,11 @@ func TestObserveRung1_ATSPI(t *testing.T) {
 	if len(obs.Refs) != 1 || obs.Refs[0].Name != "OK" {
 		t.Fatalf("refs = %+v", obs.Refs)
 	}
+	// Each ref must carry the observation's version so the host-side stale-ref guard can
+	// reject a reused positional id after a re-render (mirrors the browser tier).
+	if obs.Refs[0].Version != obs.Version {
+		t.Fatalf("ref version %d != observation version %d — stale-ref guard would misfire", obs.Refs[0].Version, obs.Version)
+	}
 	if obs.ScreenshotB64 != "" {
 		t.Fatal("rung 1 should carry no screenshot")
 	}
@@ -147,6 +152,9 @@ func TestObserveRung2_SoM(t *testing.T) {
 	}
 	if len(obs.Refs) == 0 {
 		t.Fatal("rung 2 must offer numbered refs")
+	}
+	if obs.Refs[0].Version != obs.Version {
+		t.Fatalf("rung 2 ref version %d != observation version %d", obs.Refs[0].Version, obs.Version)
 	}
 	if len(d.idBox) == 0 {
 		t.Fatal("rung 2 must keep true-pixel boxes for clicking")

@@ -72,8 +72,18 @@ func (s *Session) ContextUsage() (pct, used, window int) {
 // the append-only event log is never touched). A nil Summarizer, an unknown window,
 // a below-threshold fullness, or a trivial history all return the history unchanged
 // (byte-identical, so fake-driven tests never compact). It runs in route() with
-// s.mu released (like the router's classifier call); the overwrite of s.History is
+// s.mu released (like the router's classifier call); the SPLICE into s.History is
 // taken under s.mu.
+//
+// The summarize call is a seconds-long model round-trip made with s.mu RELEASED, so a
+// concurrent follow-up Turn can append to s.History while it runs (session.go: Turn's
+// in-flight branch does s.History = append(s.History, userMsg)). We therefore SPLICE
+// rather than overwrite: under the lock we replace only the summarized PREFIX — the
+// prior turns that went into the summary — while preserving `history`'s last turn and
+// every turn appended after the pre-lock snapshot, so a racing follow-up survives in
+// the in-memory projection. If s.History was reset out from under us (a concurrent
+// Clear, or it shrank below the summarized prefix), we skip the splice and return the
+// computed seed without touching s.History — best-effort, never corrupting the live slice.
 func (s *Session) maybeCompact(ctx context.Context, st WorkState, history []model.Message) []model.Message {
 	if s.Summarizer == nil || len(history) <= 1 {
 		return history
@@ -89,12 +99,24 @@ func (s *Session) maybeCompact(ctx context.Context, st WorkState, history []mode
 	if err != nil {
 		return history // best-effort: a summarize failure leaves the conversation intact
 	}
-	seed := []model.Message{
-		userTurn("[Earlier conversation, compacted to fit the context window]\n" + cs.String()),
-		last,
-	}
+	summaryTurn := userTurn("[Earlier conversation, compacted to fit the context window]\n" + cs.String())
+
+	// The seed returned to the caller (this drive's seed) is [summary, last] — the
+	// same compact two-turn shape as before, computed purely from the snapshot.
+	seed := []model.Message{summaryTurn, last}
+
+	// Splice the SAME summary prefix into the LIVE s.History under the lock. Everything
+	// from index len(prior) onward (the snapshot's last turn plus any follow-up appended
+	// during the summarize window) is preserved verbatim. If a concurrent reset shrank
+	// s.History below the summarized prefix, leave it untouched (best-effort).
 	s.mu.Lock()
-	s.History = seed
+	if len(s.History) >= len(prior) {
+		tail := s.History[len(prior):]
+		spliced := make([]model.Message, 0, 1+len(tail))
+		spliced = append(spliced, summaryTurn)
+		spliced = append(spliced, tail...)
+		s.History = spliced
+	}
 	s.mu.Unlock()
 	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_compact",
 		Detail: map[string]any{"pct": pct, "compacted_turns": len(prior)}})

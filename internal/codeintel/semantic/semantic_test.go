@@ -149,6 +149,60 @@ func TestSearchLexicalRanksByOverlap(t *testing.T) {
 	}
 }
 
+// TestReconcilePrunesStaleIDs proves the IDs+Delete reconciliation primitives let
+// a persistent index shed a stored id absent from the live set — the fix for a
+// renamed/deleted symbol whose INSERT OR REPLACE-only row would otherwise linger
+// forever and resurface as a phantom hit. It also confirms Delete invalidates the
+// vector graph so a pruned id no longer appears in search results.
+func TestReconcilePrunesStaleIDs(t *testing.T) {
+	ctx := context.Background()
+	ix := openIndex(t, letterEmbedder{})
+
+	// "OldName" is stale (renamed away); "Live" remains in the current tree.
+	if err := ix.Add(ctx, "OldName", "abcd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.Add(ctx, "Live", "abcd"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile against the live set: prune any stored id not currently present.
+	live := map[string]bool{"Live": true}
+	ids, err := ix.IDs(ctx)
+	if err != nil {
+		t.Fatalf("IDs: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("IDs before prune = %v, want OldName+Live", ids)
+	}
+	for _, id := range ids {
+		if !live[id] {
+			if err := ix.Delete(ctx, id); err != nil {
+				t.Fatalf("Delete(%q): %v", id, err)
+			}
+		}
+	}
+
+	// OldName is gone from the stored set...
+	after, err := ix.IDs(ctx)
+	if err != nil {
+		t.Fatalf("IDs: %v", err)
+	}
+	if len(after) != 1 || after[0] != "Live" {
+		t.Fatalf("IDs after prune = %v, want [Live]", after)
+	}
+	// ...and no longer surfaces in a search that its vector would have matched.
+	hits, err := ix.Search(ctx, "abcd", 5)
+	for _, h := range hits {
+		if h.ID == "OldName" {
+			t.Fatalf("pruned id OldName still returned by Search: %+v", hits)
+		}
+	}
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+}
+
 func TestSearchEmptyK(t *testing.T) {
 	ctx := context.Background()
 	ix := openIndex(t, nil)

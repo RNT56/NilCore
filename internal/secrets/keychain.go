@@ -68,16 +68,30 @@ func (k KeychainStore) Get(name string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("secret %q: %w", name, ErrNotFound)
 		}
-		return strings.TrimRight(out, "\n"), nil
+		v := strings.TrimRight(out, "\n")
+		// Fail closed (I3): a zero-exit CLI that returns an empty / whitespace-only
+		// value is treated as absent, never as an empty secret, so the resolver
+		// chain (keychain is FIRST) falls through instead of injecting "". Mirrors
+		// ExternalStore.Get / EnvStore.Get.
+		if strings.TrimSpace(v) == "" {
+			return "", fmt.Errorf("secret %q (keychain returned empty): %w", name, ErrNotFound)
+		}
+		return v, nil
 	case "linux":
 		out, err := k.exec("secret-tool",
 			[]string{"lookup", "service", k.service(), "account", name}, "")
-		if err != nil || len(out) == 0 {
+		if err != nil {
 			return "", fmt.Errorf("secret %q: %w", name, ErrNotFound)
 		}
 		// secret-tool emits no trailing newline, but trim to match the macOS path
 		// so the value round-trips identically across platforms.
-		return strings.TrimRight(out, "\n"), nil
+		v := strings.TrimRight(out, "\n")
+		// Same fail-closed rule as darwin: a whitespace-only payload (which the old
+		// len(out)==0 guard missed) resolves as ErrNotFound.
+		if strings.TrimSpace(v) == "" {
+			return "", fmt.Errorf("secret %q (keychain returned empty): %w", name, ErrNotFound)
+		}
+		return v, nil
 	default:
 		return "", fmt.Errorf("keychain unsupported on %s", runtime.GOOS)
 	}

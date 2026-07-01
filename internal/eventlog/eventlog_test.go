@@ -122,6 +122,7 @@ func TestOnAppendHook(t *testing.T) {
 	log.OnAppend(func(e Event) { got = append(got, e) })
 	log.Append(Event{Kind: "a"})
 	log.Append(Event{Kind: "b"})
+	log.Flush() // the hook runs on the async drainer; barrier-sync before asserting
 	if len(got) != 2 || got[0].Kind != "a" || got[1].Kind != "b" {
 		t.Fatalf("hook must fire once per append, in order: %+v", got)
 	}

@@ -45,7 +45,7 @@ func TestXC02_NoTransitiveOptIn(t *testing.T) {
 	// No envelope ⇒ wrapAutoApprove returns the human approver UNCHANGED: the graded
 	// approver is never constructed, so no auto_approve is reachable. Auto-approval
 	// requires its OWN explicit opt-in (the operator envelope), never another flag.
-	if got := wrapAutoApprove(human, onboard.Config{}, "x.jsonl", nil, blast); got != policy.Approver(human) {
+	if got := wrapAutoApprove(human, onboard.Config{}, "", "x.jsonl", nil, blast); got != policy.Approver(human) {
 		t.Fatal("no single flag/env may transitively enable auto-approval (XC-T02)")
 	}
 

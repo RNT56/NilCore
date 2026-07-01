@@ -129,14 +129,23 @@ func (s *Session) do(ctx context.Context, a desktopwire.Act) (desktopwire.Observ
 	return resp.Observation, nil
 }
 
-// validateRef rejects a ref-based act whose ref is absent from the latest snapshot
-// — the host-side half of the version-stamped staleness defense.
+// validateRef rejects a ref-based act whose ref is absent from the latest snapshot,
+// OR whose stamped Version differs from the latest observation's — the host-side,
+// version-stamped staleness defense (mirrors browsersession.validateRef exactly). Both
+// desktop drivers rebuild positional CV/AT-SPI ref ids from scratch every observe, so a
+// re-render that swaps the element behind a reused id would pass a pure membership check;
+// its refs carry the OLD snapshot version, so a model still referencing them fails closed
+// here rather than actuating a DIFFERENT element on the real desktop (a swap attack). The
+// model must re-observe after any mutation.
 func (s *Session) validateRef(a desktopwire.Act) error {
 	if a.Ref <= 0 {
 		return nil // coordinate-based or non-ref act
 	}
 	for _, r := range s.latest.Refs {
 		if r.ID == a.Ref {
+			if r.Version != s.latest.Version {
+				return fmt.Errorf("ref %d is stale (stamped version %d, current snapshot version %d) — re-observe before acting (stale-ref guard)", a.Ref, r.Version, s.latest.Version)
+			}
 			return nil
 		}
 	}

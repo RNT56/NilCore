@@ -212,6 +212,53 @@ func TestIrreversibleClickApprovedDispatches(t *testing.T) {
 	}
 }
 
+// TestEnterSubmitOnIrreversiblePageHitsApprover proves the form-submit-via-Enter path is
+// gated: an OpKey "Enter" on a page whose snapshot names an irreversible action (a "Pay
+// now" button) must consult the Approver, and a denial blocks the keypress from reaching
+// the session — closing the gate bypass that OpClick-only gating left open.
+func TestEnterSubmitOnIrreversiblePageHitsApprover(t *testing.T) {
+	fs := &fakeSession{}
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{
+		{ID: 1, Role: "textbox", Name: "Card number", Version: 1},
+		{ID: 2, Role: "button", Name: "Pay now", Version: 1},
+	}}
+	appr := &recordingApprover{verdict: false}
+	b := &BrowseTool{Sess: fs, Approver: appr}
+	in, _ := json.Marshal(map[string]any{"op": "key", "key": "Enter"})
+	out, _, err := b.RunWithImage(context.Background(), ".", in)
+	if err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if len(appr.asked) != 1 {
+		t.Fatalf("Enter-submit on an irreversible page must consult the gate exactly once, got %d", len(appr.asked))
+	}
+	if !strings.Contains(out, "BLOCKED") || len(fs.got) != 0 {
+		t.Fatalf("a denied Enter-submit must not be dispatched; out=%q sent=%d", out, len(fs.got))
+	}
+}
+
+// TestEnterKeyOnBenignPageNotGated confirms Enter is ungated when the page carries no
+// irreversible signal — so ordinary form navigation (search boxes, logins) is not
+// needlessly interrupted.
+func TestEnterKeyOnBenignPageNotGated(t *testing.T) {
+	fs := &fakeSession{}
+	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{
+		{ID: 1, Role: "textbox", Name: "Search", Version: 1},
+	}}
+	appr := &recordingApprover{verdict: false}
+	b := &BrowseTool{Sess: fs, Approver: appr}
+	in, _ := json.Marshal(map[string]any{"op": "key", "key": "Enter"})
+	if _, _, err := b.RunWithImage(context.Background(), ".", in); err != nil {
+		t.Fatalf("RunWithImage: %v", err)
+	}
+	if len(appr.asked) != 0 {
+		t.Fatal("Enter on a benign page must not consult the gate")
+	}
+	if len(fs.got) != 1 {
+		t.Fatal("a benign Enter must be dispatched")
+	}
+}
+
 func TestBenignClickNotGated(t *testing.T) {
 	fs := &fakeSession{}
 	fs.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Role: "link", Name: "Home", Version: 1}}}
@@ -246,6 +293,11 @@ func TestIrreversibleTargetMatching(t *testing.T) {
 		{"type-not-gated", browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "pay now"}, false},
 		{"navigate-not-gated", browserwire.Act{Op: browserwire.OpNavigate, URL: "http://pay.test"}, false},
 		{"selector-transfer", browserwire.Act{Op: browserwire.OpClick, Selector: "#transfer-funds"}, true},
+		// Enter/Return submits the focused form: gated when the page names an irreversible
+		// action (the "Pay now" button is in this snapshot), ungated for a benign key.
+		{"enter-submit-on-pay-page", browserwire.Act{Op: browserwire.OpKey, Key: "Enter"}, true},
+		{"return-submit-on-pay-page", browserwire.Act{Op: browserwire.OpKey, Key: "Return"}, true},
+		{"tab-key-not-gated", browserwire.Act{Op: browserwire.OpKey, Key: "Tab"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

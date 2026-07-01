@@ -113,15 +113,31 @@ var allowedBuildCommands = map[string]bool{
 	"pytest":                          true,
 }
 
-// runner names the FIXED command shape a test selector is single-quoted into, keyed by
-// a pack-allowlisted ecosystem token the claim supplies in Evidence.ExtractionMethod.
-// The model supplies only the selector (DATA); it can never pick the verb. An empty
-// selector runs the bare suite (the value of the map with %s ⇒ no trailing selector
-// handled by buildTestCommand).
-var testRunners = map[string]string{
-	"go":     "go test %s",
-	"npm":    "npm test %s",
-	"pytest": "pytest %s",
+// testRunner is a pack-allowlisted ecosystem's FIXED command shapes. selected is the
+// command a model-authored selector (DATA) is single-quoted into (its %s is the selector
+// slot). wholeSuite is the command run when the selector is EMPTY — it MUST exercise the
+// entire module, never a subset. The two are separate because "drop the %s" does not
+// yield a correct whole-suite command for every runner: bare `go test` (no package arg)
+// tests ONLY the current directory's package, so in a worktree whose tests live in
+// subpackages it compiles/runs nothing, prints "[no test files]", and exits 0 — a green
+// with the suite never running (the same I2-laundering shape validateSelector blocks for
+// "-run=^$"). The go whole-suite form must therefore recurse with "./...". If a runner has
+// no safe whole-suite form, wholeSuite is left empty and an empty selector fails closed to
+// Unverifiable rather than laundering a green.
+type testRunner struct {
+	selected   string // %s ⇒ the single-quoted selector slot (specific package/file/name)
+	wholeSuite string // run when the selector is empty; "" ⇒ empty selector is Unverifiable
+}
+
+// testRunners is keyed by the token a claim supplies in Evidence.ExtractionMethod. The
+// model supplies only the selector (DATA); it can never pick the verb.
+var testRunners = map[string]testRunner{
+	// go: bare `go test` is current-dir only, so the whole-suite form must recurse.
+	"go": {selected: "go test %s", wholeSuite: "go test ./..."},
+	// npm: the "test" script is the project-defined whole suite already; no arg needed.
+	"npm": {selected: "npm test %s", wholeSuite: "npm test"},
+	// pytest: no arg ⇒ recursive discovery from the worktree root — the whole suite.
+	"pytest": {selected: "pytest %s", wholeSuite: "pytest"},
 }
 
 // runIn runs cmd in the box and maps the outcome to a Status. It centralizes the
@@ -215,23 +231,30 @@ func checkTestPasses(ctx context.Context, box sandbox.Sandbox, c artifact.Claim)
 // fails closed, so a claim can never inject a verb. The optional selector
 // (Evidence.Value) is validated (no quote / whitespace / control byte) and
 // single-quoted into the shape, so a model-authored selector stays DATA and cannot
-// break out to a second command (I7). An empty selector runs the bare suite.
+// break out to a second command (I7). An EMPTY selector runs the runner's whole-suite
+// command (which MUST exercise the entire module — see testRunner); a runner with no safe
+// whole-suite form fails closed to Unverifiable rather than laundering a green (I2).
 func buildTestCommand(c artifact.Claim) (string, error) {
 	token := strings.TrimSpace(c.Evidence.ExtractionMethod)
 	if token == "" {
 		return "", fmt.Errorf("evidence.extraction_method must name a test runner (one of %s)", knownRunners())
 	}
-	shape, ok := testRunners[token]
+	r, ok := testRunners[token]
 	if !ok {
 		return "", fmt.Errorf("test runner %q is not allowlisted (one of %s)", token, knownRunners())
 	}
 
 	selector := strings.TrimSpace(c.Evidence.Value)
 	if selector == "" {
-		// No selector — run the whole suite. Trim the "%s" placeholder and its
-		// surrounding space so we don't pass a stray empty quoted arg.
-		bare := strings.TrimSpace(strings.ReplaceAll(shape, "%s", ""))
-		return bare, nil
+		// No selector — run the WHOLE suite. Use the runner's explicit whole-suite
+		// command, NOT the "%s"-stripped shape: for go that would be a bare `go test`
+		// (current-dir only), which greens with the suite never running when the tests
+		// live in subpackages — the I2-laundering vector. A runner without a safe
+		// whole-suite form (empty wholeSuite) fails closed to Unverifiable.
+		if r.wholeSuite == "" {
+			return "", fmt.Errorf("test runner %q has no whole-suite form; a specific selector is required", token)
+		}
+		return r.wholeSuite, nil
 	}
 	if err := validateSelector(selector); err != nil {
 		return "", err
@@ -241,7 +264,7 @@ func buildTestCommand(c artifact.Claim) (string, error) {
 	// behind validateSelector's leading-dash rejection. Even a future bypass of that
 	// guard cannot turn a selector like "-run=^$" into a flag that selects zero tests
 	// and launders a green verdict (I2).
-	return fmt.Sprintf(strings.ReplaceAll(shape, "%s", "-- '%s'"), selector), nil
+	return fmt.Sprintf(strings.ReplaceAll(r.selected, "%s", "-- '%s'"), selector), nil
 }
 
 // validateSelector constrains a model-authored test selector before it is placed into

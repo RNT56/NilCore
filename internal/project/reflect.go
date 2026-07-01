@@ -56,15 +56,20 @@ func (a ladderAction) String() string {
 // approach into the bounded carry-over summary (st.Summary) — its prose is advice
 // that re-seeds the next Plan, never a verdict on done-ness (I2). An advisor error
 // or a nil advisor degrades the switch rung to a plain narrow (still bounded).
-func (l *Loop) reflect(ctx context.Context, st State, reason string, rung int) ladderAction {
+//
+// st is taken by POINTER so the SWITCH rung's appended "switch approach" decision
+// persists into the same State the outer loop threads to the next Plan — otherwise
+// the advisor's fresh approach would be written to a discarded copy and SWITCH would
+// silently degrade to NARROW. The other rungs read st but do not mutate it.
+func (l *Loop) reflect(ctx context.Context, st *State, reason string, rung int) ladderAction {
 	switch {
 	case rung <= 0:
-		l.logReflect(st, ladderNarrow, reason)
+		l.logReflect(*st, ladderNarrow, reason)
 		return ladderNarrow
 
 	case rung == 1:
-		approach := l.switchApproach(ctx, st, reason)
-		l.logReflect(st, ladderSwitch, reason)
+		approach := l.switchApproach(ctx, *st, reason)
+		l.logReflect(*st, ladderSwitch, reason)
 		if approach != "" {
 			// Fold the new approach into bounded state so the next Plan sees it as a
 			// decision — NOT as a transcript. The advisor's text is treated as a
@@ -77,8 +82,8 @@ func (l *Loop) reflect(ctx context.Context, st State, reason string, rung int) l
 		// Top of the ladder: stop-and-ask. A "keep going" from the human is honored
 		// by the caller resetting its stall counter; here we only resolve stop vs
 		// continue. With no channel, the safe default is stop (no ambient authority).
-		l.logReflect(st, ladderStop, reason)
-		if l.askContinue(ctx, st, l.effectiveNoProgress()) {
+		l.logReflect(*st, ladderStop, reason)
+		if l.askContinue(ctx, *st, l.effectiveNoProgress()) {
 			return ladderSwitch // human said keep going → drop back to a switch pass
 		}
 		return ladderStop

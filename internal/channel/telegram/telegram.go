@@ -151,6 +151,9 @@ func (b *Bot) pushPending(tr channel.TaskRequest) {
 // previously two concurrent poll() calls read the same offset and each advanced it,
 // delivering every update twice.
 func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
+	// In serve, Receive runs first with the long-lived serve ctx and owns the poller's
+	// lifetime. If a gate Ask started (and then lost) the poller under a per-drive ctx
+	// first, startIntake is restartable, so this call revives it under the serve ctx.
 	b.startIntake(ctx)
 	for {
 		if tr, ok := b.popPending(); ok {
@@ -289,6 +292,11 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 	// so a fast answer is always routed to a registered waiter.
 	b.registerGate(id, threadID, reply)
 	defer b.unregisterGate(id)
+	// Ask ensures the poller is up so its gate answer is delivered. If Ask is the first
+	// caller (its ctx is a per-drive ctx via channel.Approver) the poller binds to that
+	// ctx — but startIntake is restartable, so when this drive ends and a serve Receive
+	// runs next, the poller is revived under the long-lived serve ctx. Ask thus can never
+	// permanently wedge intake.
 	b.startIntake(ctx)
 
 	keyboard := map[string]any{"inline_keyboard": [][]map[string]any{{
@@ -308,10 +316,18 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 	}
 }
 
-// startIntake launches the SINGLE poller goroutine once, for the lifetime of the first
-// caller's ctx — in serve that is the long-lived Receive loop. Exactly one goroutine
-// ever advances the offset / calls getUpdates, so Receive and any number of concurrent
-// Asks never double-deliver updates.
+// startIntake launches the SINGLE poller goroutine once. Exactly one goroutine ever
+// advances the offset / calls getUpdates, so Receive and any number of concurrent Asks
+// never double-deliver updates.
+//
+// The poller is bound to the STARTING caller's ctx, but startIntake is RESTARTABLE: the
+// intake goroutine clears intakeStarted on exit (see intake), so if the poller's ctx is
+// cancelled the NEXT startIntake spins a fresh poller. This closes the fragile coupling
+// the review flagged: in the normal serve path Receive starts intake with the long-lived
+// serve ctx, but a gate Ask (bound to a per-drive cancellable ctx via channel.Approver)
+// can also be the first caller. Before, the sole poller latched to that per-drive ctx and
+// died — permanently — when the drive ended. Now a later Receive simply restarts it, so a
+// per-drive starter can never wedge intake.
 func (b *Bot) startIntake(ctx context.Context) {
 	b.smu.Lock()
 	start := !b.intakeStarted
@@ -325,8 +341,18 @@ func (b *Bot) startIntake(ctx context.Context) {
 }
 
 // intake is the sole poller: it long-polls getUpdates and routes each update — a gate
-// answer to the waiting Ask, an ask_user tap or a message to the task queue.
+// answer to the waiting Ask, an ask_user tap or a message to the task queue. On exit
+// (its ctx cancelled) it clears intakeStarted under smu so the NEXT startIntake spins a
+// fresh poller — the property that makes a per-drive starter (a gate Ask) unable to wedge
+// intake: when its ctx ends, the poller stops AND unlatches, and the next Receive/Ask
+// restarts it under a live ctx. Exactly one poller still runs at a time (the flag gates
+// starts; clearing it happens only after this goroutine has returned from its loop).
 func (b *Bot) intake(ctx context.Context) {
+	defer func() {
+		b.smu.Lock()
+		b.intakeStarted = false
+		b.smu.Unlock()
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return

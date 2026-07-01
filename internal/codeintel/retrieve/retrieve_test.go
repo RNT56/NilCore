@@ -182,6 +182,32 @@ func TestRetrieveNilLSPUnchanged(t *testing.T) {
 	}
 }
 
+// TestRetrieveDropsPhantomSemanticHit proves a semantic hit whose id resolves to
+// no graph node — a stale row for a renamed/deleted symbol in the persistent index
+// — is dropped rather than rendered as a current "[semantic]" item. The graph is
+// ground truth; the phantom must never reach the bundle.
+func TestRetrieveDropsPhantomSemanticHit(t *testing.T) {
+	ctx := context.Background()
+	r := buildFixture(t)
+
+	// Seed a stale row for a symbol that does NOT exist in the graph's live tree
+	// (the fixture graph only has Run/helper/leaf). Its text matches the query so
+	// the lexical semantic index would otherwise return it as a lead.
+	if err := r.Semantic.Add(ctx, "OldName", "Run the program entry point removed"); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := r.Retrieve(ctx, "Run", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range b.Items {
+		if it.Symbol == "OldName" {
+			t.Fatalf("phantom symbol OldName surfaced in bundle: %+v", it)
+		}
+	}
+}
+
 func TestRetrieveBudget(t *testing.T) {
 	r := buildFixture(t)
 	b, err := r.Retrieve(context.Background(), "Run", 2)

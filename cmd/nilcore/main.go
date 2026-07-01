@@ -856,7 +856,7 @@ func runMain(args []string) {
 		// envelope configured (cfg.AutoApprove empty) wrapAutoApprove returns the console
 		// approver UNCHANGED, so the default is byte-identical; an envelope lets an
 		// earned-trust boundary auto-proceed within the shared blast-radius fence.
-		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, blast),
+		Approver:   wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, absDir, *c.logPath, log, blast),
 		RaceN:      *c.raceN,
 		OnSuccess:  memWriteBack(mem, absDir),
 		Checkpoint: cp,
@@ -963,7 +963,7 @@ func wireAutoSupervise(o *agent.Orchestrator, c commonFlags, b boot, prov model.
 		// GAA-T07: the -auto-supervise scale-up honors the same auto-approval envelope as
 		// `nilcore build`; default-off (no envelope) ⇒ the console approver unchanged. The
 		// SAME blast meter fences the gate + the loop's sandboxes (BR-T04).
-		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, *c.logPath, log, asBlast),
+		approver: wrapAutoApprove(policy.NewConsoleApprover(os.Stdin, os.Stdout), b.cfg, o.BaseRepo, *c.logPath, log, asBlast),
 	})
 	if err != nil {
 		fatal(err)
@@ -1068,7 +1068,7 @@ func buildRunOrchestratorWith(c commonFlags, b boot, log *eventlog.Log, absDir s
 // acceptance when there is NO envelope: a headless run with no envelope can never
 // approve an agent-authored check, so authoring it would be wasted model cost.
 func makeHeadlessBackground(orch *agent.Orchestrator, cfg onboard.Config, logPath string, log *eventlog.Log, blast *blastbudget.Budget) {
-	orch.Approver = wrapAutoApprove(denyAllApprover{}, cfg, logPath, log, blast)
+	orch.Approver = wrapAutoApprove(denyAllApprover{}, cfg, orch.BaseRepo, logPath, log, blast)
 	if cfg.AutoApprove.Empty() {
 		orch.SelfAccept = nil
 	}
@@ -1544,7 +1544,7 @@ func serveSessionFactory(d serveDeps, notifyCh channel.Channel, baseCtx context.
 		// boundary may auto-proceed within the operator envelope + the shared blast fence;
 		// fall-through still routes the gate question back over the channel. Default-off
 		// (no envelope, or a nil channel approver on a headless path) ⇒ unchanged.
-		approver = wrapAutoApprove(approver, d.boot.cfg, *d.flags.logPath, d.log, d.blast)
+		approver = wrapAutoApprove(approver, d.boot.cfg, d.baseRepo, *d.flags.logPath, d.log, d.blast)
 		// One conversation = one ledger + one global ceiling = one metered provider
 		// keyed by the threadID. Routing, drives, chat replies, and the summarize
 		// fold-back all charge this single wall (§6).
@@ -1678,16 +1678,19 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	// is egress-capable; the body is fenced as untrusted data (I7), the search key
 	// (brave) injected via per-run env, never the command string (I3).
 	if d.webEnabled() {
+		// web_search — EXACTLY ONE path (Phase 15 capability switch), at PARITY with chat.
+		// Path A (provider-native server-side search) runs OUTSIDE the box, so it needs no
+		// sandbox — register it regardless of the box type (gating it on a Container silently
+		// gave a namespace/non-container box no web_search despite the opt-in).
+		nativeWS := selectNativeWebSearch(modelSpec(os.Getenv("NILCORE_MODEL"), d.boot.cfg.Executor))
+		if nativeWS != nil {
+			reg.Register(nativeWS)
+		}
 		if _, ok := box.(*sandbox.Container); ok {
 			reg.Register(tools.WebFetchTool{Box: box})
-			// web_search — EXACTLY ONE path (Phase 15 capability switch), now at PARITY
-			// with chat: Path A (provider-native server-side search) when
-			// NILCORE_WEB_SEARCH_NATIVE is opted in and the provider supports it, ELSE
-			// Path B (the sandboxed, egress-confined client tool). Never both — a second
-			// web_search would leave a tool_use without its tool_result.
-			if nativeWS := selectNativeWebSearch(modelSpec(os.Getenv("NILCORE_MODEL"), d.boot.cfg.Executor)); nativeWS != nil {
-				reg.Register(nativeWS)
-			} else if d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
+			// Path B: the sandboxed, egress-confined client tool — ONLY when Path A did not
+			// already claim web_search (never both) and only on a container box (fetches in-box).
+			if nativeWS == nil && d.searchBackend != tools.SearchOff && d.egress.Allow(tools.SearchHostFor(d.searchBackend)) {
 				reg.Register(tools.WebSearchTool{Box: box, Backend: d.searchBackend, APIKey: d.searchKey})
 			}
 			// browser_view (P9-T02): opt-in via NILCORE_BROWSER, same as chat.
