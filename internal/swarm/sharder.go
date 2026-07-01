@@ -150,7 +150,36 @@ func (s PlanSharder) Shards(ctx context.Context, goal, runID string) ([]Shard, e
 	if err != nil {
 		return nil, err
 	}
+	return treeToShards(tree, runID, s.Kind, s.Pack, s.Role, s.Tier), nil
+}
 
+// TreeSharder maps a PRE-BUILT planner.Tree to shards WITHOUT a model call. It is the
+// seam for a caller that already knows the DAG — e.g. `nilcore flows run`, whose
+// agentic-flows agent_task nodes ARE the plan (goals + produces→requires edges): the
+// flow's structure must become real Shard.Deps so the runner honors it (a dependent
+// coded on the integrated tip of its dependency), instead of being flattened into an
+// unordered goal list. Routing fields (Kind/Pack/Role/Tier) are the caller/preset
+// defaults, exactly like PlanSharder.
+type TreeSharder struct {
+	Tree planner.Tree
+	Kind artifact.Kind
+	Pack string
+	Role string
+	Tier string
+}
+
+// Shards maps the pre-built tree to shards, carrying each task's DependsOn onto
+// Shard.Deps (re-namespaced to run shard ids) — the SAME mapping PlanSharder uses, minus
+// the model call. goal is ignored (the tree already carries the per-task goals).
+func (s TreeSharder) Shards(_ context.Context, _, runID string) ([]Shard, error) {
+	return treeToShards(s.Tree, runID, s.Kind, s.Pack, s.Role, s.Tier), nil
+}
+
+// treeToShards maps a validated planner.Tree onto run-namespaced shards, rewriting each
+// PlanTask's DependsOn (plan-task ids) onto the depended-on shards' ids so the runner's
+// DAG honors the planned ordering. Shared by PlanSharder (model-planned) and TreeSharder
+// (pre-built), so both produce identical shard shapes.
+func treeToShards(tree planner.Tree, runID string, kind artifact.Kind, pack, role, tier string) []Shard {
 	// Map plan-task ids to the run-namespaced shard ids in declaration order, so a
 	// DependsOn naming a plan-task id can be rewritten to the depended-on shard's id.
 	idByPlan := make(map[string]string, len(tree.Tasks))
@@ -165,22 +194,23 @@ func (s PlanSharder) Shards(ctx context.Context, goal, runID string) ([]Shard, e
 			if mapped, ok := idByPlan[d]; ok {
 				deps = append(deps, mapped)
 			}
-			// An unknown dep id cannot occur — planner.Validate already rejected a
-			// plan referencing an undefined task — so there is no else branch to add.
+			// An unknown dep id is dropped: planner.Validate rejects a model-planned tree
+			// referencing an undefined task, and the flows adapter derives edges only
+			// between real agent_task nodes — so a dangling dep never reaches here.
 		}
 		out = append(out, Shard{
 			ID:    shardID(runID, i),
 			Input: t.Goal,
 			Goal:  t.Goal,
-			Kind:  s.Kind,
-			Pack:  s.Pack,
-			Role:  s.Role,
-			Tier:  s.Tier,
+			Kind:  kind,
+			Pack:  pack,
+			Role:  role,
+			Tier:  tier,
 			Deps:  deps,
 			State: ShardQueued,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // planShards is the internal planner mirror: it asks the model to decompose goal and
