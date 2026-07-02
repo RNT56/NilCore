@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"nilcore/internal/agenticflows"
+	"nilcore/internal/artifact"
 	"nilcore/internal/summarize"
+	"nilcore/internal/swarm"
 )
 
 const sampleFlowJSON = `{
@@ -73,6 +76,63 @@ func TestFlowDecodeAndEdgeDerivation(t *testing.T) {
 	}
 	if len(plans) != 1 || plans[0].Tool != "command-runner" {
 		t.Fatalf("want one sandbox tool plan 'command-runner', got %+v", plans)
+	}
+}
+
+// TestFlowRunPreservesDAGThroughSwarm proves the flows→swarm path keeps the flow's
+// dependency structure: flowTree lifts the agent_tasks into a planner.Tree and the swarm
+// TreeSharder (the exact seam flowsRun feeds) turns the DependsOn edge into a real
+// Shard.Dep. This is the regression guard for the collapse bug — the old decompose path
+// flattened the DAG into a newline goal list, so `implement` ran independently off HEAD
+// instead of on `plan`'s integrated tip. The run goal must also carry the flow title +
+// agentic-flows provenance.
+func TestFlowRunPreservesDAGThroughSwarm(t *testing.T) {
+	doc, err := loadFlow(writeFlow(t, sampleFlowJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	subs, err := agenticflows.AgentTaskSubtasks(doc.toAdapterFlow(), summarize.ContextSummary{})
+	if err != nil {
+		t.Fatalf("AgentTaskSubtasks: %v", err)
+	}
+
+	tree := flowTree(doc, subs)
+	if want := "Feature implementation — agentic-flows source: coding.feature-implementation@0.1.0"; tree.Goal != want {
+		t.Errorf("tree goal = %q, want %q", tree.Goal, want)
+	}
+
+	// Locate plan and implement in the (topologically ordered) tree.
+	idx := map[string]int{}
+	for i, tk := range tree.Tasks {
+		idx[tk.ID] = i
+	}
+	planIdx, ok := idx["plan"]
+	if !ok {
+		t.Fatalf("plan task missing from tree: %+v", tree.Tasks)
+	}
+	implIdx, ok := idx["implement"]
+	if !ok {
+		t.Fatalf("implement task missing from tree: %+v", tree.Tasks)
+	}
+
+	shards, err := swarm.TreeSharder{Tree: tree, Kind: artifact.KindSpec, Pack: "code", Role: "implementer"}.Shards(context.Background(), "", "runF")
+	if err != nil {
+		t.Fatalf("TreeSharder.Shards: %v", err)
+	}
+	if len(shards) != len(tree.Tasks) {
+		t.Fatalf("got %d shards, want %d", len(shards), len(tree.Tasks))
+	}
+	// The dependent (implement) must carry a real Shard.Dep on its dependency (plan) —
+	// the flow's DAG has become runner-honored edges, not a flattened goal list.
+	planShardID := shards[planIdx].ID
+	found := false
+	for _, d := range shards[implIdx].Deps {
+		if d == planShardID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("implement shard %q Deps = %v, must include plan shard %q", shards[implIdx].ID, shards[implIdx].Deps, planShardID)
 	}
 }
 

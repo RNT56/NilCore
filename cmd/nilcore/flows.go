@@ -18,10 +18,12 @@ package main
 //     as a supported core AND every required capability is one NilCore advertises), and
 //     print the worker-dispatch plan (agent_task subtasks) + sandbox tool plans. Pure
 //     inspection — NO execution. Exits non-zero on an unconsumable flow (a preflight gate).
-//   - run: build the agent_task subtasks and execute the flow through the proven
-//     `decompose` preset (each agent_task becomes an independent verified sub-run whose
-//     branch is integrated into one re-verified tip — I2). Reuses the kernel's recursive
-//     engine; adds no new dispatch loop.
+//   - run: build the agent_task subtasks into a planner.Tree and execute the flow through
+//     the verified `swarm` path with the "code" preset. Swarm HONORS the flow's DependsOn
+//     edges (derived from produces→requires) — a dependent agent_task is coded on the
+//     INTEGRATED TIP of its dependencies (a later pass), not the original HEAD — so the
+//     flow's DAG survives instead of being flattened into an unordered goal list. Each
+//     shard is pack-verified and the merged tip re-verified (I2). Adds no new dispatch loop.
 
 import (
 	"encoding/json"
@@ -32,6 +34,8 @@ import (
 	"strings"
 
 	"nilcore/internal/agenticflows"
+	"nilcore/internal/planner"
+	"nilcore/internal/spawn"
 	"nilcore/internal/summarize"
 )
 
@@ -234,11 +238,33 @@ func flowsValidate(doc flowDoc, flow agenticflows.Flow) int {
 	return ok
 }
 
-// flowsRun executes a consumable flow's agent_task nodes through the proven decompose
-// preset: it composes one sub-goal per agent_task (in topological order) into a
-// multi-line goal, which decomposePlan splits back into verified sub-runs that are
-// integrated into one re-verified tip (I2). It fails closed if the flow is not
-// consumable. It does NOT pre-execute tool/verify/approval nodes: a tool a flow needs
+// flowTree lifts a flow's agent_task subtasks (topologically ordered, with DependsOn +
+// provenance already resolved by AgentTaskSubtasks) into a planner.Tree the swarm
+// TreeSharder can shard directly. Each subtask becomes a PlanTask carrying its id, goal,
+// and dependency edges verbatim; the tree Goal carries the flow title + agentic-flows
+// provenance for the run report. This is the single place the flow→DAG mapping lives, so
+// it is unit-testable without standing up a full swarm.
+func flowTree(doc flowDoc, subs []spawn.Subtask) planner.Tree {
+	tasks := make([]planner.PlanTask, 0, len(subs))
+	for _, s := range subs {
+		tasks = append(tasks, planner.PlanTask{ID: s.ID, Goal: s.Goal, DependsOn: s.DependsOn})
+	}
+	runGoal := doc.Title
+	if runGoal == "" {
+		runGoal = doc.ID
+	}
+	return planner.Tree{
+		Goal:  fmt.Sprintf("%s — agentic-flows source: %s@%s", runGoal, doc.ID, doc.Version),
+		Tasks: tasks,
+	}
+}
+
+// flowsRun executes a consumable flow's agent_task DAG through the verified swarm path
+// with the "code" preset: flowTree lifts the agent_tasks into a planner.Tree whose
+// DependsOn edges swarm HONORS — a dependent task is coded on the integrated tip of its
+// dependencies (a later pass), not the original HEAD — so the flow's structure survives
+// (unlike the flat goal list decompose collapsed it into). It fails closed if the flow is
+// not consumable. It does NOT pre-execute tool/verify/approval nodes: a tool a flow needs
 // is reached transitively as a model-emitted command inside an agent_task, which then
 // hits the sandbox/verifier/gate like any other command.
 func flowsRun(doc flowDoc, flow agenticflows.Flow, dir string) {
@@ -256,24 +282,26 @@ func flowsRun(doc flowDoc, flow agenticflows.Flow, dir string) {
 		os.Exit(1)
 	}
 
-	// Compose the worker-dispatch goal: the flow title as context, then one line per
-	// agent_task (decomposePlan splits on newlines, so each becomes an independent
-	// verified sub-run). AgentTaskSubtasks returns the subs in TOPOLOGICAL order, so a
-	// task's dependencies appear before it in the goal list; the integrator then merges
-	// in that order and re-verifies after each merge regardless (I2).
-	var b strings.Builder
-	if doc.Title != "" {
-		fmt.Fprintf(&b, "%s\n", doc.Title)
-	}
-	for _, s := range subs {
-		fmt.Fprintf(&b, "%s\n", s.Goal)
-	}
-	goal := strings.TrimSpace(b.String())
+	tree := flowTree(doc, subs)
 
-	fmt.Fprintf(os.Stderr, "nilcore flows: running %s@%s as %d worker sub-task(s) via decompose\n", doc.ID, doc.Version, len(subs))
-	// Reuse the verified decompose entrypoint wholesale (no new dispatch loop): it owns
-	// the worktrees, the per-child verify, the integration + re-verify, and the gate.
-	decomposeMain([]string{"-goal", goal, "-dir", dir})
+	// Default swarm flags (unparsed ⇒ registration defaults), targeted at the flow's repo
+	// with the code preset. preset + dir are set AFTER applyConfigDefaults so the
+	// flows-specific choices win over any config default.
+	fs := flag.NewFlagSet("flows-swarm", flag.ContinueOnError)
+	sf := registerSwarmFlags(fs)
+	b := loadBoot(*sf.common.config)
+	applyConfigDefaults(sf.common, b.cfg, flagsSet(fs))
+	*sf.preset = "code"
+	*sf.common.dir = dir
+	// The tree carries the per-shard goals (via TreeSharder); this run-level goal is only
+	// the report/scoreboard header (SwarmState.Goal), so give it the flow title +
+	// provenance rather than leaving it blank.
+	*sf.goal = tree.Goal
+	log := openLog(*sf.common.logPath)
+	defer log.Close()
+
+	fmt.Fprintf(os.Stderr, "nilcore flows: running %s@%s as %d agent_task shard(s) via swarm (code preset, DAG-honoring)\n", doc.ID, doc.Version, len(tree.Tasks))
+	swarmRun(swarmDeps{flags: sf, boot: b, log: log, dir: mustAbs(dir), tree: &tree})
 }
 
 func truncFlow(s string, n int) string {
@@ -293,7 +321,7 @@ convert a flow.yaml with flowctl first).
 
 Usage:
   nilcore flows validate -flow <file.json>            preflight: can NilCore consume it? (no execution)
-  nilcore flows run      -flow <file.json> [-dir .]    run the agent_task nodes via the decompose preset
+  nilcore flows run      -flow <file.json> [-dir .]    run the agent_task DAG via the swarm code preset
 
 Exit codes (validate): 0 = consumable, 1 = not consumable / decode error.
 `)

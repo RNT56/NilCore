@@ -7,6 +7,7 @@ import (
 
 	"nilcore/internal/artifact"
 	"nilcore/internal/model"
+	"nilcore/internal/planner"
 	"nilcore/internal/sandbox"
 )
 
@@ -115,6 +116,54 @@ func TestPlanSharderCarriesDeps(t *testing.T) {
 	}
 	if shards[0].Pack != "code" || shards[0].Kind != artifact.KindSpec {
 		t.Errorf("routing not applied: %+v", shards[0])
+	}
+}
+
+// TestTreeSharderReNamespacesDeps asserts a PRE-BUILT tree (no model call — the flows
+// path) maps each task to a run-namespaced shard and rewrites DependsOn (plan-task ids)
+// onto Shard.Deps (shard ids), including a task that depends on TWO others. This is the
+// structure-preservation guarantee `nilcore flows run` relies on: the flow's DAG becomes
+// real Shard.Deps the runner honors, not a flattened goal list.
+func TestTreeSharderReNamespacesDeps(t *testing.T) {
+	tree := planner.Tree{
+		Goal: "ship it — agentic-flows source: demo@1.0.0",
+		Tasks: []planner.PlanTask{
+			{ID: "scaffold", Goal: "scaffold the module", DependsOn: nil},
+			{ID: "impl", Goal: "implement on the scaffold", DependsOn: []string{"scaffold"}},
+			{ID: "wire", Goal: "wire impl into the scaffold", DependsOn: []string{"scaffold", "impl"}},
+		},
+	}
+	s := TreeSharder{Tree: tree, Kind: artifact.KindSpec, Pack: "code", Role: "implementer", Tier: "strong"}
+	shards, err := s.Shards(context.Background(), "ignored", "runF")
+	if err != nil {
+		t.Fatalf("Shards: %v", err)
+	}
+	if len(shards) != 3 {
+		t.Fatalf("got %d shards, want 3", len(shards))
+	}
+	wantIDs := []string{"swarm-runF-0", "swarm-runF-1", "swarm-runF-2"}
+	for i, sh := range shards {
+		if sh.ID != wantIDs[i] {
+			t.Errorf("shard[%d].ID = %q, want %q", i, sh.ID, wantIDs[i])
+		}
+		if sh.Goal != tree.Tasks[i].Goal || sh.Input != tree.Tasks[i].Goal {
+			t.Errorf("shard[%d] goal/input = %q/%q, want %q", i, sh.Goal, sh.Input, tree.Tasks[i].Goal)
+		}
+		if sh.Kind != artifact.KindSpec || sh.Pack != "code" || sh.Role != "implementer" || sh.Tier != "strong" {
+			t.Errorf("shard[%d] routing not carried: %+v", i, sh)
+		}
+		if sh.State != ShardQueued {
+			t.Errorf("shard[%d].State = %q, want queued", i, sh.State)
+		}
+	}
+	if len(shards[0].Deps) != 0 {
+		t.Errorf("root shard Deps = %v, want none", shards[0].Deps)
+	}
+	if len(shards[1].Deps) != 1 || shards[1].Deps[0] != "swarm-runF-0" {
+		t.Errorf("shard[1].Deps = %v, want [swarm-runF-0]", shards[1].Deps)
+	}
+	if len(shards[2].Deps) != 2 || shards[2].Deps[0] != "swarm-runF-0" || shards[2].Deps[1] != "swarm-runF-1" {
+		t.Errorf("shard[2].Deps = %v, want [swarm-runF-0 swarm-runF-1]", shards[2].Deps)
 	}
 }
 
