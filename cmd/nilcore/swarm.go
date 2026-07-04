@@ -694,11 +694,27 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		c.pool.SetShardCeiling(s.ID, c.perShard)
 	}
 
-	// One worktree per shard, branch task/<safe-id>, cut from the repo HEAD. The
-	// shared gitMu (build.go) serializes the worktree-add against concurrent shards.
+	// One worktree per ATTEMPT. The start-point honors the harness-resolved
+	// Shard.BaseRef — a dependency's verified branch, the integrated tip (multi-dep /
+	// conflict rebuild), or the shard's own preserved failed attempt (a focused
+	// retry's continue_from) — so a DAG dependent actually SEES the work it depends
+	// on instead of being cut blind from HEAD. Empty BaseRef ⇒ "HEAD", the prior
+	// behavior. The branch carries a fresh per-attempt suffix because Release KEEPS
+	// branches (that is what makes a preserved failed attempt continuable) and
+	// `worktree add -b` refuses an existing branch — a fixed name would fail every
+	// requeued attempt at the cut, and a retry must never advance the very ref its
+	// own base was cut from. The shared gitMu (build.go) serializes the worktree-add
+	// against concurrent shards.
+	startPoint := s.BaseRef
+	if startPoint == "" {
+		startPoint = "HEAD"
+	}
 	branch := "swarm/" + leafName(s.ID)
+	if s.Attempt > 0 || s.BaseRef != "" {
+		branch += "-a" + shortID() // retry / rebased attempt: a fresh, non-colliding ref
+	}
 	gitMu.Lock()
-	wt, err := worktree.CreateFrom(ctx, c.repo, branch, leafName(s.ID), "HEAD")
+	wt, err := worktree.CreateFrom(ctx, c.repo, branch, leafName(s.ID), startPoint)
 	gitMu.Unlock()
 	if err != nil {
 		return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
@@ -752,15 +768,21 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	// Run the worker. A delegated coding backend (codex/claude-code) routes through
 	// buildBackend IN-BOX (I4); native runs through roster.NewWorker. Both are judged
 	// by the SAME governing verifier (gov) — the worker's self-report never ships (I2).
+	// The backend's prose Summary is captured (bounded) so a PASSED shard can hand its
+	// account to DAG dependents; it is model-authored prose the Controller's handoff
+	// digest fences via guard.Wrap (I7) — never a verdict, never control text.
+	var workerSummary string
 	goal := c.shardGoal(s)
 	task := backendTaskFor(s, goal, wt.Path())
 	if backendName := c.pool.CodeBackendFor(s.Role); backendName != "native" {
 		be := buildBackend(backendName, nil, c.deps.boot.cred, advisorCfg{}, env.Box, gov,
 			c.deps.log, defaultShardMaxSteps, nil, c.repo, c.deps.boot.cfg)
-		if _, rerr := be.Run(ctx, task); rerr != nil {
+		bres, rerr := be.Run(ctx, task)
+		if rerr != nil {
 			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("swarm shard: delegated backend: %w", rerr)})
 		}
+		workerSummary = bres.Summary
 	} else {
 		prof := c.preset.Profile
 		prof.Model = c.pool.WorkerFor(s.ID) // attach the LIVE worker provider (Resolve left it nil)
@@ -772,10 +794,12 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		// empty and keeps --network none.
 		prof.Egress = roster.EgressFor(prof, c.egress)
 		worker := roster.NewWorker(prof, env.Box, gov, c.deps.log, c.pool.WorkerFor(s.ID), nil)
-		if _, rerr := worker.Run(ctx, task); rerr != nil {
+		wres, rerr := worker.Run(ctx, task)
+		if rerr != nil {
 			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("swarm shard: worker: %w", rerr)})
 		}
+		workerSummary = wres.Summary
 	}
 
 	// The verifier — not the worker self-report — decides whether this shard ships (I2).
@@ -802,8 +826,10 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	}
 
 	// Green: the artifact is already collated above. On a code preset, commit the
-	// worktree and surface the branch for the Integrator.
-	res := spawn.Result{ID: s.ID, Passed: true, State: spawn.StatePassed}
+	// worktree and surface the branch for the Integrator. The bounded prose Summary
+	// rides along for the DAG handoff digest (fenced downstream — I7).
+	res := spawn.Result{ID: s.ID, Passed: true, State: spawn.StatePassed,
+		Summary: truncate(workerSummary, maxReportProseBytes)}
 	if c.preset.FanIn == preset.FanInMerge {
 		gitMu.Lock()
 		if _, _, cerr := wt.Commit(ctx, "feat("+leafName(s.ID)+"): "+truncate(goal, 60)); cerr == nil {

@@ -19,7 +19,11 @@ package swarm
 // requeue-only-failed guarantee falls straight out of the Scan.
 //
 // THE TERMINATION RAILS, in the order they are checked each pass:
-//   1. converged — Scan returns an empty Worklist. The only GREEN exit.
+//   1. converged — Scan returns an empty Worklist AND every verifier-green branch is
+//                  folded into the tip. The only GREEN exit. An empty worklist with
+//                  green work stranded OFF the tip (a merge conflict past its rebuild
+//                  budget) exits `unmerged` instead — RED, so a dropped merge can
+//                  never masquerade as Done (I2).
 //   2. hard-cap  — the ABSOLUTE HardMaxPasses backstop (always on, even UntilClean):
 //                  a claim-id-rotating worker that defeats the per-Unit retry Ledger
 //                  cannot spin forever burning the budget.
@@ -118,15 +122,18 @@ type Scoreboard struct {
 
 // Outcome is the terminal report of a Run. Done is true only on the converged (green)
 // exit. Reason is the rail that stopped the loop (one of converged/exhausted/budget/
-// passes/ctx/error). Passes is how many passes ran; TipBranch is the integration tip
-// to surface as a PromoteToBase candidate (NEVER auto-landed); Remaining is the count
-// of shards not green at exit; Board is the final pass's Scoreboard.
+// passes/ctx/error/unmerged/…). Passes is how many passes ran; TipBranch is the
+// integration tip to surface as a PromoteToBase candidate (NEVER auto-landed);
+// Remaining is the count of shards not green at exit PLUS any verifier-green shard
+// whose branch never reached the tip (a dropped merge is not "done" — I2); Unmerged
+// breaks that second component out; Board is the final pass's Scoreboard.
 type Outcome struct {
 	Done      bool
 	Reason    string
 	Passes    int
 	TipBranch string
 	Remaining int
+	Unmerged  int
 	Board     Scoreboard
 }
 
@@ -141,6 +148,7 @@ const (
 	ReasonStalled   = "stalled"   // two consecutive passes made no progress (no new units resolved)
 	ReasonCtx       = "ctx"       // context cancelled/deadlined
 	ReasonError     = "error"     // a store/integrate fault aborted the loop
+	ReasonUnmerged  = "unmerged"  // verifier-green work stayed off the tip past its rebuild budget
 )
 
 // Controller drives the multi-pass loop over a Runner and a durable Queue. Worktree is
@@ -195,7 +203,8 @@ type Controller struct {
 // level a capped/red run is a result, not a program fault.
 func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (Outcome, error) {
 	// current is the set of shards to run THIS pass. It starts as the full initial set
-	// and shrinks to the requeue set (failed-with-budget shards) on each subsequent pass.
+	// and shrinks to the requeue set (failed-with-budget shards, plus any merge-
+	// conflicted greens with rebuild budget) on each subsequent pass.
 	current := initial
 	// deps is the run-wide id->dependency-ids map, captured ONCE from the full initial
 	// set. integrateGreen reads it to fold green branches in dependency order: passed
@@ -205,10 +214,30 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	for i := range initial {
 		deps[initial[i].ID] = initial[i].Deps
 	}
+	// baseGoal pins each shard's ORIGINAL goal so the per-pass suffixes (dep handoff
+	// digests, focused-retry evidence, conflict-rebuild instructions) are composed
+	// fresh each requeue instead of compounding pass over pass into an unbounded goal.
+	baseGoal := make(map[string]string, len(initial))
+	for i := range initial {
+		baseGoal[initial[i].ID] = initial[i].Goal
+	}
 	// passed accumulates the shards that have ever gone green, keyed by id, so a later
-	// pass never re-runs them and integration can fold their branches. The Result holds
-	// the verified Branch.
+	// pass never re-runs them (unless their MERGE needs a rebuild) and integration can
+	// fold their branches. The Result holds the verified Branch.
 	passed := make(map[string]spawn.Result, len(initial))
+	// merged is the set of shard ids whose branch is already folded into the verified
+	// tip, seeded from the persisted SwarmState (resume) and mirrored back onto
+	// st.Merged as integrateGreen lands new folds. It is what scopes each pass's fold
+	// to the NOT-yet-merged greens and what the termination-honesty accounting reads.
+	merged := make(map[string]bool, len(st.Merged))
+	for _, id := range st.Merged {
+		merged[id] = true
+	}
+	// conflictStale marks a green shard whose CURRENT branch already conflicted (or
+	// red-combined) on merge: re-merging that same branch would fail identically and
+	// spam integration events, so it is excluded from the fold until the shard re-runs
+	// and produces a FRESH branch (the fold criterion; run-scoped in-memory state).
+	conflictStale := make(map[string]bool)
 	var board Scoreboard
 
 	// prevRemaining anchors the no-progress detector: a pass that leaves the remaining
@@ -221,30 +250,36 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		// Honor cancellation at the top of every pass so a deadline between passes stops
 		// the loop with a Skipped-style outcome rather than dispatching another wave.
 		if err := ctx.Err(); err != nil {
-			return c.finish(ctx, st, board, passed, ReasonCtx, false), nil
+			return c.finish(ctx, st, board, passed, merged, ReasonCtx, false), nil
 		}
 
 		// Hard backstop BEFORE dispatch, enforced even under UntilClean: if the run has
 		// already spent the absolute pass budget, stop. This is the rail that bounds a
 		// claim-id-rotating worker — one whose every red Unit reads "fresh" to the retry
 		// Ledger, so the exhausted rail never fires — from looping forever (MINOR #10).
+		// It also bounds a permanently-conflicting rebuild ping-pong past the merge
+		// Ledger (belt and braces).
 		if st.Pass >= c.effectiveHardMaxPasses() {
-			return c.finish(ctx, st, board, passed, ReasonHardCap, false), nil
+			return c.finish(ctx, st, board, passed, merged, ReasonHardCap, false), nil
 		}
 
 		// Budget rail BEFORE dispatch: if the global ceiling has no headroom there is no
 		// point running a pass. We probe with the shared ledger; a global breach stops
 		// the run (ErrCeiling is a termination rail, never a done signal).
 		if c.globalBudgetExhausted(ctx) {
-			return c.finish(ctx, st, board, passed, ReasonBudget, false), nil
+			return c.finish(ctx, st, board, passed, merged, ReasonBudget, false), nil
 		}
 
 		st.Pass++
 		board = Scoreboard{Pass: st.Pass}
 
-		// --- run the open shards under the pool; the Fn writes+verifies each artifact ---
-		flat := !hasDeps(current)
-		results := c.Runner.RunPass(ctx, current, flat)
+		// --- run the open shards under the pool; the Fn writes+verifies each artifact.
+		// Dispatch a PREPARED COPY: cross-pass dep handoff (BaseRef + fenced digest) is
+		// resolved onto the copies so the canonical goals in `current` never accrete;
+		// same-pass deps are resolved intra-pass by the Runner's DAG path. ---
+		dispatch := prepareShards(current, passed, st.TipSHA)
+		flat := !hasDeps(dispatch)
+		results := c.Runner.RunPass(ctx, dispatch, flat)
 
 		// Fold this pass's verdicts: mark each shard durably from the VERIFIER verdict
 		// (Passed in the Result, set by the Fn's ship gate — I2), accumulate passed
@@ -268,10 +303,22 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			} else {
 				board.Failed++
 				s.State = ShardFailed
+				// KEEP the preserved failed-attempt branch (the shardFn commits the red
+				// WIP so a retry can continue from it): a requeue cuts its worktree from
+				// this branch instead of blindly re-rolling from base. An empty Branch
+				// (nothing committed) keeps any earlier attempt's branch. The branch is
+				// NEVER integrated or used as a dep base — those gate on Passed (I2).
+				if res.Branch != "" {
+					s.Branch = res.Branch
+				}
 			}
+			// A fresh result supersedes any stale conflict verdict recorded against the
+			// shard's PRIOR branch — the new branch has not been merge-attempted yet.
+			delete(conflictStale, s.ID)
 			s.Attempt = st.Pass - 1
+			current[i] = s // write back: requeueSet reads Branch/State from here
 			if err := c.Queue.Mark(ctx, s); err != nil {
-				return c.finish(ctx, st, board, passed, ReasonError, false), err
+				return c.finish(ctx, st, board, passed, merged, ReasonError, false), err
 			}
 		}
 
@@ -279,29 +326,37 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		// verifier-set statuses on disk, never from a worker self-report. ---
 		after, err := requeue.Scan(c.Worktree, &st.Ledger)
 		if err != nil {
-			return c.finish(ctx, st, board, passed, ReasonError, false), err
+			return c.finish(ctx, st, board, passed, merged, ReasonError, false), err
 		}
 		board.Remaining = distinctArtifacts(after)
 
-		// Integrate the green code branches onto the prior tip (BaseRef=TipSHA) and
-		// thread the new tip forward. Collate presets pass Integrate=nil and skip this.
-		tip, ierr := c.integrateGreen(ctx, passed, deps, &st)
+		// Integrate the NOT-yet-merged green branches onto the prior tip (BaseRef=
+		// TipSHA), thread the new tip forward, and learn which folds were rolled back
+		// (conflict / red-combined). Collate presets pass Integrate=nil and skip this.
+		conflicted, ierr := c.integrateGreen(ctx, passed, deps, merged, conflictStale, &st)
 		if ierr != nil {
-			return c.finish(ctx, st, board, passed, ReasonError, false), ierr
+			return c.finish(ctx, st, board, passed, merged, ReasonError, false), ierr
 		}
-		_ = tip
 
-		// Persist the run row once per pass (crash-atomic): Pass/Ledger/TipSHA reflect
-		// this completed pass, so a resume re-Scans from a consistent snapshot.
+		// Conflict requeue: a shard that greened SOLO but could not be folded is NOT
+		// silently dropped (I2 — verified work must reach the tip or surface). Each
+		// conflict spends one merge-rebuild attempt against the retry Ledger (bounded —
+		// no infinite rebuild loop); shards with budget re-enter the next pass cut from
+		// the integrated tip with a harness-authored rebuild goal. Computed BEFORE
+		// SaveState so the spent attempts persist with this pass's snapshot.
+		conflictRetry := c.conflictRequeue(current, conflicted, baseGoal, &st)
+
+		// Persist the run row once per pass (crash-atomic): Pass/Ledger/TipSHA/Merged
+		// reflect this completed pass, so a resume re-Scans from a consistent snapshot.
 		if err := c.Queue.SaveState(ctx, st); err != nil {
-			return c.finish(ctx, st, board, passed, ReasonError, false), err
+			return c.finish(ctx, st, board, passed, merged, ReasonError, false), err
 		}
 
 		// Poll the audit chain each pass: a broken log HALTS the run (I5) — a swarm must
 		// not keep shipping verdicts onto a tampered trail.
 		if c.Log != nil {
 			if lerr := c.Log.Err(); lerr != nil {
-				return c.finish(ctx, st, board, passed, ReasonError, false), lerr
+				return c.finish(ctx, st, board, passed, merged, ReasonError, false), lerr
 			}
 		}
 
@@ -312,9 +367,26 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			c.OnPass()
 		}
 
-		// --- convergence: an empty worklist is the only green exit ---
+		// --- convergence: an empty worklist AND no green work stranded off the tip ---
 		if len(after.Units) == 0 {
-			return c.finish(ctx, st, board, passed, ReasonConverged, true), nil
+			if len(conflictRetry) > 0 {
+				// Everything is verifier-green but some verified branch is NOT on the tip
+				// and retains rebuild budget: converging now would silently drop it (I2).
+				// Run another pass for the rebuilds — still under the operator's pass cap
+				// (and the hard cap / budget rails at the loop top).
+				if !c.Policy.UntilClean && st.Pass >= c.effectiveMaxPasses() {
+					return c.finish(ctx, st, board, passed, merged, ReasonPasses, false), nil
+				}
+				current = conflictRetry
+				continue
+			}
+			if unmergedGreens(c.Integrate != nil, passed, merged) > 0 {
+				// TERMINATION HONESTY: green shards that stayed unmerged past their
+				// rebuild budget surface as a RED exit — Done stays false and the drop is
+				// counted in Remaining — never a Done=true that lost verified work.
+				return c.finish(ctx, st, board, passed, merged, ReasonUnmerged, false), nil
+			}
+			return c.finish(ctx, st, board, passed, merged, ReasonConverged, true), nil
 		}
 
 		// No-progress detector: count a pass that did not SHRINK the remaining worklist
@@ -327,7 +399,7 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		if prevRemaining >= 0 && board.Remaining >= prevRemaining {
 			c.noProgress++
 			if c.noProgress >= 2 {
-				return c.finish(ctx, st, board, passed, ReasonStalled, false), nil
+				return c.finish(ctx, st, board, passed, merged, ReasonStalled, false), nil
 			}
 		} else {
 			c.noProgress = 0
@@ -350,65 +422,109 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		// until-clean run falls through to the exhausted check below — which is why the
 		// exhausted reason only ever surfaces for an until-clean (or high-MaxPasses) run.
 		if !c.Policy.UntilClean && st.Pass >= c.effectiveMaxPasses() {
-			return c.finish(ctx, st, board, passed, ReasonPasses, false), nil
+			return c.finish(ctx, st, board, passed, merged, ReasonPasses, false), nil
 		}
 
-		// Exhausted rail: another pass IS permitted, but no shard retains retry budget —
-		// every still-red Unit hit MaxAttempts — so the run converges RED rather than
-		// dispatching a pass that could change nothing.
-		if len(eligibleIDs) == 0 {
-			return c.finish(ctx, st, board, passed, ReasonExhausted, false), nil
+		// Exhausted rail: another pass IS permitted, but no red shard retains retry
+		// budget AND no conflicted green retains rebuild budget — so the run converges
+		// RED rather than dispatching a pass that could change nothing.
+		if len(eligibleIDs) == 0 && len(conflictRetry) == 0 {
+			return c.finish(ctx, st, board, passed, merged, ReasonExhausted, false), nil
 		}
 
-		// Build the next pass's shard set from the eligible ids, re-using the shard
-		// definitions (Kind/Pack/Role/Deps) from the current set so the verifier routing
-		// survives the requeue. A shard absent from current (cannot happen — eligible ids
-		// are a subset of this pass's shards' artifacts) is skipped.
-		current = c.requeueSet(current, eligibleIDs)
+		// Build the next pass's shard set: the still-red shards with budget (their goal
+		// re-composed as an EVIDENCE-CARRYING focused retry, their base the preserved
+		// failed-attempt branch) plus any merge-conflicted greens rebuilding on the tip.
+		// The focused goals read the SAME post-bump Ledger bumpAndSelect wrote, so the
+		// plan's exhaustion view matches the eligible set.
+		focus := focusedGoals(after, &st.Ledger)
+		current = append(c.requeueSet(current, eligibleIDs, baseGoal, focus), conflictRetry...)
 	}
 }
 
-// finish builds the terminal Outcome and emits a metadata-only scoreboard event. It
-// recomputes Remaining from the accumulated passed set against the worktree so the
-// reported figure is the FINAL artifact-derived count, not a stale per-pass tally.
-func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard, passed map[string]spawn.Result, reason string, done bool) Outcome {
+// finish builds the terminal Outcome and emits a metadata-only scoreboard event.
+// TERMINATION HONESTY: whatever rail stopped the loop, a verifier-green shard whose
+// branch never reached the tip is COUNTED — folded into Remaining (and broken out as
+// Unmerged) — and can force Done back to false, so a run can never report Done=true
+// while verified work was silently dropped from the integration tip (I2).
+func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard, passed map[string]spawn.Result, merged map[string]bool, reason string, done bool) Outcome {
+	unmerged := unmergedGreens(c.Integrate != nil, passed, merged)
 	out := Outcome{
 		Done:      done,
 		Reason:    reason,
 		Passes:    st.Pass,
 		TipBranch: st.TipSHA,
-		Remaining: board.Remaining,
+		Remaining: board.Remaining + unmerged,
+		Unmerged:  unmerged,
 		Board:     board,
 	}
-	// On a clean converge there is nothing red; force Remaining to 0 so the Outcome and
-	// the Done flag agree even if a late Scan raced an in-flight write.
-	if done {
+	// Belt and braces: the loop never passes done=true with unmerged greens, but if a
+	// future edit did, the honesty backstop here flips the verdict rather than lying.
+	if out.Done && unmerged > 0 {
+		out.Done, out.Reason = false, ReasonUnmerged
+	}
+	// On a clean converge there is nothing red and nothing stranded; force Remaining to
+	// 0 so the Outcome and the Done flag agree even if a late Scan raced an in-flight
+	// write.
+	if out.Done {
 		out.Remaining = 0
 	}
 	c.emit("swarm_done", map[string]any{
-		"reason": reason, "done": done, "passes": st.Pass,
-		"remaining": out.Remaining,
-		"checked":   board.Checked, "passed": board.Passed,
+		"reason": out.Reason, "done": out.Done, "passes": st.Pass,
+		"remaining": out.Remaining, "unmerged": unmerged,
+		"checked": board.Checked, "passed": board.Passed,
 		"failed": board.Failed, "retry_pass": board.RetryPass,
 	})
 	return out
 }
 
-// integrateGreen folds every green shard's branch through the IntegrateFunc, in a
-// DEPENDENCY-RESPECTING order (a node after the deps it was coded on top of), with the
-// prior tip as the base. It threads the resulting integration tip onto st.TipSHA so the
-// NEXT pass folds remaining green work on top of the already-merged tip (no work lost
-// across passes). A nil Integrate (collate preset) is a no-op returning the current tip.
-// A shard with no Branch (verified but not a code branch — e.g. a research artifact)
-// contributes no MergeItem. deps is the run-wide id->dependency-ids map (passed carries
-// no Deps), so the fold can honor the DAG even though passed accumulates across passes.
-func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn.Result, deps map[string][]string, st *SwarmState) (string, error) {
-	if c.Integrate == nil {
-		return st.TipSHA, nil // collate preset: artifacts stay independent, never merged
+// unmergedGreens counts the verifier-green shards whose branch has NOT been folded
+// into the integration tip — the work a dishonest terminal report would silently
+// drop. Only meaningful when an integrator is wired (a collate preset never merges,
+// so nothing can be "unmerged"); a green shard with no Branch (a non-code artifact)
+// contributes no MergeItem and therefore does not count.
+func unmergedGreens(integrating bool, passed map[string]spawn.Result, merged map[string]bool) int {
+	if !integrating {
+		return 0
 	}
-	order := mergeOrder(passed, deps)
+	n := 0
+	for id, res := range passed {
+		if res.Branch != "" && !merged[id] {
+			n++
+		}
+	}
+	return n
+}
+
+// integrateGreen folds the NOT-yet-merged green branches through the IntegrateFunc,
+// in a DEPENDENCY-RESPECTING order (a node after the deps it was coded on top of),
+// with the prior tip as the base. It threads the resulting integration tip onto
+// st.TipSHA so the NEXT pass folds remaining green work on top of the already-merged
+// tip (no work lost across passes), records every Merged&&Verified fold into the
+// merged set + st.Merged (so a later pass never re-merges it — the event-spam fix),
+// and marks every rolled-back fold (conflict, or red-combined) conflictStale + returns
+// its id so the Controller can requeue a rebuild. A nil Integrate (collate preset) is
+// a no-op. A shard with no Branch (verified but not a code branch — e.g. a research
+// artifact) contributes no MergeItem. deps is the run-wide id->dependency-ids map
+// (passed carries no Deps), so the fold can honor the DAG even though passed
+// accumulates across passes.
+func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn.Result, deps map[string][]string, merged, conflictStale map[string]bool, st *SwarmState) ([]string, error) {
+	if c.Integrate == nil {
+		return nil, nil // collate preset: artifacts stay independent, never merged
+	}
+	// Fold ONLY the pending greens: not yet on the tip, and not a branch that already
+	// conflicted (a stale branch merges identically until its shard re-runs — retrying
+	// it would only spam integration events; the rebuild path mints a fresh branch).
+	pending := make(map[string]spawn.Result, len(passed))
+	for id, res := range passed {
+		if res.Branch == "" || merged[id] || conflictStale[id] {
+			continue
+		}
+		pending[id] = res
+	}
+	order := mergeOrder(pending, deps)
 	if len(order) == 0 {
-		return st.TipSHA, nil // nothing green with a branch to fold yet
+		return nil, nil // nothing new to fold this pass
 	}
 	// Fold THIS pass's green branches onto the prior verified tip (st.TipSHA), not base
 	// HEAD: the swarm-wiring adapter pins the Integrator's BaseRef to this baseRef before
@@ -416,7 +532,22 @@ func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn
 	// (MAJOR #6). The first pass passes "" ⇒ the integrator starts from HEAD.
 	branch, results, err := c.Integrate(ctx, st.TipSHA, order)
 	if err != nil {
-		return st.TipSHA, err
+		return nil, err
+	}
+	var conflicted []string
+	for _, r := range results {
+		if r.Merged && r.Verified {
+			if !merged[r.ID] {
+				merged[r.ID] = true
+				st.Merged = append(st.Merged, r.ID) // durable mirror, persisted by SaveState
+			}
+			continue
+		}
+		// Conflict or red-combined ⇒ the Integrator rolled this branch back: the tip
+		// does NOT contain its verified work. Stale until the shard produces a fresh
+		// branch; the Controller decides (under the Ledger) whether to requeue a rebuild.
+		conflictStale[r.ID] = true
+		conflicted = append(conflicted, r.ID)
 	}
 	// Advance the tip to the last green-and-verified merge SHA so the next pass cuts
 	// from there. The IntegrateFunc returns the integration branch name; the verified
@@ -426,8 +557,68 @@ func (c *Controller) integrateGreen(ctx context.Context, passed map[string]spawn
 	}
 	c.emit("swarm_integrate", map[string]any{
 		"branch": branch, "items": len(order), "tip_sha": st.TipSHA,
+		"merged": len(order) - len(conflicted), "conflicts": len(conflicted),
 	})
-	return st.TipSHA, nil
+	return conflicted, nil
+}
+
+// mergeConflictClaimID is the synthetic claim id a merge-rebuild attempt is budgeted
+// under in the run's retry Ledger, keyed "<shardID>/<this>". A merge conflict is not
+// an artifact claim, but it consumes the SAME kind of bounded retry a red claim does —
+// reusing the Ledger keeps one budget authority and makes the rebuild loop provably
+// finite. (A model-authored claim sharing this id would merely share the counter —
+// still bounded, never looser.)
+const mergeConflictClaimID = "merge-conflict"
+
+// mergeUnit keys a shard's merge-rebuild budget in the requeue Ledger.
+func mergeUnit(shardID string) requeue.Unit {
+	return requeue.Unit{ArtifactID: shardID, ClaimID: mergeConflictClaimID}
+}
+
+// conflictRequeue converts this pass's rolled-back folds into next-pass rebuild
+// shards, bounded by the retry Ledger: each conflict spends ONE attempt against the
+// shard's synthetic merge Unit; a shard whose merge budget is exhausted is dropped
+// from the retry set and left to the termination-honesty accounting (it will surface
+// as Unmerged/Remaining — never silently vanish). A retryable shard re-enters queued,
+// cut from the CURRENT integrated tip (BaseRef=TipSHA; "" ⇒ HEAD when nothing has
+// merged yet) with a harness-authored rebuild goal composed on the shard's ORIGINAL
+// goal (no suffix compounding). Shard definitions come from this pass's set — a fold
+// is only attempted for a freshly-produced result, so a conflicted shard always ran
+// this pass.
+func (c *Controller) conflictRequeue(current []Shard, conflicted []string, baseGoal map[string]string, st *SwarmState) []Shard {
+	if len(conflicted) == 0 {
+		return nil
+	}
+	byID := make(map[string]Shard, len(current))
+	for i := range current {
+		byID[current[i].ID] = current[i]
+	}
+	out := make([]Shard, 0, len(conflicted))
+	for _, id := range conflicted {
+		u := mergeUnit(id)
+		st.Ledger.Bump(u) // one rebuild attempt spent, persisted with this pass
+		if st.Ledger.Exhausted(u) {
+			c.emit("swarm_merge_exhausted", map[string]any{"shard": id})
+			continue // out of rebuild budget: surfaces via unmergedGreens at termination
+		}
+		s, ok := byID[id]
+		if !ok {
+			continue // defensive: a fold is only attempted for a shard that ran this pass
+		}
+		s.State = ShardQueued
+		s.Attempt++           // this rebuild is one more attempt at the shard
+		s.BaseRef = st.TipSHA // rebuild ON the integrated tip the branch conflicted with
+		g := baseGoal[s.ID]
+		if g == "" {
+			g = s.Goal
+		}
+		s.Goal = g + "\n\n" + conflictRebuildSuffix
+		out = append(out, s)
+		c.emit("swarm_conflict_requeue", map[string]any{
+			"shard": id, "base": s.BaseRef, "attempt": st.Ledger.Attempts[id+"/"+mergeConflictClaimID],
+		})
+	}
+	return out
 }
 
 // bumpAndSelect Bumps the Ledger for every still-red Unit and returns the distinct
@@ -462,8 +653,17 @@ func (c *Controller) bumpAndSelect(after requeue.Worklist, led *requeue.Ledger) 
 
 // requeueSet selects from this pass's shards the ones whose id is in the eligible set,
 // preserving their full definition (Kind/Pack/Role/Deps) so the next pass re-verifies
-// with the same routing. Order follows the current slice for determinism.
-func (c *Controller) requeueSet(current []Shard, eligibleIDs []string) []Shard {
+// with the same routing. Order follows the current slice for determinism. A requeued
+// shard is no blind re-roll:
+//
+//   - its BaseRef is its own preserved failed-attempt branch (continue_from semantics —
+//     the fold kept res.Branch on red), so the retry worktree continues the prior work
+//     and the claims that already passed survive; no preserved branch ⇒ "" ⇒ base HEAD
+//     (or the dep-resolved base prepareShards fills in before dispatch);
+//   - its Goal is re-composed from the shard's ORIGINAL goal plus the EVIDENCE-CARRYING
+//     focus suffix (red claim ids + verifier Detail), so the retry aims at the exact
+//     broken cells. Composing on baseGoal keeps repeated requeues from compounding.
+func (c *Controller) requeueSet(current []Shard, eligibleIDs []string, baseGoal, focus map[string]string) []Shard {
 	want := make(map[string]bool, len(eligibleIDs))
 	for _, id := range eligibleIDs {
 		want[id] = true
@@ -473,6 +673,16 @@ func (c *Controller) requeueSet(current []Shard, eligibleIDs []string) []Shard {
 		if want[current[i].ID] {
 			s := current[i]
 			s.State = ShardQueued // re-queue for the next pass
+			s.Attempt++           // the dispatched shard carries the ordinal of the attempt it makes
+			s.BaseRef = s.Branch  // continue from the preserved attempt ("" ⇒ HEAD/dep base)
+			g := baseGoal[s.ID]
+			if g == "" {
+				g = s.Goal
+			}
+			if f := focus[s.ID]; f != "" {
+				g += "\n\n" + f
+			}
+			s.Goal = g
 			out = append(out, s)
 		}
 	}

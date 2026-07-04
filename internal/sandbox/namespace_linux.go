@@ -3,7 +3,10 @@
 // The namespace backend confines a model-emitted command (invariant I4) with
 // Linux kernel primitives instead of a container runtime: it is born inside
 // fresh user/mount/pid/net/ipc/uts namespaces, then — in the re-exec'd child,
-// before the command runs — sets no_new_privs, a Landlock ruleset that maps
+// before the command runs — masks the operator's credential paths (~/.ssh, the
+// NilCore config dir holding the encrypted vault + its key, …) with empty
+// read-only mounts (I3; see buildMaskSet), sets no_new_privs, a Landlock
+// ruleset that maps
 // read-only-everywhere + read-write-under-the-worktree (mirroring the container
 // backend's read-only rootfs + writable /work + tmpfs + no-egress), and a
 // seccomp-bpf syscall denylist (seccomp_linux.go — defense-in-depth). No daemon,
@@ -40,6 +43,12 @@ const (
 	envMarker  = "NILCORE_SANDBOX_INIT"
 	envWorkdir = "NILCORE_SANDBOX_WORKDIR"
 	envCmd     = "NILCORE_SANDBOX_CMD"
+	// Host-resolved roots for credential masking (buildMaskSet). The child's
+	// deliberately minimal env carries no HOME/XDG_CONFIG_HOME, so it cannot
+	// resolve these itself — the parent resolves them where the real environment
+	// lives and hands them down. They are path NAMES, not secrets (I3 holds).
+	envMaskHome = "NILCORE_SANDBOX_MASK_HOME"
+	envMaskCfg  = "NILCORE_SANDBOX_MASK_CFG"
 )
 
 // Namespace runs each command in a throwaway set of Linux namespaces with a
@@ -88,6 +97,18 @@ func (n *Namespace) ExecWithEnv(ctx context.Context, cmd string, env map[string]
 		envMarker + "=1",
 		envWorkdir + "=" + n.HostDir,
 		envCmd + "=" + cmd,
+	}
+	// SECURITY (I3): resolve the operator's home and the NilCore config dir here,
+	// in the parent, so sandboxInit can mask the credential paths beneath them
+	// (~/.ssh, secrets.vault + secrets.key, …) before the command runs. An
+	// unresolvable root simply masks nothing under it — the fail-closed contract
+	// applies to mask failures on paths that provably exist (see
+	// maskSensitivePaths), not to a host with no resolvable HOME.
+	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
+		c.Env = append(c.Env, envMaskHome+"="+home)
+	}
+	if cfg, cerr := nilcoreConfigDir(); cerr == nil && cfg != "" {
+		c.Env = append(c.Env, envMaskCfg+"="+cfg)
 	}
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
@@ -141,7 +162,7 @@ func MaybeRunInit() {
 	// and are carried across the upcoming execve.
 	runtime.LockOSThread()
 
-	if err := sandboxInit(os.Getenv(envWorkdir)); err != nil {
+	if err := sandboxInit(os.Getenv(envWorkdir), os.Getenv(envMaskHome), os.Getenv(envMaskCfg)); err != nil {
 		fmt.Fprintf(os.Stderr, "nilcore sandbox init: %v\n", err)
 		os.Exit(126)
 	}
@@ -152,10 +173,12 @@ func MaybeRunInit() {
 	}
 }
 
-// sandboxInit establishes the confinement. The security boundaries (no_new_privs,
-// Landlock) are fail-closed; cosmetic steps (private mounts, a fresh /proc) are
-// best-effort — Landlock, not /proc, is the boundary.
-func sandboxInit(workdir string) error {
+// sandboxInit establishes the confinement. The security boundaries (credential
+// masks, no_new_privs, Landlock) are fail-closed; cosmetic steps (private
+// mounts, a fresh /proc) are best-effort — Landlock, not /proc, is the boundary.
+// maskHome/maskCfg are the parent-resolved operator home and NilCore config dir
+// (empty when the parent could not resolve them).
+func sandboxInit(workdir, maskHome, maskCfg string) error {
 	if workdir == "" {
 		return errors.New("empty workdir")
 	}
@@ -182,6 +205,22 @@ func sandboxInit(workdir string) error {
 		// Best-effort create; if it fails the command simply has no extra scratch
 		// beyond its worktree (fail-closed: less writable surface, never more).
 		_ = os.MkdirAll(scratch, 0o700)
+	}
+
+	// SECURITY (I3+I4): mask the operator's credential paths. Landlock below is
+	// allowlist-only — the {"/", read+exec} grant cannot SUBTRACT ~/.ssh or the
+	// NilCore config dir (secrets.vault + secrets.key + secrets.salt live there:
+	// readable together they decrypt every stored secret INSIDE the sandbox, at
+	// the same uid). The fresh mount namespace can subtract: shadow each existing
+	// credential path with an empty read-only mount. This must happen exactly
+	// HERE — after the MS_PRIVATE remount (the masks never propagate back to the
+	// host) and BEFORE Landlock and seccomp, because a Landlock-restricted thread
+	// is denied all filesystem-topology changes and the seccomp filter denylists
+	// mount(2), so a later mask would EPERM. Fail-closed like Landlock: any mask
+	// failure on an existing path aborts the exec (exit 126 via MaybeRunInit)
+	// rather than run the command with a credential path exposed.
+	if err := maskSensitivePaths(buildMaskSet(maskHome, maskCfg, workdir)); err != nil {
+		return fmt.Errorf("mask credential paths: %w", err)
 	}
 
 	if err := unix.Chdir(workdir); err != nil {
@@ -245,6 +284,127 @@ func sandboxScratch(workdir string) string {
 	return filepath.Join(parent, ".nilcore-scratch")
 }
 
+// nilcoreConfigDir mirrors internal/paths.ConfigDir — $XDG_CONFIG_HOME/nilcore
+// (default ~/.config/nilcore) on Linux — the directory cmd/nilcore keeps the
+// encrypted vault, its master-key file, and its salt in (secrets.vault /
+// secrets.key / secrets.salt). Replicated as one stdlib call rather than
+// imported: the sandbox leaf's documented import footprint is stdlib + x/sys
+// (docs/ARCHITECTURE.md layer map), and widening it for a Join is not worth it.
+func nilcoreConfigDir() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve config dir: %w", err)
+	}
+	return filepath.Join(base, "nilcore"), nil
+}
+
+// buildMaskSet returns the absolute host paths whose contents must never be
+// readable by a model-emitted command: the NilCore config dir (encrypted vault
+// + master key + salt — readable together they decrypt every stored secret)
+// and the classic credential paths under the operator's home. The set is
+// curated and concrete — no runtime globbing — because every mask is a mount
+// and the failure mode of a bad pattern is an unusable sandbox. Nothing in the
+// sandbox legitimately needs any of these: egress is deny-all, so e.g.
+// git-over-ssh could not reach a remote anyway.
+//
+// A candidate that equals, contains, or is contained by the worktree is
+// dropped — masking it would shadow the one tree the command is entitled to
+// read and write. An operator who points the worktree at (or under) a
+// credential path has made that exposure explicitly.
+//
+// Pure (no I/O): existence is the applier's concern, which keeps this
+// table-testable on any OS that can compile the file.
+func buildMaskSet(home, configDir, workdir string) []string {
+	var candidates []string
+	if configDir != "" {
+		candidates = append(candidates, configDir)
+	}
+	if home != "" {
+		for _, rel := range []string{
+			".ssh",                // private keys, known_hosts
+			".aws",                // cloud credentials
+			".gnupg",              // signing keys
+			".netrc",              // machine/login/password triplets (curl, git)
+			".config/gh",          // GitHub CLI OAuth token
+			".docker/config.json", // registry auths
+			".codex",              // delegated-CLI credentials (Codex)
+			".claude",             // delegated-CLI credentials (Claude Code)
+			".claude.json",        // delegated-CLI state (Claude Code)
+		} {
+			candidates = append(candidates, filepath.Join(home, rel))
+		}
+	}
+	wd := filepath.Clean(workdir)
+	excludeWD := filepath.IsAbs(wd)
+	seen := make(map[string]bool, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		c = filepath.Clean(c)
+		if !filepath.IsAbs(c) || seen[c] {
+			continue
+		}
+		if excludeWD && (pathContains(wd, c) || pathContains(c, wd)) {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// pathContains reports whether child is parent or lies beneath it. Both paths
+// must be Clean'd and absolute (Linux-only code, so "/" separators).
+func pathContains(parent, child string) bool {
+	if parent == child || parent == "/" {
+		return true
+	}
+	return strings.HasPrefix(child, parent+"/")
+}
+
+// maskSensitivePaths shadows each EXISTING target with an empty read-only
+// mount, subtracting it from the read-everywhere Landlock grant that follows:
+//
+//   - a directory gets a fresh read-only tmpfs: empty, nothing to list, and
+//     MS_RDONLY at mount time so no remount step is needed;
+//   - anything else (a regular file such as ~/.netrc) gets /dev/null
+//     bind-mounted over it: reads hit EOF immediately and the device discards
+//     writes. /dev/null is preferred over binding an empty regular file
+//     because it always exists (no pre-Landlock file creation) and needs no
+//     read-only remount — an MS_REMOUNT|MS_BIND in a user namespace can EPERM
+//     when the source mount carries locked flags. Landlock (applied right
+//     after, read+exec-only outside the worktree) independently denies writes
+//     through the masked path.
+//
+// A missing target is skipped silently — there is nothing to protect (ENOTDIR
+// means a parent component is a file, so the path cannot exist either).
+// Targets are processed in order, so a candidate nested inside an
+// already-masked directory stats as absent and is skipped, never
+// double-mounted. Any other stat or mount failure is returned and the caller
+// aborts the exec — fail-closed, exactly like a Landlock failure — because the
+// alternative is running the command with a credential path exposed.
+func maskSensitivePaths(targets []string) error {
+	for _, target := range targets {
+		fi, err := os.Stat(target)
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", target, err)
+		}
+		if fi.IsDir() {
+			if err := unix.Mount("tmpfs", target, "tmpfs",
+				unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+				return fmt.Errorf("mask dir %s: %w", target, err)
+			}
+			continue
+		}
+		if err := unix.Mount("/dev/null", target, "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("mask file %s: %w", target, err)
+		}
+	}
+	return nil
+}
+
 // sandboxEnv is the command's environment: the inherited env minus our control
 // vars, with a sane PATH and a writable HOME + Go caches pinned into the
 // confined scratch dir (matching the container backend).
@@ -253,7 +413,9 @@ func sandboxEnv(home string) []string {
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, envMarker+"=") ||
 			strings.HasPrefix(kv, envWorkdir+"=") ||
-			strings.HasPrefix(kv, envCmd+"=") {
+			strings.HasPrefix(kv, envCmd+"=") ||
+			strings.HasPrefix(kv, envMaskHome+"=") ||
+			strings.HasPrefix(kv, envMaskCfg+"=") {
 			continue
 		}
 		env = append(env, kv)

@@ -20,30 +20,287 @@ import (
 	"nilcore/internal/verify/vcache"
 )
 
-// vcacheDecorate wraps base in the A9 content-hash verify cache (Phase 16, LRN-T05)
-// when NILCORE_VCACHE is set and a log + worktree box are available: a chain-verified
-// PASS over the EXACT same worktree content + verifier-id + toolchain is REPLAYED
-// instead of re-run, skipping a redundant (expensive) `make verify` the loop would
-// otherwise repeat on an unchanged integration tip. It is I2-safe by construction —
-// vcache.Lookup re-runs eventlog.Verify and FAILS CLOSED to recompute on any chain
-// error, and only a pass the inner verifier itself produced is ever replayed; the
-// verifier stays the sole authority on "done". DEFAULT-OFF: with the env unset (or no
-// log / log path / box / workdir) Decorate returns base UNCHANGED — byte-identical.
-func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string, log *eventlog.Log, logPath string) verify.Verifier {
-	if os.Getenv("NILCORE_VCACHE") == "" || log == nil || logPath == "" || box == nil || box.Workdir() == "" {
-		return base
+// verifyFlagEnabled mirrors the NILCORE_KERNEL default-on idiom (kernel.go,
+// kernelEnabled): the feature is the norm, the env var is an instant escape hatch.
+// Unset/anything ⇒ on; 0/off/false/no ⇒ off, byte-identical to the undecorated path.
+func verifyFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "0", "off", "false", "no":
+		return false
+	default:
+		return true
 	}
-	return vcache.Decorate(vcache.Config{
-		Inner:   base,
-		Log:     log,
-		LogPath: logPath,
-		Hash: func(ctx context.Context) (string, error) {
-			// Hash everything the verifier reads (the worktree), skipping VCS/agent state.
-			return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
-		},
-		VerifierID: verifierID,
-		Toolchain:  verify.Toolchain(),
-	})
+}
+
+// vcacheDecorate composes the verify decorator chain around base (the name is kept
+// stable for its build.go call site; it grew from the original vcache-only wrap).
+// verifierID is the RESOLVED verify command (build.go passes verifyCmd), which both
+// keys the cache and drives the tiered soundness gate. All three stages are
+// DEFAULT-ON (kernel precedent: each is I2-safe by construction and equivalently
+// escape-hatched), each with its own kill switch:
+//
+//	NILCORE_VCACHE=0         — disable the chain-verified pass-replay cache
+//	NILCORE_FLAKEPROBE=0     — disable the one-shot flaky-test re-run
+//	NILCORE_TIERED_VERIFY=0  — disable the scoped fast red path
+//
+// DECORATOR ORDER (outermost → innermost): tiered → flakeprobe → vcache → base.
+//
+//   - tiered OUTERMOST: the scoped fast check is the cheapest possible signal and
+//     most iterations are red — when it fires, nothing inside (no tree hash, no
+//     cache lookup, no full verify) runs at all. Its green/error path falls
+//     through, so the inner chain is untouched on every conclusive-pass path.
+//   - flakeprobe AROUND vcache: the probe's re-run goes back through the cache,
+//     which is correct — a failure is never cached, so the probe re-run always
+//     reaches the real verifier; and a cache-replayed pass needs no probing.
+//     (Inside-out would let a probe bypass the cache for no benefit.)
+//   - vcache INNERMOST, hugging base: the identical-content pass replay must key
+//     on exactly what the real verifier would run, with no decorator between it
+//     and the verdict it records/replays.
+//
+// I2 holds at every layer: vcache only replays a chain-verified pass the verifier
+// itself produced (fail-closed on any chain error); flakeprobe's probe IS the real
+// verifier; tiered can only short-circuit RED (its gate below) — the full verifier
+// remains the sole source of a PASS. Stages that lack their inputs (nil log, no
+// box/workdir, non-Go verify command) are skipped individually; with every flag
+// off, base is returned UNCHANGED — byte-identical.
+func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string, log *eventlog.Log, logPath string) verify.Verifier {
+	v := base
+	hasBox := box != nil && box.Workdir() != ""
+
+	// Stage 1 (innermost): the A9 content-hash verify cache (Phase 16, LRN-T05). A
+	// chain-verified PASS over the EXACT same worktree content + verifier-id +
+	// toolchain is REPLAYED instead of re-run — every successful run otherwise pays
+	// a pure-waste second full verify on the unchanged integration tip. I2-safe:
+	// vcache.Lookup re-runs eventlog.Verify and FAILS CLOSED to recompute on any
+	// chain error; only a pass the inner verifier itself produced is ever replayed.
+	if verifyFlagEnabled("NILCORE_VCACHE") && log != nil && logPath != "" && hasBox {
+		v = vcache.Decorate(vcache.Config{
+			Inner:   v,
+			Log:     log,
+			LogPath: logPath,
+			Hash: func(ctx context.Context) (string, error) {
+				// Hash everything the verifier reads (the worktree), skipping VCS/agent state.
+				return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
+			},
+			VerifierID: verifierID,
+			Toolchain:  verify.Toolchain(),
+		})
+	}
+
+	// Stage 2: the flake probe — one bounded re-run of the REAL verifier when a
+	// test-class failure lands on content identical to the immediately preceding
+	// Check (nothing changed, so the red is plausibly nondeterministic). A confirmed
+	// flake is recorded as an additive `verify_flaky` event (I5); the probe never
+	// invents a verdict — both runs are the authoritative verifier (I2).
+	if verifyFlagEnabled("NILCORE_FLAKEPROBE") && hasBox {
+		fp := &verify.FlakeProbe{
+			Inner: v,
+			Hash: func(ctx context.Context) (string, error) {
+				return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
+			},
+		}
+		if log != nil {
+			fp.OnFlaky = func(failClass, contentHash string) {
+				log.Append(eventlog.Event{Kind: "verify_flaky", Detail: map[string]any{
+					"fail_class":   failClass,
+					"content_hash": contentHash,
+					"verifier_id":  verifierID,
+				}})
+			}
+		}
+		v = fp
+	}
+
+	// Stage 3 (outermost): the tiered scoped-red fast path, gated on SOUNDNESS
+	// (tieredSound): a scoped `go vet`/`go test` red is only a true project red
+	// when the project's own verify runs Go tests, so the wrap is enabled only for
+	// the Go-default verify-command family. Only the full verifier can PASS.
+	if verifyFlagEnabled("NILCORE_TIERED_VERIFY") && hasBox && tieredSound(verifierID) {
+		v = &verify.TieredVerifier{Full: v, ScopedRed: scopedRedFunc(box, verifierID)}
+	}
+	return v
+}
+
+// tieredSound is the I2-soundness gate for the tiered wrap: a scoped go-test red
+// may only short-circuit the full verify when it is guaranteed to be a subset of
+// what the full verify would find. That holds for the Go-default verify-command
+// family only:
+//
+//   - a command containing "go test" (verify.Detect's go.mod fallback is
+//     "go build ./... && go test ./..."): `go test <pkgs>` compiles and tests a
+//     subset of the same packages, so its red is the full command's red;
+//   - exactly the default "make verify" (verify.New's zero-command default and
+//     Detect's Makefile-verify-target hit): NilCore's own convention (CLAUDE.md §3)
+//     defines it as build+vet+test. A repo whose verify target diverges has
+//     NILCORE_TIERED_VERIFY=0 as the escape hatch — and even then the failure mode
+//     is a marked false red costing one loop iteration, never a false PASS (only
+//     the full verifier can pass, so I2's "done" authority is structurally intact).
+//
+// Any other command (npm test, cargo test, pytest, "true", a custom script) leaves
+// the verifier UNWRAPPED — we cannot prove a Go-scoped red is that project's red.
+func tieredSound(verifyCmd string) bool {
+	c := strings.TrimSpace(verifyCmd)
+	return c == "make verify" || containsGoTest(c)
+}
+
+// containsGoTest reports whether cmd invokes `go test` as a COMMAND — the match
+// must sit on a word boundary, because a naive substring check is unsound:
+// "cargo test" contains the bytes "go test" ("car|go test") but runs no Go test.
+func containsGoTest(cmd string) bool {
+	for i := 0; ; {
+		j := strings.Index(cmd[i:], "go test")
+		if j < 0 {
+			return false
+		}
+		j += i
+		if j == 0 || !isWordByte(cmd[j-1]) {
+			return true
+		}
+		i = j + 1
+	}
+}
+
+// isWordByte reports whether b could be part of a longer program name, which
+// would make a following "go test" a false command match (e.g. the 'r' in
+// "cargo test"). Separators like space, ';', '&', '(' or a path '/' are fine.
+func isWordByte(b byte) bool {
+	return b == '_' || b == '-' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// scopedRedFunc builds the TieredVerifier.ScopedRed seam: discover the packages
+// touched since the run baseline via git, then run a targeted vet/test over just
+// those packages — all through the SAME sandbox exec path the full verifier uses
+// (I4: nothing here executes on the host). Every inconclusive outcome (git fault,
+// unscopable change, no touched Go packages) returns failed=false or an error,
+// which the decorator treats as "fall through to Full" — under-scoping can only
+// cost speed, never correctness.
+//
+// Baseline note: the diff is `git diff --name-only HEAD` (uncommitted work) plus
+// untracked files — the simplest baseline reachable from this wiring layer. If the
+// worker has already committed (empty diff), the scoped set is empty and we fall
+// through to the full verify: a too-small touched set is always sound, because a
+// scoped GREEN never decides anything.
+//
+// `go vet` is folded into the scoped command only when the resolved verify command
+// visibly runs vet (or is the default "make verify", which does — CLAUDE.md §3);
+// for a plain "go build && go test" project a vet-only red would NOT be a project
+// red, so there the scoped check is `go test` alone (whose red is always a project
+// red for the gated family, since go test compiles its packages).
+func scopedRedFunc(box sandbox.Sandbox, verifyCmd string) func(ctx context.Context) (bool, string, error) {
+	includeVet := strings.Contains(verifyCmd, "go vet") || strings.TrimSpace(verifyCmd) == "make verify"
+	return func(ctx context.Context) (failed bool, output string, err error) {
+		// (a) Touched files since the run baseline, through the sandbox git.
+		res, err := box.Exec(ctx, "git diff --name-only HEAD && git ls-files --others --exclude-standard")
+		if err != nil {
+			return false, "", err
+		}
+		if res.ExitCode != 0 {
+			return false, "", fmt.Errorf("scoped diff: exit %d", res.ExitCode)
+		}
+		pkgs, ok := touchedGoPackageDirs(box.Workdir(), res.Stdout)
+		if !ok || len(pkgs) == 0 {
+			return false, "", nil // unscopable or nothing touched ⇒ Full decides
+		}
+
+		// (b) The targeted red-detector over exactly the touched packages.
+		list := strings.Join(pkgs, " ")
+		cmd := "go test " + list
+		if includeVet {
+			cmd = "go vet " + list + " && " + cmd
+		}
+		r, err := box.Exec(ctx, cmd)
+		if err != nil {
+			return false, "", err
+		}
+		out := strings.TrimSpace(r.Stdout + "\n" + r.Stderr)
+		return r.ExitCode != 0, out, nil
+	}
+}
+
+// touchedGoPackageDirs maps a git name-list (one path per line, relative to the
+// worktree root) to the deduped, sorted package-dir patterns to vet/test. It
+// returns ok=false when the change set cannot be SOUNDLY scoped, so the caller
+// falls through to the full verify:
+//
+//   - any touched non-.go file (go.mod, Makefile, testdata, generated inputs) can
+//     affect arbitrary packages — unscopable;
+//   - any path with characters outside a conservative allowlist is refused: these
+//     names are model-authored file paths and are being folded into a sandboxed
+//     shell command line, so hygiene demands rejecting anything shell-significant
+//     (falling through to Full is always sound) rather than quoting cleverly (I7);
+//   - a touched dir that no longer exists or holds no .go files (a deleted
+//     package) is SKIPPED, not tested: `go test` on a vanished dir would be a
+//     false red, while any breakage its deletion causes elsewhere is caught by
+//     the full verify that every scoped-green run still falls through to.
+//
+// Paths under .nilcore/ are ignored (agent scratch state, mirrored from the
+// content-hash skip set). The existence probe is a host-side READ of the worktree
+// (like artifactFiles above) — discovery only, never execution.
+func touchedGoPackageDirs(root, nameList string) ([]string, bool) {
+	seen := map[string]bool{}
+	var dirs []string
+	for _, line := range strings.Split(nameList, "\n") {
+		rel := strings.TrimSpace(line)
+		if rel == "" || strings.HasPrefix(rel, ".nilcore/") {
+			continue
+		}
+		if !strings.HasSuffix(rel, ".go") {
+			return nil, false // a non-Go file can affect the world ⇒ unscopable
+		}
+		if !safeScopedPath(rel) {
+			return nil, false
+		}
+		dir := filepath.ToSlash(filepath.Dir(rel))
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		if !dirHasGoFiles(root, dir) {
+			continue // deleted/emptied package: skip; Full still guards the fallout
+		}
+		if dir == "." {
+			dirs = append(dirs, ".")
+		} else {
+			dirs = append(dirs, "./"+dir)
+		}
+	}
+	sort.Strings(dirs)
+	return dirs, true
+}
+
+// safeScopedPath allowlists the characters a touched path may contain before it is
+// folded into the scoped command line: letters, digits, '_', '-', '.', '/'. It
+// also refuses a leading '-' (flag injection) and any ".." segment. Anything
+// outside the allowlist ⇒ unscopable, never quoted-and-hoped.
+func safeScopedPath(rel string) bool {
+	if rel == "" || strings.HasPrefix(rel, "-") || strings.Contains(rel, "..") {
+		return false
+	}
+	for _, r := range rel {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '-' || r == '.' || r == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// dirHasGoFiles reports whether dir (relative to root) still exists and directly
+// contains at least one .go file — i.e. `go test ./dir` has something to build.
+func dirHasGoFiles(root, dir string) bool {
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(dir)))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+			return true
+		}
+	}
+	return false
 }
 
 // behavioralVerifier builds the project verifier, optionally composed with a
