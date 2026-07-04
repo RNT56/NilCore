@@ -137,11 +137,14 @@ func TestAnthropicCompleteTypedAPIError(t *testing.T) {
 	}
 }
 
-// TestAnthropicCachedTokens proves the adapter now decodes Anthropic's
-// prompt-cache tallies: cache_read_input_tokens maps to model.Usage.CachedTokens
-// on both the non-stream and stream paths (parity with the OpenAI adapter, which a
-// budget/meter reading CachedTokens relies on). A response without the cache fields
-// leaves CachedTokens zero (byte-identical to before).
+// TestAnthropicCachedTokens proves the adapter decodes Anthropic's prompt-cache
+// tallies AND folds them into the canonical model.Usage convention on both the
+// non-stream and stream paths: Anthropic's input_tokens is only the uncached
+// remainder, so InputTokens = input + cache_read + cache_creation (the total
+// prompt, matching the OpenAI adapter) and CachedTokens = cache_read (the
+// discount-billed subset the pricer subtracts). Without the fold, the pricer —
+// which clamps CachedTokens to InputTokens — would under-bill every cache hit. A
+// response without the cache fields leaves the shape byte-identical to before.
 func TestAnthropicCachedTokens(t *testing.T) {
 	t.Run("non-stream", func(t *testing.T) {
 		const body = `{
@@ -164,8 +167,9 @@ func TestAnthropicCachedTokens(t *testing.T) {
 		if resp.Usage.CachedTokens != 90 {
 			t.Errorf("CachedTokens = %d, want 90 (cache_read_input_tokens)", resp.Usage.CachedTokens)
 		}
-		if resp.Usage.InputTokens != 12 || resp.Usage.OutputTokens != 7 {
-			t.Errorf("base usage = %+v, want input 12 output 7", resp.Usage)
+		// 12 fresh + 90 cache-read + 5 cache-creation = 107 total prompt tokens.
+		if resp.Usage.InputTokens != 107 || resp.Usage.OutputTokens != 7 {
+			t.Errorf("base usage = %+v, want input 107 (12+90+5 folded) output 7", resp.Usage)
 		}
 	})
 
@@ -208,6 +212,9 @@ func TestAnthropicCachedTokens(t *testing.T) {
 		}
 		if resp.Usage.CachedTokens != 77 {
 			t.Errorf("stream CachedTokens = %d, want 77", resp.Usage.CachedTokens)
+		}
+		if resp.Usage.InputTokens != 88 {
+			t.Errorf("stream InputTokens = %d, want 88 (11 fresh + 77 cache-read folded)", resp.Usage.InputTokens)
 		}
 		if resp.Usage.OutputTokens != 9 {
 			t.Errorf("stream OutputTokens = %d, want 9 (message_delta)", resp.Usage.OutputTokens)
@@ -415,6 +422,230 @@ func TestAnthropicStreamHTTPError(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest || apiErr.Retryable {
 		t.Errorf("err = %v, want a terminal (non-retryable) *model.APIError with status 400", err)
 	}
+}
+
+// ccProbe decodes one cache_control marker from a captured request body.
+type ccProbe struct {
+	Type string `json:"type"`
+}
+
+// cacheReqProbe decodes exactly the cache-relevant slice of a captured Messages
+// request: which system blocks, tools, and message content blocks carry a
+// cache_control marker.
+type cacheReqProbe struct {
+	System []struct {
+		Type         string   `json:"type"`
+		Text         string   `json:"text"`
+		CacheControl *ccProbe `json:"cache_control"`
+	} `json:"system"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type         string   `json:"type"`
+			CacheControl *ccProbe `json:"cache_control"`
+		} `json:"content"`
+	} `json:"messages"`
+	Tools []struct {
+		Name         string   `json:"name"`
+		Type         string   `json:"type"`
+		CacheControl *ccProbe `json:"cache_control"`
+	} `json:"tools"`
+}
+
+// TestAnthropicCacheBreakpoints proves the request marshal emits Anthropic
+// prompt-cache breakpoints — the request half of the cache pricing the usage
+// decode already meters (without them the cache hit rate is exactly 0%). Exactly
+// three of the four allowed cache_control markers are placed: on the last system
+// block (system is sent as a block ARRAY, not a plain string), on the last tool
+// definition, and on the last content block of the FINAL message — the moving
+// breakpoint that lets step N+1 re-read the prefix step N cached. Earlier
+// messages never carry a marker. Absent sections (empty system, zero tools,
+// uncacheable final block) skip their marker and the request stays valid.
+func TestAnthropicCacheBreakpoints(t *testing.T) {
+	// captureBody runs one adapter call against a canned server and returns the
+	// raw request body it sent. The canned JSON reply satisfies Complete; Stream
+	// tolerates it too (no data: frames ⇒ clean EOF ⇒ empty response, no error).
+	captureBody := func(t *testing.T, call func(a *Anthropic)) []byte {
+		t.Helper()
+		var body []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ = io.ReadAll(r.Body)
+			w.Header().Set("content-type", "application/json")
+			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+		}))
+		defer srv.Close()
+		a := NewAnthropic("k", "claude-x")
+		a.baseURL = srv.URL
+		call(a)
+		return body
+	}
+
+	fullMsgs := []model.Message{
+		{Role: "user", Content: []model.Block{{Type: "text", Text: "first"}}},
+		{Role: "assistant", Content: []model.Block{
+			{Type: "text", Text: "on it"},
+			{Type: "tool_use", ID: "t1", Name: "run", Input: json.RawMessage(`{"cmd":"ls"}`)},
+		}},
+		{Role: "user", Content: []model.Block{
+			{Type: "tool_result", ToolUseID: "t1", Content: "out"},
+			{Type: "text", Text: "keep going"},
+		}},
+	}
+	fullTools := []model.Tool{
+		{Name: "run", Description: "d", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		{Name: "read", Description: "r", InputSchema: json.RawMessage(`{"type":"object"}`)},
+	}
+
+	// assertFullShape checks the three-breakpoint layout on a captured body; it is
+	// shared by the Complete and Stream subtests (both paths ride newRequest).
+	assertFullShape := func(t *testing.T, body []byte) {
+		t.Helper()
+		if !json.Valid(body) {
+			t.Fatalf("request body is not valid JSON: %s", body)
+		}
+		var req cacheReqProbe
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode captured body: %v", err)
+		}
+
+		// System is a block array whose LAST block carries the marker.
+		if len(req.System) != 1 || req.System[0].Type != "text" || req.System[0].Text != "sys" {
+			t.Fatalf("system = %+v, want one text block \"sys\"", req.System)
+		}
+		if cc := req.System[len(req.System)-1].CacheControl; cc == nil || cc.Type != "ephemeral" {
+			t.Errorf("last system block cache_control = %+v, want ephemeral", cc)
+		}
+
+		// Only the LAST tool definition carries the marker.
+		if len(req.Tools) != 2 {
+			t.Fatalf("tools = %+v, want 2", req.Tools)
+		}
+		if req.Tools[0].CacheControl != nil {
+			t.Errorf("first tool must not carry cache_control: %+v", req.Tools[0])
+		}
+		if cc := req.Tools[1].CacheControl; cc == nil || cc.Type != "ephemeral" {
+			t.Errorf("last tool cache_control = %+v, want ephemeral", cc)
+		}
+
+		// Only the FINAL message's LAST content block carries the moving marker.
+		if len(req.Messages) != 3 {
+			t.Fatalf("messages = %d, want 3", len(req.Messages))
+		}
+		for i, m := range req.Messages {
+			for j, b := range m.Content {
+				last := i == len(req.Messages)-1 && j == len(m.Content)-1
+				if last {
+					if b.CacheControl == nil || b.CacheControl.Type != "ephemeral" {
+						t.Errorf("final message last block cache_control = %+v, want ephemeral", b.CacheControl)
+					}
+				} else if b.CacheControl != nil {
+					t.Errorf("message %d block %d (%s) must not carry cache_control", i, j, b.Type)
+				}
+			}
+		}
+
+		// The hard bound: exactly 3 breakpoints in the whole request (max is 4).
+		if n := strings.Count(string(body), `"cache_control"`); n != 3 {
+			t.Errorf("total cache_control breakpoints = %d, want exactly 3:\n%s", n, body)
+		}
+	}
+
+	t.Run("complete-three-breakpoints", func(t *testing.T) {
+		body := captureBody(t, func(a *Anthropic) {
+			if _, err := a.Complete(context.Background(), "sys", fullMsgs, fullTools, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		})
+		assertFullShape(t, body)
+	})
+
+	t.Run("stream-three-breakpoints", func(t *testing.T) {
+		// Stream shares newRequest with Complete; prove the streamed body carries
+		// the identical breakpoint layout (plus stream:true, asserted elsewhere).
+		body := captureBody(t, func(a *Anthropic) {
+			if _, err := a.Stream(context.Background(), "sys", fullMsgs, fullTools, 100, nil); err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+		})
+		assertFullShape(t, body)
+	})
+
+	t.Run("empty-system-zero-tools", func(t *testing.T) {
+		body := captureBody(t, func(a *Anthropic) {
+			if _, err := a.Complete(context.Background(), "", fullMsgs[:1], nil, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		})
+		if !json.Valid(body) {
+			t.Fatalf("request body is not valid JSON: %s", body)
+		}
+		s := string(body)
+		if strings.Contains(s, `"system"`) {
+			t.Errorf("empty system must be omitted entirely: %s", s)
+		}
+		if strings.Contains(s, `"tools"`) {
+			t.Errorf("zero tools must be omitted entirely: %s", s)
+		}
+		// Only the moving message breakpoint remains.
+		if n := strings.Count(s, `"cache_control"`); n != 1 {
+			t.Errorf("breakpoints = %d, want 1 (message only): %s", n, s)
+		}
+	})
+
+	t.Run("uncacheable-final-block-skips-marker", func(t *testing.T) {
+		msgs := append(append([]model.Message{}, fullMsgs[:2]...),
+			model.Message{Role: "user", Content: []model.Block{{Type: "mystery_block", Text: "?"}}})
+		body := captureBody(t, func(a *Anthropic) {
+			if _, err := a.Complete(context.Background(), "sys", msgs, fullTools, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		})
+		if !json.Valid(body) {
+			t.Fatalf("request body is not valid JSON: %s", body)
+		}
+		var req cacheReqProbe
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode captured body: %v", err)
+		}
+		for i, m := range req.Messages {
+			for j, b := range m.Content {
+				if b.CacheControl != nil {
+					t.Errorf("message %d block %d (%s): marker on an uncacheable/earlier block", i, j, b.Type)
+				}
+			}
+		}
+		// System + tools markers survive; the message marker is skipped.
+		if n := strings.Count(string(body), `"cache_control"`); n != 2 {
+			t.Errorf("breakpoints = %d, want 2 (system + tools): %s", n, body)
+		}
+	})
+
+	t.Run("builtin-last-tool-still-marked", func(t *testing.T) {
+		// The last tool renders through the builtin typed-shape MarshalJSON; the
+		// marker must be spliced in without corrupting that shape.
+		tools := []model.Tool{fullTools[0], model.NewComputerTool(800, 600)}
+		body := captureBody(t, func(a *Anthropic) {
+			if _, err := a.Complete(context.Background(), "sys", fullMsgs, tools, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		})
+		if !json.Valid(body) {
+			t.Fatalf("request body is not valid JSON: %s", body)
+		}
+		var req cacheReqProbe
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode captured body: %v", err)
+		}
+		if len(req.Tools) != 2 || req.Tools[1].Type != model.ComputerToolV20251124 {
+			t.Fatalf("tools = %+v, want the computer builtin last", req.Tools)
+		}
+		if req.Tools[0].CacheControl != nil {
+			t.Errorf("first tool must not carry cache_control")
+		}
+		if cc := req.Tools[1].CacheControl; cc == nil || cc.Type != "ephemeral" {
+			t.Errorf("builtin last tool cache_control = %+v, want ephemeral", cc)
+		}
+	})
 }
 
 // streamerCheck is a compile-time assertion that *Anthropic satisfies the

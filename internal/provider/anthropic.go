@@ -40,28 +40,193 @@ func NewAnthropic(key, modelID string) *Anthropic {
 // Model returns the configured model id.
 func (a *Anthropic) Model() string { return a.model }
 
+// anthropicCacheControl marks an Anthropic prompt-cache breakpoint (5-minute
+// ephemeral TTL — the default tier; reads bill at ~0.1x, writes at 1.25x input).
+type anthropicCacheControl struct {
+	Type string `json:"type"` // always "ephemeral"
+}
+
+// ephemeralCache is the single breakpoint value every marker uses.
+func ephemeralCache() *anthropicCacheControl { return &anthropicCacheControl{Type: "ephemeral"} }
+
+// anthropicSystemBlock is one system-prompt content block. The system prompt is
+// sent in block-array form rather than as a plain string because only a content
+// block can carry a cache_control breakpoint.
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"` // "text"
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicBlock wraps a canonical content block with the optional cache_control
+// member. The embedded model.Block keeps its exact field set and tags, and
+// CacheControl is omitempty — so every block except the single moving breakpoint
+// marshals byte-identically to the bare model.Block.
+type anthropicBlock struct {
+	model.Block
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicMessage mirrors model.Message with cache-capable blocks.
+type anthropicMessage struct {
+	Role    string           `json:"role"`
+	Content []anthropicBlock `json:"content"`
+}
+
 type anthropicRequest struct {
-	Model     string          `json:"model"`
-	MaxTokens int             `json:"max_tokens"`
-	System    string          `json:"system,omitempty"`
-	Messages  []model.Message `json:"messages"`
-	Tools     []model.Tool    `json:"tools,omitempty"`
-	Stream    bool            `json:"stream,omitempty"`
+	Model     string                 `json:"model"`
+	MaxTokens int                    `json:"max_tokens"`
+	System    []anthropicSystemBlock `json:"system,omitempty"`
+	Messages  []anthropicMessage     `json:"messages"`
+	Tools     []json.RawMessage      `json:"tools,omitempty"`
+	Stream    bool                   `json:"stream,omitempty"`
+}
+
+// buildAnthropicRequest assembles the wire body with prompt-cache breakpoints.
+//
+// Prompt caching is a prefix match over the rendered request (render order:
+// tools → system → messages), so without breakpoints every step of a long native
+// drive re-bills the entire growing transcript at the full input rate. We place
+// EXACTLY THREE of Anthropic's maximum FOUR cache_control markers:
+//
+//  1. the LAST tool definition — caches the (stable) tool set;
+//  2. the LAST system block — caches tools + system together;
+//  3. the last content block of the FINAL message — the MOVING breakpoint: each
+//     step's request re-reads the prefix the previous step cached and pays the
+//     cache-read rate on everything before the newest turn.
+//
+// Each rule sets at most one marker, which keeps the 3 ≤ 4 bound structural
+// rather than counted. A section that cannot safely carry a marker (zero tools,
+// empty system, empty or uncacheable final block) simply skips it — dropping a
+// breakpoint is always a valid request; a malformed one is not.
+func buildAnthropicRequest(modelID string, maxTokens int, system string, msgs []model.Message, tools []model.Tool, stream bool) (anthropicRequest, error) {
+	req := anthropicRequest{
+		Model:     modelID,
+		MaxTokens: maxTokens,
+		Messages:  toAnthropicMessages(msgs),
+		Stream:    stream,
+	}
+	if system != "" {
+		// One block ⇒ it is the last block, so it carries the marker.
+		req.System = []anthropicSystemBlock{{Type: "text", Text: system, CacheControl: ephemeralCache()}}
+	}
+	wireTools, err := marshalAnthropicTools(tools)
+	if err != nil {
+		return anthropicRequest{}, err
+	}
+	req.Tools = wireTools
+	markMovingBreakpoint(req.Messages)
+	return req, nil
+}
+
+// toAnthropicMessages converts canonical messages to the cache-capable wire shape.
+// nil content stays nil so an image-free/empty message marshals byte-identically
+// to the pre-caching request.
+func toAnthropicMessages(msgs []model.Message) []anthropicMessage {
+	if msgs == nil {
+		return nil
+	}
+	out := make([]anthropicMessage, len(msgs))
+	for i, m := range msgs {
+		var blocks []anthropicBlock
+		if m.Content != nil {
+			blocks = make([]anthropicBlock, len(m.Content))
+			for j, b := range m.Content {
+				blocks[j] = anthropicBlock{Block: b}
+			}
+		}
+		out[i] = anthropicMessage{Role: m.Role, Content: blocks}
+	}
+	return out
+}
+
+// markMovingBreakpoint sets the cache_control marker on the last content block of
+// the FINAL message only — earlier messages never carry one, so the marker moves
+// forward one turn per step. Canonical messages are always block arrays (there is
+// no string-content form in model.Message), so no conversion is needed; an empty
+// final message or a block type Anthropic does not accept a marker on skips the
+// breakpoint instead of risking a 400.
+func markMovingBreakpoint(msgs []anthropicMessage) {
+	if len(msgs) == 0 {
+		return
+	}
+	content := msgs[len(msgs)-1].Content
+	if len(content) == 0 {
+		return
+	}
+	last := &content[len(content)-1]
+	if !cacheableBlockType(last.Type) {
+		return
+	}
+	last.CacheControl = ephemeralCache()
+}
+
+// cacheableBlockType reports whether Anthropic accepts cache_control on a message
+// content block of this type (text, image, tool_use, tool_result, document).
+func cacheableBlockType(t string) bool {
+	switch t {
+	case "text", "image", "tool_use", "tool_result", "document":
+		return true
+	}
+	return false
+}
+
+// marshalAnthropicTools serializes each tool via its own MarshalJSON (so builtin
+// tools keep their typed shape + beta semantics) and splices the cache_control
+// breakpoint into the LAST definition. Splicing into the rendered bytes — rather
+// than re-marshaling through a map — keeps every tool's key order byte-identical
+// to the pre-caching request, which is exactly what a prefix-matched cache needs.
+func marshalAnthropicTools(tools []model.Tool) ([]json.RawMessage, error) {
+	if len(tools) == 0 {
+		return nil, nil
+	}
+	out := make([]json.RawMessage, 0, len(tools))
+	for _, t := range tools {
+		b, err := json.Marshal(t)
+		if err != nil {
+			return nil, fmt.Errorf("marshal tool %q: %w", t.Name, err)
+		}
+		out = append(out, b)
+	}
+	out[len(out)-1] = spliceCacheControl(out[len(out)-1])
+	return out, nil
+}
+
+// cacheControlJSON is the rendered member spliceCacheControl appends. It must
+// match what ephemeralCache marshals to.
+const cacheControlJSON = `"cache_control":{"type":"ephemeral"}`
+
+// spliceCacheControl appends the cache_control member as the final key of a
+// rendered JSON object. If the bytes are not a non-empty object (a shape no
+// current tool marshal produces), the input is returned unchanged — skipping the
+// breakpoint is always safe; corrupting the request is not.
+func spliceCacheControl(obj json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(obj)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return obj
+	}
+	if len(bytes.TrimSpace(trimmed[1:len(trimmed)-1])) == 0 {
+		return obj // empty object: a leading comma would be invalid JSON
+	}
+	spliced := make(json.RawMessage, 0, len(trimmed)+len(cacheControlJSON)+1)
+	spliced = append(spliced, trimmed[:len(trimmed)-1]...)
+	spliced = append(spliced, ',')
+	spliced = append(spliced, cacheControlJSON...)
+	spliced = append(spliced, '}')
+	return spliced
 }
 
 // newRequest marshals the canonical inputs into the Messages API request body and
 // builds the authenticated POST. stream toggles SSE delivery; the body is
-// otherwise identical between Complete and Stream. Headers carry the API key per
-// request and never touch disk (invariant I3).
+// otherwise identical between Complete and Stream — so both paths carry the same
+// prompt-cache breakpoints. Headers carry the API key per request and never touch
+// disk (invariant I3).
 func (a *Anthropic) newRequest(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int, stream bool) (*http.Request, error) {
-	body, err := json.Marshal(anthropicRequest{
-		Model:     a.model,
-		MaxTokens: maxTokens,
-		System:    system,
-		Messages:  msgs,
-		Tools:     tools,
-		Stream:    stream,
-	})
+	wire, err := buildAnthropicRequest(a.model, maxTokens, system, msgs, tools, stream)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -139,14 +304,7 @@ type anthropicResponse struct {
 func (ar anthropicResponse) toModel() model.Response {
 	out := model.Response{
 		StopReason: ar.StopReason,
-		Usage: model.Usage{
-			InputTokens:  ar.Usage.InputTokens,
-			OutputTokens: ar.Usage.OutputTokens,
-			// Cache reads are input tokens billed at the reduced cached rate; a meter
-			// reading CachedTokens now sees them for Anthropic calls too (parity with
-			// the OpenAI adapter). Absent ⇒ 0 ⇒ omitempty ⇒ byte-identical.
-			CachedTokens: ar.Usage.CacheReadInputTokens,
-		},
+		Usage:      ar.Usage.toModelUsage(),
 	}
 	for _, b := range ar.Content {
 		switch b.Type {
@@ -191,18 +349,34 @@ type streamEvent struct {
 	} `json:"content_block"`
 }
 
-// anthropicUsage decodes the Messages-API usage object. InputTokens/OutputTokens
-// are the original frozen counts; the two cache fields are additive (Anthropic's
-// prompt-caching tallies). CacheReadInputTokens are input tokens served from the
-// cache (a billing discount), surfaced as model.Usage.CachedTokens;
-// CacheCreationInputTokens are tokens written INTO the cache this turn — kept for
-// completeness/observability but not folded into CachedTokens (which means "served
-// from cache"). Absent ⇒ zero ⇒ model.Usage is byte-identical to before.
+// anthropicUsage decodes the Messages-API usage object. Anthropic reports
+// DISJOINT tallies: input_tokens is only the uncached remainder, with cache reads
+// and cache writes broken out separately (total prompt = input_tokens +
+// cache_read_input_tokens + cache_creation_input_tokens).
 type anthropicUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	OutputTokens             int `json:"output_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+// toModelUsage folds Anthropic's disjoint tallies into the canonical model.Usage
+// convention (shared with the OpenAI adapter, and what the meter's pricer
+// assumes): InputTokens is the TOTAL prompt and CachedTokens is the
+// discount-billed subset (pricer: fresh = InputTokens − CachedTokens). Passing
+// the raw input_tokens through unfolded would under-bill as soon as cache hits
+// occur — the pricer clamps CachedTokens to InputTokens, so a 90K cache read on a
+// 4K fresh remainder would price as 4K cached + 0 fresh. Cache-creation tokens
+// (billed by Anthropic at 1.25x input) have no dedicated model.Usage field; they
+// ride in the fresh remainder at the full input rate — the closest honest
+// accounting without inventing a new exported field. Absent cache fields ⇒ both
+// folds add zero ⇒ model.Usage is byte-identical to before.
+func (u anthropicUsage) toModelUsage() model.Usage {
+	return model.Usage{
+		InputTokens:  u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens,
+		OutputTokens: u.OutputTokens,
+		CachedTokens: u.CacheReadInputTokens,
+	}
 }
 
 // streamBlock accumulates one content block as its deltas arrive. For tool_use
@@ -306,11 +480,10 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 
 		switch ev.Type {
 		case "message_start":
-			out.Usage.InputTokens = ev.Message.Usage.InputTokens
-			out.Usage.OutputTokens = ev.Message.Usage.OutputTokens
-			// Cache reads ride message_start's usage (the input side is fixed at the
-			// turn's start); carry them onto CachedTokens for parity with Complete.
-			out.Usage.CachedTokens = ev.Message.Usage.CacheReadInputTokens
+			// The input side (including the cache tallies) is fixed at the turn's
+			// start and rides message_start's usage. Apply the same disjoint→total
+			// fold as Complete so both paths report identical accounting.
+			out.Usage = ev.Message.Usage.toModelUsage()
 
 		case "content_block_start":
 			if _, seen := blocks[ev.Index]; !seen {

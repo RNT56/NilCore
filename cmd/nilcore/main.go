@@ -2236,8 +2236,12 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			n.EscalateAfter = adv.escalateAfter
 		}
 		if mem != nil {
+			// Merged task-context view (LRN last mile): the lessons distiller writes
+			// to GLOBAL scope, so a project-only query would hide the agent's own
+			// distilled lessons. TaskContext folds both scopes under the same total
+			// record budget as before, newest-first, with the I7 labels intact.
 			n.MemoryContext = func(ctx context.Context, _ string) string {
-				blk, _ := mem.Context(ctx, memory.ScopeProject, project, "", 10)
+				blk, _ := mem.TaskContext(ctx, project, 10)
 				return blk
 			}
 		}

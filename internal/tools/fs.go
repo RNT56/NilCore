@@ -54,21 +54,47 @@ type ReadTool struct {
 
 func (ReadTool) Name() string { return "read" }
 func (t ReadTool) Description() string {
+	// The paging sentence is how the model LEARNS the recovery move: a truncated
+	// result is useless unless the description teaches offset/limit re-reads.
+	const paging = " Optional offset/limit select a line window: offset is the 1-based " +
+		"first line, limit the max number of lines. Results are byte-capped; a truncated " +
+		"result ends with \"[truncated at line N of M total lines — re-read with " +
+		"offset=N to continue]\"."
 	if len(t.ReadRoots) == 0 {
-		return "Read a file in the working directory. Returns its full contents."
+		return "Read a file in the working directory. Returns its contents." + paging
 	}
 	return "Read a file by path. Relative paths are in the working directory; added context roots " +
-		"are read by absolute path. Returns the file's full contents."
+		"are read by absolute path. Returns the file's contents." + paging
 }
 func (ReadTool) Schema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`)
+	return json.RawMessage(`{"type":"object","properties":{` +
+		`"path":{"type":"string"},` +
+		`"offset":{"type":"integer","description":"1-based line number to start reading from (default: 1)"},` +
+		`"limit":{"type":"integer","description":"maximum number of lines to return (default: to end of file)"}` +
+		`},"required":["path"]}`)
 }
+
+// maxReadBytes bounds how much of a file one read returns to the model, so a single
+// cat-style read of a lockfile or a huge generated file cannot flood the context
+// window. web_fetch caps a page at 64KB; reads sit a notch under it because read is
+// the highest-frequency tool. The truncation notice names the offset to continue
+// from, so nothing becomes unreachable — just paged.
+const maxReadBytes = 48 * 1024
+
 func (t ReadTool) Run(_ context.Context, workdir string, input json.RawMessage) (string, error) {
 	var in struct {
-		Path string `json:"path"`
+		Path   string `json:"path"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return "", fmt.Errorf("bad input: %w", err)
+	}
+	if in.Offset < 0 {
+		return "", fmt.Errorf("bad input: offset must be a 1-based line number (got %d)", in.Offset)
+	}
+	if in.Limit < 0 {
+		return "", fmt.Errorf("bad input: limit must be a line count >= 0 (got %d)", in.Limit)
 	}
 	p, err := resolveReadable(workdir, t.ReadRoots, in.Path)
 	if err != nil {
@@ -78,7 +104,72 @@ func (t ReadTool) Run(_ context.Context, workdir string, input json.RawMessage) 
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	// Fast path: a small file with no explicit window returns byte-identical full
+	// contents — the overwhelmingly common case behaves exactly as it always has.
+	if in.Offset == 0 && in.Limit == 0 && len(b) <= maxReadBytes {
+		return string(b), nil
+	}
+	return boundedRead(string(b), in.Offset, in.Limit), nil
+}
+
+// boundedRead returns a line window of src bounded by maxReadBytes, appending a
+// harness-authored notice whenever content remains beyond what was returned. offset
+// is the 1-based first line (0 ⇒ start of file); limit is a max line count (0 ⇒ to
+// EOF). The notice is plain text INSIDE the tool result the loop fences as data — it
+// opens/closes no fence itself, so it can never un-fence anything (I7).
+func boundedRead(src string, offset, limit int) string {
+	lines := strings.Split(src, "\n")
+	// A final trailing newline yields one empty trailing element, not a real line.
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	total := len(lines)
+	if offset == 0 {
+		offset = 1
+	}
+	if offset > total {
+		return fmt.Sprintf("[no content: offset %d is past end of file — %d total lines]", offset, total)
+	}
+	window := lines[offset-1:]
+	if limit > 0 && limit < len(window) {
+		window = window[:limit]
+	}
+
+	// Take whole lines while they fit under the byte cap. A single line longer than
+	// the cap (e.g. minified output) is clipped and counted as consumed, so paging
+	// via the advertised offset still makes progress past it instead of looping.
+	var b strings.Builder
+	taken, clipped := 0, false
+	for _, ln := range window {
+		add := len(ln)
+		if taken > 0 {
+			add++ // the joining newline
+		}
+		if b.Len()+add > maxReadBytes {
+			break
+		}
+		if taken > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(ln)
+		taken++
+	}
+	if taken == 0 {
+		b.WriteString(window[0][:maxReadBytes])
+		taken, clipped = 1, true
+	}
+
+	next := offset + taken // 1-based first line NOT returned
+	switch {
+	case taken < len(window) || clipped:
+		// The byte cap cut the window short (or clipped an oversized line): the exact
+		// wording here is the one the tool description promises the model.
+		fmt.Fprintf(&b, "\n[truncated at line %d of %d total lines — re-read with offset=%d to continue]", next, total, next)
+	case next <= total:
+		// The explicit window was fully delivered, but the file continues past it.
+		fmt.Fprintf(&b, "\n[showing lines %d-%d of %d total lines — re-read with offset=%d to continue]", offset, next-1, total, next)
+	}
+	return b.String()
 }
 
 // WriteTool creates or overwrites a file in the worktree.
