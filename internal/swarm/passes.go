@@ -212,6 +212,12 @@ type termAccounting struct {
 	allShards     map[string]Shard
 	passed        map[string]spawn.Result
 	merged        map[string]bool
+	// ran records every planned shard that produced a terminal result this run (green
+	// OR verifier-red) — i.e. everything requeue.Scan can see on disk. A shard that only
+	// ever SKIPPED (its dep failed) is absent from ran, and that absence is exactly what
+	// distinguishes the never-executed node board.Remaining is blind to from a red-with-
+	// budget node board.Remaining already counts (so unresolvedPlanned never double-counts).
+	ran map[string]bool
 }
 
 // Run executes the multi-pass loop from the initial shard set and returns the terminal
@@ -283,9 +289,10 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	// Share the accounting maps (by reference) with finish's termination-honesty backstop
 	// so it sees every mutation the loop makes without threading them through finish's
 	// signature at each of its many call sites.
+	ran := make(map[string]bool)
 	c.term = termAccounting{
 		planned: planned, exhaustedFail: exhaustedFail, allShards: allShards,
-		passed: passed, merged: merged,
+		passed: passed, merged: merged, ran: ran,
 	}
 
 	var board Scoreboard
@@ -347,6 +354,9 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			// its dep greens (I2: a skipped planned node is not "done").
 			skipped := res.State == spawn.StateSkipped
 			_, wasPassed := passed[s.ID]
+			if !skipped {
+				ran[s.ID] = true // produced a terminal verdict ⇒ Scan can see it (see termAccounting.ran)
+			}
 
 			board.Checked++
 			switch {
@@ -591,28 +601,26 @@ func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard
 	return out
 }
 
-// unresolvedPlanned counts the planned shards that never reached an honest terminal
-// disposition (Fix #21 backstop): a planned node is UNRESOLVED unless it is merged,
-// verifier-green (in passed), or ran red and exhausted its budget (exhaustedFail). A
-// Skipped dependent that never re-ran is exactly the unresolved case Scan cannot see.
-// A verifier-green-but-unmerged shard is NOT counted here (unmergedGreens owns it), so
-// the two counters never double-count the same shard. The zero value of c.term (no Run
+// unresolvedPlanned counts ONLY the planned shards that NEVER RAN — a dependent that
+// was Skipped (its dep failed) and, for whatever reason (cap/budget/ctx hit first),
+// never re-ran. Such a node wrote no artifact, so board.Remaining (derived from Scan)
+// is blind to it; folding it into Remaining is what keeps the run from a false green
+// over a silently-dropped DAG node (Fix #21, I2).
+//
+// It deliberately counts NOTHING that ran: a red-with-budget or exhausted-red shard is
+// in `ran` AND has a red artifact board.Remaining already counts, and a verifier-green-
+// but-unmerged shard is owned by unmergedGreens — so keying strictly on `!ran` makes
+// this counter disjoint from BOTH board.Remaining and unmergedGreens (it previously
+// double-counted red-with-budget shards against board.Remaining). A merged shard ran by
+// definition; the explicit merged guard is belt-and-braces. Zero value of c.term (no Run
 // yet) yields 0, keeping finish safe if ever called without loop setup.
 func (c *Controller) unresolvedPlanned() int {
 	n := 0
 	for id := range c.term.planned {
-		// A green-with-branch-but-unmerged shard is accounted by unmergedGreens; skip it
-		// here so it is counted once, not twice.
-		if res, ok := c.term.passed[id]; ok {
-			if res.Branch != "" && !c.term.merged[id] {
-				continue // owned by the unmergedGreens tally
-			}
-			continue // otherwise resolved (green/merged)
+		if c.term.ran[id] || c.term.merged[id] {
+			continue // ran (⇒ Scan-visible / green-owned) or merged ⇒ not a silent drop
 		}
-		if c.term.merged[id] || c.term.exhaustedFail[id] {
-			continue
-		}
-		n++ // planned, never passed, never merged, never exhausted-failed ⇒ dropped
+		n++ // planned but never executed this run ⇒ a dropped DAG node
 	}
 	return n
 }

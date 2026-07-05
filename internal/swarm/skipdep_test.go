@@ -121,3 +121,45 @@ func TestControllerSkippedDependentSurfacesWhenDepNeverGreens(t *testing.T) {
 		t.Errorf("dependent B ran %d times, want 0 (its dep never greened)", got)
 	}
 }
+
+// TestControllerRedWithBudgetNotDoubleCounted is the regression for the double-count
+// the honesty backstop (Fix #21) introduced: a shard that RAN, verified RED, and still
+// has retry budget is already in board.Remaining (Scan sees its red artifact). The
+// termination backstop (unresolvedPlanned) must NOT also count it — it counts only
+// planned nodes that NEVER ran. One always-red shard that stops at the passes rail must
+// therefore report Remaining == 1 (the one red shard), not 2.
+func TestControllerRedWithBudgetNotDoubleCounted(t *testing.T) {
+	h := newHarness(t)
+	// One shard, red on both passes, high retry budget so it never exhausts — it stays
+	// red-with-budget when MaxPasses caps the run.
+	plan := map[string]*script{
+		"swarm-run1-0": {status: []artifact.Status{artifact.StatusFail, artifact.StatusFail}},
+	}
+	cf := newCaptureFn(h, plan)
+	is := &integrateScript{}
+	c := &Controller{
+		Runner:    &Runner{Concurrency: 1, Fn: cf.fn},
+		Queue:     h.q,
+		Worktree:  h.worktree,
+		Policy:    PassPolicy{UntilClean: true, MaxPasses: 2},
+		Integrate: is.fn,
+	}
+	shards := []Shard{
+		{ID: "swarm-run1-0", Goal: "build A", Kind: artifact.KindReport, State: ShardQueued},
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 100}}, shards)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Done {
+		t.Fatalf("out = %+v, want Done=false (the shard is red)", out)
+	}
+	// The one red shard is counted EXACTLY once. Before the fix, unresolvedPlanned added
+	// it again on top of board.Remaining, yielding 2.
+	if out.Remaining != 1 {
+		t.Errorf("Remaining = %d, want 1 (the single red shard counted once, not double-counted)", out.Remaining)
+	}
+	if out.Board.Remaining != 1 {
+		t.Errorf("Board.Remaining = %d, want 1", out.Board.Remaining)
+	}
+}
