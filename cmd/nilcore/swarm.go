@@ -885,10 +885,22 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		Summary: truncate(workerSummary, maxReportProseBytes)}
 	if c.preset.FanIn == preset.FanInMerge {
 		gitMu.Lock()
-		if _, _, cerr := wt.Commit(ctx, "feat("+leafName(s.ID)+"): "+truncate(goal, 60)); cerr == nil {
-			res.Branch = branch
-		}
+		_, _, cerr := wt.Commit(ctx, "feat("+leafName(s.ID)+"): "+truncate(goal, 60))
 		gitMu.Unlock()
+		// A commit FAULT on a verifier-green code shard is a hard shard FAILURE, never a
+		// silent drop: discarding it (the prior `if cerr == nil` guard) left res.Branch
+		// empty while res.Passed stayed true, so unmergedGreens/integrateGreen skipped the
+		// branchless green and requeue.Scan found nothing red — the run reported Done while
+		// the committed code never reached integration (a false-green, I2). commitFaultIsFatal
+		// encodes the decision: a fault fails the shard; a clean tree (changed=false,
+		// cerr==nil) is NOT a fault (Commit returns the HEAD sha and the branch already
+		// points at the verified tree), so the branch is surfaced normally.
+		if commitFaultIsFatal(cerr) {
+			br := preserveFailedAttempt(ctx, wt)
+			return c.recordFail(s, spawn.Result{ID: s.ID, Branch: br, Passed: false, State: spawn.StateFailed,
+				Err: fmt.Errorf("swarm shard: commit green worktree: %w", cerr)})
+		}
+		res.Branch = branch
 	}
 	// Project the trusted (harness-set) artifact fields onto the Result for the report.
 	// readVerifiedArtifact is id-agnostic (P11 #48): it discovers the single artifact the
@@ -900,6 +912,16 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	c.recordVerdict(s, true)
 	return res
 }
+
+// commitFaultIsFatal reports whether a wt.Commit outcome on a verifier-green code
+// shard must FAIL the shard. A non-nil error is a genuine git fault (a failed
+// stage/commit) and is fatal — a green shard whose commit faulted must never
+// surface a branchless green (which unmergedGreens/integrateGreen skip and
+// requeue.Scan can't see, producing a false Done — I2). A nil error is NOT fatal,
+// including the clean-tree case (Commit returns changed=false with the HEAD sha):
+// the shard branch already points at the verified tree, so it merges harmlessly.
+// Isolated so the false-green regression is unit-tested without a sandbox.
+func commitFaultIsFatal(commitErr error) bool { return commitErr != nil }
 
 // shardGoal frames the shard's task with the typed-artifact instruction: the worker
 // MUST write its claims to .nilcore/artifacts/<id>.json (the out-of-band path the

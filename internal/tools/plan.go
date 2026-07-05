@@ -224,7 +224,7 @@ func savePlan(workdir string, steps []PlanStep) error {
 	if err != nil {
 		return err
 	}
-	return writeNoFollow(p, b)
+	return writeNoFollow(workdir, p, b)
 }
 
 // renderPlan produces a compact, stable checklist view: a status glyph per step,

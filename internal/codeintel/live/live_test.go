@@ -22,6 +22,18 @@ func openGraph(t *testing.T) *graph.Graph {
 	return g
 }
 
+// names extracts the bare display name from each qualified node id (NodeID = file NUL
+// recv NUL name), preserving order. The graph query API returns QUALIFIED ids (the
+// same-name-collision fix); these tests assert on WHICH symbols are involved, so they
+// compare against bare names independent of the qualified-id encoding.
+func names(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, graph.DisplayName(id))
+	}
+	return out
+}
+
 func TestLiveIncrementalWorktreeEdit(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -37,8 +49,8 @@ func TestLiveIncrementalWorktreeEdit(t *testing.T) {
 	if err := ix.Update(ctx, path); err != nil {
 		t.Fatal(err)
 	}
-	if callees, _ := ix.Graph.Callees(ctx, "b"); len(callees) != 1 || callees[0] != "a" {
-		t.Fatalf("initial b callees = %v, want [a]", callees)
+	if callees, _ := ix.Graph.Callees(ctx, "b"); len(callees) != 1 || names(callees)[0] != "a" {
+		t.Fatalf("initial b callees = %v, want [a]", names(callees))
 	}
 
 	// Edit the file in place (an uncommitted worktree edit) and re-index it.
@@ -47,8 +59,8 @@ func TestLiveIncrementalWorktreeEdit(t *testing.T) {
 		t.Fatal(err)
 	}
 	callees, _ := ix.Graph.Callees(ctx, "b")
-	if len(callees) != 2 || callees[0] != "a" || callees[1] != "c" {
-		t.Errorf("after edit b callees = %v, want [a c] (worktree edit reflected)", callees)
+	if got := names(callees); len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("after edit b callees = %v, want [a c] (worktree edit reflected)", got)
 	}
 }
 
@@ -75,8 +87,8 @@ func TestLiveRemoveDropsDeletedFile(t *testing.T) {
 	if err := ix.Update(ctx, keepPath); err != nil {
 		t.Fatal(err)
 	}
-	if callees, _ := ix.Graph.Callees(ctx, "User"); len(callees) != 1 || callees[0] != "Gone" {
-		t.Fatalf("pre-remove User callees = %v, want [Gone]", callees)
+	if callees, _ := ix.Graph.Callees(ctx, "User"); len(callees) != 1 || names(callees)[0] != "Gone" {
+		t.Fatalf("pre-remove User callees = %v, want [Gone]", names(callees))
 	}
 
 	// Delete gone.go and signal the removal.
@@ -87,21 +99,21 @@ func TestLiveRemoveDropsDeletedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The Gone node is gone...
+	// The Gone node is gone... (nodes are keyed by QUALIFIED id now; match on Name).
 	nodes, _ := ix.Graph.Nodes(ctx)
 	for _, n := range nodes {
-		if n.ID == "Gone" {
+		if n.Name == "Gone" {
 			t.Errorf("removed file's symbol 'Gone' still present: %+v", n)
 		}
 	}
 	// ...and the incoming edge from the surviving file no longer dangles.
 	if callees, _ := ix.Graph.Callees(ctx, "User"); len(callees) != 0 {
-		t.Errorf("post-remove User callees = %v, want [] (dangling edge into deleted file pruned)", callees)
+		t.Errorf("post-remove User callees = %v, want [] (dangling edge into deleted file pruned)", names(callees))
 	}
 	// User itself (in the surviving file) is untouched.
 	var sawUser bool
 	for _, n := range nodes {
-		if n.ID == "User" {
+		if n.Name == "User" {
 			sawUser = true
 		}
 	}

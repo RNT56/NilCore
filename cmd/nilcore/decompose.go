@@ -84,6 +84,26 @@ func decomposePlan(goal string) []string {
 	return out
 }
 
+// clampSubGoals bounds a planned sub-goal split to at most max children WITHOUT
+// dropping any work: the first max-1 sub-goals stay as-is and every sub-goal from
+// max onward is BATCHED into the final child (joined with " and "), so a 10-item
+// list at -max-children=8 runs as 8 children (the 8th coding the last 3 items)
+// instead of aborting the command via the kernel's fail-closed MaxChildren guard.
+// max<=0 means unbounded (matching the kernel's own MaxChildren semantics) and
+// returns subs unchanged; a split that already fits is likewise returned as-is, so
+// the fast path is byte-identical. It emits a one-line stderr notice on a clamp so
+// the operator sees the degradation rather than silently losing the granularity.
+func clampSubGoals(subs []string, max int) []string {
+	if max <= 0 || len(subs) <= max {
+		return subs
+	}
+	fmt.Fprintf(os.Stderr, "decompose: %d sub-goals exceed -max-children=%d; batching the overflow into the last child (no work dropped)\n", len(subs), max)
+	out := make([]string, 0, max)
+	out = append(out, subs[:max-1]...)
+	out = append(out, strings.Join(subs[max-1:], " and "))
+	return out
+}
+
 // splitConjuncts splits a one-line goal on ';' and the word ' and ' (and ', and ').
 func splitConjuncts(s string) []string {
 	s = strings.ReplaceAll(s, ", and ", ";")
@@ -208,7 +228,13 @@ func decomposeEnvelope(rootID, baseRepo string, runChild childRunner, verify ver
 		},
 	}
 	plan := func(_ context.Context, n kernel.Node) ([]kernel.Node, error) {
-		subs := decomposePlan(n.Goal)
+		// Clamp the split to the fan-out bound BEFORE the kernel's fail-closed
+		// MaxChildren guard can reject it: a valid goal that segments into more sub-goals
+		// than -max-children (e.g. a 10-item list at the default 8) must DEGRADE
+		// gracefully — batch the overflow into the last child so no work is dropped —
+		// rather than abort the whole command with a hard error. clampSubGoals is a no-op
+		// when the split already fits, so the common case is byte-identical.
+		subs := clampSubGoals(decomposePlan(n.Goal), maxChildren)
 		nodes := make([]kernel.Node, len(subs))
 		for i, s := range subs {
 			nodes[i] = kernel.Node{ID: fmt.Sprintf("%s-%d", rootID, i+1), Goal: s}

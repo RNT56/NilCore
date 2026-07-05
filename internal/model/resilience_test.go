@@ -55,16 +55,23 @@ func (f *fakeProvider) callCount() int {
 
 // streamingFakeProvider is a controllable Streamer (and Provider) for the
 // streaming resilience tests. Like fakeProvider it fails its first failUntil
-// calls; each call forwards a fixed sequence of deltas to onChunk BEFORE
-// returning, so a test can prove that a failed attempt's chunks are discarded
-// (no double-emit) while only the winning attempt's chunks reach the caller.
+// calls. By default a FAILING attempt emits NOTHING before returning the error —
+// modelling the realistic transient failure that strikes before the first token,
+// which the wrapper may recover from by streaming the next attempt live (the
+// winning attempt is the one whose deltas reach the caller). A SUCCESSFUL attempt
+// always forwards its fixed delta sequence live.
+//
+// emitBeforeFail opts into the opposite: a failing attempt forwards its deltas
+// BEFORE returning the error, so a test can exercise the double-paint fence — once
+// a partial has been painted the wrapper must NOT retry/fail over into a repaint.
 type streamingFakeProvider struct {
-	model      string
-	mu         sync.Mutex
-	calls      int
-	failUntil  int
-	alwaysFail bool
-	deltas     []string
+	model          string
+	mu             sync.Mutex
+	calls          int
+	failUntil      int
+	alwaysFail     bool
+	emitBeforeFail bool
+	deltas         []string
 }
 
 func (f *streamingFakeProvider) Complete(ctx context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
@@ -79,16 +86,25 @@ func (f *streamingFakeProvider) Stream(ctx context.Context, _ string, _ []Messag
 	n := f.calls
 	f.mu.Unlock()
 
+	willFail := f.alwaysFail || n <= f.failUntil
+	// A failing attempt emits its deltas only when emitBeforeFail is set; otherwise
+	// it fails cleanly before the first token (the realistic retryable case).
+	emit := !willFail || f.emitBeforeFail
+
 	var b strings.Builder
 	for _, d := range f.deltas {
 		b.WriteString(d)
-		if onChunk != nil {
+		if emit && onChunk != nil {
 			onChunk(Chunk{Text: d})
 		}
 	}
-	if f.alwaysFail || n <= f.failUntil {
-		// Even a failed attempt may have pushed deltas to its (buffering) callback;
-		// the wrapper must NOT have committed them.
+	if willFail {
+		// Mirror a real stream assembler: when deltas were forwarded before the
+		// failure, return the PARTIAL assembled Response (== the forwarded text)
+		// alongside the error, so the wrapper can surface exactly what was painted.
+		if emit {
+			return Response{Content: []Block{{Type: "text", Text: b.String()}}}, errFail
+		}
 		return Response{}, errFail
 	}
 	return Response{
@@ -468,10 +484,11 @@ func TestBackoff_JitterWithinBounds(t *testing.T) {
 }
 
 // TestStream_RetrySucceedsNoDoubleEmit is the core streaming acceptance: a
-// provider that fails its first two attempts then succeeds must (a) recover via
-// retry and (b) emit each delta EXACTLY ONCE. The walk's first attempt streams
-// live ("Hel","lo"); the two retries (including the winning one) buffer-and-
-// discard, so those same deltas are never re-emitted — no double-emit.
+// provider whose first two attempts fail cleanly (before any token) then succeeds
+// must (a) recover via retry and (b) emit each delta EXACTLY ONCE. Because the two
+// failed attempts painted nothing, the winning third attempt is the one that
+// streams live ("Hel","lo") — forwarded text equals the returned Response text, no
+// double-emit.
 func TestStream_RetrySucceedsNoDoubleEmit(t *testing.T) {
 	p := &streamingFakeProvider{model: "p", failUntil: 2, deltas: []string{"Hel", "lo"}}
 	r := newTestResilient(t, []Provider{p}, Options{
@@ -490,10 +507,47 @@ func TestStream_RetrySucceedsNoDoubleEmit(t *testing.T) {
 	if p.callCount() != 3 {
 		t.Fatalf("calls = %d, want 3", p.callCount())
 	}
-	// The first attempt streamed "Hel","lo" live; the retries are discarded, so the
-	// caller sees each delta exactly once — no double-emit across the 3 attempts.
+	// Only the winning (third) attempt streamed, "Hel","lo"; the two failed attempts
+	// painted nothing, so the caller sees each delta exactly once — no double-emit.
 	if strings.Join(got, "|") != "Hel|lo" {
 		t.Fatalf("emitted %q, want exactly \"Hel|lo\" (no double-emit)", strings.Join(got, "|"))
+	}
+	// The contract invariant: concatenation of forwarded text == returned text.
+	if strings.Join(got, "") != resp.Content[0].Text {
+		t.Fatalf("forwarded %q != returned %q (invariant broken)", strings.Join(got, ""), resp.Content[0].Text)
+	}
+}
+
+// TestStream_PartialThenFailNoRepaint is the MEDIUM-finding acceptance (double-paint
+// fence): when the first attempt paints a PARTIAL live and then fails, the wrapper
+// must NOT retry/fail over into a fresh full reply — that would leave the caller
+// having seen the partial live AND then the complete text, so forwarded != returned.
+// Instead it stops, surfaces the error, and returns the partial Response (whose text
+// equals exactly what was forwarded). Retry budget is ample; it must go unused.
+func TestStream_PartialThenFailNoRepaint(t *testing.T) {
+	// attempt 0 emits "Hel","lo" live then fails; a naive retry would succeed and
+	// return "Hello" — the double-paint. The fence must stop after attempt 0.
+	p := &streamingFakeProvider{model: "p", failUntil: 1, emitBeforeFail: true, deltas: []string{"Hel", "lo"}}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:  5, // ample budget — the fence must leave it unused
+		BaseBackoff: time.Millisecond,
+	}, nil)
+
+	var got []string
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err == nil {
+		t.Fatal("want an error after a partial-then-fail, got nil (would be a double-paint)")
+	}
+	if p.callCount() != 1 {
+		t.Fatalf("calls = %d, want 1 (no retry after a partial was painted)", p.callCount())
+	}
+	// The caller saw the partial exactly once — never re-painted.
+	if strings.Join(got, "|") != "Hel|lo" {
+		t.Fatalf("emitted %q, want exactly \"Hel|lo\" (painted once, no repaint)", strings.Join(got, "|"))
+	}
+	// The load-bearing invariant: forwarded text == the RETURNED Response text.
+	if len(resp.Content) == 0 || strings.Join(got, "") != resp.Content[0].Text {
+		t.Fatalf("forwarded %q != returned partial %+v (invariant broken)", strings.Join(got, ""), resp.Content)
 	}
 }
 
@@ -578,11 +632,10 @@ func TestStream_CtxCancelReturnsPartial(t *testing.T) {
 }
 
 // TestStream_FailoverNoDoubleEmit asserts the live-forward contract across a
-// failover: the walk's VERY FIRST attempt streams live, so the primary's first
-// attempt emits its deltas as they arrive; every attempt after that (the primary's
-// retry and the whole fallback stream) buffers-and-discards. The winning
-// fallback's chunks are therefore NOT re-emitted — no double-emit — even though
-// the primary's first-attempt deltas did reach the caller live.
+// failover: the primary fails cleanly (painting nothing) on every attempt, so the
+// live gate is still open when the fallback runs — the WINNING fallback stream is
+// the one that reaches the caller live. Because the primary painted nothing there
+// is no double-emit, and forwarded text ("a","b") equals the returned text ("ab").
 func TestStream_FailoverNoDoubleEmit(t *testing.T) {
 	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"X", "Y"}}
 	fallback := &streamingFakeProvider{model: "fallback", deltas: []string{"a", "b"}}
@@ -599,14 +652,16 @@ func TestStream_FailoverNoDoubleEmit(t *testing.T) {
 	if resp.Content[0].Text != "ab" {
 		t.Fatalf("assembled = %q, want ab", resp.Content[0].Text)
 	}
-	if primary.callCount() != 2 { // initial + 1 retry, both failed
+	if primary.callCount() != 2 { // initial + 1 retry, both failed cleanly
 		t.Fatalf("primary calls = %d, want 2", primary.callCount())
 	}
-	// The walk's first attempt (primary attempt 0) streamed live: "X","Y". The
-	// primary retry and the fallback stream are all buffered-and-discarded, so the
-	// fallback's "a","b" are NOT re-emitted — that is the no-double-emit guarantee.
-	if strings.Join(got, "|") != "X|Y" {
-		t.Fatalf("emitted %q, want exactly \"X|Y\" (first attempt live, later attempts discarded)", strings.Join(got, "|"))
+	// The primary painted nothing, so the live gate stayed open and the winning
+	// fallback streamed live: "a","b". Forwarded text equals the returned text.
+	if strings.Join(got, "|") != "a|b" {
+		t.Fatalf("emitted %q, want exactly \"a|b\" (winning fallback streams live)", strings.Join(got, "|"))
+	}
+	if strings.Join(got, "") != resp.Content[0].Text {
+		t.Fatalf("forwarded %q != returned %q (invariant broken)", strings.Join(got, ""), resp.Content[0].Text)
 	}
 }
 
@@ -635,9 +690,9 @@ func TestStream_NonStreamerFallbackOneChunk(t *testing.T) {
 }
 
 // TestStream_AllProvidersFail asserts an all-down streaming run surfaces the
-// wrapped errFail. The walk's first attempt streams live before it fails, so its
-// deltas reach the caller; every later (failed-over / retried) attempt is
-// discarded, so nothing after the first attempt is emitted.
+// wrapped errFail. Every attempt fails cleanly before painting a token, so the
+// caller sees NO deltas — and, because nothing was ever committed, the wrapper
+// tried the whole walk (primary then fallback) rather than stopping early.
 func TestStream_AllProvidersFail(t *testing.T) {
 	primary := &streamingFakeProvider{model: "primary", alwaysFail: true, deltas: []string{"x"}}
 	fallback := &streamingFakeProvider{model: "fallback", alwaysFail: true, deltas: []string{"y"}}
@@ -651,10 +706,13 @@ func TestStream_AllProvidersFail(t *testing.T) {
 	if err == nil || !errors.Is(err, errFail) {
 		t.Fatalf("err = %v, want wrapped errFail", err)
 	}
-	// Only the first attempt (primary attempt 0) streamed live: "x". The fallback's
-	// "y" is discarded (it is not the walk's first attempt).
-	if strings.Join(got, "|") != "x" {
-		t.Fatalf("emitted %q, want exactly \"x\" (first attempt live, fallback discarded)", strings.Join(got, "|"))
+	// No attempt painted anything (all failed before the first token), so the caller
+	// saw no deltas; failover was still exercised across both providers.
+	if len(got) != 0 {
+		t.Fatalf("emitted %q, want no deltas (every attempt failed before painting)", strings.Join(got, "|"))
+	}
+	if primary.callCount() != 1 || fallback.callCount() != 1 {
+		t.Fatalf("calls primary=%d fallback=%d, want 1/1 (full failover walk)", primary.callCount(), fallback.callCount())
 	}
 }
 

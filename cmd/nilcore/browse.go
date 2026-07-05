@@ -298,7 +298,8 @@ func browseExtractVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.Nam
 	if box == nil {
 		return nil
 	}
-	paths := artifactFiles(box.Workdir())
+	root := box.Workdir()
+	paths := artifactFiles(root)
 	if len(paths) == 0 {
 		return nil
 	}
@@ -309,7 +310,7 @@ func browseExtractVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.Nam
 	for _, p := range paths {
 		out = append(out, verify.NamedVerifier{
 			Name: "extract:" + artifactID(p),
-			V:    &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: p, EventSink: sink},
+			V:    &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: p, Root: root, EventSink: sink},
 		})
 	}
 	return out

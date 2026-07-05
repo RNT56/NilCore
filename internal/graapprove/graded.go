@@ -1,7 +1,12 @@
 package graapprove
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
 	"sync"
 	"time"
 
@@ -19,12 +24,19 @@ import (
 type GradedApprover struct {
 	human policy.Approver // the fall-through; consulted on any non-pass
 	env   Envelope        // operator policy (validated by the caller)
-	// logPath is the append-only event log; the trust view and the per-day rate
-	// window are rebuilt from it per decision (read-only, fail-closed).
+	// logPath is the append-only event log; the trust view, the per-day rate window,
+	// and the per-day auto-approved-$ total are all seeded/rebuilt from it per decision
+	// (read-only, fail-closed).
 	logPath string
-	// blast is the SHARED $/rate/irreversible meter; nil ⇒ no dollar ceiling is
-	// enforced through it (the clause MaxDollarsDay still gates structurally).
+	// blast is the SHARED $/rate/irreversible meter. When non-nil the per-day dollar
+	// charge routes through it so the effective ceiling is min(clause.MaxDollarsDay,
+	// blast day budget). nil (default -blast-radius off) is fully REACHABLE: the clause's
+	// own MaxDollarsDay still bounds the per-day auto-approved total in-process (dollarsDay).
 	blast *blastbudget.Budget
+	// trust is the memoizing incremental trust builder over logPath: each decision
+	// folds only the log's appended suffix (and skips scan+Verify when the log is
+	// unchanged) instead of rescanning+re-Verifying the whole log every time.
+	trust *TrustBuilder
 	// sink receives auto_approve / auto_deny audit events; nil ⇒ silent.
 	sink Sink
 	// now is injected for deterministic recency/rate; nil ⇒ time.Now.
@@ -32,11 +44,13 @@ type GradedApprover struct {
 	// root resolves the kill-switch sentinel (normally the worktree).
 	root string
 
-	// rateMu guards rateCount. It makes the per-day rate cap ATOMIC across
-	// concurrent decisions (the autonomy daemon / swarm can share one approver over
-	// one log): the log replay (countAutoApprovalsToday) is only the restart-recovery
-	// SEED, and this in-process counter is the authority — two concurrent decisions
-	// for the same (type,scope,day) can never both slip past a MaxPerDay cap.
+	// rateMu guards rateCount AND dollarsDay. It makes the per-day rate cap and the
+	// per-day dollar ceiling ATOMIC across concurrent decisions (the autonomy daemon /
+	// swarm can share one approver over one log): the log replay
+	// (countAutoApprovalsToday / sumAutoApprovalDollarsToday) is only the
+	// restart-recovery SEED, and these in-process counters are the authority — two
+	// concurrent decisions for the same (type,scope,day) can never both slip past a
+	// MaxPerDay cap or both over-run a MaxDollarsDay ceiling.
 	rateMu sync.Mutex
 	// rateCount maps a per-(type|scope|yyyy-mm-dd) key to the count of auto-approvals
 	// granted (or seeded from the log) for that window. A key that is present has been
@@ -44,6 +58,23 @@ type GradedApprover struct {
 	// recovers the day's prior approvals; a key absent from a new day is seeded fresh
 	// (the window rolls at midnight UTC because the day is part of the key).
 	rateCount map[string]int
+
+	// dollarsDay maps a per-(type|scope|yyyy-mm-dd) key to the cumulative auto-approval
+	// DOLLARS granted for that window. It is the per-day $ authority that enforces
+	// clause.MaxDollarsDay against ACTUAL auto-approved spend — NOT a per-action delta
+	// derived from the run ledger. It is seeded once per window from the durable log
+	// (sumAutoApprovalDollarsToday, which sums each auto_approve event's dollars.actual_usd
+	// for that day), guarded by rateMu, and rolls at midnight UTC because the day is part
+	// of the key. There is no chargedUSD watermark: Evidence.SpentUSD is the run ledger's
+	// CUMULATIVE total (build.go sets it to ledger.Total() on EVERY gated action), so it
+	// is NOT this action's incremental cost and must never be charged as such — the prior
+	// fix's `SpentUSD - chargedUSD` premise (that actual per-action cost is ≈0 because no
+	// site populates SpentUSD) was false and, under the default -blast-radius off, denied
+	// every action once the run had spent any money. A single boundary action's own
+	// incremental $ is not isolable from the cumulative ledger, so we meter the per-day
+	// auto-approved total (which is what MaxDollarsDay means) and charge each action its
+	// own declared cost (perActionUSD) — $0 today, since no signal carries it.
+	dollarsDay map[string]float64
 }
 
 // Option configures a GradedApprover.
@@ -61,7 +92,7 @@ func WithRoot(root string) Option { return func(g *GradedApprover) { g.root = ro
 // newGraded constructs a GradedApprover. Callers go through MaybeWrap so the
 // default-off (return-human-unchanged) discipline is enforced in one place.
 func newGraded(human policy.Approver, env Envelope, logPath string, blast *blastbudget.Budget, opts ...Option) *GradedApprover {
-	g := &GradedApprover{human: human, env: env, logPath: logPath, blast: blast, now: time.Now, rateCount: map[string]int{}}
+	g := &GradedApprover{human: human, env: env, logPath: logPath, blast: blast, now: time.Now, rateCount: map[string]int{}, dollarsDay: map[string]float64{}, trust: &TrustBuilder{}}
 	for _, o := range opts {
 		o(g)
 	}
@@ -157,9 +188,10 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		}
 	}
 
-	// (4) Trust bar — rebuilt from the log per decision; a chain error denies
-	// EXPLICITLY (a tampered log earns nothing).
-	view, err := BuildTrust(g.logPath)
+	// (4) Trust bar — rebuilt from the log per decision via the memoizing incremental
+	// builder (folds only new events, skips scan+Verify when unchanged); a chain error
+	// denies EXPLICITLY (a tampered log earns nothing).
+	view, err := g.trust.Build(g.logPath)
 	if err != nil || !view.ChainOK {
 		g.emitDeny("chain_broken", typ, scope, map[string]any{"chain_ok": view.ChainOK})
 		return g.fallThrough(a)
@@ -207,49 +239,195 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		return g.fallThrough(a)
 	}
 
-	// (5c) Dollars — when a clause carries a $/day ceiling, charge it through the SAME
-	// shared meter (never a second counter). On a breach, roll back the irreversible
-	// slot we just took (CreditIrreversible) so a denied action consumes nothing, then
-	// deny and delegate. A zero ceiling charges nothing.
+	// (5c) Dollars — MaxDollarsDay is the per-UTC-day CEILING for this class, enforced
+	// against the ACTUAL per-day auto-approved-dollar total (dollarsDay), NOT against a
+	// per-action delta of the run ledger. Evidence.SpentUSD is the run ledger's CUMULATIVE
+	// total (build.go sets it to ledger.Total() on every gated action), so it is NOT this
+	// action's incremental cost; a boundary action's own $ is not isolable from that
+	// cumulative figure, and no site carries a per-action figure today, so this action's
+	// charge (perActionCost) is $0 by default. chargeDay checks whether adding that charge
+	// to the day's running auto-approved total would exceed clause.MaxDollarsDay — and, when
+	// a blast budget is present, routes the same charge through the SHARED meter so the
+	// effective ceiling is min(clause.MaxDollarsDay, blast day ceiling). It commits the
+	// in-process day total only when the whole charge lands, so a denied action consumes
+	// nothing. On a breach, roll back the irreversible slot and the rate slot we already
+	// took, then deny and delegate.
 	//
-	// Fail-CLOSED when a positive $ ceiling has no meter to enforce it: if a clause
-	// declares MaxDollarsDay>0 but no blast meter is wired (g.blast==nil, the default
-	// when -blast-radius is off), the ceiling cannot be charged and would silently admit
-	// the action with NO dollar accounting at all. Rather than honor a $ ceiling we can't
-	// enforce, deny and delegate to the human (reason dollar_ceiling_unmetered) so the
-	// operator's intended ceiling is never a no-op. (A zero/absent ceiling needs no meter
-	// and stays byte-identical.)
-	dollars := clause.MaxDollarsDay
-	if dollars > 0 {
-		if g.blast == nil {
-			g.blast.CreditIrreversible(1)    // release the slot we took (no-op on a nil meter)
-			g.releaseRate(typ, scope, today) // release the rate slot too — nothing proceeded
-			g.emitDeny("dollar_ceiling_unmetered", typ, scope, map[string]any{
-				"max_dollars_day": dollars,
-			})
-			return g.fallThrough(a)
-		}
-		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, dollars); cerr != nil {
-			g.blast.CreditIrreversible(1)    // this action did not proceed — release its slot
-			g.releaseRate(typ, scope, today) // …and its rate slot
-			g.emitDeny("over_ceiling", typ, scope, map[string]any{
-				"max_dollars_day": dollars,
-			})
-			return g.fallThrough(a)
-		}
+	// The default -blast-radius off (g.blast==nil) is REACHABLE and metered by the clause's
+	// OWN MaxDollarsDay: a $0-cost action always fits, and a positive per-day total is bounded
+	// by the clause ceiling in-process — we do NOT blanket-deny as "unmetered" merely because
+	// the run has spent money (the prior bug, which disabled graduated auto-approval in its
+	// default mode). A clause with MaxDollarsDay==0 means "$-unbounded not allowed" and stays
+	// deny for any positive charge; today's $0-cost actions still pass a zero ceiling.
+	charged, cerr := g.chargeDay(ctx, a, today, clause.MaxDollarsDay)
+	if cerr != nil {
+		g.blast.CreditIrreversible(1)    // this action did not proceed — release its slot
+		g.releaseRate(typ, scope, today) // …and its rate slot
+		g.emitDeny("over_ceiling", typ, scope, map[string]any{
+			"max_dollars_day": clause.MaxDollarsDay, "actual_usd": charged,
+		})
+		return g.fallThrough(a)
 	}
 
 	// Full pass ⇒ emit auto_approve with the full evidence object and return true.
+	// dollars.charged and the explicit dollars.actual_usd both carry the ACTUAL amount
+	// charged for this action (NOT the clause ceiling), so per-day $ accounting
+	// (cmd/nilcore/blast.go rebuildBlastDay) can sum real spend; max_dollars_day carries
+	// the ceiling. actual_usd is emitted as the unambiguous, purpose-named field so a
+	// reader never has to know that `charged` happens to equal the actual cost, and it is
+	// the field sumAutoApprovalDollarsToday re-reads to reseed the per-day total after a
+	// restart.
 	g.emit("auto_approve", map[string]any{
 		"action": typ, "scope": scope,
 		"green": t.Green, "total": t.Total,
 		"last_green": t.LastGreen.UTC().Format(time.RFC3339),
 		"bar":        map[string]any{"min_successes": clause.MinSuccesses, "min_sample": clause.MinSample, "recency_days": clause.RecencyDays},
 		"rate":       map[string]any{"count": rate, "max_per_day": clause.MaxPerDay},
-		"dollars":    map[string]any{"charged": dollars, "max_dollars_day": clause.MaxDollarsDay},
+		"dollars":    map[string]any{"charged": charged, "actual_usd": charged, "max_dollars_day": clause.MaxDollarsDay},
 		"chain_ok":   view.ChainOK,
 	})
 	return true
+}
+
+// perActionCost is THIS action's own incremental dollar cost — the amount a single
+// auto-approval contributes to the per-day auto-approved total. It is deliberately NOT
+// derived from a.Evidence.SpentUSD: that field is the run ledger's CUMULATIVE total (set
+// by build.go to ledger.Total() on every gated action), so it is dominated by prior model
+// work and is not this boundary action's cost. No GateAction field carries a per-action $
+// figure today, so this returns 0 — which keeps today's auto-approvals reachable while the
+// per-day CEILING (MaxDollarsDay) still bounds the running total the moment any real
+// per-action signal is wired here. Isolating one action's $ from the cumulative ledger is
+// out of scope for this package.
+//
+// It is a var, not a func, for one reason: it is the SINGLE place a real per-action $
+// signal will be read when one exists (so the day-total metering below "just works"), and
+// tests inject a positive cost through it to exercise the ceiling. Production never
+// reassigns it.
+var perActionCost = func(a policy.GateAction) float64 { return 0 }
+
+// chargeDay enforces clause.MaxDollarsDay against the ACTUAL per-day auto-approved-dollar
+// total. Under rateMu (which guards dollarsDay) it lazily SEEDS the day's total from the
+// durable log once per (type,scope,day) window (sumAutoApprovalDollarsToday), so a restart
+// recovers the day's prior auto-approved spend; then it does an atomic check-and-commit:
+//
+//   - cost := perActionCost(a) — this action's own $ (0 today; NEVER the cumulative ledger).
+//   - if maxDollarsDay > 0 and dayTotal+cost would exceed it ⇒ refuse (over the clause
+//     ceiling). maxDollarsDay == 0 means "$-unbounded not allowed": any positive cost
+//     refuses, a $0 cost passes.
+//   - when g.blast != nil, route the SAME cost through the shared meter
+//     (ChargeAutoApprovalDollars), which enforces the blast day ceiling. The tighter of the
+//     two bites first, so the effective ceiling is min(clause.MaxDollarsDay, blast dayCeil).
+//     The blast charge is attempted only AFTER the clause check passes, and if it refuses
+//     nothing is committed to dollarsDay — the two meters never disagree.
+//   - g.blast == nil (default -blast-radius off) is REACHABLE: the clause ceiling alone
+//     bounds the in-process day total. We never blanket-deny "unmetered" — a run spending
+//     money on prior work does not disable graduated auto-approval.
+//
+// The in-process day total is committed ONLY on a landed charge, so a refused/denied action
+// consumes no dollars and leaves the accounting exactly where it was. Two concurrent
+// decisions sharing one approver serialize here and can never both push the same day over
+// its ceiling.
+func (g *GradedApprover) chargeDay(ctx context.Context, a policy.GateAction, today string, maxDollarsDay float64) (charged float64, err error) {
+	cost := perActionCost(a)
+
+	g.rateMu.Lock()
+	defer g.rateMu.Unlock()
+
+	key := rateKey(a.Type.String(), scopeFor(a), today)
+	dayTotal, seeded := g.dollarsDay[key]
+	if !seeded {
+		// First access of this window this process — seed the day's auto-approved $ from
+		// the durable log so a restart recovers prior spend. A read/parse fault fails closed.
+		seed, serr := sumAutoApprovalDollarsToday(g.logPath, a.Type.String(), scopeFor(a), today)
+		if serr != nil {
+			return 0, serr
+		}
+		dayTotal = seed
+		g.dollarsDay[key] = dayTotal // record the seed so we never re-scan this window
+	}
+
+	// Clause ceiling: MaxDollarsDay <= 0 means "$-unbounded not allowed" ⇒ only a $0 cost
+	// fits; a positive ceiling admits the charge only while the day total stays within it.
+	if maxDollarsDay <= 0 {
+		if cost > 0 {
+			return cost, errors.New("graapprove: MaxDollarsDay is 0 (unbounded $ not allowed)")
+		}
+	} else if dayTotal+cost > maxDollarsDay+dollarEpsilon {
+		return cost, errors.New("graapprove: over clause MaxDollarsDay")
+	}
+
+	// Shared blast meter (when present) enforces min(clause, blast dayCeil). Attempt it
+	// only after the clause check passes; on refusal commit nothing.
+	if g.blast != nil {
+		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, cost); cerr != nil {
+			return cost, cerr
+		}
+	}
+
+	// The charge landed — commit it to the day total so a later action in the same window
+	// is bounded by the remaining headroom.
+	g.dollarsDay[key] = dayTotal + cost
+	return cost, nil
+}
+
+// dollarEpsilon absorbs float64 rounding when comparing a day total against the clause
+// ceiling, mirroring blastbudget.epsilon so a charge meant to land exactly on the ceiling
+// is not spuriously refused.
+const dollarEpsilon = 1e-9
+
+// sumAutoApprovalDollarsToday folds the append-only log READ-ONLY and sums the
+// dollars.actual_usd each `auto_approve` event recorded for (action,scope) whose event-day
+// equals today (UTC). This reseeds the per-day auto-approved-dollar total from the durable
+// log on first access of a window, so a restart never resets it (mirroring
+// countAutoApprovalsToday for the rate axis). A missing log is 0. A read/parse fault returns
+// the sum so far plus the error so the caller can fail closed (deny) rather than under-count.
+func sumAutoApprovalDollarsToday(logPath, action, scope, today string) (float64, error) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+
+	var sum float64
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var e boundaryEvent // reuse: same {Time,Kind,Detail} shape
+		if err := json.Unmarshal(line, &e); err != nil {
+			return sum, err
+		}
+		if e.Kind != "auto_approve" {
+			continue
+		}
+		a, _ := e.Detail["action"].(string)
+		s, _ := e.Detail["scope"].(string)
+		if a != action || s != scope {
+			continue
+		}
+		if dayKey(e.Time) != today {
+			continue
+		}
+		// dollars.actual_usd is the purpose-named field the auto_approve evidence carries;
+		// fall back to dollars.charged for older events that predate actual_usd.
+		if d, ok := e.Detail["dollars"].(map[string]any); ok {
+			if v, ok := d["actual_usd"].(float64); ok {
+				sum += v
+			} else if v, ok := d["charged"].(float64); ok {
+				sum += v
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return sum, err
+	}
+	return sum, nil
 }
 
 // emitDeny records an auto_deny with its reason plus the action/scope, then the

@@ -65,7 +65,7 @@ func (r *Registry) AsTools() []tools.Tool {
 // skillTool adapts a Skill into a tool whose invocation returns its instructions.
 type skillTool struct{ s Skill }
 
-func (t skillTool) Name() string { return "skill_" + t.s.Name }
+func (t skillTool) Name() string { return skillNamePrefix + t.s.Name }
 func (t skillTool) Description() string {
 	return t.s.Description + " (returns step-by-step instructions)"
 }
@@ -134,5 +134,52 @@ func parseSkill(text string) (Skill, error) {
 	if s.Name == "" {
 		return Skill{}, fmt.Errorf("frontmatter missing name")
 	}
+	// The skill name flows into an API tool name ("skill_"+Name), which the
+	// provider requires to match ^[a-zA-Z0-9_-]{1,64}$. A frontmatter name with a
+	// space, non-ASCII rune, or excessive length would otherwise make EVERY model
+	// call 400 (skills load into every primary loop). Deterministically slugify to
+	// the safe charset, budgeting for the 6-char "skill_" prefix. If nothing
+	// survives (e.g. an all-emoji name), reject with a clear error rather than emit
+	// a poison tool name.
+	safe := sanitizeSkillName(s.Name)
+	if safe == "" {
+		return Skill{}, fmt.Errorf("skill name %q has no characters valid for an API tool name (allowed: a-z A-Z 0-9 _ -)", s.Name)
+	}
+	s.Name = safe
 	return s, nil
+}
+
+// skillNamePrefix is prepended to every skill's tool name by skillTool.Name.
+const skillNamePrefix = "skill_"
+
+// maxSkillNameLen is the length budget for a slugified skill name so that
+// skillNamePrefix+Name stays within the provider's 64-char tool-name limit.
+const maxSkillNameLen = 64 - len(skillNamePrefix)
+
+// sanitizeSkillName maps an arbitrary frontmatter name onto the API tool-name
+// charset (a-z A-Z 0-9 _ -), collapsing every other rune to a single '-', and
+// truncates to the length budget. It returns "" when nothing valid remains, so
+// the caller can reject rather than emit a name that poisons every model call.
+func sanitizeSkillName(name string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range name {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-'
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		// Collapse runs of invalid runes into a single '-' separator.
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > maxSkillNameLen {
+		out = strings.Trim(out[:maxSkillNameLen], "-")
+	}
+	return out
 }

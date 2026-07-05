@@ -18,6 +18,7 @@ package worktreefs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/rand/v2"
 	"os"
@@ -111,6 +112,38 @@ func OpenNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
 	return os.OpenFile(path, flag|syscall.O_NOFOLLOW, perm)
 }
 
+// ReadConfined reads the whole regular file at an already-confined absolute target
+// (produced by SafeJoin / SafeAbs) WITHOUT following a symlink at the final
+// component. It is the read counterpart of WriteConfined: confine() checks the path
+// at CHECK time, but a concurrently-running sandboxed process can swap the final
+// component for a symlink between that check and a plain os.ReadFile (a TOCTOU
+// window), leaking an out-of-worktree file. Opening with O_NOFOLLOW closes that
+// window — a swapped-in symlink is refused (ELOOP) rather than followed — so the
+// bytes returned are always from the confined regular file, never a redirected one.
+//
+// A symlink at the final component fails closed with an error; a directory is
+// rejected. The caller is responsible for confining target first (this mirrors
+// WriteConfined's contract).
+func ReadConfined(target string) ([]byte, error) {
+	f, err := OpenNoFollow(target, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir() {
+		return nil, fmt.Errorf("read %q: is a directory", target)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 // WriteAtomic writes data to root/rel atomically and without following a symlink at
 // the destination.
 //
@@ -137,7 +170,15 @@ func WriteAtomic(root, rel string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	return writeNoFollow(target, data, perm)
+	// SafeJoin already resolved root through EvalSymlinks to produce target, so the
+	// canonical boundary is that same resolved root. Re-resolve it here to pass a
+	// canonical boundary to writeNoFollow's stepwise mkdir — the no-follow check is
+	// bounded to components at/below this boundary, never the host's own ancestors.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve worktree root: %w", err)
+	}
+	return writeNoFollow(filepath.Clean(resolvedRoot), target, data, perm)
 }
 
 // WriteConfined performs the same atomic, symlink-safe write as WriteAtomic but
@@ -148,17 +189,250 @@ func WriteAtomic(root, rel string, data []byte, perm os.FileMode) error {
 // path" case). The atomic temp+rename + O_NOFOLLOW discipline is identical; only the
 // confinement step is the caller's responsibility.
 //
+// root is the worktree/confinement boundary target lives under. The stepwise
+// no-follow mkdir rejects a symlinked directory component only at or below this
+// boundary (an in-worktree parent a sandboxed process could swap — I4); components
+// ABOVE the boundary are the host's own stable filesystem (e.g. a `/var`→`/private/var`
+// symlink on macOS, a symlinked $TMPDIR/home) which are not attacker-writable in the
+// sandbox threat model and are therefore trusted, not rejected. Pass the same
+// worktree root whose join produced target; if a site truly has no root, the dir of
+// target is a safe fallback (target's own parent is at/below the boundary).
+//
 // perm <= 0 ⇒ preserve existing perms on overwrite (default 0644 for a new file).
-func WriteConfined(target string, data []byte, perm os.FileMode) error {
-	return writeNoFollow(target, data, perm)
+func WriteConfined(root, target string, data []byte, perm os.FileMode) error {
+	return writeNoFollow(root, target, data, perm)
+}
+
+// mkdirAllNoFollow creates dir and any missing ancestors, refusing to traverse a
+// symlinked component — but ONLY for components at or below the confinement root. It
+// is the symlink-safe replacement for os.MkdirAll used on the write path: os.MkdirAll
+// happily walks THROUGH an existing directory component even when that component is a
+// symlink, so a parent-directory symlink swapped in after the caller's confinement
+// check could redirect the write outside the worktree. Here, for every ancestor below
+// the root that already exists we os.Lstat it (which does not follow the link) and
+// reject it if it is a symlink; a missing component is created with os.Mkdir (which
+// never follows a link at the component being created). A concurrent creator racing us
+// to a component is tolerated (ErrExist), then re-validated as a real directory.
+//
+// Why the check is BOUNDED to root. The threat model (I4) is a sandboxed process
+// swapping an IN-WORKTREE directory for a symlink to escape confinement — those
+// components live at or below the worktree root and MUST still be rejected. The
+// components ABOVE the root are the host's own stable filesystem: on macOS the system
+// temp dir is under `/var/folders/...` where `/var` is a symlink to `/private/var`, and
+// a user's $TMPDIR or home can likewise be symlinked. Those ancestors are not
+// attacker-writable in the sandbox threat model, so rejecting them wrongly fails
+// legitimate writes (the regression this fixes). We therefore Lstat/validate ONLY the
+// components strictly below the canonical root and NEVER the root itself or anything
+// above it — the root is resolved through EvalSymlinks first so it names a real dir.
+//
+// root and dir must both be absolute. dir is normally at or below the canonical root
+// (callers pair SafeJoin/SafeAbs — which resolve root through EvalSymlinks — with this).
+// When root is unusable as a boundary — it does not exist, cannot be resolved, or dir
+// is not under it (e.g. a call site whose "root" is a placeholder while the real target
+// lives elsewhere) — we fall back to bounding the check at dir's OWN longest existing
+// prefix. That fallback is still safe: it trusts only ancestors that ALREADY EXIST as
+// real directories and validates every component created below them, so an attacker
+// cannot pre-plant a symlink under the not-yet-created tail.
+func mkdirAllNoFollow(root, dir string) error {
+	clean := filepath.Clean(dir)
+	canonRoot, rel, err := boundaryTail(root, clean)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		// dir IS the boundary: it already exists as a real dir (EvalSymlinks succeeded).
+		return nil
+	}
+
+	// Walk ONLY the components below canonRoot, creating/validating each. The root and
+	// every ancestor above it are trusted and never Lstat'd or rejected here.
+	sep := string(os.PathSeparator)
+	prefix := canonRoot
+	for _, comp := range strings.Split(rel, sep) {
+		if comp == "" || comp == "." {
+			continue
+		}
+		prefix = filepath.Join(prefix, comp)
+		fi, lerr := os.Lstat(prefix)
+		if lerr == nil {
+			// Component exists: it must be a REAL directory. A symlink here is exactly
+			// the swapped-in-parent escape we refuse to traverse (it is below the root).
+			if fi.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("refusing to traverse symlinked path component %q", prefix)
+			}
+			if !fi.IsDir() {
+				return fmt.Errorf("path component %q is not a directory", prefix)
+			}
+			continue
+		}
+		if !errors.Is(lerr, fs.ErrNotExist) {
+			return fmt.Errorf("stat path component %q: %w", prefix, lerr)
+		}
+		// Missing: create just this component. os.Mkdir does not follow a symlink at
+		// the leaf being created. A racing creator (ErrExist) is fine as long as what
+		// now exists is a real directory (re-validated just below).
+		if err := os.Mkdir(prefix, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("mkdir %q: %w", prefix, err)
+		}
+		// Re-validate after a possible race: whatever exists now must be a real dir.
+		fi, lerr = os.Lstat(prefix)
+		if lerr != nil {
+			return fmt.Errorf("stat created component %q: %w", prefix, lerr)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to traverse symlinked path component %q", prefix)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("path component %q is not a directory", prefix)
+		}
+	}
+	return nil
+}
+
+// boundaryTail returns the canonical confinement boundary (canonRoot) and the
+// slash-relative tail of clean below it. clean must be an absolute, cleaned path.
+//
+// THE ROOT-vs-clean SYMLINK-SPACE RULE. The no-follow walk that consumes this result
+// must (a) TRUST a symlinked ancestor ABOVE the worktree root (the host's own stable
+// filesystem — e.g. macOS `/var`→`/private/var`, a symlinked $TMPDIR/home — which is
+// not attacker-writable in the sandbox threat model) while (b) REJECTING any swapped
+// IN-WORKTREE symlink AT OR BELOW the root (the I4 escape). To decide (a) vs (b)
+// correctly we must compare root and clean in the SAME symlink-space — otherwise a
+// caller who passes a RAW root and a RAW target that both contain a symlinked host
+// ancestor (exactly evverify's `Root = box.Workdir()` shape) produces a spurious
+// escape at the Rel() step, and the OLD fallback then EvalSymlinks-resolved the whole
+// existing prefix of clean — FOLLOWING an attacker-swapped in-worktree symlink out of
+// the tree. That was the confirmed hole.
+//
+// The fix canonicalizes BOTH sides consistently:
+//   - canonRoot   = EvalSymlinks(root), cleaned.
+//   - canonClean  = clean's LONGEST-EXISTING PREFIX resolved through EvalSymlinks with
+//     the not-yet-existing tail re-appended UNRESOLVED (resolveExistingPrefix).
+//
+// tail := Rel(canonRoot, canonClean). Two outcomes fall out correctly, fail-closed:
+//
+//	(a) A legit host-ancestor symlink above root is resolved on BOTH sides, so the two
+//	    canonical paths AGREE on that ancestor — the tail is the real in-worktree
+//	    suffix, and the caller walks it from canonRoot, Lstat-rejecting any symlink
+//	    component and Mkdir-ing missing ones no-follow.
+//	(b) A swapped IN-WORKTREE symlink pointing OUTSIDE lives in clean's existing prefix,
+//	    so resolveExistingPrefix FOLLOWS it and canonClean lands OUTSIDE canonRoot →
+//	    Rel escapes → we REJECT (error). The write never happens.
+//
+// If root cannot be resolved yet (it does not exist), we fall back to bounding at
+// canonClean's own longest-existing prefix — every trusted ancestor there is an
+// already-real directory, and every not-yet-created component below it is still created
+// + re-validated no-follow by the caller.
+func boundaryTail(root, clean string) (canonRoot, rel string, err error) {
+	// Canonicalize clean in the SAME symlink-space we canonicalize root in: resolve its
+	// longest existing prefix (following any in-worktree symlink there — which is the
+	// point: a swapped one escapes and gets rejected below) and re-append the missing tail.
+	canonClean, cerr := resolveExistingPrefix(clean)
+	if cerr != nil {
+		return "", "", fmt.Errorf("resolve target %q: %w", clean, cerr)
+	}
+
+	// Prefer root as the boundary — resolved through EvalSymlinks so a symlinked
+	// ANCESTOR of root is trusted. Because canonClean is resolved in the same space, a
+	// legit host-ancestor symlink agrees on both sides (tail is the real suffix) while a
+	// swapped in-worktree symlink makes canonClean escape canonRoot.
+	if canon, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		canon = filepath.Clean(canon)
+		r, relErr := filepath.Rel(canon, canonClean)
+		if relErr != nil || escapes(r) {
+			// root resolved fine, but canonClean lands OUTSIDE it. In the same
+			// symlink-space this can only mean an in-worktree symlink at/below root was
+			// FOLLOWED out of the tree — the I4 escape. Fail closed; do NOT fall through
+			// to a canonClean-rooted boundary (that would trust the attacker's target).
+			return "", "", fmt.Errorf("target %q resolves outside its root (symlink escape)", clean)
+		}
+		return canon, r, nil
+	}
+
+	// Fallback boundary — reached ONLY when root itself is not resolvable (it does not
+	// exist yet): bound at canonClean's OWN longest-existing prefix. That prefix names
+	// only already-real directories, so trusting it is safe while every not-yet-created
+	// component below it is still created + re-validated no-follow.
+	boundary, berr := deepestExisting(canonClean)
+	if berr != nil {
+		return "", "", fmt.Errorf("resolve boundary of %q: %w", clean, berr)
+	}
+	r, relErr := filepath.Rel(boundary, canonClean)
+	if relErr != nil || escapes(r) {
+		return "", "", fmt.Errorf("target %q is not within a resolvable boundary", clean)
+	}
+	return boundary, r, nil
+}
+
+// deepestExisting returns p's longest ancestor (or p itself) that currently exists.
+func deepestExisting(p string) (string, error) {
+	probe := filepath.Clean(p)
+	for {
+		if _, lerr := os.Lstat(probe); lerr == nil {
+			return probe, nil
+		} else if !errors.Is(lerr, fs.ErrNotExist) {
+			return "", lerr
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return probe, nil // reached the volume root
+		}
+		probe = parent
+	}
+}
+
+// escapes reports whether a filepath.Rel result climbs out of its base (".." or a
+// leading "../"), i.e. the path is NOT at or below the base.
+func escapes(rel string) bool {
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// resolveExistingPrefix resolves p through EvalSymlinks by walking up to its longest
+// existing ancestor (p itself may not exist yet — a new nested file/dir), then
+// re-appending the missing tail. It mirrors confine()'s deepest-existing-ancestor
+// probe: symlinked ancestors are canonicalized while the not-yet-created suffix is
+// preserved, so the returned path is comparable against a canonical root.
+func resolveExistingPrefix(p string) (string, error) {
+	probe := filepath.Clean(p)
+	var missing []string
+	for {
+		if _, lerr := os.Lstat(probe); lerr == nil {
+			break
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		missing = append([]string{filepath.Base(probe)}, missing...)
+		probe = parent
+	}
+	real, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return "", err
+	}
+	real = filepath.Clean(real)
+	if len(missing) == 0 {
+		return real, nil
+	}
+	return filepath.Join(append([]string{real}, missing...)...), nil
 }
 
 // writeNoFollow performs the atomic temp + rename against an already-confined target
-// path. perm <= 0 ⇒ preserve existing perms on overwrite (default 0644 for a new
-// file); a positive perm is used verbatim.
-func writeNoFollow(p string, content []byte, perm os.FileMode) error {
+// path. root is the confinement boundary the no-follow parent-dir check is bounded to
+// (see mkdirAllNoFollow): a symlinked component AT OR BELOW root is refused, one ABOVE
+// it (the host's own stable ancestors, e.g. macOS `/var`→`/private/var`) is trusted.
+// perm <= 0 ⇒ preserve existing perms on overwrite (default 0644 for a new file); a
+// positive perm is used verbatim.
+func writeNoFollow(root, p string, content []byte, perm os.FileMode) error {
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Create parent dirs with a symlink-safe stepwise walk instead of os.MkdirAll:
+	// MkdirAll follows an EXISTING directory component even if it is a symlink, so a
+	// parent-directory symlink swapped in AFTER the caller's confinement check
+	// (SafeJoin/SafeAbs) would let the eventual write land outside the worktree
+	// (a TOCTOU escape). mkdirAllNoFollow refuses to traverse any in-worktree component
+	// that is a symlink, closing that window — while trusting the host's own ancestors
+	// above root so a legitimately symlinked temp/home dir does not fail the write.
+	if err := mkdirAllNoFollow(root, dir); err != nil {
 		return err
 	}
 

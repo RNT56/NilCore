@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"time"
 )
 
@@ -21,9 +22,13 @@ type ServerSpec struct {
 	Command []string `json:"command,omitempty"`
 	// URL selects the remote Streamable-HTTP transport. When set, Command is ignored.
 	URL string `json:"url,omitempty"`
-	// Headers are static HTTP headers (e.g. {"Authorization": "Bearer …"}) sent on
-	// every request to an HTTP server. Resolve secrets into these host-side at config
-	// load; they never reach the model (I3). Ignored for a stdio server.
+	// Headers are static HTTP headers sent on every request to an HTTP server. A value
+	// may embed a secret PLACEHOLDER — {{secret:NAME}} (resolved via the SecretStore) or
+	// {{env:NAME}} (resolved from the process environment) — so a bearer token is NEVER
+	// required in plaintext on disk. Placeholders are resolved host-side at config load
+	// (ResolveSecrets), so the literal token never reaches the model (I3). An unresolved
+	// placeholder is a hard error, never silently sent as the literal text. Ignored for a
+	// stdio server. Example: {"Authorization": "Bearer {{secret:MY_MCP_TOKEN}}"}.
 	Headers map[string]string `json:"headers,omitempty"`
 	// Version is optional metadata tracked by the registry (P10-T06); omitted when
 	// absent so existing mcp.json files are byte-identical.
@@ -53,6 +58,84 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse mcp config %s: %w", path, err)
 	}
 	return c, nil
+}
+
+// SecretResolver resolves a named secret host-side (e.g. the SecretStore). It is the
+// seam through which header placeholders are filled without the mcp package depending
+// on any concrete credential backend.
+type SecretResolver interface {
+	Get(name string) (string, error)
+}
+
+// placeholderRE matches a whole-value secret placeholder: {{secret:NAME}} or
+// {{env:NAME}}. NAME is a conservative identifier so a header value can never smuggle a
+// separator or whitespace through the lookup.
+var placeholderRE = regexp.MustCompile(`\{\{(secret|env):([A-Za-z_][A-Za-z0-9_.-]*)\}\}`)
+
+// ResolveSecrets fills every header placeholder ({{secret:NAME}} / {{env:NAME}}) in the
+// config's HTTP servers, host-side, so no literal token has to live in mcp.json and none
+// ever reaches the model (I3). {{secret:NAME}} goes through the resolver (SecretStore);
+// {{env:NAME}} reads the process environment. An unresolved placeholder is a hard error
+// — the literal is NEVER sent as-is (which would leak a placeholder as a bogus bearer
+// token). A header with no placeholder is passed through verbatim (static values still
+// work). A stdio server (no URL) has no headers to resolve.
+//
+// It mutates the receiver's specs in place and returns it for chaining. resolver may be
+// nil only when no {{secret:…}} placeholder is present; a {{secret:…}} without a resolver
+// is a clear error.
+func (c Config) ResolveSecrets(resolver SecretResolver) (Config, error) {
+	for i := range c.Servers {
+		s := &c.Servers[i]
+		if s.stdio() || len(s.Headers) == 0 {
+			continue
+		}
+		for k, v := range s.Headers {
+			resolved, err := resolveHeaderValue(v, resolver)
+			if err != nil {
+				return c, fmt.Errorf("mcp server %q header %q: %w", s.Name, k, err)
+			}
+			s.Headers[k] = resolved
+		}
+	}
+	return c, nil
+}
+
+// resolveHeaderValue replaces every {{secret:NAME}}/{{env:NAME}} placeholder in v. A
+// lookup failure (missing secret, absent env var, or a {{secret:…}} with no resolver) is
+// returned as an error so an unresolved placeholder is never emitted as a literal.
+func resolveHeaderValue(v string, resolver SecretResolver) (string, error) {
+	var lookupErr error
+	out := placeholderRE.ReplaceAllStringFunc(v, func(match string) string {
+		m := placeholderRE.FindStringSubmatch(match)
+		kind, name := m[1], m[2]
+		switch kind {
+		case "secret":
+			if resolver == nil {
+				lookupErr = fmt.Errorf("placeholder %s needs a secret store but none is configured", match)
+				return match
+			}
+			val, err := resolver.Get(name)
+			if err != nil {
+				lookupErr = fmt.Errorf("resolve secret %q: %w", name, err)
+				return match
+			}
+			return val
+		case "env":
+			val, ok := os.LookupEnv(name)
+			if !ok || val == "" {
+				lookupErr = fmt.Errorf("environment variable %q for placeholder %s is unset", name, match)
+				return match
+			}
+			return val
+		default:
+			lookupErr = fmt.Errorf("unknown placeholder kind %q", kind)
+			return match
+		}
+	})
+	if lookupErr != nil {
+		return "", lookupErr
+	}
+	return out, nil
 }
 
 // Server returns the spec named name, or ok=false.

@@ -386,6 +386,82 @@ func TestRedactionInlineSecrets(t *testing.T) {
 	}
 }
 
+// TestRedactionBareHighEntropyToken covers the entropy-based last resort: a bare
+// credential with NO known prefix (so secretRe/inlineSecretRe/flagSecretRe all miss
+// it) is still masked when it is long, mixes character classes, and reads as random.
+// Ordinary prose and long structured identifiers must survive untouched.
+func TestRedactionBareHighEntropyToken(t *testing.T) {
+	// A random-looking 40-char mixed base64/hex token with no recognizable prefix and
+	// not assigned to any named field — the exact shape prefix rules cannot catch.
+	bare := "9f3Ka7Lp2Qz8Rt4Vw1Xy6Bc0Dn5Fm3Hj7Gk2Ls8"
+	// A bare 40-char lowercase-HEX token (git-SHA / content-hash / cache-key shape). Hex
+	// caps at log2(16)=4.0 bits/char, so the entropy belt does NOT mask it — deliberately:
+	// context-free hex is indistinguishable from, and vastly outnumbered by, the legitimate
+	// content/chain/cache-key hashes that fill this audit log (e.g. the verify-cache key),
+	// so masking it would corrupt the trail and break hash-keyed lookups. A hex value that
+	// IS a secret is caught by its prefix or a key=/token= assignment, not by entropy. So
+	// this bare hash must SURVIVE (a false-positive guard).
+	hexHash := "3f9a2b8c1d7e4056af23bc91de8074f5a6b3c2d1"
+	d := map[string]any{
+		"free":   "the model emitted " + bare + " into the output",
+		"nested": map[string]any{"blob": bare},
+		"list":   []any{"ok", bare},
+		// False-positive guards: none of these may be masked.
+		"commit":  hexHash, // a bare hex hash — must not be mistaken for a secret
+		"prose":   "this is a perfectly ordinary sentence about verification and rotation",
+		"ident":   "internal/verify/vcache/lookup.go:the_long_snake_case_identifier_here",
+		"number":  "1234567890123456789012345678901234567890", // all digits, no letters
+		"word":    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // low entropy, single class
+		"version": "go1.25.0-darwin-arm64-release-build",
+	}
+	redact(d)
+	blob, _ := json.Marshal(d)
+	s := string(blob)
+
+	if strings.Contains(s, bare) {
+		t.Errorf("bare high-entropy token leaked through redaction: %q present in %s", bare, s)
+	}
+	if !strings.Contains(s, hexHash) {
+		t.Errorf("a bare hex hash must NOT be masked (it is indistinguishable from the log's own content/chain/cache-key hashes): %q missing from %s", hexHash, s)
+	}
+	if !strings.Contains(s, "[redacted]") {
+		t.Error("expected the bare token to be masked with a redaction marker")
+	}
+	// The prose around the token must be preserved (only the token span is masked).
+	if !strings.Contains(s, "the model emitted") {
+		t.Error("redaction destroyed surrounding prose")
+	}
+	for _, keep := range []string{
+		"perfectly ordinary sentence",
+		"the_long_snake_case_identifier_here",
+		"1234567890123456789012345678901234567890",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"go1.25.0-darwin-arm64-release-build",
+	} {
+		if !strings.Contains(s, keep) {
+			t.Errorf("entropy masking over-redacted non-secret content: %q missing from %s", keep, s)
+		}
+	}
+
+	// A DB written with this redaction must still verify — masking happens before hashing.
+	path := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log.Append(Event{Kind: "cmd", Detail: map[string]any{"free": "token " + bare}})
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(path); err != nil {
+		t.Fatalf("Verify after entropy redaction: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if strings.Contains(string(data), bare) {
+		t.Errorf("bare token leaked into the on-disk log: %s", data)
+	}
+}
+
 // TestHMACKeyedChain proves a keyed chain verifies under its key but not without
 // it or under a different key — so an attacker who cannot read NILCORE_LOG_HMAC_KEY
 // cannot forge a chain that passes Verify (audit L6).

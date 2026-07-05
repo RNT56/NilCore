@@ -81,6 +81,52 @@ func TestControllerSkippedDependentReRunsWhenDepGreens(t *testing.T) {
 	}
 }
 
+// TestControllerSlowDAGChainDoesNotFalseStall is the no-progress-detector regression:
+// a deep chain A←B←C where each link is RED on its first attempt and GREEN on the next,
+// and a dependent only starts running once its dep greens. The worklist holds ONE red
+// shard at a time (the current link retrying), so board.Remaining stays flat pass to
+// pass — but the run IS advancing every pass (a new dependency merges and a new
+// dependent runs). Before the fix the flat worklist tripped ReasonStalled after two
+// passes and killed a converging run; now the merge/ran progress signals keep it alive
+// until it converges green.
+func TestControllerSlowDAGChainDoesNotFalseStall(t *testing.T) {
+	h := newHarness(t)
+	// Each link: red on its first run, green on its second. A dependent's first run only
+	// happens after its dep greens, so exactly one link is "the current red retry" per pass.
+	plan := map[string]*script{
+		"swarm-run1-0": {status: []artifact.Status{artifact.StatusFail, artifact.StatusPass},
+			branch: []string{"", "task/swarm-run1-0"}},
+		"swarm-run1-1": {status: []artifact.Status{artifact.StatusFail, artifact.StatusPass},
+			branch: []string{"", "task/swarm-run1-1"}},
+		"swarm-run1-2": {status: []artifact.Status{artifact.StatusFail, artifact.StatusPass},
+			branch: []string{"", "task/swarm-run1-2"}},
+	}
+	cf := newCaptureFn(h, plan)
+	is := &integrateScript{}
+	c := &Controller{
+		Runner:    &Runner{Concurrency: 3, Fn: cf.fn},
+		Queue:     h.q,
+		Worktree:  h.worktree,
+		Policy:    PassPolicy{UntilClean: true, MaxPasses: 12},
+		Integrate: is.fn,
+	}
+	shards := []Shard{
+		{ID: "swarm-run1-0", Goal: "A", Kind: artifact.KindReport, State: ShardQueued},
+		{ID: "swarm-run1-1", Goal: "B on A", Kind: artifact.KindReport, State: ShardQueued, Deps: []string{"swarm-run1-0"}},
+		{ID: "swarm-run1-2", Goal: "C on B", Kind: artifact.KindReport, State: ShardQueued, Deps: []string{"swarm-run1-1"}},
+	}
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shards)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Reason == ReasonStalled {
+		t.Fatalf("a slowly-converging DAG chain must NOT false-stall: %+v", out)
+	}
+	if !out.Done || out.Reason != ReasonConverged {
+		t.Fatalf("out = %+v, want Done converged", out)
+	}
+}
+
 // TestControllerSkippedDependentSurfacesWhenDepNeverGreens is the honesty backstop:
 // if A can NEVER green (its retry budget is spent), B stays skipped/unresolved — the
 // run must exit RED (Done=false, B counted in Remaining), never a false Done=true just

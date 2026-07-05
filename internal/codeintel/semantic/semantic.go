@@ -64,6 +64,11 @@ type Index struct {
 	db  *sql.DB
 	emb Embedder
 
+	// model tags the content-hash cache with the embedding model in force, so a model
+	// change never reuses a vector produced by a DIFFERENT model. Empty ⇒ the cache
+	// keys on text alone (back-compat with Open). See OpenModel and cachedVector.
+	model string
+
 	mu    sync.Mutex
 	graph *hnswGraph
 	dirty bool // graph is stale (doc set changed) and must be rebuilt
@@ -75,8 +80,22 @@ type Index struct {
 }
 
 // Open opens (creating if needed) an index at path (use ":memory:" for ephemeral).
-// Pass a nil Embedder to run in lexical-only mode.
+// Pass a nil Embedder to run in lexical-only mode. The content-hash cache keys on
+// text alone; use OpenModel to additionally key it on the embedding model so a model
+// switch cannot reuse another model's vectors.
 func Open(path string, e Embedder) (*Index, error) {
+	return OpenModel(path, e, "")
+}
+
+// OpenModel is Open with an explicit embedding-model tag folded into the content-hash
+// cache key. This isolates cached vectors by model: re-Adding an unchanged symbol
+// after the operator changes the embedding model no longer reuses the old model's
+// vector (a hash MISS forces a fresh embed), so two models' vector spaces (and
+// possibly dimensions) never mix in one HNSW graph. An empty model reduces to Open's
+// text-only key. The DB path SHOULD also be namespaced by model at the call site so a
+// switch starts a clean file; folding the model into the hash is the second belt so a
+// shared file still refuses to serve a stale-model vector.
+func OpenModel(path string, e Embedder, model string) (*Index, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open semantic index: %w", err)
@@ -98,7 +117,7 @@ func Open(path string, e Embedder) (*Index, error) {
 		return nil, fmt.Errorf("semantic schema migrate: %w", err)
 	}
 	// An index opened against existing data must build its graph on first use.
-	return &Index{db: db, emb: e, dirty: true}, nil
+	return &Index{db: db, emb: e, model: model, dirty: true}, nil
 }
 
 // Close closes the index.
@@ -114,8 +133,7 @@ func (ix *Index) Close() error { return ix.db.Close() }
 // replaces; rows written before this column existed have a null hash and so
 // re-embed exactly once on their next Add.
 func (ix *Index) Add(ctx context.Context, id, text string) error {
-	sum := sha256.Sum256([]byte(text))
-	hash := hex.EncodeToString(sum[:])
+	hash := ix.contentHash(text)
 
 	var vec any // NULL when no embedder
 	if ix.emb != nil {
@@ -192,6 +210,23 @@ func (ix *Index) Delete(ctx context.Context, id string) error {
 	}
 	ix.dirty = true
 	return nil
+}
+
+// contentHash is the cache key for a document body. It folds the embedding model
+// (when set via OpenModel) into the sha256 alongside the text, so a vector produced
+// by one model is never reused after the model changes: the stored hash was computed
+// with the old model tag and will MISS against the new one, forcing a fresh embed.
+// With an empty model this is exactly sha256(text) — back-compat with Open.
+func (ix *Index) contentHash(text string) string {
+	h := sha256.New()
+	if ix.model != "" {
+		// A separator that cannot appear in the model string avoids a tag/text
+		// boundary ambiguity (a NUL byte is not valid in a model identifier).
+		h.Write([]byte(ix.model))
+		h.Write([]byte{0})
+	}
+	h.Write([]byte(text))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // cachedVector returns the stored vector JSON for id when the row's stored hash

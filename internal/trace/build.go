@@ -89,9 +89,14 @@ func BuildAll(logPath string) ([]*Trace, error) {
 	return traces, nil
 }
 
-// scan parses every non-empty line of the log into rawEvents, ordered by Seq.
-// A parse error is returned (a log we cannot read is not a log we can explain);
-// chain integrity is a separate, later question answered by eventlog.Verify.
+// scan parses every non-empty line of the log into rawEvents, ordered by Seq. A
+// parse error on an INTERIOR line is returned (a log we cannot read mid-stream is not
+// a log we can explain). A parse error on the FINAL line is TOLERATED: the trace CLI
+// is routinely pointed at a LIVE, in-progress log, whose last line may be a torn
+// partial write the writer has not yet completed. Rather than abort the whole build
+// against a running loop, we read up to the last COMPLETE record and drop the trailing
+// fragment — mirroring eventlog.lastEvent, which likewise resumes from the last fully
+// persisted event. Chain integrity remains eventlog.Verify's separate, later verdict.
 func scan(logPath string) ([]rawEvent, error) {
 	f, err := os.Open(logPath)
 	if err != nil {
@@ -99,22 +104,44 @@ func scan(logPath string) ([]rawEvent, error) {
 	}
 	defer f.Close()
 
-	var events []rawEvent
+	// Read all lines first so we can tell whether an unparseable line is the final one
+	// (a tolerable in-progress torn write) or an interior one (a genuine corruption we
+	// must surface). A trailing newline yields a final empty field, which we ignore.
+	var lines [][]byte
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for n := 1; sc.Scan(); n++ {
-		line := sc.Bytes()
+	for sc.Scan() {
+		// Copy: Scanner reuses its buffer across iterations.
+		lines = append(lines, append([]byte(nil), sc.Bytes()...))
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading event log: %w", err)
+	}
+
+	// Index of the last non-empty line — the only line a torn final write can land on.
+	lastNonEmpty := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if len(lines[i]) != 0 {
+			lastNonEmpty = i
+			break
+		}
+	}
+
+	var events []rawEvent
+	for i, line := range lines {
 		if len(line) == 0 {
 			continue
 		}
 		var e rawEvent
 		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, fmt.Errorf("event %d: parsing line: %w", n, err)
+			if i == lastNonEmpty {
+				// Trailing torn/partial final line of a live log: drop it and keep the
+				// records we could read. eventlog.Verify still judges the chain separately.
+				break
+			}
+			return nil, fmt.Errorf("event %d: parsing line: %w", i+1, err)
 		}
 		events = append(events, e)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("reading event log: %w", err)
 	}
 
 	// Seq is the authoritative order (the chain anchors against reordering); sort

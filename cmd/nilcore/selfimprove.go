@@ -56,6 +56,12 @@ func proposeEditMain(args []string) {
 	defer log.Close()
 
 	orch := buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log))
+	// KeepBranch preserves the run's verified worktree branch so the scope screen below
+	// can diff exactly what the run wrote (execution-time path enforcement, not just the
+	// pre-declaration scope check): the free-text Goal could otherwise steer the model to
+	// edit a file the proposal never declared, and the diff catches that before the gate.
+	orch.KeepBranch = true
+	var runBranch string // the verified branch the last Run left behind (for the diff)
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
 		Run: func(ctx context.Context, g string) (bool, error) {
@@ -63,7 +69,15 @@ func proposeEditMain(args []string) {
 			if err != nil {
 				return false, err
 			}
+			runBranch = out.Branch
 			return out.Verified, nil
+		},
+		// Changed reports what the verified run actually modified, by diffing the kept
+		// branch against the base repo's HEAD. Propose fail-closes on ANY path outside the
+		// declared, in-scope allow-list. If the branch was not preserved (older path), it
+		// returns an error so Propose refuses to gate an unverifiable run (fail-closed).
+		Changed: func(ctx context.Context) ([]string, error) {
+			return selfEditChangedPaths(ctx, absDir, runBranch)
 		},
 		Gate: policy.NewConsoleApprover(os.Stdin, os.Stdout).Approve,
 		Log:  log,
@@ -80,4 +94,30 @@ func proposeEditMain(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("self-edit accepted, verified, and approved.")
+}
+
+// selfEditChangedPaths reports the repo-relative files a verified self-edit run
+// actually modified, by diffing the run's kept branch against the base repo HEAD in
+// dir. It is the EXECUTION-time scope evidence selfimprove.Flow.Changed screens: a
+// run that (steered by the free-text Goal) touched a file the proposal never
+// declared — including the verifier of record — is caught here and never gated.
+//
+// Fail-closed: an empty branch (KeepBranch did not preserve one) or a git fault
+// returns an error, so Propose refuses to gate a run whose footprint it cannot
+// prove. Uses the SAME hardened git clamp as the rest of the cmd layer (I4).
+func selfEditChangedPaths(ctx context.Context, dir, branch string) ([]string, error) {
+	if strings.TrimSpace(branch) == "" {
+		return nil, fmt.Errorf("self-edit run left no verified branch to scope-check (KeepBranch not honored)")
+	}
+	out, err := chatGit(ctx, dir, "diff", "--name-only", "HEAD.."+branch)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		if p := strings.TrimSpace(line); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths, nil
 }

@@ -141,6 +141,35 @@ func TestControllerConverges(t *testing.T) {
 	}
 }
 
+// TestControllerConvergedMarksRunTerminal asserts a converged run moves its durable run
+// row to the terminal status, so a later --resume (which discovers work via
+// InFlightSwarm) does NOT re-adopt the finished run.
+func TestControllerConvergedMarksRunTerminal(t *testing.T) {
+	h := newHarness(t)
+	fn := h.fnFromStatusPlan(map[string][]artifact.Status{}) // all green
+	c := &Controller{
+		Runner:   &Runner{Concurrency: 4, Fn: fn},
+		Queue:    h.q,
+		Worktree: h.worktree,
+		Policy:   PassPolicy{UntilClean: true, MaxPasses: 5},
+	}
+	shards := shardSet("swarm/run1/0")
+	out, err := c.Run(context.Background(), SwarmState{RunID: "run1", Ledger: requeue.Ledger{MaxAttempts: 3}}, shards)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done {
+		t.Fatalf("run should converge: %+v", out)
+	}
+	rows, err := h.q.InFlightSwarm(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("a converged run must not stay in-flight (got %d rows); --resume would re-adopt it", len(rows))
+	}
+}
+
 // TestControllerUntilCleanRetryToGreen asserts a shard red on attempt 1 and green on
 // attempt 2 converges in exactly 2 passes, and that ONLY the failed shard is re-run
 // (the call-count proves the passed shard's Fn is not invoked in pass 2).

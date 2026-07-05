@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"nilcore/internal/agenticflows"
@@ -96,9 +97,23 @@ func TestFlowRunPreservesDAGThroughSwarm(t *testing.T) {
 		t.Fatalf("AgentTaskSubtasks: %v", err)
 	}
 
-	tree := flowTree(doc, subs)
+	tree, err := flowTree(doc, subs)
+	if err != nil {
+		t.Fatalf("flowTree: %v", err)
+	}
 	if want := "Feature implementation — agentic-flows source: coding.feature-implementation@0.1.0"; tree.Goal != want {
 		t.Errorf("tree goal = %q, want %q", tree.Goal, want)
+	}
+	// Contract-first: every flow task must carry a non-empty Acceptance criterion so the
+	// tree passes planner.Validate (flowTree itself validates, but assert the criterion is
+	// actually populated, not just non-empty by accident).
+	for _, tk := range tree.Tasks {
+		if strings.TrimSpace(tk.Acceptance) == "" {
+			t.Errorf("flow task %q has empty Acceptance — contract-first waived", tk.ID)
+		}
+	}
+	if err := tree.Validate(); err != nil {
+		t.Errorf("flowTree produced a non-contract-valid tree: %v", err)
 	}
 
 	// Locate plan and implement in the (topologically ordered) tree.

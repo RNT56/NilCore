@@ -8,9 +8,11 @@ package tools
 // to their files so the output is actually usable with `go test -run`.
 //
 // ADVISORY ONLY (I2): this is a fast-path hint to shrink the inner loop, never a
-// substitute for the full verifier suite that governs "done". Bare-name graph IDs
-// mean it over-approximates on cross-package name collisions — deliberately, since
-// running an extra test is safe and missing one is not.
+// substitute for the full verifier suite that governs "done". Graph nodes carry a
+// QUALIFIED id (file+recv+name), but a call site names its callee only by BARE name,
+// so impact.AffectedTests resolves the changed bare name to every same-named
+// definition and walks their callers — it over-approximates on cross-file/package name
+// collisions deliberately, since running an extra test is safe and missing one is not.
 
 import (
 	"context"
@@ -107,8 +109,8 @@ func (AffectedTestsTool) Run(ctx context.Context, workdir string, input json.Raw
 		return "affected_tests: no impacted tests found via the call graph — still run the full suite to be safe.", nil
 	}
 
-	// Re-join bare test names to their files (graph IDs are bare names; `go test -run`
-	// needs the package), via a worktree symbol index.
+	// Re-join test names to their files (impact.AffectedTests returns BARE test names;
+	// `go test -run` needs the package), via a worktree symbol index.
 	allSyms, _, _ := worktreeSymbols(ctx, workdir)
 	fileOf := map[string][]string{}
 	for _, s := range allSyms {

@@ -123,11 +123,12 @@ func writeRequeueArtifact(t *testing.T, root, id string) string {
 // overwrites the on-disk statuses from the box exit (the real I2 keystone path).
 func reverifyOver(box sandbox.Sandbox, log *eventlog.Log) requeueReverify {
 	return func() verify.Verifier {
-		paths := artifactFiles(box.Workdir())
+		root := box.Workdir()
+		paths := artifactFiles(root)
 		named := make([]verify.NamedVerifier, 0, len(paths))
 		for _, p := range paths {
 			named = append(named, verify.NamedVerifier{Name: "evidence:" + artifactID(p),
-				V: &evverify.ArtifactVerifier{Box: box, Reg: evverify.Default(), RelPath: p,
+				V: &evverify.ArtifactVerifier{Box: box, Reg: evverify.Default(), RelPath: p, Root: root,
 					EventSink: evidenceEventSink(log)}})
 		}
 		return verify.Composite{Named: named}

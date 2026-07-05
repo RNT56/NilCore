@@ -101,10 +101,15 @@ func (k KeychainStore) Get(name string) (string, error) {
 func (k KeychainStore) Set(name, value string) error {
 	switch runtime.GOOS {
 	case "darwin":
-		// -U updates if present. (security reads the value from argv; that is the
-		// documented path. NilCore never logs it.)
+		// SECURITY (I3): keep the plaintext secret OFF argv. A trailing `-w` with NO
+		// value tells `security add-generic-password` to read the password from its
+		// prompt — which, when stdin is not a tty, is standard input (man security:
+		// "Put at end of command to be prompted (recommended)"). We feed the value on
+		// stdin via the exec seam, so it never lands on the process command line where
+		// any same-user `ps` could read it. This mirrors the Linux secret-tool path.
+		// -U updates in place if the item already exists. NilCore never logs the value.
 		_, err := k.exec("security",
-			[]string{"add-generic-password", "-U", "-s", k.service(), "-a", name, "-w", value}, "")
+			[]string{"add-generic-password", "-U", "-s", k.service(), "-a", name, "-w"}, value)
 		return wrapQuiet(err, "keychain set")
 	case "linux":
 		// secret-tool reads the value from stdin — never argv.

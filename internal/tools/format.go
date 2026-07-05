@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -45,7 +44,11 @@ func (FormatTool) Run(_ context.Context, workdir string, input json.RawMessage) 
 	if err != nil {
 		return "", err
 	}
-	src, err := os.ReadFile(p)
+	// O_NOFOLLOW read (readNoFollow): safePath checks the path at CHECK time, but a
+	// plain os.ReadFile follows a final-component symlink swapped in after the check
+	// and would leak an out-of-worktree file (I4 TOCTOU). readNoFollow refuses a
+	// swapped-in link instead.
+	src, err := readNoFollow(p)
 	if err != nil {
 		return "", err
 	}
@@ -75,7 +78,7 @@ func (FormatTool) Run(_ context.Context, workdir string, input json.RawMessage) 
 	if in.Check {
 		return fmt.Sprintf("format_file %s: NOT formatted (%d → %d bytes); run without check to apply", in.Path, len(src), len(canonical)), nil
 	}
-	if err := writeNoFollow(p, canonical); err != nil {
+	if err := writeNoFollow(workdir, p, canonical); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("format_file %s: reformatted (%d → %d bytes)", in.Path, len(src), len(canonical)), nil

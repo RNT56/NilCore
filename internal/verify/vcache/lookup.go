@@ -55,14 +55,60 @@ func (c *Cache) lookup(key string) bool {
 	}
 
 	// A matching line exists — but it is only trustworthy if the WHOLE chain
-	// verifies. eventlog.Verify re-reads the file end to end (sequence anchor, prev
-	// links, keyed hashes); on ANY error we discard the match and recompute. This is
-	// the fail-closed-to-recompute rule: a cached pass may ONLY ever come from a
-	// chain-verified log.
-	if err := eventlog.Verify(c.cfg.LogPath); err != nil {
+	// verifies. verifyChain runs eventlog.Verify (sequence anchor, prev links, keyed
+	// hashes) end to end, MEMOIZED by a cheap file fingerprint (size + mtime): an
+	// unchanged file is still the chain-verified file it was, so a run of hits over the
+	// same log verifies exactly once instead of O(hits) full re-hashes. On ANY error we
+	// discard the match and recompute — the fail-closed-to-recompute rule: a cached pass
+	// may ONLY ever come from a chain-verified log.
+	return c.verifyChain()
+}
+
+// verifyChain reports whether the log at LogPath is chain-verified, memoizing the
+// result by a cheap fingerprint of the file (size + mod-time). Trusting the memo is
+// SOUND because it is keyed on a fingerprint that changes on ANY mutation: an append
+// grows the size, an in-place edit (a tamper) bumps the mtime — either misses the memo
+// and pays a full fresh eventlog.Verify. So chain integrity is never assumed across a
+// change, only re-affirmed for free across a genuinely-unchanged file. A stat error or
+// a failing Verify is fail-closed (false) and is NOT memoized as a pass.
+func (c *Cache) verifyChain() bool {
+	print, err := statPrint(c.cfg.LogPath)
+	if err != nil {
 		return false
 	}
-	return true
+
+	c.mu.Lock()
+	if c.haveVerifyMemo && c.verifiedPrint == print {
+		ok := c.verifiedOK
+		c.mu.Unlock()
+		return ok
+	}
+	c.mu.Unlock()
+
+	ok := eventlog.Verify(c.cfg.LogPath) == nil
+
+	c.mu.Lock()
+	// Re-stat guard: only record the memo against the fingerprint we actually verified.
+	// If the file changed during Verify (a concurrent append/edit), the print no longer
+	// describes what Verify read, so leave the memo untouched (the next lookup
+	// re-verifies) rather than caching a verdict against a moved target.
+	if print2, serr := statPrint(c.cfg.LogPath); serr == nil && print2 == print {
+		c.verifiedPrint = print
+		c.verifiedOK = ok
+		c.haveVerifyMemo = true
+	}
+	c.mu.Unlock()
+	return ok
+}
+
+// statPrint returns the change-detection fingerprint (size + mod-time) of the file
+// at path.
+func statPrint(path string) (filePrint, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return filePrint{}, err
+	}
+	return filePrint{size: fi.Size(), mtime: fi.ModTime().UnixNano()}, nil
 }
 
 // scanForKey reports whether the log stream carries an original cache PASS for key.

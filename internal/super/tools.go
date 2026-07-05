@@ -65,10 +65,21 @@ type SubagentSpec struct {
 // Handle is the supervisor's record of one spawned subagent: its spec plus its
 // terminal Result once it reports. Outstanding handles are what await_results
 // blocks on; Done flips when the result is folded in.
+//
+// Folded marks a handle whose result the supervisor has consumed — read via
+// await_results or merged via integrate — so it no longer counts against the
+// live MaxFanout budget. Spawning is synchronous, so every handle is Done the
+// instant it is recorded; without Folded the fanout rail would count CUMULATIVE
+// spawns (len(handles) only ever grows) and refuse every spawn past MaxFanout
+// for the whole run, rather than bounding the concurrently-outstanding cohort
+// of one decomposition wave (the documented meaning). A folded handle stays in
+// st.handles (integration order, resume snapshot, await history all read it) —
+// only outstanding() stops counting it.
 type Handle struct {
 	Spec   SubagentSpec
 	Result spawn.Result
 	Done   bool
+	Folded bool
 }
 
 // Outcome is the supervisor run's terminal report. Done is the VERIFIER's verdict

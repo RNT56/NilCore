@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 
 	"nilcore/internal/guard"
 	"nilcore/internal/mcp"
+	"nilcore/internal/secrets"
 )
 
 // envMCPResources opts INTO the resources + prompts surface (off by default). When
@@ -37,15 +39,46 @@ func mcpConfigPath(workdir string) string {
 	return filepath.Join(workdir, "mcp.json")
 }
 
+// mcpDescriptorBase resolves where MCP tool descriptors are written. They are codegen
+// artifacts the operator never edits — and the model reads a server's live catalog
+// through the `mcp` tool, not off disk — so they must NOT land in the operator's checkout
+// (the one MCP write that would otherwise escape a disposable worktree, polluting the
+// working tree on every boot). We write them under <user-cache-dir>/nilcore/mcp, keyed by
+// the workdir so distinct checkouts don't collide, and fall back to the workdir only when
+// no cache dir is available (best-effort, never fatal). Override with $NILCORE_MCP_DESC_DIR.
+func mcpDescriptorBase(workdir string) string {
+	if d := strings.TrimSpace(os.Getenv("NILCORE_MCP_DESC_DIR")); d != "" {
+		return d
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return workdir // no cache dir on this host — degrade to the old location
+	}
+	// Key by a filesystem-safe digest of the absolute workdir so two checkouts with the
+	// same basename never share (and stomp) one descriptor set.
+	key := fmt.Sprintf("%x", sha256.Sum256([]byte(mustAbs(workdir))))[:16]
+	return filepath.Join(cache, "nilcore", "mcp", key)
+}
+
 // setupMCP loads the MCP config, opens a live Manager over the configured servers, and
-// generates the on-demand descriptors under workdir/mcp/servers/ (warming the
-// connections the `mcp` tool then reuses). It returns the Manager so the caller can
-// `defer mcpClose(...)`; nil when no servers are configured. Best-effort: a bad config
-// or a server that will not start is logged and skipped, never blocking the task.
+// generates the on-demand descriptors under a non-repo cache dir (mcpDescriptorBase),
+// warming the connections the `mcp` tool then reuses. It returns the Manager so the
+// caller can `defer mcpClose(...)`; nil when no servers are configured. Best-effort: a
+// bad config or a server that will not start is logged and skipped, never blocking the
+// task.
 func setupMCP(workdir string) *mcp.Manager {
+	descBase := mcpDescriptorBase(workdir)
 	cfg, err := mcp.LoadConfig(mcpConfigPath(workdir))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nilcore: mcp config: %v\n", err)
+		return nil
+	}
+	// Resolve any {{secret:NAME}}/{{env:NAME}} header placeholder host-side, so a bearer
+	// token is never required in plaintext in mcp.json and never reaches the model (I3).
+	// An unresolved placeholder is fatal for MCP setup (we refuse to send a bogus literal),
+	// but non-fatal for the task: MCP is skipped, not the run.
+	if cfg, err = cfg.ResolveSecrets(secrets.Detect()); err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: mcp config secret resolution: %v\n", err)
 		return nil
 	}
 	// Reconcile the discovery surface with the live config: prune the wrapper dir of
@@ -56,7 +89,7 @@ func setupMCP(workdir string) *mcp.Manager {
 	for _, spec := range cfg.Servers {
 		keep[spec.Name] = true
 	}
-	if err := mcp.PruneServers(workdir, keep); err != nil {
+	if err := mcp.PruneServers(descBase, keep); err != nil {
 		fmt.Fprintf(os.Stderr, "nilcore: mcp prune stale servers: %v\n", err)
 	}
 	if len(cfg.Servers) == 0 {
@@ -70,7 +103,7 @@ func setupMCP(workdir string) *mcp.Manager {
 	// tool call. Generous, per-boot total cap.
 	dctx, dcancel := context.WithTimeout(context.Background(), mcpDiscoverTimeout)
 	defer dcancel()
-	for _, e := range mgr.Discover(dctx, workdir, mcpResourcesEnabled()) {
+	for _, e := range mgr.Discover(dctx, descBase, mcpResourcesEnabled()) {
 		fmt.Fprintf(os.Stderr, "nilcore: skipping mcp server %v\n", e)
 	}
 	mcpMgr = mgr
@@ -160,7 +193,7 @@ func (t *mcpTool) Run(ctx context.Context, _ string, input json.RawMessage) (str
 	default:
 		// Discovery: {"server":"x"} with no tool/resource/prompt returns the server's
 		// live tool catalog, so the model discovers what to call WITHOUT a filesystem read
-		// (the codegen descriptors live in the base repo, not the disposable run worktree
+		// (the codegen descriptors live in a host cache dir, not the disposable run worktree
 		// the model's file tools are rooted at).
 		return t.listCatalog(ctx, in.Server)
 	}
@@ -245,6 +278,12 @@ func mcpCallMain(args []string) {
 	}
 	cfg, err := mcp.LoadConfig(path)
 	if err != nil {
+		fatal(err)
+	}
+	// Resolve header secret placeholders host-side before dialing, so the operator CLI
+	// path also keeps bearer tokens out of mcp.json (I3). An unresolved placeholder is
+	// fatal here — we refuse to send a bogus literal as a credential.
+	if cfg, err = cfg.ResolveSecrets(secrets.Detect()); err != nil {
 		fatal(err)
 	}
 	spec, ok := cfg.Server(server)

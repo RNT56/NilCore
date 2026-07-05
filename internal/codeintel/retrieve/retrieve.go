@@ -18,7 +18,15 @@ import (
 )
 
 // Item is one element of a Context Bundle, with why it was included.
+//
+// Symbol is the human-facing DISPLAY name (a bare symbol name, or "recv.name" for a
+// method) — safe to render, never leaking the file path or NUL delimiters a qualified
+// graph id carries. ID is the retrieval IDENTITY: the qualified graph node id when the
+// item comes from a graph node (so two same-named symbols in different files stay
+// distinct and dedup does not collapse them), else the same bare name as Symbol. Dedup
+// and any cross-item wiring key on ID; only Symbol is shown.
 type Item struct {
+	ID         string
 	Symbol     string
 	File       string
 	Provenance string // "precise" | "semantic" | "lexical" | "graph-neighbor" | "repomap"
@@ -50,12 +58,24 @@ var provRank = map[string]int{"precise": -1, "semantic": 0, "lexical": 1, "graph
 func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bundle, error) {
 	b := Bundle{Need: need}
 	seen := map[string]bool{}
-	add := func(sym, file, prov, why string, score float64) {
-		if sym == "" || seen[sym] {
+	// add records one item, keyed for dedup on its IDENTITY (id — a qualified graph
+	// node id, so two same-named symbols in different files do NOT collapse), while the
+	// rendered Symbol is the human-facing DISPLAY name derived from that id. Graph ids
+	// carry the file path + NUL delimiters, so they must never be shown; graph.DisplayName
+	// is the display-side projection.
+	add := func(id, file, prov, why string, score float64) {
+		if id == "" || seen[id] {
 			return
 		}
-		seen[sym] = true
-		b.Items = append(b.Items, Item{Symbol: sym, File: file, Provenance: prov, Rationale: why, Score: score})
+		seen[id] = true
+		b.Items = append(b.Items, Item{
+			ID:         id,
+			Symbol:     graph.DisplayName(id),
+			File:       file,
+			Provenance: prov,
+			Rationale:  why,
+			Score:      score,
+		})
 	}
 
 	nodes, err := r.Graph.Nodes(ctx)
@@ -63,8 +83,15 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 		return b, err
 	}
 	fileOf := make(map[string]string, len(nodes))
+	// byName maps a bare symbol NAME to the qualified node(s) that carry it. The
+	// semantic index is keyed by bare symbol name (see internal/tools.openSemantic),
+	// but graph nodes are keyed by QUALIFIED id, so a semantic hit must be resolved
+	// through byName to land in the graph's id space (a name shared by two files
+	// resolves to both nodes — the same over-approximation the graph query layer makes).
+	byName := make(map[string][]graph.Node, len(nodes))
 	for _, n := range nodes {
 		fileOf[n.ID] = n.File
+		byName[n.Name] = append(byName[n.Name], n)
 	}
 
 	// 1a. Precise entry points: a language server's global symbol search — exact,
@@ -84,20 +111,23 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 	// The semantic index is PERSISTENT across runs, so a renamed/deleted symbol's
 	// row can linger and Search can return a name absent from the current tree. The
 	// graph, by contrast, is rebuilt fresh from the live source, so its node set is
-	// ground truth. A hit whose id resolves to no graph node (fileOf lookup misses)
-	// is such a phantom: including it would render "- OldName (?) [semantic]" — dead
-	// code shown as current. Drop those hits here (the correctness guard); the index
+	// ground truth. A hit's id is a bare symbol NAME (the semantic index's key); it is
+	// resolved through byName to the qualified graph node(s). A hit that resolves to no
+	// node is a phantom (a stale index row with no live symbol): including it would
+	// render dead code as current, so it is dropped (the correctness guard); the index
 	// itself is separately reconciled at build time so it does not grow unbounded.
 	var leads []string
 	if r.Semantic != nil {
 		if hits, serr := r.Semantic.Search(ctx, need, 5); serr == nil {
 			for _, h := range hits {
-				file, live := fileOf[h.ID]
-				if !live {
+				matches := byName[h.ID]
+				if len(matches) == 0 {
 					continue // phantom: stale index row with no live graph node
 				}
-				leads = append(leads, h.ID)
-				add(h.ID, file, "semantic", "matches the query", h.Score)
+				for _, n := range matches {
+					leads = append(leads, n.ID)
+					add(n.ID, n.File, "semantic", "matches the query", h.Score)
+				}
 			}
 		}
 	}
@@ -112,15 +142,18 @@ func (r *Retriever) Retrieve(ctx context.Context, need string, budget int) (Bund
 		}
 	}
 
-	// 2. Expand each lead by its immediate neighborhood — structurally coherent.
+	// 2. Expand each lead by its immediate neighborhood — structurally coherent. The
+	// rationale names the lead by its DISPLAY name (graph.DisplayName), never the raw
+	// qualified id, which would leak the file path into the human-readable text.
 	for _, lead := range leads {
+		leadName := graph.DisplayName(lead)
 		callees, _ := r.Graph.Callees(ctx, lead)
 		for _, c := range callees {
-			add(c, fileOf[c], "graph-neighbor", "called by "+lead, 0.5)
+			add(c, fileOf[c], "graph-neighbor", "called by "+leadName, 0.5)
 		}
 		callers, _ := r.Graph.Callers(ctx, lead)
 		for _, c := range callers {
-			add(c, fileOf[c], "graph-neighbor", "calls "+lead, 0.5)
+			add(c, fileOf[c], "graph-neighbor", "calls "+leadName, 0.5)
 		}
 	}
 

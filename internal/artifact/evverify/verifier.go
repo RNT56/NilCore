@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -48,7 +49,14 @@ import (
 //
 // RelPath is the path to the artifact JSON inside the worktree the verifier owns. It
 // is resolved with worktreefs (O_NOFOLLOW) so a symlink swapped in at the target is
-// refused rather than followed. Box is the sandbox every check reaches through (I4);
+// refused rather than followed. Root is the worktree/confinement boundary RelPath
+// lives under; writeBack passes it to worktreefs.WriteConfined so the atomic write's
+// no-follow parent-dir check is bounded to the worktree — an in-worktree symlinked
+// component is still refused (I4), while the host's own stable ancestors above the
+// root (e.g. a macOS `/var`→`/private/var` symlink in a temp path) are trusted rather
+// than wrongly rejected. Wire Root to the same worktree root whose join produced
+// RelPath; if a site has no root, the directory of RelPath is a safe fallback (it is
+// at/below the boundary). Box is the sandbox every check reaches through (I4);
 // a nil Box fails every network claim closed to Unverifiable and makes no host-side
 // call. MaxAge gates staleness (0 disables it); EventSink, when non-nil, receives one
 // Detail-only event per claim and one per artifact — the leaf never imports eventlog,
@@ -57,6 +65,7 @@ type ArtifactVerifier struct {
 	Box       sandbox.Sandbox
 	Reg       *Registry
 	RelPath   string
+	Root      string
 	MaxAge    time.Duration
 	EventSink func(ev any)
 }
@@ -222,13 +231,22 @@ func (v *ArtifactVerifier) load() (*artifact.Artifact, error) {
 
 // writeBack persists the verdict-overwritten artifact atomically and symlink-safely
 // to the SAME confined path it was read from. WriteConfined keeps the temp+rename +
-// O_NOFOLLOW discipline; the path was already confined when load() opened it.
+// O_NOFOLLOW discipline; the path was already confined when load() opened it. The
+// no-follow parent-dir check is bounded to Root (the worktree boundary RelPath lives
+// under): an in-worktree symlinked component is still refused, while a legitimately
+// symlinked host ancestor above Root (the macOS `/var` temp-dir case) is trusted. When
+// Root is empty we fall back to RelPath's own directory — still a correct boundary,
+// since that dir is at/below the worktree root.
 func (v *ArtifactVerifier) writeBack(a *artifact.Artifact) error {
 	data, err := artifact.Marshal(a)
 	if err != nil {
 		return err
 	}
-	return worktreefs.WriteConfined(v.RelPath, data, 0)
+	root := v.Root
+	if strings.TrimSpace(root) == "" {
+		root = filepath.Dir(v.RelPath)
+	}
+	return worktreefs.WriteConfined(root, v.RelPath, data, 0)
 }
 
 // counts tallies the per-status verdicts for the artifact summary + event.

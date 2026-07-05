@@ -23,6 +23,13 @@ type logEvent struct {
 	Detail  map[string]any `json:"detail"`
 }
 
+// clsAgg accumulates a per-class outcome rollup while replaying the log (the
+// samples are held per-class so the median is over that class's contests only).
+type clsAgg struct {
+	agg         Aggregate
+	costs, lats []float64
+}
+
 // OverLog builds a read-only Experience by replaying the append-only event log
 // at logPath, then verifying its hash chain. It folds the verifier-judged
 // race_outcome events (Backend + Detail["passed"]) into the trust scoreboard and
@@ -47,11 +54,14 @@ func OverLog(logPath string) (*Experience, error) {
 	}
 	defer f.Close()
 
+	// One ledger folds every race into its (class, backend) cell AND the global ""
+	// cell (trust.Record keys "" as the global-view cell), so a class-less query
+	// reads the whole scoreboard while a `-class X` query reads that class only —
+	// the same split the store-backed projection makes, keeping the two paths
+	// consistent. Per-class outcome rollups accumulate alongside so Outcomes filters
+	// by class too.
 	l := trust.New()
-	var (
-		agg         Aggregate
-		costs, lats []float64
-	)
+	byCls := map[string]*clsAgg{"": {}} // "" = the global rollup
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for n := 1; sc.Scan(); n++ {
@@ -66,20 +76,36 @@ func OverLog(logPath string) (*Experience, error) {
 		if e.Kind != "race_outcome" {
 			continue // only verifier-judged race outcomes carry standing signal
 		}
+		class, _ := e.Detail["class"].(string)
 		passed, _ := e.Detail["passed"].(bool)
-		l.Record(trust.Outcome{Backend: e.Backend, Passed: passed})
-		agg.Races++
-		if passed {
-			agg.Passes++
+		// One Record per race: it folds the GLOBAL backend map (which backs
+		// BackendStanding("")) once AND the class cell (which backs a `-class X`
+		// query). No second fold — that would double-count the global scoreboard.
+		l.Record(trust.Outcome{Backend: e.Backend, Class: class, Passed: passed})
+
+		clss := []string{""}
+		if class != "" {
+			clss = append(clss, class)
 		}
-		if c, ok := floatOf(e.Detail["cost"]); ok {
-			costs = append(costs, c)
-		}
-		if v, ok := floatOf(e.Detail["latency_ns"]); ok {
-			lats = append(lats, v)
-		}
-		if e.Time.After(agg.LastSeen) {
-			agg.LastSeen = e.Time
+		for _, cl := range clss {
+			ca := byCls[cl]
+			if ca == nil {
+				ca = &clsAgg{}
+				byCls[cl] = ca
+			}
+			ca.agg.Races++
+			if passed {
+				ca.agg.Passes++
+			}
+			if c, ok := floatOf(e.Detail["cost"]); ok {
+				ca.costs = append(ca.costs, c)
+			}
+			if v, ok := floatOf(e.Detail["latency_ns"]); ok {
+				ca.lats = append(ca.lats, v)
+			}
+			if e.Time.After(ca.agg.LastSeen) {
+				ca.agg.LastSeen = e.Time
+			}
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -92,13 +118,40 @@ func OverLog(logPath string) (*Experience, error) {
 		return nil, fmt.Errorf("verifying chain: %w", err)
 	}
 
-	agg.MedianCostUSD = median(costs)
-	agg.MedianLatency = median(lats)
+	aggByCls := make(map[string]Aggregate, len(byCls))
+	for cl, ca := range byCls {
+		ca.agg.MedianCostUSD = median(ca.costs)
+		ca.agg.MedianLatency = median(ca.lats)
+		ca.agg.Class = cl
+		aggByCls[cl] = ca.agg
+	}
 	snap := l.Snapshot()
 	return &Experience{
 		backends: snap.Backends,
+		byClass:  classStandings(snap),
 		configs:  snap.Configs,
-		agg:      agg,
+		agg:      aggByCls[""],
+		aggByCls: aggByCls,
 		chainOK:  true,
 	}, nil
+}
+
+// classStandings groups a trust snapshot's per-class cells into per-class Stat
+// slices (best-first within a class, as the snapshot already orders them). The
+// global "" cells are omitted — a class-less query reads the global Backends
+// scoreboard directly (which is byte-identical to the "" cells).
+func classStandings(snap trust.Snapshot) map[string][]trust.Stat {
+	out := map[string][]trust.Stat{}
+	for _, c := range snap.Classes {
+		if c.Class == "" {
+			continue // the global bucket is served by Backends
+		}
+		out[c.Class] = append(out[c.Class], trust.Stat{
+			Backend:  c.Backend,
+			Races:    c.Races,
+			Wins:     c.Wins,
+			PassRate: c.PassRate,
+		})
+	}
+	return out
 }

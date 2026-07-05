@@ -60,22 +60,15 @@ func (a *Authorized) Update(ctx context.Context, threadID, message string) error
 	return a.Channel.Update(ctx, threadID, message)
 }
 
-// Ask passes the gate question through to the wrapped channel. Whether an answer
-// is honored is decided by GuardedApprove, which the channel layer calls with the
-// responding principal.
+// Ask passes the gate question through to the wrapped channel. Gate-answer
+// authorization is NOT enforced here: it lives in the transport, where the clicker
+// is known. Each channel's ask handler (slack/telegram choices.go
+// handleAskAction/handleAskCallback) authorize()-checks the clicker — emitting the
+// same unauthorized_gate audit event and dropping the click — and, because the
+// resulting answer rides back in as a TaskRequest whose Sender is the clicker, it is
+// re-gated by Permit at server.intake before it can become a principal answer. So an
+// answer is never honored from an unauthorized principal, without this wrapper
+// needing a separate GuardedApprove seam.
 func (a *Authorized) Ask(ctx context.Context, threadID, question string) (bool, error) {
 	return a.Channel.Ask(ctx, threadID, question)
-}
-
-// GuardedApprove returns the gate decision only when the responding principal is
-// authorized; an unauthorized principal's approval is ignored (treated as a
-// denial) and logged. This is the enforcement point the channel routes a gate
-// answer through once it knows who clicked.
-func (a *Authorized) GuardedApprove(principal string, answer bool) bool {
-	if !a.Permit(principal) {
-		a.Log.Append(eventlog.Event{Kind: "unauthorized_gate",
-			Detail: map[string]any{"principal": principal}})
-		return false
-	}
-	return answer
 }

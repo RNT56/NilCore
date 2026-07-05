@@ -50,6 +50,15 @@ import (
 // background self-service (reactive chat is unaffected — it never goes through here).
 const autonomyPollInterval = 15 * time.Second
 
+// autonomyQueueCap bounds the unified priority queue's in-flight depth so the
+// daemon honors its "bounded priority queue" contract: a burst of dropped signals,
+// due wakes, or backlog objectives cannot grow the queue without limit. A source
+// that outruns the (serial) handler gets fast-fail back-pressure (ErrQueueFull),
+// which the daemon logs and the feeder retries on the next tick, rather than an
+// unbounded memory climb. The cap is generous — background self-service is not a
+// high-throughput path — while still being a real fence.
+const autonomyQueueCap = 256
+
 // runAutonomyDaemon drives the unified autosrc daemon until ctx is cancelled (serve
 // shutdown), draining gracefully. The orchestrator, store, and wake registry are owned
 // by the caller (serve, at startup) so a missing model key fails loudly at boot, and
@@ -92,7 +101,7 @@ func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *event
 		sources = append(sources, autosrc.WakeSource{Fires: wakeCh})
 	}
 
-	d := autosrc.New(handler, autosrc.Config{Concurrency: 1, Log: log})
+	d := autosrc.New(handler, autosrc.Config{Concurrency: 1, QueueCap: autonomyQueueCap, Log: log})
 	if err := d.Run(ctx, sources...); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "nilcore: autonomy daemon stopped: %v\n", err)
 	}
@@ -143,18 +152,24 @@ func fileSignalFeeder(ctx context.Context, dir string, ch chan<- autosrc.FileSig
 // passed, re-engaging durable self-timers in serve (they were armed but never fired
 // before). A registry read error is skipped, never fatal.
 //
-// Ordering matters for durability. It DELIVERS the wake onto the queue FIRST, then
-// disarms it — so a shutdown (or a cancel) caught mid-handoff leaves the wake ARMED and
-// it re-fires on the next boot (at-least-once), rather than disarming it and losing the
-// timer forever. The inFlight set bridges the brief window between delivery and disarm
-// (and an undisarmable wake) so the next tick can never re-queue the same wake — giving
-// effectively-once delivery in steady state without the lose-on-shutdown hazard of
-// disarming first.
+// Every due wake is dispatched through Registry.Claim — the durable single-fire
+// primitive: Claim atomically takes the wake AND durably disarms it in the store, so a
+// wake fires AT MOST ONCE even across a restart or two concurrent pollers (a second
+// serve process, or serve's own runWaker, cannot also fire a claimed wake). Only the
+// winner of Claim delivers onto the queue; a lost claim (someone else won, or it was
+// already fired) is skipped silently. This replaces the previous process-local inFlight
+// map, whose at-most-once was only in-memory — a restart or a second process could
+// re-fire the same wake, bypassing the single-fire guarantee the registry exists to
+// provide (durable at-most-once, the finding's fix).
+//
+// A Claim failure (store error) leaves the wake armed for a later tick to retry, never
+// swallowed. On ctx cancel after a winning Claim the wake is already durably disarmed,
+// so it does not re-fire — the accepted at-most-once trade (a rare crash between Claim
+// and enqueue drops that one wake rather than risking a double-fire).
 func wakeFeeder(ctx context.Context, reg *wake.Registry, ch chan<- autosrc.Wake, interval time.Duration) {
 	defer close(ch)
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	inFlight := make(map[string]bool) // delivered-but-not-yet-disarmed (or undisarmable)
 	for {
 		select {
 		case <-ctx.Done():
@@ -167,21 +182,23 @@ func wakeFeeder(ctx context.Context, reg *wake.Registry, ch chan<- autosrc.Wake,
 		}
 		now := time.Now()
 		for _, w := range pending {
-			if w.WakeAt.After(now) || inFlight[w.ThreadID] {
-				continue // not due yet, or already handed off this session
+			if w.WakeAt.After(now) {
+				continue // not due yet
 			}
-			// Deliver FIRST: a shutdown here leaves the wake armed (re-fires next boot).
+			// Claim is the durable, atomic single-fire gate: it disarms the wake in the
+			// store before returning won=true, so no restart or concurrent poller can
+			// re-fire it. A lost claim (won=false) or a store error means someone else
+			// owns it (or it will retry next tick) — skip without delivering.
+			won, cerr := reg.Claim(ctx, w.ThreadID)
+			if cerr != nil || !won {
+				continue
+			}
+			// We durably own this fire. Deliver it; a cancel here drops only this single
+			// already-disarmed wake (at-most-once), never a re-fire.
 			select {
 			case ch <- autosrc.Wake{ThreadID: w.ThreadID, Note: w.Note}:
 			case <-ctx.Done():
-				return // not delivered, not disarmed ⇒ survives to next boot
-			}
-			// Delivered. Mark in-flight so the next tick won't re-queue it during the
-			// gap until Disarm lands; on a successful disarm it leaves Pending and we can
-			// forget it. A disarm error keeps it in-flight (no tight re-fire loop).
-			inFlight[w.ThreadID] = true
-			if reg.Disarm(ctx, w.ThreadID) == nil {
-				delete(inFlight, w.ThreadID)
+				return
 			}
 		}
 	}

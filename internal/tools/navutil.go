@@ -62,9 +62,9 @@ func worktreeSymbols(ctx context.Context, workdir string) (syms []symRef, indexe
 
 // buildGraph opens an EPHEMERAL in-memory call graph over the worktree and returns
 // it (the caller closes it). It is the same construction CodeintelTool uses: parse
-// each supported source file into graph nodes (bare-name IDs) + `calls` edges,
-// best-effort, capped at maxIndexedFiles. Nothing is persisted; the graph dies with
-// the caller's Close.
+// each supported source file into graph nodes (QUALIFIED ids — NodeID(file,recv,name),
+// so same-named symbols in different files stay distinct) + `calls` edges, best-effort,
+// capped at maxIndexedFiles. Nothing is persisted; the graph dies with the caller's Close.
 func buildGraph(ctx context.Context, workdir string) (g *graph.Graph, indexed int, err error) {
 	g, err = graph.Open(":memory:")
 	if err != nil {
@@ -91,18 +91,33 @@ func buildGraph(ctx context.Context, workdir string) (g *graph.Graph, indexed in
 	return g, indexed, nil
 }
 
-// forwardReachable returns the set of node IDs reachable from any root by following
-// `calls` edges forward (a callee BFS) — the mirror of impact.ImpactSet, which
-// walks callers. The roots themselves are included. It is the reachability core of
-// the dead-code lens.
+// forwardReachable returns the set of reachable symbols, keyed by BARE name, reached
+// from any root by following `calls` edges forward (a callee BFS) — the mirror of
+// impact.ImpactSet, which walks callers. The roots themselves are included.
+//
+// The graph query API (Callees) is keyed by QUALIFIED id (the same-name collision fix):
+// it accepts a bare name OR a qualified id and returns qualified callee ids. The
+// dead-code lens, however, checks membership by BARE symbol name (a func/method's Name),
+// so this normalizes every reached id to its bare name via graph.SplitID before
+// recording it. Roots arrive as bare names; callees come back qualified — both collapse
+// to the bare name here so a symbol reached only as a transitive callee is not a false
+// "dead" positive. The BFS frontier still traverses on the qualified id (unambiguous),
+// but the returned set — the membership test the caller uses — is bare-name keyed.
 func forwardReachable(ctx context.Context, g *graph.Graph, roots []string) (map[string]bool, error) {
-	seen := make(map[string]bool, len(roots))
+	seenID := make(map[string]bool, len(roots)) // BFS frontier de-dup, on the traversal id
+	seenName := make(map[string]bool, len(roots))
 	queue := make([]string, 0, len(roots))
-	for _, r := range roots {
-		if !seen[r] {
-			seen[r] = true
-			queue = append(queue, r)
+	visit := func(id string) {
+		if seenID[id] {
+			return
 		}
+		seenID[id] = true
+		_, _, name := graph.SplitID(id)
+		seenName[name] = true
+		queue = append(queue, id)
+	}
+	for _, r := range roots {
+		visit(r)
 	}
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -112,13 +127,10 @@ func forwardReachable(ctx context.Context, g *graph.Graph, roots []string) (map[
 			return nil, err
 		}
 		for _, c := range callees {
-			if !seen[c] {
-				seen[c] = true
-				queue = append(queue, c)
-			}
+			visit(c)
 		}
 	}
-	return seen, nil
+	return seenName, nil
 }
 
 // isExportedName reports whether a symbol name is exported in the Go sense (leading

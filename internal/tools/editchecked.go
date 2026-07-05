@@ -20,7 +20,6 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -53,7 +52,11 @@ func (EditCheckedTool) Run(_ context.Context, workdir string, input json.RawMess
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(p)
+	// O_NOFOLLOW read (readNoFollow): safePath checks the path at CHECK time, but a
+	// plain os.ReadFile follows a final-component symlink swapped in after the check
+	// and would leak an out-of-worktree file (I4 TOCTOU). readNoFollow refuses a
+	// swapped-in link instead — matching the sibling ReadTool/EditTool hardening.
+	b, err := readNoFollow(p)
 	if err != nil {
 		return "", err
 	}
@@ -94,7 +97,7 @@ func (EditCheckedTool) Run(_ context.Context, workdir string, input json.RawMess
 		}
 	}
 
-	if err := writeNoFollow(p, []byte(candidate)); err != nil {
+	if err := writeNoFollow(workdir, p, []byte(candidate)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("edit_checked %s (%d replacement(s))%s", in.Path, n, note), nil

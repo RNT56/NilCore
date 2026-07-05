@@ -119,6 +119,36 @@ jobs:
           NILCORE_SANDBOX_MUST_RUN: "1"
         run: go test -v -run 'TestNamespace|TestPick|TestNew|TestAvailable' ./internal/sandbox/
 
+  # The real verifier for the CONTAINER sandbox (docker/podman) — the primary I4 boundary
+  # for model-emitted shell and both delegated CLIs (Codex, Claude Code), and the DEFAULT
+  # backend on the maintainer's macOS host. Its confinement + egress tests are opt-in
+  # (requireContainer skips unless NILCORE_SANDBOX_INTEGRATION=1 / MUST_RUN=1), so without
+  # this lane a regression to `--read-only` or `--network none` merged green — the primary
+  # sandbox boundary had zero automated protection. Docker is preinstalled on ubuntu-latest;
+  # MUST_RUN=1 turns a missing/unusable runtime into a FAILURE (never a silent skip), so the
+  # sandbox wall can never produce a false green.
+  sandbox-container:
+    name: container sandbox (I4 confinement + egress wall)
+    runs-on: ubuntu-latest
+    env:
+      GIT_AUTHOR_NAME: nilcore-ci
+      GIT_AUTHOR_EMAIL: ci@nilcore.local
+      GIT_COMMITTER_NAME: nilcore-ci
+      GIT_COMMITTER_EMAIL: ci@nilcore.local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Confirm a container runtime is present
+        run: docker version
+      - name: Container confinement + egress tests must run (not skip)
+        env:
+          NILCORE_SANDBOX_MUST_RUN: "1"
+          NILCORE_SANDBOX_INTEGRATION: "1"
+        run: go test -v -run 'TestContainer' ./internal/sandbox/
+
   # The real verifier for behavioral browser verification (D1): the headless-browser
   # run needs a real Chromium, which the hermetic `make verify` job has not — so the
   # LIVE navigate + screenshot path is exercised HERE (mirroring sandbox-linux above,

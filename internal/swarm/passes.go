@@ -301,6 +301,15 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	// worklist no smaller than the prior pass resolved zero NEW units. -1 is the
 	// "no prior pass" sentinel so the FIRST pass can never be counted as a stall.
 	prevRemaining := -1
+	// prevMerged / prevRan anchor the OTHER forward-progress signals a deep DAG chain
+	// makes even when board.Remaining does not shrink: a pass that FOLDED a new branch
+	// onto the tip (len(merged) grew) or RAN a previously-skipped node (len(ran) grew)
+	// is legitimate progress, not a stall — a chain A←B←C converges one link per pass
+	// while the still-skipped tail keeps board.Remaining flat. Without these a slowly-
+	// converging chain trips ReasonStalled after two such passes even though it is
+	// advancing every pass. Tracking the cumulative counts (which only grow) lets the
+	// detector reset on any of the three progress kinds.
+	prevMerged, prevRan := 0, 0
 	c.noProgress = 0
 
 	for {
@@ -473,14 +482,23 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			return c.finish(ctx, st, board, passed, merged, ReasonConverged, true), nil
 		}
 
-		// No-progress detector: count a pass that did not SHRINK the remaining worklist
-		// as zero new units resolved. Two such passes in a row stop the run RED — a
-		// claim-id-rotating worker keeps the worklist the same size (or larger) forever
-		// while every Unit reads "fresh" to the Ledger, so neither the exhausted nor the
-		// budget rail would catch it promptly. A pass that DID shrink the worklist resets
-		// the counter, so a slowly-converging run is never mistaken for a stall. The
-		// first pass (prevRemaining<0) can never count as a stall.
-		if prevRemaining >= 0 && board.Remaining >= prevRemaining {
+		// No-progress detector: a pass is a stall ONLY if it made NO forward progress of
+		// ANY kind. A claim-id-rotating worker keeps the worklist the same size (or larger)
+		// forever while every Unit reads "fresh" to the Ledger, so neither the exhausted nor
+		// the budget rail would catch it promptly — two consecutive fully-stalled passes stop
+		// the run RED. But a legitimately slow, deep DAG chain advances every pass without
+		// shrinking board.Remaining, so we count a pass as PROGRESS if ANY of:
+		//   - the worklist shrank (board.Remaining < prevRemaining) — a red Unit resolved;
+		//   - a new branch folded onto the tip (len(merged) grew) — a green shard integrated;
+		//   - a shard went red→green this pass (board.RetryPass > 0);
+		//   - a previously-skipped node RAN this pass (len(ran) grew) — the chain advanced.
+		// Only when NONE of these fired is the counter bumped, so a converging chain is never
+		// mistaken for a stall. The first pass (prevRemaining<0) can never count as a stall.
+		progressed := board.Remaining < prevRemaining ||
+			len(merged) > prevMerged ||
+			board.RetryPass > 0 ||
+			len(ran) > prevRan
+		if prevRemaining >= 0 && !progressed {
 			c.noProgress++
 			if c.noProgress >= 2 {
 				return c.finish(ctx, st, board, passed, merged, ReasonStalled, false), nil
@@ -489,6 +507,8 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			c.noProgress = 0
 		}
 		prevRemaining = board.Remaining
+		prevMerged = len(merged)
+		prevRan = len(ran)
 
 		// Bump the Ledger for the still-red Units and compute the requeue set: the
 		// shards whose artifact still has a NON-EXHAUSTED red Unit. A shard with every
@@ -591,6 +611,18 @@ func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard
 	// write.
 	if out.Done {
 		out.Remaining = 0
+		// Move the run row to a TERMINAL status so a later --resume does not re-adopt a
+		// finished run and spin a no-op pass: a converged run has nothing red left to
+		// re-drive. Only the GREEN converged exit reaches here (every honesty backstop
+		// above has already flipped a dishonest Done to false), so a capped/red/exhausted
+		// run keeps StatusRun and stays resumable. Best-effort: a durability-write failure
+		// is logged but never fails a healthy converged run (resume degrades to re-adopting
+		// it, the pre-fix behaviour), mirroring recordIntegration's SaveState discipline.
+		if c.Queue != nil {
+			if err := c.Queue.MarkConverged(ctx, st); err != nil {
+				c.emit("swarm_markconverged_error", map[string]any{"error": err.Error()})
+			}
+		}
 	}
 	c.emit("swarm_done", map[string]any{
 		"reason": out.Reason, "done": out.Done, "passes": st.Pass,

@@ -25,6 +25,11 @@ import (
 // endpoints support.
 const DefaultModel = "text-embedding-3-small"
 
+// DefaultBaseURL is the OpenAI embeddings base. An operator pointing at
+// OpenRouter, vLLM, Ollama, or Azure overrides it via NewOpenAIWithBase so their
+// key is never POSTed to OpenAI.
+const DefaultBaseURL = "https://api.openai.com/v1"
+
 // OpenAIEmbedder calls an OpenAI-compatible /embeddings endpoint. BaseURL is
 // overridable for OpenRouter / self-hosted servers and for tests.
 type OpenAIEmbedder struct {
@@ -35,15 +40,28 @@ type OpenAIEmbedder struct {
 }
 
 // NewOpenAI returns an embedder for the given key and model (empty model uses
-// DefaultModel).
+// DefaultModel), pointed at OpenAI's endpoint (DefaultBaseURL).
 func NewOpenAI(key, model string) *OpenAIEmbedder {
+	return NewOpenAIWithBase(key, model, "")
+}
+
+// NewOpenAIWithBase returns an embedder for the given key and model against an
+// explicit OpenAI-compatible base URL. An empty model uses DefaultModel; an empty
+// baseURL uses DefaultBaseURL. This is the seam that lets an operator target
+// OpenRouter / vLLM / Ollama / Azure (NILCORE_EMBED_BASE_URL) so their key is sent
+// to THEIR endpoint, never silently POSTed to OpenAI. A trailing slash on baseURL
+// is tolerated (Embed trims it).
+func NewOpenAIWithBase(key, model, baseURL string) *OpenAIEmbedder {
 	if model == "" {
 		model = DefaultModel
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = DefaultBaseURL
 	}
 	return &OpenAIEmbedder{
 		Key:     key,
 		Model:   model,
-		BaseURL: "https://api.openai.com/v1",
+		BaseURL: baseURL,
 		HTTP:    &http.Client{Timeout: 60 * time.Second},
 	}
 }

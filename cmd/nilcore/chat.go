@@ -481,9 +481,26 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 	hostAlias := "host.containers.internal" // podman (rootless) provides this by default
 	if runtime == "docker" {
 		hostAlias = "host.docker.internal"
-		c.ExtraHosts = append(c.ExtraHosts, "host.docker.internal:host-gateway")
+		// Idempotent: a repeated apply on the same box must not accumulate duplicate
+		// --add-host entries (they compound each re-run of the env factory), so only
+		// add the docker host-gateway alias when it is not already present.
+		const dockerHostGateway = "host.docker.internal:host-gateway"
+		if !containsString(c.ExtraHosts, dockerHostGateway) {
+			c.ExtraHosts = append(c.ExtraHosts, dockerHostGateway)
+		}
 	}
 	c.AllowEgressVia(policy.ProxyURL(net.JoinHostPort(hostAlias, port)))
+}
+
+// containsString reports whether s is present in xs (small linear scan — the slices
+// it guards, like a box's ExtraHosts, hold only a handful of entries).
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // applyContainerReadRoots bind-mounts the user's /add <path> context roots into a
@@ -1069,10 +1086,6 @@ func applyKeptBranch(ctx context.Context, sess chatSession, gate policy.Approver
 		return
 	}
 
-	// Earned-trust signal BEFORE the gate (mirrors the swarm/project promote paths):
-	// the branch is only ever kept when the verifier passed, so passed=true is the
-	// verifier's verdict on this tip — never a self-report (I2).
-	emitBoundaryOutcome(log, policy.PromoteToBase.String(), branch, true)
 	// I2 floor: GateAction.Branch MUST be the merge TARGET (the base being advanced),
 	// not the harmless kept source. GradedApprover.scopeFor keys the structural
 	// "never auto-approve main/prod" floor (isProtectedBase / isProd / DenyBranches)
@@ -1082,6 +1095,15 @@ func applyKeptBranch(ctx context.Context, sess chatSession, gate policy.Approver
 	// correct value; the source branch rides in Detail for the audit trail.
 	action := policy.GateAction{Type: policy.PromoteToBase, Branch: base,
 		Detail: "apply verified chat work from " + branch + " to " + base}
+	// Earned-trust signal BEFORE the gate (mirrors the swarm/project promote paths):
+	// the branch is only ever kept when the verifier passed, so passed=true is the
+	// verifier's verdict on this tip — never a self-report (I2). It MUST be filed under
+	// the SAME ScopeKey the gate reads — graapprove.BuildTrust tallies by (action,scope)
+	// and GradedApprover consults Tally({promote-to-base, scopeFor(action)==action.Branch}).
+	// scopeFor keys on the merge TARGET (base), so recording under the kept SOURCE branch
+	// would file trust in a bucket the gate never reads and chat /apply could never earn
+	// graduated auto-approval. Record under action.Branch (= base) so the scopes agree.
+	emitBoundaryOutcome(log, action.Type.String(), action.Branch, true)
 	allowed := policy.GateStructured(action, gate)
 	log.Append(eventlog.Event{Kind: "gate", Detail: map[string]any{
 		"action": action.Type.String(), "branch": action.Branch,
@@ -1429,8 +1451,18 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 
 	// The reader goroutine blocks on Scan (which has no ctx), so it is detached and
 	// drained via the lines channel; the select on ctx.Done lets the loop exit even
-	// while the scanner is parked on a blocking read. The goroutine exits on EOF or
-	// when the process tears down stdin.
+	// while the scanner is parked on a blocking read. To keep the parked goroutine
+	// from OUTLIVING the conversation (leaking until the process happens to receive
+	// EOF on stdin), a watcher closes the reader when ctx is cancelled if it is an
+	// io.Closer (os.Stdin is): the close unblocks the parked Scan so the goroutine
+	// returns. A non-closeable reader (a test's strings.Reader) reaches EOF on its own,
+	// so it is never left parked. The watcher itself returns on either signal.
+	if rc, ok := in.(io.Closer); ok {
+		go func() {
+			<-ctx.Done()
+			_ = rc.Close() // unblock a Scan parked on a blocking read so it returns
+		}()
+	}
 	go func() {
 		sc := bufio.NewScanner(in)
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // tolerate a long pasted instruction
@@ -1441,7 +1473,16 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 				return
 			}
 		}
-		readErr <- sc.Err()
+		// A close-induced error surfaces as os.ErrClosed (NOT io.EOF): the ctx-cancel
+		// watcher above closes the reader to unblock a parked Scan, and stdin may also be
+		// closed externally. Reporting os.ErrClosed would race the ctx.Done() arm below and
+		// turn a clean Ctrl-C shutdown into fatal(err) at the caller. Map it to a clean end
+		// (nil); a genuine read error still propagates.
+		err := sc.Err()
+		if errors.Is(err, os.ErrClosed) {
+			err = nil
+		}
+		readErr <- err
 	}()
 
 	// The bottom line is EITHER the prompt (Idle, awaiting input) OR the live

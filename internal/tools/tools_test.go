@@ -262,7 +262,7 @@ func TestWriteNoPartialContentObservable(t *testing.T) {
 			if i%2 == 0 {
 				body = large
 			}
-			if err := writeNoFollow(p, []byte(body)); err != nil {
+			if err := writeNoFollow(dir, p, []byte(body)); err != nil {
 				t.Errorf("write %d: %v", i, err)
 				return
 			}

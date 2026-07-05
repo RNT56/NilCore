@@ -147,15 +147,18 @@ func (w *Worktree) Commit(ctx context.Context, message string) (sha string, chan
 
 // Merge folds ref into this worktree with `--no-ff`, committing the merge with an
 // inert committer identity (the same one Commit uses, so it never depends on
-// host/global git config). It distinguishes a CONFLICT (the branches do not
-// combine — git exits non-zero; we run a clean `git merge --abort` and report
-// conflict=true) from a git FAULT (err set). It is the throwaway-re-base primitive
-// (Phase 2): a multi-dep worker's base is built by CreateFrom(refs[0]) + Merge(each
-// remaining ref). Committing per merge (rather than --no-commit) avoids a lingering
-// MERGE_HEAD across sequential merges. It is NOT an integration — the verified
-// merge stays the Integrator's job (I2). Hardened (I4): runs through the same
-// clamped git helper as every other worktree op, so a merged-in branch's
-// hooks/config can never execute on the host.
+// host/global git config). It distinguishes a genuine CONTENT CONFLICT (the branches
+// do not combine — git leaves the tree mid-merge with unmerged paths; we run a clean
+// `git merge --abort` and report conflict=true, err=nil) from a git FAULT (an unknown
+// ref, a "not something we can merge" error, a corrupt repo — git fails WITHOUT
+// entering the conflicted merge state; we report conflict=false and a non-nil err).
+// Conflating the two hid real faults behind a bogus "conflict". It is the
+// throwaway-re-base primitive (Phase 2): a multi-dep worker's base is built by
+// CreateFrom(refs[0]) + Merge(each remaining ref). Committing per merge (rather than
+// --no-commit) avoids a lingering MERGE_HEAD across sequential merges. It is NOT an
+// integration — the verified merge stays the Integrator's job (I2). Hardened (I4):
+// runs through the same clamped git helper as every other worktree op, so a merged-in
+// branch's hooks/config can never execute on the host.
 func (w *Worktree) Merge(ctx context.Context, ref, message string) (conflict bool, err error) {
 	if w == nil {
 		return false, fmt.Errorf("worktree merge: nil worktree")
@@ -163,18 +166,42 @@ func (w *Worktree) Merge(ctx context.Context, ref, message string) (conflict boo
 	if message == "" {
 		message = "merge " + ref
 	}
-	if _, merr := git(ctx, w.path,
+	_, merr := git(ctx, w.path,
 		"-c", "user.email=agent@nilcore.local", "-c", "user.name=nilcore",
-		"merge", "--no-ff", "-m", message, ref); merr != nil {
-		// A merge that does not apply cleanly leaves the tree mid-merge. Abort to
-		// restore the pre-merge tip exactly; a failed abort is a real fault (the tree
-		// may be dirty) we surface so the caller tears the throwaway down.
-		if _, aerr := git(ctx, w.path, "merge", "--abort"); aerr != nil {
-			return true, fmt.Errorf("worktree merge %s conflicted and abort failed: %w", ref, aerr)
-		}
-		return true, nil
+		"merge", "--no-ff", "-m", message, ref)
+	if merr == nil {
+		return false, nil
 	}
-	return false, nil
+
+	// git merge failed. Only a genuine content conflict leaves the tree mid-merge
+	// (MERGE_HEAD present / unmerged index entries). A fault — unknown ref, refusal
+	// to merge, corrupt repo — fails WITHOUT ever starting the merge, so there is
+	// nothing to abort and it must surface as an error, not a phantom "conflict".
+	if !w.mergeInProgress(ctx) {
+		return false, fmt.Errorf("worktree merge %s failed (not a content conflict): %w", ref, merr)
+	}
+
+	// A real conflict left the tree mid-merge. Abort to restore the pre-merge tip
+	// exactly; a failed abort is a real fault (the tree may be dirty) we surface so
+	// the caller tears the throwaway down.
+	if _, aerr := git(ctx, w.path, "merge", "--abort"); aerr != nil {
+		return true, fmt.Errorf("worktree merge %s conflicted and abort failed: %w", ref, aerr)
+	}
+	return true, nil
+}
+
+// mergeInProgress reports whether the worktree is sitting in the conflicted state
+// left by a failed `git merge` — i.e. a MERGE_HEAD exists. It is how Merge tells a
+// genuine content conflict (merge started, then hit unmergeable hunks) apart from a
+// git fault that never began a merge (unknown ref, refusal, corrupt repo). It reads
+// through the hardened git helper (I4); a git error here is treated as "no merge in
+// progress" so a fault degrades to the fault branch, never a false conflict.
+func (w *Worktree) mergeInProgress(ctx context.Context) bool {
+	out, err := git(ctx, w.path, "rev-parse", "--verify", "--quiet", "MERGE_HEAD")
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) != ""
 }
 
 // Checkout re-points this worktree at ref in DETACHED mode, forcing the working

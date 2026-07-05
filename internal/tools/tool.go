@@ -11,9 +11,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"nilcore/internal/model"
 )
+
+// validToolName reports whether name matches the provider's tool-name contract
+// ^[a-zA-Z0-9_-]{1,64}$. A single tool with an out-of-spec name (e.g. a skill
+// whose SKILL.md frontmatter name carried a space or non-ASCII rune) would make
+// the ENTIRE Messages request invalid, 400-ing every model call. Defs() uses this
+// to skip+warn such a tool so one bad tool can never poison the whole request.
+func validToolName(name string) bool {
+	if len(name) == 0 || len(name) > 64 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
 
 // Tool is one structured capability. Run executes it against workdir with the
 // model's JSON input and returns a human/model-readable result.
@@ -108,6 +129,14 @@ func (r *Registry) Defs() []model.Tool {
 	defs := make([]model.Tool, 0, len(r.order))
 	for _, name := range r.order {
 		t := r.tools[name]
+		// Defense-in-depth: never advertise a tool whose name violates the provider's
+		// ^[a-zA-Z0-9_-]{1,64}$ contract — a single bad name (e.g. a malformed installed
+		// skill) invalidates the whole request and 400s every model call. Skip+warn it so
+		// the valid tools still ship.
+		if !validToolName(t.Name()) {
+			fmt.Fprintf(os.Stderr, "nilcore: skipping tool %q: name violates the provider tool-name contract [a-zA-Z0-9_-]{1,64}\n", t.Name())
+			continue
+		}
 		def := model.Tool{Name: t.Name(), Description: t.Description(), InputSchema: t.Schema()}
 		// A provider built-in (e.g. the native `computer` tool) carries its typed def
 		// so the provider serializes the builtin shape + sets the beta header (Path A).

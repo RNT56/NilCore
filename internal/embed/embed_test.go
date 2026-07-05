@@ -79,6 +79,55 @@ func TestNewOpenAIDefaults(t *testing.T) {
 	if e.Model != DefaultModel {
 		t.Errorf("default model = %q", e.Model)
 	}
+	if e.BaseURL != DefaultBaseURL {
+		t.Errorf("default BaseURL = %q, want %q", e.BaseURL, DefaultBaseURL)
+	}
+}
+
+// TestNewOpenAIWithBaseHonorsBaseURL is the regression for the hardwired-endpoint
+// bug: an operator with an OpenRouter/vLLM/Ollama/Azure key must have it POSTed to
+// THEIR endpoint, not silently to OpenAI. NewOpenAIWithBase must send the request to
+// the configured base; an empty base falls back to OpenAI's; an empty model to the
+// default.
+func TestNewOpenAIWithBaseHonorsBaseURL(t *testing.T) {
+	var hits int
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		gotAuth = r.Header.Get("authorization")
+		if r.URL.Path != "/embeddings" {
+			t.Errorf("path = %q, want /embeddings off the configured base", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[0.5]}]}`))
+	}))
+	defer srv.Close()
+
+	e := NewOpenAIWithBase("sk-operator", "custom-model", srv.URL)
+	if e.BaseURL != srv.URL {
+		t.Fatalf("BaseURL = %q, want the configured base %q", e.BaseURL, srv.URL)
+	}
+	if e.Model != "custom-model" {
+		t.Errorf("Model = %q, want custom-model", e.Model)
+	}
+	e.HTTP = srv.Client()
+	if _, err := e.Embed(context.Background(), "x"); err != nil {
+		t.Fatalf("embed against configured base: %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("configured base was hit %d times, want 1 — the key was not sent to OpenAI", hits)
+	}
+	if gotAuth != "Bearer sk-operator" {
+		t.Errorf("auth = %q, want the operator key sent to the configured endpoint", gotAuth)
+	}
+
+	// Empty base falls back to OpenAI's; empty model to the default.
+	fb := NewOpenAIWithBase("k", "", "")
+	if fb.BaseURL != DefaultBaseURL {
+		t.Errorf("empty base must fall back to %q, got %q", DefaultBaseURL, fb.BaseURL)
+	}
+	if fb.Model != DefaultModel {
+		t.Errorf("empty model must fall back to %q, got %q", DefaultModel, fb.Model)
+	}
 }
 
 // TestEmbedderIsProviderAgnostic pins the embedder to the OpenAI-compatible wire

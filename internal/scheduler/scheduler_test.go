@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,6 +158,76 @@ func TestMinConcurrencyClamped(t *testing.T) {
 	}
 	if s.MaxInFlight() > 1 {
 		t.Errorf("MaxInFlight = %d with clamp to 1, want <= 1", s.MaxInFlight())
+	}
+}
+
+// TestManySubmitsBeforeStart is the regression for the fixed-buffer deadlock: a
+// wave that submits FAR more ready tasks than any fixed queue buffer BEFORE Start
+// (the submit-all-then-Start pattern every production caller uses) must not block
+// the producer. With the old 1024-buffered channel the 1025th Submit blocked
+// forever because no worker drained until Start; the unbounded queue accepts all
+// of them, and every task still runs under the concurrency cap.
+func TestManySubmitsBeforeStart(t *testing.T) {
+	const n = 5000 // comfortably past the old 1024 buffer
+	var ran atomic.Int64
+	s := New(4)
+
+	// Submit ALL work before Start — this is the call that used to deadlock.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < n; i++ {
+			s.Submit(Task{ID: fmt.Sprintf("t-%d", i), Run: func(ctx context.Context) error {
+				ran.Add(1)
+				return nil
+			}})
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Submit blocked before Start — the queue must be unbounded")
+	}
+
+	s.Start(context.Background())
+	if err := s.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := ran.Load(); got != n {
+		t.Errorf("ran %d tasks, want %d", got, n)
+	}
+	if s.Ran() != n {
+		t.Errorf("Ran() = %d, want %d", s.Ran(), n)
+	}
+	if s.MaxInFlight() > 4 {
+		t.Errorf("MaxInFlight() = %d, exceeds cap 4", s.MaxInFlight())
+	}
+}
+
+// TestFIFOOrder asserts the unbounded queue preserves FIFO with a single worker:
+// tasks run in submission order.
+func TestFIFOOrder(t *testing.T) {
+	const n = 200
+	s := New(1) // one worker ⇒ strict order is observable
+	var mu sync.Mutex
+	var order []int
+	for i := 0; i < n; i++ {
+		i := i
+		s.Submit(Task{ID: fmt.Sprintf("t-%d", i), Run: func(ctx context.Context) error {
+			mu.Lock()
+			order = append(order, i)
+			mu.Unlock()
+			return nil
+		}})
+	}
+	s.Start(context.Background())
+	if err := s.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if order[i] != i {
+			t.Fatalf("FIFO violated at %d: got %d", i, order[i])
+		}
 	}
 }
 

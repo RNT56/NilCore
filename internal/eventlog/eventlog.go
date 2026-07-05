@@ -275,6 +275,7 @@ func (l *Log) Append(e Event) {
 	if l.store != nil {
 		detail, _ := json.Marshal(e.Detail)
 		if serr := l.store.InsertEvent(context.Background(), store.Event{
+			Seq:  e.Seq,
 			Time: e.Time, Task: e.Task, Kind: e.Kind, Backend: e.Backend,
 			Detail: string(detail), Prev: e.Prev, Hash: e.Hash,
 		}); serr != nil {

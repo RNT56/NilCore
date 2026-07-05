@@ -68,6 +68,12 @@ func writeLog(t *testing.T, dir string, entries []logEntry) string {
 		if e.kind == "" {
 			e.kind = "boundary_outcome"
 		}
+		// An auto_approve event carries a dollars map (as the production emit does), so a
+		// test can seed the per-day auto-approved-$ total the reseed path (sumAutoApprovalDollarsToday)
+		// reads back. dollars is only meaningful on auto_approve entries.
+		if e.kind == "auto_approve" && e.dollars > 0 {
+			detail["dollars"] = map[string]any{"charged": e.dollars, "actual_usd": e.dollars}
+		}
 		l.Append(eventlog.Event{Kind: e.kind, Detail: detail})
 	}
 	if err := l.Err(); err != nil {
@@ -80,10 +86,11 @@ func writeLog(t *testing.T, dir string, entries []logEntry) string {
 }
 
 type logEntry struct {
-	kind   string // default "boundary_outcome"
-	action string
-	scope  string
-	passed bool
+	kind    string // default "boundary_outcome"
+	action  string
+	scope   string
+	passed  bool
+	dollars float64 // for kind=="auto_approve": the dollars.actual_usd this grant recorded
 }
 
 // greenRun returns n passing boundary_outcomes for (action,scope).
@@ -598,18 +605,24 @@ func TestApproveStructuredOverDollarCeiling(t *testing.T) {
 		MaxDollarsDay: 25,
 	}}}
 
-	// blast budget already at its $ ceiling for today ⇒ the charge is refused.
+	// Blast $10/day ceiling, $9 already spent today; this action's own $2 cost would push
+	// the day to $11 > $10 ⇒ refused by the tighter blast fence (min(clause 25, blast 10)).
 	blast := blastbudget.New()
-	blast.SetAutoApprovalDollarCeiling(10) // smaller than the $25 charge
+	blast.SetAutoApprovalDollarCeiling(10)
 	today := dayKey(time.Now().UTC())
-	_ = blast.ChargeAutoApprovalDollars(context.Background(), today, 0)
+	if err := blast.ChargeAutoApprovalDollars(context.Background(), today, 9); err != nil {
+		t.Fatalf("setup charge: %v", err)
+	}
+	withPerActionCost(t, 2)
 
 	human := &recHuman{reply: false}
 	sink := &recSink{}
 	g := newGraded(human, env, path, blast,
 		WithSink(sink), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
 
-	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging"}
+	// Evidence.SpentUSD (cumulative run ledger) is NOT this action's cost — it must not affect
+	// the charge; only the action's own $2 cost is metered.
+	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging", Evidence: &policy.GateEvidence{SpentUSD: 500}}
 	if g.ApproveStructured(deploy) {
 		t.Fatal("over-ceiling deploy must not auto-approve")
 	}
@@ -617,11 +630,14 @@ func TestApproveStructuredOverDollarCeiling(t *testing.T) {
 }
 
 // A clause that declares a positive $/day ceiling but has NO blast meter wired
-// (g.blast == nil, the default when -blast-radius is off) must FAIL CLOSED: the
-// ceiling cannot be charged, so the action is denied and delegated rather than
-// silently auto-approved with no dollar accounting. The action otherwise clears
-// every earlier gate (eligibility, scope, trust, rate).
-func TestApproveStructuredDollarCeilingUnmetered(t *testing.T) {
+// (g.blast == nil, the default when -blast-radius is off) is REACHABLE and metered by the
+// clause's OWN MaxDollarsDay — NOT blanket-denied "unmetered". This is the regression fix:
+// the prior code failed closed on any positive cost under a nil meter, which (since
+// build.go set Evidence.SpentUSD to the CUMULATIVE run ledger on every action) denied every
+// auto-approval once the run had spent money. The clause ceiling now bounds the per-day
+// auto-approved total in-process. This test proves the ceiling BITES on the nil-meter path
+// when a per-action charge would exceed it, and is REACHABLE when it would not.
+func TestApproveStructuredNilMeterClauseCeiling(t *testing.T) {
 	dir := t.TempDir()
 	path := writeLog(t, dir, greenRun("deploy", "staging", 3))
 
@@ -634,23 +650,38 @@ func TestApproveStructuredDollarCeilingUnmetered(t *testing.T) {
 		MinSample:     2,
 		RecencyDays:   7,
 		MaxPerDay:     5,
-		MaxDollarsDay: 25, // positive ceiling, but no meter below
+		MaxDollarsDay: 25, // positive ceiling, no blast meter — the clause alone must bound it
 	}}}
 
+	// Reachable: this action's own cost $10 <= the $25 clause ceiling ⇒ auto-approve, even
+	// though the cumulative run ledger (Evidence.SpentUSD) is $500. The ledger is NOT charged.
+	withPerActionCost(t, 10)
 	human := &recHuman{reply: false}
 	sink := &recSink{}
-	// nil blast meter — the unmetered case (-blast-radius off).
-	g := newGraded(human, env, path, nil,
+	g := newGraded(human, env, path, nil, // nil meter — default -blast-radius off
 		WithSink(sink), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
+	reachable := policy.GateAction{Type: policy.Deploy, Branch: "staging", Evidence: &policy.GateEvidence{SpentUSD: 500}}
+	if !g.ApproveStructured(reachable) {
+		t.Fatalf("an in-clause-budget deploy must auto-approve under a nil meter (last: %+v)", mustLast(t, sink).detail)
+	}
+	if human.called {
+		t.Fatal("a reachable nil-meter auto-approval must not consult the human")
+	}
 
-	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging"}
-	if g.ApproveStructured(deploy) {
-		t.Fatal("a positive $ ceiling with no wired meter must not auto-approve")
+	// Bites: a fresh approver whose action's own cost $26 > the $25 clause ceiling ⇒ deny
+	// over_ceiling and delegate, WITHOUT any blast meter. Not "unmetered".
+	withPerActionCost(t, 26)
+	human2 := &recHuman{reply: false}
+	sink2 := &recSink{}
+	g2 := newGraded(human2, env, path, nil,
+		WithSink(sink2), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
+	if g2.ApproveStructured(deployStaging()) {
+		t.Fatal("an over-clause-ceiling deploy must not auto-approve under a nil meter")
 	}
-	if !human.called {
-		t.Fatal("an unmetered $ ceiling must delegate to the human")
+	if !human2.called {
+		t.Fatal("an over-ceiling nil-meter action must delegate to the human")
 	}
-	assertDenyReason(t, sink, "dollar_ceiling_unmetered")
+	assertDenyReason(t, sink2, "over_ceiling")
 }
 
 // SIF-T07: the self-improve auto-approval CLASS is its OWN double opt-in.
@@ -779,14 +810,21 @@ func TestApproveStructuredDollarBreachRollsBackIrreversible(t *testing.T) {
 
 	blast := blastbudget.New()
 	blast.SetIrreversibleCeiling(5)        // irreversible has plenty of room
-	blast.SetAutoApprovalDollarCeiling(10) // but the $ ceiling ($10) < the $25 charge
+	blast.SetAutoApprovalDollarCeiling(10) // but the $ ceiling ($10) is exhausted below
+	today := dayKey(time.Now().UTC())
+	if err := blast.ChargeAutoApprovalDollars(context.Background(), today, 10); err != nil {
+		t.Fatalf("setup charge to ceiling: %v", err)
+	}
+	withPerActionCost(t, 1) // any positive charge now breaches the exhausted $10 ceiling
 
 	human := &recHuman{reply: false}
 	sink := &recSink{}
 	g := newGraded(human, env, path, blast,
 		WithSink(sink), WithClock(fixedClock(time.Now().UTC())), WithRoot(dir))
 
-	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging"}
+	// This action's own $1 cost breaches the exhausted $10 day ceiling ⇒ the $ charge
+	// refuses AFTER the irreversible slot was taken, which must then be rolled back.
+	deploy := policy.GateAction{Type: policy.Deploy, Branch: "staging", Evidence: &policy.GateEvidence{SpentUSD: 25}}
 	if g.ApproveStructured(deploy) {
 		t.Fatal("over-$-ceiling deploy must not auto-approve")
 	}

@@ -9,12 +9,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"nilcore/internal/model"
 )
 
 const anthropicVersion = "2023-06-01"
+
+// defaultAnthropicMaxTokens is the output cap applied when a caller passes a
+// non-positive maxTokens. The Messages API REQUIRES a positive max_tokens; sending
+// 0 (or a negative value) yields a terminal 400 that no retry or failover can fix.
+// Defaulting it in the provider turns a guaranteed hard failure into a working call.
+const defaultAnthropicMaxTokens = 4096
 
 // Anthropic is the Messages API adapter. The canonical model.* format already
 // matches Anthropic's wire shape (tool_use/tool_result blocks), so translation
@@ -100,6 +108,11 @@ type anthropicRequest struct {
 // empty system, empty or uncacheable final block) simply skips it — dropping a
 // breakpoint is always a valid request; a malformed one is not.
 func buildAnthropicRequest(modelID string, maxTokens int, system string, msgs []model.Message, tools []model.Tool, stream bool) (anthropicRequest, error) {
+	// The Messages API rejects a non-positive max_tokens with a terminal 400; default
+	// it so a caller that forgot to set a cap gets a working call, not a hard failure.
+	if maxTokens <= 0 {
+		maxTokens = defaultAnthropicMaxTokens
+	}
 	req := anthropicRequest{
 		Model:     modelID,
 		MaxTokens: maxTokens,
@@ -347,6 +360,11 @@ type streamEvent struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	} `json:"content_block"`
+
+	// Error carries the in-band error object of an `error` event (e.g. an
+	// overloaded_error emitted mid-stream). Decoded so the class can be surfaced as
+	// a typed, correctly-classified error instead of an untyped one.
+	Error *streamErrorEnvelope `json:"error"`
 }
 
 // anthropicUsage decodes the Messages-API usage object. Anthropic reports
@@ -538,6 +556,13 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 			return finish(), nil
 
 		case "error":
+			// Classify the in-band error the way an HTTP-status error is classified:
+			// an overloaded_error / rate_limit_error is retryable (honoring Retry-After);
+			// everything else is terminal. Falling back to an untyped error would make
+			// the resilience wrapper blindly retry AND fail over even a terminal class.
+			if ev.Error != nil {
+				return finish(), ev.Error.toAPIError()
+			}
 			return finish(), fmt.Errorf("anthropic stream error: %s", tail(string(data), 1000))
 		}
 	}
@@ -563,4 +588,74 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// streamErrorEnvelope is the in-band error object both vendor SSE dialects emit
+// when a request fails AFTER a 200 OK (Anthropic's `error` event, OpenAI-compatible
+// / OpenRouter's `data: {"error":{...}}` frame). It carries only the failure class
+// — never a secret — and is parsed as data (I7). Code is json.RawMessage because
+// vendors send it as a string OR a number.
+type streamErrorEnvelope struct {
+	Type       string          `json:"type"`
+	Message    string          `json:"message"`
+	Code       json.RawMessage `json:"code"`
+	RetryAfter string          `json:"retry_after"` // rare in-band hint; honored when present
+}
+
+// codeString normalizes Code (string or number) to a plain string.
+func (e *streamErrorEnvelope) codeString() string {
+	if len(e.Code) == 0 || string(e.Code) == "null" {
+		return ""
+	}
+	if s, err := strconv.Unquote(string(e.Code)); err == nil {
+		return s
+	}
+	return strings.TrimSpace(string(e.Code))
+}
+
+// toAPIError maps an in-band stream error to a typed, classified *model.APIError so
+// the resilience wrapper makes the SAME retry-vs-terminal decision it makes for an
+// HTTP-status error. Transient classes (overloaded / rate-limited / timeout /
+// generic server errors) are retryable, honoring any Retry-After hint; every other
+// class (invalid request, authentication, permission, not found, …) is terminal.
+// The synthetic StatusCode mirrors the class so downstream logging reads naturally.
+func (e *streamErrorEnvelope) toAPIError() *model.APIError {
+	class := strings.ToLower(strings.TrimSpace(e.Type))
+	code := strings.ToLower(e.codeString())
+	retryable := false
+	status := 400
+	switch {
+	case strings.Contains(class, "overloaded") || strings.Contains(class, "rate_limit") ||
+		strings.Contains(code, "rate_limit") || strings.Contains(code, "overloaded"):
+		retryable, status = true, 429
+	case strings.Contains(class, "timeout") || class == "api_error" || class == "server_error" ||
+		strings.Contains(class, "service_unavailable") || strings.Contains(class, "overloaded_error"):
+		retryable, status = true, 503
+	}
+	msg := e.Message
+	if msg == "" {
+		msg = "stream error"
+	}
+	return &model.APIError{
+		StatusCode: status,
+		Retryable:  retryable,
+		RetryAfter: parseStreamRetryAfter(e.RetryAfter),
+		Type:       e.Type,
+		Code:       e.codeString(),
+		Message:    tail(msg, 1000),
+	}
+}
+
+// parseStreamRetryAfter parses the (rare) in-band retry_after hint: integer seconds.
+// An empty/invalid value yields 0 (no hint), so timing is unchanged for the common
+// case where the envelope carries none.
+func parseStreamRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
 }

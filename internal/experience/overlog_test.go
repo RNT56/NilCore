@@ -47,10 +47,11 @@ func TestOverLogFoldsVerifierVerdicts(t *testing.T) {
 	}
 
 	// Outcomes: 4 contests, 2 passes; median cost over {0.10,0.20,0.30} = 0.20;
-	// median latency over {1000,2000,3000} = 2000.
-	agg, _ := x.Outcomes(ctx, "go-refactor")
-	if agg.Class != "go-refactor" {
-		t.Errorf("Class = %q, want echoed taskClass", agg.Class)
+	// median latency over {1000,2000,3000} = 2000. These races carry no class, so
+	// the GLOBAL ("") rollup holds them all.
+	agg, _ := x.Outcomes(ctx, "")
+	if agg.Class != "" {
+		t.Errorf("Class = %q, want the global class", agg.Class)
 	}
 	if agg.Races != 4 || agg.Passes != 2 {
 		t.Errorf("races/passes = %d/%d, want 4/2", agg.Races, agg.Passes)
@@ -66,7 +67,7 @@ func TestOverLogFoldsVerifierVerdicts(t *testing.T) {
 	}
 
 	// BackendStanding: native has 3 races / 2 wins; codex 1 race / 0 wins.
-	stands, _ := x.BackendStanding(ctx, "go-refactor")
+	stands, _ := x.BackendStanding(ctx, "")
 	got := map[string][2]int{}
 	for _, s := range stands {
 		got[s.Backend] = [2]int{s.Races, s.Wins}
@@ -85,6 +86,56 @@ func TestOverLogFoldsVerifierVerdicts(t *testing.T) {
 	// log-only reader has no memory backend.
 	if recs, _ := x.Lessons(ctx, "global", "", "", 0); len(recs) != 0 {
 		t.Errorf("Lessons over a log-only reader = %d, want 0", len(recs))
+	}
+}
+
+// TestOverLogClassFiltering asserts the `-class` filter works on the log-replay
+// path: a class-tagged race lands in BOTH the global ("") scoreboard and its own
+// class bucket, and a query for a class returns only that class's races.
+func TestOverLogClassFiltering(t *testing.T) {
+	ctx := context.Background()
+	path := writeLog(t, []map[string]any{
+		{"backend": "native", "passed": true, "class": "code"},
+		{"backend": "native", "passed": false, "class": "code"},
+		{"backend": "codex", "passed": true, "class": "docs"},
+	})
+	x, err := experience.OverLog(path)
+	if err != nil {
+		t.Fatalf("OverLog: %v", err)
+	}
+
+	// Global ("") sees every race.
+	gl, _ := x.BackendStanding(ctx, "")
+	gm := map[string][2]int{}
+	for _, s := range gl {
+		gm[s.Backend] = [2]int{s.Races, s.Wins}
+	}
+	if gm["native"] != [2]int{2, 1} || gm["codex"] != [2]int{1, 1} {
+		t.Fatalf("global standing = %v, want native 2/1, codex 1/1", gm)
+	}
+	if agg, _ := x.Outcomes(ctx, ""); agg.Races != 3 || agg.Passes != 2 {
+		t.Errorf("global outcomes = %d/%d, want 3/2", agg.Races, agg.Passes)
+	}
+
+	// class "code" holds only the two native/code races.
+	code, _ := x.BackendStanding(ctx, "code")
+	cm := map[string][2]int{}
+	for _, s := range code {
+		cm[s.Backend] = [2]int{s.Races, s.Wins}
+	}
+	if len(code) != 1 || cm["native"] != [2]int{2, 1} {
+		t.Fatalf("class=code standing = %v, want only native 2/1", cm)
+	}
+	if agg, _ := x.Outcomes(ctx, "code"); agg.Races != 2 || agg.Passes != 1 {
+		t.Errorf("class=code outcomes = %d/%d, want 2/1", agg.Races, agg.Passes)
+	}
+
+	// An unknown class yields nothing (no evidence), never the global scoreboard.
+	if unk, _ := x.BackendStanding(ctx, "no-such-class"); len(unk) != 0 {
+		t.Errorf("unknown class standing = %v, want none", unk)
+	}
+	if agg, _ := x.Outcomes(ctx, "no-such-class"); agg.Races != 0 {
+		t.Errorf("unknown class outcomes races = %d, want 0", agg.Races)
 	}
 }
 

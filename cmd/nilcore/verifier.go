@@ -536,7 +536,8 @@ func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVer
 		return nil
 	}
 
-	paths := artifactFiles(box.Workdir())
+	root := box.Workdir()
+	paths := artifactFiles(root)
 	if len(paths) == 0 {
 		return nil
 	}
@@ -571,6 +572,7 @@ func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVer
 			Box:       box,
 			Reg:       reg,
 			RelPath:   p,
+			Root:      root,
 			MaxAge:    maxAge,
 			EventSink: sink,
 		}

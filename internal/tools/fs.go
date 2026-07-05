@@ -36,13 +36,26 @@ func safeAbs(root, abs string) (string, error) {
 // writeNoFollow writes content to p atomically and without following a symlink at
 // the destination, preserving the destination's existing permissions on overwrite
 // (default 0644 for a new file). p is an already-confined absolute target (produced
-// by safePath); we write into its directory via a confined relative name so the
+// by safePath); workdir is the worktree root the no-follow parent-dir check is bounded
+// to (a symlinked component at/below it is refused, one above it — the host's own
+// ancestors — is trusted). We write into p's directory via the confined path so the
 // atomic temp+rename + O_NOFOLLOW discipline lives in one place (worktreefs).
-func writeNoFollow(p string, content []byte) error {
+func writeNoFollow(workdir, p string, content []byte) error {
 	// p is already confined by safePath; WriteConfined performs the atomic temp+rename
 	// + O_NOFOLLOW write without re-resolving p (which would fail on a not-yet-existing
 	// parent dir). perm 0 ⇒ preserve-existing-else-0644, matching the prior behavior.
-	return worktreefs.WriteConfined(p, content, 0)
+	return worktreefs.WriteConfined(workdir, p, content, 0)
+}
+
+// readNoFollow reads an already-confined absolute target WITHOUT following a symlink
+// at the final component. safePath/safeAbs check the path at CHECK time, but a plain
+// os.ReadFile follows a final-component symlink at OPEN time — so a sandboxed process
+// racing us can swap the final component for a symlink between the check and the open
+// and leak an out-of-worktree file (a TOCTOU escape, I4). Routing every tool read
+// through worktreefs.ReadConfined (which opens with O_NOFOLLOW) closes that window:
+// a swapped-in link is refused rather than followed. p is confined by the caller.
+func readNoFollow(p string) ([]byte, error) {
+	return worktreefs.ReadConfined(p)
 }
 
 // ReadTool returns the contents of a file in the worktree, or — by absolute path —
@@ -100,7 +113,11 @@ func (t ReadTool) Run(_ context.Context, workdir string, input json.RawMessage) 
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(p)
+	// O_NOFOLLOW read: the confinement check in resolveReadable happens before this
+	// open, so a plain os.ReadFile would follow a final-component symlink swapped in
+	// after the check and leak an out-of-worktree file (I4 TOCTOU). readNoFollow
+	// refuses a swapped-in link instead.
+	b, err := readNoFollow(p)
 	if err != nil {
 		return "", err
 	}
@@ -192,7 +209,7 @@ func (WriteTool) Run(_ context.Context, workdir string, input json.RawMessage) (
 	if err != nil {
 		return "", err
 	}
-	if err := writeNoFollow(p, []byte(in.Content)); err != nil {
+	if err := writeNoFollow(workdir, p, []byte(in.Content)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("wrote %d bytes to %s", len(in.Content), in.Path), nil
@@ -223,7 +240,9 @@ func (EditTool) Run(_ context.Context, workdir string, input json.RawMessage) (s
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(p)
+	// O_NOFOLLOW read (see readNoFollow): defends the final component against a
+	// symlink swapped in between safePath's check and the open (I4 TOCTOU).
+	b, err := readNoFollow(p)
 	if err != nil {
 		return "", err
 	}
@@ -241,7 +260,7 @@ func (EditTool) Run(_ context.Context, workdir string, input json.RawMessage) (s
 	} else {
 		out = strings.Replace(src, in.Old, in.New, 1)
 	}
-	if err := writeNoFollow(p, []byte(out)); err != nil {
+	if err := writeNoFollow(workdir, p, []byte(out)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("edited %s (%d replacement(s))", in.Path, n), nil

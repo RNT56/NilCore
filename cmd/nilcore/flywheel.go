@@ -121,14 +121,35 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 		}
 		return report, nil
 	}
+	// runBranch is the verified branch the AUTONOMOUS self-edit run left behind, captured
+	// by the Run closure so the Changed screen below can diff exactly what that run wrote.
+	// The flywheel's edit reaches Propose via the free-text Goal, so — like the interactive
+	// `nilcore propose-edit` path (cmd/nilcore/selfimprove.go) — it needs the SAME execution-
+	// time path screen: without it, the Goal could steer the model to touch a file the
+	// proposal never declared (including the verifier of record) and still be gated/merged.
+	var runBranch string
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
 		Run: func(ctx context.Context, g string) (bool, error) {
-			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("flywheel-edit-%d", time.Now().UnixNano()), Goal: g})
+			// Preserve the run's verified branch (KeepBranch) so Changed can diff it. We flip
+			// KeepBranch on a per-edit COPY of orch — NOT the shared orch — so the eval-scoring
+			// runs (runSuite) keep their default disposable worktrees (no leaked branches).
+			editOrch := *orch
+			editOrch.KeepBranch = true
+			out, err := runViaKernel(ctx, &editOrch, backend.Task{ID: fmt.Sprintf("flywheel-edit-%d", time.Now().UnixNano()), Goal: g})
 			if err != nil {
 				return false, err
 			}
+			runBranch = out.Branch
 			return out.Verified, nil
+		},
+		// Changed reports what the verified self-edit actually modified, by diffing the kept
+		// branch against the base repo HEAD. Propose fail-closes on ANY path outside the
+		// declared, in-scope allow-list. If no branch was preserved (KeepBranch not honored),
+		// selfEditChangedPaths returns an error so Propose refuses to gate an unverifiable
+		// footprint (fail-closed) — mirroring cmd/nilcore/selfimprove.go exactly.
+		Changed: func(ctx context.Context) ([]string, error) {
+			return selfEditChangedPaths(ctx, orch.BaseRepo, runBranch)
 		},
 		Gate: graapprove.SelfImproveGate(policy.NewConsoleApprover(os.Stdin, os.Stdout).Approve, autoApproveSink{log}),
 		Log:  log,

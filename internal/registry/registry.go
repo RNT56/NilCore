@@ -106,6 +106,26 @@ func InstallSkill(e Entry, skillsDir string) error {
 		return fmt.Errorf("registry: read skill source %s: %w", e.Source, err)
 	}
 
+	// Install-time API-tool-name check (defense-in-depth). The SKILL.md frontmatter
+	// `name` becomes the `skill_<name>` API tool name, which the provider requires to
+	// match ^[a-zA-Z0-9_-]{1,64}$ (budgeting the 6-char "skill_" prefix). internal/skills
+	// already slugifies at load time and guards the Defs() boundary, but that rewrite is
+	// SILENT — an operator never learns their name was mangled until a tool shows up under
+	// a different name. Inspecting the frontmatter here surfaces the problem to the human
+	// at install time, the earliest point: a name that survives slugification but was not
+	// already conformant WARNs (the install proceeds under the slugified name); a name
+	// that slugifies to nothing (e.g. all-emoji) ERRORs before we write anything, rather
+	// than deferring to the load-time reject below.
+	if fn, ok := frontmatterName(src); ok {
+		slug := slugifyToolName(fn)
+		switch {
+		case slug == "":
+			return fmt.Errorf("registry: skill %q frontmatter name %q has no characters valid for an API tool name (allowed: a-z A-Z 0-9 _ -); rename it in %s", e.Name, fn, e.Source)
+		case slug != fn:
+			fmt.Fprintf(os.Stderr, "nilcore: registry: skill %q frontmatter name %q is not a valid API tool name; it will load as %q — rename it in %s to control the tool name\n", e.Name, fn, slug, e.Source)
+		}
+	}
+
 	destDir := filepath.Join(skillsDir, e.Name)
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("registry: mkdir %s: %w", destDir, err)
@@ -150,6 +170,63 @@ func singleSegment(name string) bool {
 		return false
 	}
 	return filepath.Clean(name) == name
+}
+
+// frontmatterName extracts the `name:` value from a SKILL.md "--- ... ---" frontmatter
+// block, returning it and true when present. It mirrors internal/skills' parse just
+// enough to read the raw (pre-slugify) name for the install-time check; the authoritative
+// parse still happens in skills.LoadDir during verification below. ok is false when there
+// is no frontmatter or no name key.
+func frontmatterName(src []byte) (name string, ok bool) {
+	lines := strings.Split(string(src), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return "", false
+	}
+	for _, ln := range lines[1:] {
+		if strings.TrimSpace(ln) == "---" {
+			break // end of frontmatter
+		}
+		k, v, cut := strings.Cut(ln, ":")
+		if !cut {
+			continue
+		}
+		if strings.TrimSpace(k) == "name" {
+			return strings.TrimSpace(v), true
+		}
+	}
+	return "", false
+}
+
+// maxToolNameLen budgets the API tool-name length (64) minus the "skill_" prefix that
+// skills prepends, matching internal/skills' maxSkillNameLen.
+const maxToolNameLen = 64 - len("skill_")
+
+// slugifyToolName maps an arbitrary frontmatter name onto the API tool-name charset
+// (a-z A-Z 0-9 _ -), collapsing runs of other runes to a single '-' and truncating to
+// the length budget. It returns "" when nothing valid survives. It is a local mirror of
+// internal/skills.sanitizeSkillName (unexported there), used ONLY to predict at install
+// time what the load-time slugify will produce, so the operator is warned early.
+func slugifyToolName(name string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range name {
+		valid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-'
+		if valid {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > maxToolNameLen {
+		out = strings.Trim(out[:maxToolNameLen], "-")
+	}
+	return out
 }
 
 // Installed lists the skills currently present in skillsDir (with their versions),

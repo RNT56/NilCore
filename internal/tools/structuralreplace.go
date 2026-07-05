@@ -232,7 +232,7 @@ func renderStructural(pattern, rewrite string, rewriting, dryRun bool, total, li
 				if perr != nil {
 					return "", perr
 				}
-				if werr := writeNoFollow(p, r.newBytes); werr != nil {
+				if werr := writeNoFollow(workdir, p, r.newBytes); werr != nil {
 					return "", werr
 				}
 				wrote++

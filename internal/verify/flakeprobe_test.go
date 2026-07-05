@@ -212,6 +212,74 @@ func TestFlakeProbeProbeError(t *testing.T) {
 	}
 }
 
+// TestFlakeProbeOpaqueRecipeIsProbed proves the broadened detection: a test flake
+// hidden behind an OPAQUE recipe (make/wrapper), whose first output line is the make
+// wrapper rather than `go test`, is still recognized as a test-class failure and
+// probed. First-line command sniffing (FailClass) returns "other" here, so without
+// the full-output scan this flake would never get its one probe.
+func TestFlakeProbeOpaqueRecipeIsProbed(t *testing.T) {
+	// First line is the make wrapper (FailClass -> "other"); the go test banner is
+	// buried below. FailClassUnknown + a test-runner signature ⇒ probe.
+	opaqueRed := Report{
+		Passed: false,
+		Output: "make: *** [Makefile:12: test] Error 1\n--- FAIL: TestFlaky (0.01s)\n    x_test.go:9: timing",
+	}
+	// Sanity: first-line sniffing does NOT see this as a test class.
+	if got := FailClass(opaqueRed); got == FailClassTest {
+		t.Fatalf("precondition: FailClass should not already classify the opaque recipe as test, got %q", got)
+	}
+
+	inner := &scriptedVerifier{reports: []Report{opaqueRed, opaqueRed, repPass}}
+	fired := 0
+	p := &FlakeProbe{
+		Inner:   inner,
+		Hash:    scriptedHash([]string{"h", "h"}, nil),
+		OnFlaky: func(string, string) { fired++ },
+	}
+
+	// Check 1: red, no preceding hash ⇒ no probe.
+	if rep, err := p.Check(context.Background()); err != nil || rep.Passed {
+		t.Fatalf("check 1: want unprobed red, got %+v err=%v", rep, err)
+	}
+	// Check 2: same hash + opaque-recipe test red ⇒ probe ⇒ probe pass is the verdict.
+	rep, err := p.Check(context.Background())
+	if err != nil {
+		t.Fatalf("check 2: %v", err)
+	}
+	if !rep.Passed {
+		t.Fatalf("opaque-recipe flake must be probed and the probe pass returned, got %+v", rep)
+	}
+	if inner.calls != 3 {
+		t.Fatalf("inner called %d times, want 3 (1 + fail + one probe)", inner.calls)
+	}
+	if fired != 1 {
+		t.Fatalf("OnFlaky must fire once for the confirmed opaque-recipe flake, fired=%d", fired)
+	}
+}
+
+// TestFlakeProbeOpaqueBuildRedNotProbed guards the other direction: a DETERMINISTIC
+// build red must never be probed even if its output mentions the word "test". A
+// structurally-classified build/lint/browser red is a compiler/analyzer fact, not a
+// flake.
+func TestFlakeProbeOpaqueBuildRedNotProbed(t *testing.T) {
+	// FailClass classifies this as build (first token "go", subcommand "build"); the
+	// stray "test" word must not upgrade it to a probe candidate.
+	buildRed := Report{Passed: false, Output: "go build ./...\n./test_helpers.go:3: undefined: Foo"}
+	if got := FailClass(buildRed); got != FailClassBuild {
+		t.Fatalf("precondition: want build class, got %q", got)
+	}
+	inner := &scriptedVerifier{reports: []Report{buildRed, buildRed}}
+	p := &FlakeProbe{Inner: inner, Hash: scriptedHash([]string{"h", "h"}, nil)}
+	for i := 0; i < 2; i++ {
+		if _, err := p.Check(context.Background()); err != nil {
+			t.Fatalf("check %d: %v", i+1, err)
+		}
+	}
+	if inner.calls != 2 {
+		t.Fatalf("a deterministic build red must not be probed; inner ran %d, want 2", inner.calls)
+	}
+}
+
 // TestFlakeProbeGuards covers the structural guards: nil Inner errors, nil Hash
 // disables probing, and an inner error propagates unchanged.
 func TestFlakeProbeGuards(t *testing.T) {

@@ -63,19 +63,32 @@ type Reader interface {
 // directly) or OverStore (read the derived projection; a later task). The zero
 // value is a valid empty reader (no history ⇒ no earned signal).
 type Experience struct {
-	backends []trust.Stat
+	backends []trust.Stat            // the GLOBAL (class "") scoreboard
+	byClass  map[string][]trust.Stat // per-class scoreboards ("" ⇒ global); nil ⇒ class filter degrades to global
 	configs  []trust.ConfigStat
-	agg      Aggregate
+	agg      Aggregate            // the GLOBAL (class "") outcome rollup
+	aggByCls map[string]Aggregate // per-class outcome rollups ("" ⇒ global); nil ⇒ class filter degrades to global
 	chainOK  bool
 	mem      *memory.Memory // nil for the log-only reader (memory lives in the store)
 }
 
-// BackendStanding returns the per-backend scoreboard (taskClass reserved).
-func (x *Experience) BackendStanding(_ context.Context, _ string) ([]trust.Stat, error) {
+// BackendStanding returns the verifier-judged scoreboard for taskClass. An empty
+// taskClass ("") reads the GLOBAL scoreboard (every race, class-agnostic); a
+// non-empty class reads only that class's races. This mirrors the store-backed
+// reader (OverStore queries exp_backend_standing by the same class column), so the
+// warm and log-replay paths agree on `-class` filtering. An unknown class yields no
+// standings (no evidence for that bucket), never the global scoreboard.
+func (x *Experience) BackendStanding(_ context.Context, taskClass string) ([]trust.Stat, error) {
 	if x == nil {
 		return nil, nil
 	}
-	return x.backends, nil
+	if taskClass == "" {
+		return x.backends, nil
+	}
+	if x.byClass == nil {
+		return nil, nil
+	}
+	return x.byClass[taskClass], nil
 }
 
 // ConfigStanding returns the per-config eval rollup.
@@ -102,13 +115,21 @@ func (x *Experience) Lessons(ctx context.Context, scope, project, keyword string
 	return recs, nil
 }
 
-// Outcomes returns the verifier-judged outcome rollup with Class set to the
-// requested taskClass (echoed; per-class bucketing arrives in Pillar 2).
+// Outcomes returns the verifier-judged outcome rollup for taskClass. An empty
+// taskClass ("") is the GLOBAL rollup (every race); a non-empty class is that
+// class's rollup only — consistent with BackendStanding and the store-backed
+// reader (which sums exp_backend_standing rows for the same class). An unknown
+// class yields a zero rollup (no evidence for that bucket).
 func (x *Experience) Outcomes(_ context.Context, taskClass string) (Aggregate, error) {
 	if x == nil {
 		return Aggregate{Class: taskClass}, nil
 	}
-	a := x.agg
+	if taskClass == "" {
+		a := x.agg
+		a.Class = ""
+		return a, nil
+	}
+	a := x.aggByCls[taskClass] // zero Aggregate for an unknown class
 	a.Class = taskClass
 	return a, nil
 }
