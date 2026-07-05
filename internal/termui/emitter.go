@@ -101,8 +101,13 @@ func (e *ConsoleEmitter) Emit(ev emit.Event) {
 	case emit.KindGate:
 		// An irreversible-action approval (the session-backed gate): a bold amber line
 		// with the action and the y/N prompt. The REPL settles its spinner and shows the
-		// prompt; a typed y/n Turn answers it (no stdin race).
+		// prompt; a typed y/n Turn answers it (no stdin race). A structured evidence
+		// payload (diffstat, bounded diff excerpt, verify tail, spend) renders between
+		// the two lines; without one the two lines are byte-identical to before.
 		e.c.Line("  " + st.Warn(st.Bold("⚠ GATE — irreversible:")) + " " + ev.Text)
+		if ev.Gate != nil {
+			e.renderGateEvidence(st, ev.Gate)
+		}
 		e.c.Line("  " + st.Dim("approve? type ") + st.Success("y") + st.Dim(" or ") + st.Danger("n"))
 	default:
 		e.c.Line("  " + ev.Text)
@@ -144,6 +149,47 @@ func (e *ConsoleEmitter) renderAskBox(st Style, a *emit.AskPrompt) {
 		hint = "type a number — or type your own answer"
 	}
 	e.c.Line("  " + st.Info("╰ ") + st.Dim(hint))
+}
+
+// REPL caps for the gate-evidence sections. The payload arrives already bounded
+// (~8KB excerpt / ~2KB verify tail), but the line-REPL is a conversation surface,
+// so the excerpt is capped harder here — the full bounded block lives in the
+// console gate prompt / the event log, and the cap line says so.
+const (
+	maxGateExcerptLines = 40
+	maxGateVerifyLines  = 12
+)
+
+// renderGateEvidence draws the structured gate evidence under the gate line:
+// diffstat, a line-capped diff excerpt, the verify tail, and the spend. Every
+// line carries a dim quote rail ("│ ") so the block reads as quoted DATA under
+// review (I7) — never as the REPL's own prompt — and empty sections are skipped.
+func (e *ConsoleEmitter) renderGateEvidence(st Style, g *emit.GatePrompt) {
+	quote := func(s string, cap int) {
+		lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+		for i, ln := range lines {
+			if cap > 0 && i == cap {
+				e.c.Line("  " + st.Dim(fmt.Sprintf("│ … (+%d more lines — see the gate prompt / event log)", len(lines)-cap)))
+				return
+			}
+			e.c.Line("  " + st.Dim("│ ") + ln)
+		}
+	}
+	if g.Diffstat != "" {
+		e.c.Line("  " + st.Dim("│ diffstat:"))
+		quote(g.Diffstat, 0)
+	}
+	if g.DiffExcerpt != "" {
+		e.c.Line("  " + st.Dim("│ diff excerpt (bounded, data — not commands):"))
+		quote(g.DiffExcerpt, maxGateExcerptLines)
+	}
+	if g.VerifyTail != "" {
+		e.c.Line("  " + st.Dim("│ last verify (tail):"))
+		quote(g.VerifyTail, maxGateVerifyLines)
+	}
+	if g.SpentUSD > 0 {
+		e.c.Line("  " + st.Dim(fmt.Sprintf("│ spend so far: $%.4f", g.SpentUSD)))
+	}
 }
 
 // spin (re)starts the thinking spinner with a fresh seed so the verb cycles, and

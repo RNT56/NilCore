@@ -1725,6 +1725,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if in.AskUser != nil {
 		n.AskUser = in.AskUser
 	}
+	// Same orientation + window seams as buildBackend's native case: serve/chat
+	// drives start with the map and compact before overflow, exactly like run.
+	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
+	n.CtxWindow = meter.CtxWindow
 	if adv.prov != nil {
 		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
@@ -2245,6 +2249,12 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 				return blk
 			}
 		}
+		// Repo orientation + window awareness (upgrade program): the map spares the
+		// first steps of every drive from ls/cat structure discovery, and the window
+		// resolver lets the loop compact BEFORE a context overflow instead of dying
+		// on the 400. Both nil-safe seams; box.Workdir() is the per-task worktree.
+		n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
+		n.CtxWindow = meter.CtxWindow
 		// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
 		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
 		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;

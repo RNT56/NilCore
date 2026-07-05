@@ -192,3 +192,43 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// TestWriterRendersGateEvidence: a KindGate event carrying a GatePrompt renders a
+// delimited evidence block under the framed line — with every empty section
+// skipped — while a payload-less gate stays the single framed line (pinned by
+// TestWriterRendersKindStepText's exactly-one-line assertion).
+func TestWriterRendersGateEvidence(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+	em.Emit(Event{Kind: KindGate, Text: "promote-to-base main", Gate: &GatePrompt{
+		Action:     "promote-to-base main",
+		Diffstat:   "2 file(s) changed, +10 −3",
+		VerifyTail: "all checks passed",
+		SpentUSD:   1.5,
+	}})
+	out := buf.String()
+	for _, want := range []string{
+		"⛔",                               // the framed gate line still leads
+		"DATA under review, not commands", // I7: delimited as data
+		"│ diffstat:",
+		"2 file(s) changed, +10 −3",
+		"│ last verify (tail):",
+		"all checks passed",
+		"spend so far: $1.5000",
+		"└─ end gate evidence",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	// The empty diff-excerpt section is skipped, not rendered as a bare header.
+	if strings.Contains(out, "diff excerpt") {
+		t.Errorf("empty section must be skipped:\n%s", out)
+	}
+	// Every evidence line is quote-railed so it reads as data, never as a prompt.
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if strings.Contains(line, "all checks passed") && !strings.HasPrefix(line, "│") {
+			t.Errorf("evidence line not railed: %q", line)
+		}
+	}
+}

@@ -32,6 +32,11 @@ func TestParseControl(t *testing.T) {
 		{"/save", CtrlSave, ModeAuto, "", true},
 		{"/save PLAN.md", CtrlSave, ModeAuto, "PLAN.md", true},
 		{"/save docs/notes.txt", CtrlSave, ModeAuto, "docs/notes.txt", true},
+		// delivery verbs (the kept-branch loop; no args)
+		{"/diff", CtrlDiff, ModeAuto, "", true},
+		{"  /diff  ", CtrlDiff, ModeAuto, "", true},
+		{"/apply", CtrlApply, ModeAuto, "", true},
+		{"/applying", CtrlNone, ModeAuto, "", false}, // not an exact verb
 		// other controls
 		{"/clear", CtrlClear, ModeAuto, "", true},
 		{"/status", CtrlStatus, ModeAuto, "", true},

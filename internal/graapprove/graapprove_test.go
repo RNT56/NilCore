@@ -1017,3 +1017,46 @@ func TestApproveStructuredRateCapConcurrent(t *testing.T) {
 		t.Fatalf("rate_exceeded denies = %d, want %d", got, n-1)
 	}
 }
+
+// recStructuredHuman is a human approver that ALSO implements the structured
+// seam, recording the full action it received — the fall-through must forward
+// the whole GateAction (Evidence intact), not the flattened Describe() string.
+type recStructuredHuman struct {
+	recHuman
+	structCalled bool
+	got          policy.GateAction
+}
+
+func (h *recStructuredHuman) ApproveStructured(a policy.GateAction) bool {
+	h.structCalled = true
+	h.got = a
+	return h.reply
+}
+
+// TestFallThroughForwardsEvidenceToStructuredHuman pins the graded wrapper's
+// fall-through: a structured human receives the FULL action with its decision
+// Evidence, while a plain human keeps the exact flat Describe() path (covered
+// by the other fall-through tests above).
+func TestFallThroughForwardsEvidenceToStructuredHuman(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 6, 26, 12, 0, 0, 0, time.UTC)
+	path := writeLog(t, dir, greenRun("push", "feat/x", 3))
+
+	human := &recStructuredHuman{recHuman: recHuman{reply: true}}
+	g := newGraded(human, trustedEnv(), path, nil, // env has open-pr only ⇒ Push falls through
+		WithSink(&recSink{}), WithClock(fixedClock(now)), WithRoot(dir))
+
+	ev := &policy.GateEvidence{Diffstat: "1 file changed"}
+	if !g.ApproveStructured(policy.GateAction{Type: policy.Push, Branch: "feat/x", Evidence: ev}) {
+		t.Fatal("structured human approved ⇒ fall-through must return true")
+	}
+	if !human.structCalled {
+		t.Fatal("fall-through must use the human's structured seam when available")
+	}
+	if human.recHuman.called {
+		t.Fatal("structured forward must not ALSO hit the flat Approve path")
+	}
+	if human.got.Evidence != ev {
+		t.Fatal("fall-through must forward the action's Evidence intact")
+	}
+}

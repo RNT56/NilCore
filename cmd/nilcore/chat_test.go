@@ -161,7 +161,7 @@ func TestChatREPLQueuesAndSteers(t *testing.T) {
 
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, termui.New(&out), nil) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(&out), nil, nil) }()
 
 	// Line 1 routes a drive; wait for Working.
 	r.next()
@@ -227,7 +227,7 @@ func TestChatREPLShutsDownOnCtxCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, termui.New(io.Discard), nil) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(io.Discard), nil, nil) }()
 
 	// Cancel (Ctrl-C) and require a prompt return.
 	cancel()
@@ -253,7 +253,7 @@ func TestChatREPLStatusAndQuit(t *testing.T) {
 	r := newScriptReader("/status", "/quit")
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(context.Background(), sess, r, termui.New(&out), nil) }()
+	go func() { done <- chatREPL(context.Background(), sess, r, termui.New(&out), nil, nil) }()
 
 	r.next() // /status — reads phase, returns to prompt
 	r.next() // /quit — returns nil

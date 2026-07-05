@@ -100,6 +100,19 @@ func scopeFor(a policy.GateAction) string {
 	return a.Branch
 }
 
+// fallThrough delegates a non-auto-approved structured action to the human. When
+// the wrapped human approver is itself structured (console/TUI/channel gates), the
+// FULL GateAction is forwarded so the decision Evidence (diffstat, verify tail,
+// spend) survives the graded wrapper — without this, every graded fall-through
+// flattened to Describe() and the operator decided the irreversible step from one
+// line. A plain approver keeps the exact prior flat path.
+func (g *GradedApprover) fallThrough(a policy.GateAction) bool {
+	if sa, ok := g.human.(policy.StructuredApprover); ok {
+		return sa.ApproveStructured(a)
+	}
+	return g.human.Approve(a.Describe())
+}
+
 // ApproveStructured is the graded decision. It runs the gates in order and, on the
 // first failure, emits auto_deny{reason} and delegates to the human. On a full pass
 // it emits auto_approve with the full evidence object and returns true. The order
@@ -114,14 +127,14 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	// (1) Kill-switch first — instant, no restart.
 	if killSwitchEngaged(g.root) {
 		g.emitDeny("killswitch", typ, scope, nil)
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 
 	// (2) Eligibility — no clause for this Type ⇒ human.
 	clause, ok := g.clauseFor(typ)
 	if !ok {
 		g.emitDeny("not_eligible", typ, scope, nil)
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 
 	// (3) Blast radius — protected bases (prod*, main/master/release*), DenyBranches
@@ -131,16 +144,16 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	// graduated auto-approval never auto-approves main/prod).
 	if isProd(scope) || isProtectedBase(scope) || matchAny(scope, clause.DenyBranches) {
 		g.emitDeny("out_of_scope", typ, scope, map[string]any{"protected": true})
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 	if !matchAny(scope, clause.AllowBranches) {
 		g.emitDeny("out_of_scope", typ, scope, nil)
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 	if a.Type == policy.Deploy {
 		if len(clause.Environments) == 0 || !matchAny(scope, clause.Environments) {
 			g.emitDeny("out_of_scope", typ, scope, map[string]any{"environment": scope})
-			return g.human.Approve(a.Describe())
+			return g.fallThrough(a)
 		}
 	}
 
@@ -149,7 +162,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	view, err := BuildTrust(g.logPath)
 	if err != nil || !view.ChainOK {
 		g.emitDeny("chain_broken", typ, scope, map[string]any{"chain_ok": view.ChainOK})
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 	t := view.Tally(ScopeKey{Type: typ, Scope: scope})
 	now := g.now().UTC()
@@ -162,7 +175,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 			"min_successes": clause.MinSuccesses, "min_sample": clause.MinSample,
 			"recency_days": clause.RecencyDays, "recent_ok": recentOK,
 		})
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 
 	// (5) Rate — per-UTC-day auto_approve count for (type,scope) must be < MaxPerDay.
@@ -178,7 +191,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		g.emitDeny("rate_exceeded", typ, scope, map[string]any{
 			"rate": rate, "max_per_day": clause.MaxPerDay, "seed_error": rerr != nil,
 		})
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 
 	// (5b) Blast irreversible fence — every auto-approval consumes one slot of the
@@ -191,7 +204,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 	if cerr := g.blast.ChargeIrreversible(ctx, 1); cerr != nil {
 		g.releaseRate(typ, scope, today) // this action did not proceed — release its rate slot
 		g.emitDeny("blast_radius", typ, scope, map[string]any{"axis": "irreversible"})
-		return g.human.Approve(a.Describe())
+		return g.fallThrough(a)
 	}
 
 	// (5c) Dollars — when a clause carries a $/day ceiling, charge it through the SAME
@@ -214,7 +227,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 			g.emitDeny("dollar_ceiling_unmetered", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})
-			return g.human.Approve(a.Describe())
+			return g.fallThrough(a)
 		}
 		if cerr := g.blast.ChargeAutoApprovalDollars(ctx, today, dollars); cerr != nil {
 			g.blast.CreditIrreversible(1)    // this action did not proceed — release its slot
@@ -222,7 +235,7 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 			g.emitDeny("over_ceiling", typ, scope, map[string]any{
 				"max_dollars_day": dollars,
 			})
-			return g.human.Approve(a.Describe())
+			return g.fallThrough(a)
 		}
 	}
 

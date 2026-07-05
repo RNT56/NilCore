@@ -624,6 +624,35 @@ func (s *Session) LastAnswer() string {
 	return s.State.LastOutcome
 }
 
+// KeptBranch reads the branch carried in WorkState under s.mu — for a verified
+// execute drive that is the KEPT branch holding the drive's verified work (the
+// delivery loop: /diff previews it, /apply lands it); for a project/supervise
+// drive mid-flight it is the integration tip. Empty when no drive has kept one.
+func (s *Session) KeptBranch() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.State.Branch
+}
+
+// ClearKeptBranch drops the carried branch after the front door has LANDED it
+// (/apply merged it into the base branch), and persists the updated bounded state
+// so a restart does not resurrect an already-merged branch. Like SetMode it is
+// invoked only by a principal control verb at the front door — never from Turn
+// text, an inbox follow-up, or tool output (I7).
+func (s *Session) ClearKeptBranch(ctx context.Context) {
+	s.mu.Lock()
+	prev := s.State.Branch
+	s.State.Branch = ""
+	folded := s.State
+	s.mu.Unlock()
+	if prev == "" {
+		return // nothing carried; no state change, no event
+	}
+	s.persist(ctx, folded)
+	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_branch_clear",
+		Detail: map[string]any{"had_branch": true}})
+}
+
 // AddReadRoot registers an additional READ-ONLY context root (an absolute,
 // already-symlink-resolved host path — the caller validates it before calling, so
 // the session stays a pure state container with no filesystem dependency). It is

@@ -26,8 +26,35 @@ type gateApprover struct {
 	ctx context.Context
 }
 
-// Approve parks the session and blocks for the typed y/n answer.
-func (a *gateApprover) Approve(action string) bool { return a.s.approveViaTurn(a.ctx, action) }
+// Approve parks the session and blocks for the typed y/n answer (the legacy
+// flat-string path — no evidence payload rides it).
+func (a *gateApprover) Approve(action string) bool { return a.s.approveViaTurn(a.ctx, action, nil) }
+
+// ApproveStructured opts in to the full policy.GateAction (policy.StructuredApprover)
+// so the gate-evidence payload — diffstat, bounded diff excerpt, verify tail, spend —
+// rides the SAME KindGate event the flat line does, mirrored to emit.GatePrompt for
+// the surface to render (the AskPrompt precedent). Text stays the flattened
+// Describe() line, so a surface that ignores the payload renders exactly as before.
+func (a *gateApprover) ApproveStructured(act policy.GateAction) bool {
+	return a.s.approveViaTurn(a.ctx, act.Describe(), gatePromptOf(act))
+}
+
+// gatePromptOf mirrors a GateAction's evidence into the emit-local GatePrompt.
+// nil evidence ⇒ nil prompt, keeping the emitted event byte-identical to the
+// legacy path (renderers fall back to Text).
+func gatePromptOf(act policy.GateAction) *emit.GatePrompt {
+	ev := act.Evidence
+	if ev == nil {
+		return nil
+	}
+	return &emit.GatePrompt{
+		Action:      act.Describe(),
+		Diffstat:    ev.Diffstat,
+		DiffExcerpt: ev.DiffExcerpt,
+		VerifyTail:  ev.VerifyTail,
+		SpentUSD:    ev.SpentUSD,
+	}
+}
 
 // NewGateApprover returns a session-backed approver bound to ctx (the drive ctx). The
 // chat REPL front door wires it in place of ConsoleApprover.
@@ -35,9 +62,11 @@ func (s *Session) NewGateApprover(ctx context.Context) policy.Approver {
 	return &gateApprover{s: s, ctx: ctx}
 }
 
-// approveViaTurn flips Phase=AwaitingGate, surfaces the action, and blocks until a typed
-// Turn delivers a y/n line (a non-y/n line re-prompts). ctx-cancel ⇒ DENY (fail-closed).
-func (s *Session) approveViaTurn(ctx context.Context, action string) bool {
+// approveViaTurn flips Phase=AwaitingGate, surfaces the action (plus the structured
+// evidence payload when the structured path supplied one — gp is nil on the legacy
+// path, keeping the event byte-identical), and blocks until a typed Turn delivers a
+// y/n line (a non-y/n line re-prompts). ctx-cancel ⇒ DENY (fail-closed).
+func (s *Session) approveViaTurn(ctx context.Context, action string, gp *emit.GatePrompt) bool {
 	s.mu.Lock()
 	if s.Phase == Working {
 		s.Phase = AwaitingGate
@@ -58,7 +87,7 @@ func (s *Session) approveViaTurn(ctx context.Context, action string) bool {
 	}()
 
 	if s.Out != nil {
-		s.Out.Emit(emit.Event{Kind: emit.KindGate, Text: action})
+		s.Out.Emit(emit.Event{Kind: emit.KindGate, Text: action, Gate: gp})
 	}
 	s.Log.Append(eventlog.Event{Task: s.ID, Kind: "session_gate_ask"})
 	for {

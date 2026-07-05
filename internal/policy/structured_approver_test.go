@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -21,25 +20,66 @@ func (f *fakeStructured) ApproveStructured(GateAction) bool {
 
 var allGateActionTypes = []GateActionType{PromoteToBase, Push, Deploy, OpenPR}
 
+// flatApprover is a free-text-only approver (it deliberately does NOT implement
+// StructuredApprover), standing in for any legacy/third-party approver. It
+// records the exact string it was handed so tests can pin the flattened line.
+type flatApprover struct {
+	verdict bool
+	got     string
+}
+
+func (f *flatApprover) Approve(action string) bool { f.got = action; return f.verdict }
+
 // TestGateStructuredFreeTextPathByteIdentical proves a non-StructuredApprover
-// (here a ConsoleApprover) still reaches the exact prior behaviour: the free-text
-// Approve is consulted and its verdict governs, for every GateActionType, with a
-// nil approver default-denying. This is the byte-identical default-off proof.
+// still reaches the exact prior behaviour: the free-text Approve is consulted
+// with the flattened Describe() string and its verdict governs, for every
+// GateActionType, with a nil approver default-denying. This is the
+// byte-identical default-off proof. (ConsoleApprover no longer serves as the
+// exemplar here: it opts in to StructuredApprover to render gate evidence.)
 func TestGateStructuredFreeTextPathByteIdentical(t *testing.T) {
 	for _, ty := range allGateActionTypes {
 		a := GateAction{Type: ty, Branch: "feature/x", Detail: "ctx"}
 
-		// "y" ⇒ approve, anything else ⇒ deny — the ConsoleApprover contract.
-		if got := GateStructured(a, NewConsoleApprover(strings.NewReader("y\n"), &strings.Builder{})); !got {
-			t.Errorf("%s: console 'y' ⇒ %v, want true", ty, got)
+		yes := &flatApprover{verdict: true}
+		if got := GateStructured(a, yes); !got {
+			t.Errorf("%s: approving flat approver ⇒ %v, want true", ty, got)
 		}
-		if got := GateStructured(a, NewConsoleApprover(strings.NewReader("n\n"), &strings.Builder{})); got {
-			t.Errorf("%s: console 'n' ⇒ %v, want false", ty, got)
+		if yes.got != a.Describe() {
+			t.Errorf("%s: flat approver got %q, want Describe() %q", ty, yes.got, a.Describe())
+		}
+		if got := GateStructured(a, &flatApprover{verdict: false}); got {
+			t.Errorf("%s: denying flat approver ⇒ %v, want false", ty, got)
 		}
 		// nil approver default-denies (no ambient authority), unchanged.
 		if got := GateStructured(a, nil); got {
 			t.Errorf("%s: nil approver ⇒ %v, want false", ty, got)
 		}
+	}
+}
+
+// TestGateStructuredEvidenceInvisibleToUnawareApprover pins the optional
+// carriage: an action CARRYING an Evidence payload hands an unaware approver the
+// byte-identical flattened Describe() string — the payload never leaks into, or
+// alters, the legacy path.
+func TestGateStructuredEvidenceInvisibleToUnawareApprover(t *testing.T) {
+	bare := GateAction{Type: PromoteToBase, Branch: "main", Detail: "ctx"}
+	loaded := bare
+	loaded.Evidence = &GateEvidence{
+		Diffstat:    "1 file(s) changed, +2 −1",
+		DiffExcerpt: "diff --git a/x b/x",
+		VerifyTail:  "ok",
+		SpentUSD:    1.25,
+	}
+
+	f := &flatApprover{verdict: true}
+	if !GateStructured(loaded, f) {
+		t.Fatal("verdict of the flat approver must govern")
+	}
+	if f.got != bare.Describe() {
+		t.Errorf("unaware approver got %q, want the evidence-free Describe() %q", f.got, bare.Describe())
+	}
+	if loaded.Describe() != bare.Describe() {
+		t.Errorf("Describe() must not change when Evidence is set: %q vs %q", loaded.Describe(), bare.Describe())
 	}
 }
 

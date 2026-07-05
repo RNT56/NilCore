@@ -503,6 +503,54 @@ func Diff(ctx context.Context, baseRepo, branch string) (string, error) {
 	return git(ctx, baseRepo, "diff", "HEAD.."+branch)
 }
 
+// DiffPreview reports what landing branch onto the base repo's current HEAD would
+// change, as a BOUNDED operator preview: the `git diff --stat` summary followed by
+// the head of the unified diff, the whole report clamped to maxBytes (on a line
+// boundary — clampBytes) so a sprawling branch can never flood a terminal. It uses
+// the same HEAD..branch endpoints as Diff (the change a promote would land). The
+// branch is resolved first so a swept/renamed ref is a clear error rather than a
+// confusing empty diff; an identical tree returns "" with a nil error. Read-only,
+// hardened git (I4). A non-positive maxBytes applies defaultDiffPreviewBytes.
+func DiffPreview(ctx context.Context, baseRepo, branch string, maxBytes int) (string, error) {
+	if branch == "" {
+		return "", fmt.Errorf("worktree diff preview: empty branch")
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultDiffPreviewBytes
+	}
+	if _, err := git(ctx, baseRepo, "rev-parse", "--verify", "--quiet", branch+"^{commit}"); err != nil {
+		return "", fmt.Errorf("branch %q does not resolve in %s: %w", branch, baseRepo, err)
+	}
+	stat, err := git(ctx, baseRepo, "diff", "--stat", "HEAD.."+branch)
+	if err != nil {
+		return "", fmt.Errorf("worktree diff preview stat: %w", err)
+	}
+	full, err := Diff(ctx, baseRepo, branch)
+	if err != nil {
+		return "", fmt.Errorf("worktree diff preview: %w", err)
+	}
+	stat, full = strings.TrimSpace(stat), strings.TrimSpace(full)
+	if stat == "" && full == "" {
+		return "", nil // the branch lands nothing
+	}
+	var b strings.Builder
+	if stat != "" {
+		b.WriteString(stat)
+	}
+	if full != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(full)
+	}
+	return clampBytes(b.String(), maxBytes), nil
+}
+
+// defaultDiffPreviewBytes bounds a DiffPreview when the caller passes no cap —
+// generous enough to read a real change, small enough for one terminal screenful
+// scroll.
+const defaultDiffPreviewBytes = 16 << 10
+
 // git runs a hardening-clamped git subcommand in dir and returns its combined
 // output. The clamp (HardenArgs `-c` flags + HardenedEnv) is identical to the
 // `git` tool's, so a repo-authored hook/fsmonitor/config can never execute on the

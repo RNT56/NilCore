@@ -115,14 +115,17 @@ func (r Route) String() string {
 // It reuses summarize.ContextSummary's discipline (goal/constraints/decisions/
 // remaining) so a follow-up re-enters a driver seeded with intent, not a full
 // replayed history. Active names which driver currently or last owned the work
-// (so RouteContinue knows where to re-enter); Branch is the integration tip when
-// a project/supervisor drive is mid-flight; LastOutcome is the data-only tail of
+// (so RouteContinue knows where to re-enter); Branch carries a branch across
+// drives: the integration tip while a project/supervisor drive is mid-flight,
+// and — the delivery loop — the KEPT branch holding a verified execute drive's
+// work, which /diff previews and /apply lands (it persists, so the kept work
+// survives a restart); LastOutcome is the data-only tail of
 // the last terminal result; Mode is the user-set behavioral policy (sticky across
 // drives and persisted, so a safety posture like "plan only" survives a restart).
 type WorkState struct {
 	Summary     summarize.ContextSummary // bounded handoff (no raw transcripts)
 	Active      Route                    // driver that currently/last owned the work
-	Branch      string                   // integration tip when project/super mid-flight
+	Branch      string                   // kept verified branch / mid-flight integration tip
 	LastOutcome string                   // data-only tail of the last terminal result
 	Mode        Mode                     // user-set behavioral policy (auto/discuss/plan/execute)
 	// AskLevel is the user-set ask-aggressiveness on a 1..6 scale (off..max), sticky

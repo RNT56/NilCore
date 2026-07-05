@@ -3,7 +3,8 @@ package session
 // control.go is the SHARED control-verb parser used by BOTH front doors — the
 // terminal REPL (cmd/nilcore/chat.go) and the serve intake (internal/server) — so
 // /discuss (/ask) /plan /execute /auto /add /save /clear /mode /status /cancel
-// behave identically over the keyboard and over Telegram/Slack, defined once. The
+// /diff /apply behave identically over the keyboard and over Telegram/Slack,
+// defined once. The
 // one exception is /save (CtrlSave): it is parsed here but ACTED ON only by the
 // terminal front door (it writes a host file for the local operator); the serve
 // path recognizes it and refuses, rather than letting a remote principal write to
@@ -52,6 +53,14 @@ const (
 	// spec ("less"/"more"/"off"/"normal"/a level); empty Arg ⇒ show the current level.
 	// The deterministic sibling of telling the agent "ask me fewer questions" in prose.
 	CtrlQuestions
+	// CtrlDiff: preview the KEPT verified branch (WorkState.Branch) as a bounded
+	// diffstat + diff head. Read-only; the rendering (git IO) is the front door's job —
+	// session stays pure. No kept branch ⇒ the front door reports "nothing to preview".
+	CtrlDiff
+	// CtrlApply: land the kept verified branch onto the base branch — an IRREVERSIBLE
+	// action that must go through the structured PromoteToBase gate at the front door
+	// (never here; parsing carries no authority). No kept branch ⇒ friendly refusal.
+	CtrlApply
 )
 
 // Control is the parsed result of a control line.
@@ -102,6 +111,10 @@ func ParseControl(line string) (Control, bool) {
 		return Control{Kind: CtrlAdd, Arg: rest}, true
 	case "/save":
 		return Control{Kind: CtrlSave, Arg: rest}, true
+	case "/diff":
+		return Control{Kind: CtrlDiff}, true
+	case "/apply":
+		return Control{Kind: CtrlApply}, true
 	case "/questions", "/ask-less", "/ask-more":
 		// /questions <spec> dials the ask budget; the two dashed aliases are sugar that
 		// fold straight to one notch in either direction.

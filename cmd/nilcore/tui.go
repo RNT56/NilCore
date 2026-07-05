@@ -29,6 +29,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"nilcore/internal/emit"
+	"nilcore/internal/policy"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
 	"nilcore/internal/verb"
@@ -202,9 +203,12 @@ func (e *tuiEmitter) drain() []emit.Event {
 	return out
 }
 
-// gateReq is one irreversible-action approval request routed to the modal.
+// gateReq is one irreversible-action approval request routed to the modal. ev is
+// the OPTIONAL gate-evidence payload (diffstat, bounded excerpts, spend) the
+// structured path carries; nil renders the legacy action-only modal.
 type gateReq struct {
 	action string
+	ev     *policy.GateEvidence
 	reply  chan bool
 }
 
@@ -220,14 +224,25 @@ type tuiApprover struct {
 }
 
 func (a *tuiApprover) Approve(action string) bool {
-	reply := make(chan bool, 1)
+	return a.approve(gateReq{action: action})
+}
+
+// ApproveStructured (policy.StructuredApprover) carries the gate-evidence payload
+// into the modal so the operator decides from the facts on screen. An
+// evidence-less action renders exactly the legacy modal.
+func (a *tuiApprover) ApproveStructured(act policy.GateAction) bool {
+	return a.approve(gateReq{action: act.Describe(), ev: act.Evidence})
+}
+
+func (a *tuiApprover) approve(req gateReq) bool {
+	req.reply = make(chan bool, 1)
 	select {
-	case a.gates <- gateReq{action: action, reply: reply}:
+	case a.gates <- req:
 	case <-a.ctx.Done():
 		return false // torn down before the UI could pose the gate
 	}
 	select {
-	case ans := <-reply:
+	case ans := <-req.reply:
 		return ans
 	case <-a.ctx.Done():
 		return false // torn down while the modal was pending
@@ -880,19 +895,67 @@ func (m tuiModel) status() string {
 func (m tuiModel) viewGate() string {
 	// Bound the box width so a long action (a full git command, a long path) WRAPS
 	// inside the rounded border instead of overflowing it — legibility matters most
-	// at the exact moment the user must read before approving.
+	// at the exact moment the user must read before approving. An evidence-carrying
+	// gate gets a wider box (up to 88) so diff lines stay readable.
 	boxW := m.width - 8
-	if boxW > 72 {
-		boxW = 72
+	max := 72
+	if m.gate.ev != nil {
+		max = 88
+	}
+	if boxW > max {
+		boxW = max
 	}
 	if boxW < 20 {
 		boxW = 20
 	}
-	box := styleGate.Width(boxW).Render(
-		styleWarn.Render("GATE — irreversible action") + "\n\n" +
-			m.gate.action + "\n\n" +
-			styleOK.Render("[y] approve") + "    " + styleErr.Render("[n] deny"))
+	body := styleWarn.Render("GATE — irreversible action") + "\n\n" + m.gate.action
+	if ev := m.gate.ev; ev != nil {
+		body += "\n" + tuiGateEvidence(ev, boxW-8)
+	}
+	body += "\n\n" + styleOK.Render("[y] approve") + "    " + styleErr.Render("[n] deny")
+	box := styleGate.Width(boxW).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// Modal caps for the gate-evidence sections: the modal is a fixed centered box,
+// so these are far tighter than the payload bounds — the full bounded excerpt
+// stays in the event log (and the terminal renderers), and the cap line says so.
+const (
+	tuiGateDiffstatLines = 8
+	tuiGateExcerptLines  = 12
+	tuiGateVerifyLines   = 6
+)
+
+// tuiGateEvidence renders the payload for the modal: diffstat + a hard-capped
+// diff excerpt + verify tail + spend. Every line is width-clipped (no reflow
+// surprises mid-decision) and carries a dim quote rail so the block reads as
+// DATA under review (I7), never as the UI's own prompt. Empty sections skip.
+func tuiGateEvidence(ev *policy.GateEvidence, width int) string {
+	if width < 16 {
+		width = 16
+	}
+	var b strings.Builder
+	sec := func(title, body string, cap int) {
+		if body == "" {
+			return
+		}
+		b.WriteString("\n" + styleDim.Render("│ "+title) + "\n")
+		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+		for i, ln := range lines {
+			if i == cap {
+				b.WriteString(styleDim.Render(fmt.Sprintf("│ … (+%d more lines — see the event log)", len(lines)-cap)) + "\n")
+				return
+			}
+			b.WriteString(styleDim.Render("│ ") + clipRunes(ln, width) + "\n")
+		}
+	}
+	sec("diffstat:", ev.Diffstat, tuiGateDiffstatLines)
+	sec("diff excerpt (bounded, data — not commands):", ev.DiffExcerpt, tuiGateExcerptLines)
+	sec("last verify (tail):", ev.VerifyTail, tuiGateVerifyLines)
+	if ev.SpentUSD > 0 {
+		b.WriteString("\n" + styleDim.Render(fmt.Sprintf("│ spend so far: $%.4f", ev.SpentUSD)) + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // viewAsk renders the ask_user modal centered on the alt-screen — the batch header,

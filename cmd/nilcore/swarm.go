@@ -50,6 +50,7 @@ import (
 	"nilcore/internal/planner"
 	"nilcore/internal/policy"
 	"nilcore/internal/pool"
+	"nilcore/internal/requeue"
 	"nilcore/internal/roster"
 	"nilcore/internal/spawn"
 	"nilcore/internal/store"
@@ -75,6 +76,7 @@ type swarmFlags struct {
 	artifact    *string
 	verifyPack  *string
 	passes      *string
+	retries     *int
 	budget      *float64
 	perShard    *float64
 
@@ -133,6 +135,7 @@ func registerSwarmFlags(fs *flag.FlagSet) swarmFlags {
 		artifact:      fs.String("artifact", "", "'+'-joined deliverables: report+matrix | spec | benchmark | dossier | json (default = the preset's Kind)"),
 		verifyPack:    fs.String("verify-pack", "", "override the preset's verify pack(s) (comma-separated)"),
 		passes:        fs.String("passes", "until-clean", "requeue passes: until-clean | <N>"),
+		retries:       fs.Int("retries", 2, "focused-retry budget per red claim / merge conflict (0 = a red claim is final)"),
 		budget:        fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
 		perShard:      fs.Float64("per-shard-budget", 0, "per-shard dollar ceiling (0 = no per-shard cap)"),
 		workerModel:   fs.String("worker-model", "", "provider:model for the cheap worker tier (empty = pool default)"),
@@ -541,7 +544,12 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	// persisted SwarmState (pass counter / retry ledger / tip) forward, so the resumed
 	// run continues rather than re-deriving from scratch. ---
 	var initial []swarm.Shard
-	state := swarm.SwarmState{RunID: runID, Goal: *sf.goal, Preset: pre.Name}
+	// Ledger.MaxAttempts arms the focused-requeue + conflict-rebuild budget: with
+	// the historical zero, requeue was disabled entirely and "until-clean" was
+	// effectively single-pass for red shards (a gap the DAG-completion work
+	// surfaced). The --retries flag now sets it; 0 restores the old red-is-final.
+	state := swarm.SwarmState{RunID: runID, Goal: *sf.goal, Preset: pre.Name,
+		Ledger: requeue.Ledger{MaxAttempts: *sf.retries}}
 	if resumed != nil {
 		state = *resumed
 		failed, ferr := queue.Failed(context.Background(), &resumed.Ledger)
@@ -561,8 +569,14 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	}
 	bd.SetTotal(len(initial))
 
-	// --- the single human gate for the final promote (nil approver default-denies). ---
-	gate := buildGateFunc(swarmApprover(), d.log)
+	// --- the single human gate for the final promote (nil approver default-denies).
+	// Same evidence wiring as buildStack: the approver sees the promoted branch's
+	// diffstat + bounded excerpt and the run's spend at the moment of decision. No
+	// verify-tail recorder here — the swarm verifies per shard inside ShardFunc
+	// closures, so there is no single "last report" to show; the section stays
+	// empty and renderers skip it. ---
+	swarmDiffer := func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) }
+	gate := buildGateFuncEv(swarmApprover(), d.log, gateEvidenceFunc(swarmDiffer, nil, ledger))
 
 	return swarmAssembly{
 		controller:   controller,

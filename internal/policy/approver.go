@@ -36,3 +36,17 @@ func (c *ConsoleApprover) Approve(action string) bool {
 		return false
 	}
 }
+
+// ApproveStructured renders the action's evidence payload (when present) ahead
+// of the standard prompt, so the operator decides the irreversible step from the
+// diffstat / verify facts instead of one flattened line. The block is DATA under
+// review (I7): RenderBlock quote-rails every line and nothing in it is executed
+// or re-parsed. With no evidence the output is byte-identical to the legacy
+// Approve(Describe()) path (pinned by test), so gates that carry no payload —
+// and every pre-existing caller — are unchanged.
+func (c *ConsoleApprover) ApproveStructured(a GateAction) bool {
+	if a.Evidence != nil {
+		fmt.Fprint(c.Out, a.Evidence.RenderBlock())
+	}
+	return c.Approve(a.Describe())
+}
