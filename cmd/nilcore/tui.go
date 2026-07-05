@@ -29,6 +29,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"nilcore/internal/emit"
+	"nilcore/internal/eventlog"
+	"nilcore/internal/policy"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
 	"nilcore/internal/verb"
@@ -133,7 +135,10 @@ func tuiMain(args []string) {
 		greeting = append(greeting, styleDim.Render("web access is off — pass -allow-egress <host> to enable /add <url> + web tools"))
 	}
 
-	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), em, gates, greeting), tea.WithAltScreen())
+	// The TUI shares the chat session; /apply reuses the SAME gated PromoteToBase core
+	// the REPL uses, driven by this modal approver (ap) and audit log — no duplicated
+	// gate logic.
+	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), em, gates, ap, log, greeting), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)
 	}
@@ -202,9 +207,12 @@ func (e *tuiEmitter) drain() []emit.Event {
 	return out
 }
 
-// gateReq is one irreversible-action approval request routed to the modal.
+// gateReq is one irreversible-action approval request routed to the modal. ev is
+// the OPTIONAL gate-evidence payload (diffstat, bounded excerpts, spend) the
+// structured path carries; nil renders the legacy action-only modal.
 type gateReq struct {
 	action string
+	ev     *policy.GateEvidence
 	reply  chan bool
 }
 
@@ -220,14 +228,25 @@ type tuiApprover struct {
 }
 
 func (a *tuiApprover) Approve(action string) bool {
-	reply := make(chan bool, 1)
+	return a.approve(gateReq{action: action})
+}
+
+// ApproveStructured (policy.StructuredApprover) carries the gate-evidence payload
+// into the modal so the operator decides from the facts on screen. An
+// evidence-less action renders exactly the legacy modal.
+func (a *tuiApprover) ApproveStructured(act policy.GateAction) bool {
+	return a.approve(gateReq{action: act.Describe(), ev: act.Evidence})
+}
+
+func (a *tuiApprover) approve(req gateReq) bool {
+	req.reply = make(chan bool, 1)
 	select {
-	case a.gates <- gateReq{action: action, reply: reply}:
+	case a.gates <- req:
 	case <-a.ctx.Done():
 		return false // torn down before the UI could pose the gate
 	}
 	select {
-	case ans := <-reply:
+	case ans := <-req.reply:
 		return ans
 	case <-a.ctx.Done():
 		return false // torn down while the modal was pending
@@ -237,11 +256,13 @@ func (a *tuiApprover) Approve(action string) bool {
 // --- model ---
 
 type tuiModel struct {
-	ctx     context.Context
-	sess    *session.Session
-	model   string // provider:model, for the header
-	emitter *tuiEmitter
-	gates   chan gateReq
+	ctx      context.Context
+	sess     *session.Session
+	model    string // provider:model, for the header
+	emitter  *tuiEmitter
+	gates    chan gateReq
+	approver policy.Approver // the modal approver, for the /apply PromoteToBase gate
+	log      *eventlog.Log   // the audit log, for /apply's boundary + gate events
 
 	vp viewport.Model
 	ta textarea.Model
@@ -320,7 +341,7 @@ func (a *askModal) hint() string {
 	}
 }
 
-func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq, greeting []string) tuiModel {
+func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq, approver policy.Approver, log *eventlog.Log, greeting []string) tuiModel {
 	ta := textarea.New()
 	ta.Placeholder = "talk to the agent — it picks the machine and works while you type"
 	ta.Prompt = "❯ "
@@ -330,6 +351,7 @@ func newTUIModel(ctx context.Context, sess *session.Session, model string, emitt
 	ta.Focus()
 	return tuiModel{
 		ctx: ctx, sess: sess, model: model, emitter: emitter, gates: gates,
+		approver: approver, log: log,
 		ta:    ta,
 		lines: greeting, // seed the transcript (resume note + intro + web status)
 		spin:  verb.New(1, verb.General),
@@ -640,6 +662,28 @@ func (m tuiModel) applyControl(c session.Control) (tea.Model, tea.Cmd) {
 			m.append(styleWarn.Render("  cancelling current run…"))
 			go m.sess.Cancel()
 		}
+	case session.CtrlQuestions:
+		// Dial how often the agent asks clarifying questions — the deterministic sibling
+		// of "ask me fewer questions" in prose, exactly like the REPL door.
+		if ack, err := m.sess.SetAskLevelSpec(c.Arg); err != nil {
+			m.append(styleWarn.Render("  " + err.Error()))
+		} else {
+			m.append(styleInfo.Render("  " + ack))
+		}
+	case session.CtrlDiff:
+		// Read-only preview of the kept verified branch — runs the SAME core the REPL
+		// door uses (chat.go's diffKeptBranch), rendered onto the transcript. Synchronous:
+		// it takes no gate and moves nothing.
+		diffKeptBranch(m.ctx, m.sess, m.transcriptSink())
+	case session.CtrlApply:
+		// Land the kept verified branch behind the SAME structured PromoteToBase gate the
+		// REPL uses (chat.go's applyKeptBranch) — no duplicated gate logic. It BLOCKS on
+		// the modal approver, which is driven by THIS Update loop, so it must run off-loop:
+		// the goroutine routes its output back through the emitter (the sanctioned
+		// goroutine→model bridge) so the transcript stays the single render path.
+		go func() {
+			applyKeptBranch(m.ctx, m.sess, m.approver, m.log, m.emitterSink())
+		}()
 	}
 	m.refresh()
 	return m, nil
@@ -795,6 +839,42 @@ func (m *tuiModel) commitStream() {
 	}
 }
 
+// tuiDeliverKind is a synthetic emit Kind used only to carry a pre-styled delivery
+// line (from an off-loop /apply goroutine) into the transcript verbatim: onEvent's
+// default case appends ev.Text unchanged, so styling is applied at the source.
+const tuiDeliverKind = "tui_deliver"
+
+// styleDeliverLine maps a delivery-verb severity to the TUI's transcript styling —
+// shared by both the synchronous /diff sink and the /apply emitter sink so the two
+// render identically.
+func styleDeliverLine(sev deliverSev, line string) string {
+	switch sev {
+	case sevInfo:
+		return styleInfo.Render(line)
+	case sevWarn:
+		return styleWarn.Render(line)
+	default:
+		return styleDim.Render(line)
+	}
+}
+
+// transcriptSink is a deliverSink that appends styled lines straight onto the
+// transcript. It is safe ONLY on the Update goroutine (mutates m.lines), so it backs
+// the synchronous, read-only /diff verb.
+func (m *tuiModel) transcriptSink() deliverSink {
+	return func(sev deliverSev, line string) { m.append(styleDeliverLine(sev, line)) }
+}
+
+// emitterSink is a deliverSink that routes styled lines through the session emitter —
+// the sanctioned goroutine→model bridge — so an off-loop /apply goroutine's output
+// lands in the transcript without touching m.lines from another goroutine. The line
+// is pre-styled and carried under tuiDeliverKind, which onEvent renders verbatim.
+func (m *tuiModel) emitterSink() deliverSink {
+	return func(sev deliverSev, line string) {
+		m.emitter.Emit(emit.Event{Kind: tuiDeliverKind, Text: styleDeliverLine(sev, line)})
+	}
+}
+
 func (m *tuiModel) append(line string) { m.lines = append(m.lines, line) }
 
 // refresh re-renders the transcript (including the in-progress stream) into the
@@ -880,19 +960,67 @@ func (m tuiModel) status() string {
 func (m tuiModel) viewGate() string {
 	// Bound the box width so a long action (a full git command, a long path) WRAPS
 	// inside the rounded border instead of overflowing it — legibility matters most
-	// at the exact moment the user must read before approving.
+	// at the exact moment the user must read before approving. An evidence-carrying
+	// gate gets a wider box (up to 88) so diff lines stay readable.
 	boxW := m.width - 8
-	if boxW > 72 {
-		boxW = 72
+	max := 72
+	if m.gate.ev != nil {
+		max = 88
+	}
+	if boxW > max {
+		boxW = max
 	}
 	if boxW < 20 {
 		boxW = 20
 	}
-	box := styleGate.Width(boxW).Render(
-		styleWarn.Render("GATE — irreversible action") + "\n\n" +
-			m.gate.action + "\n\n" +
-			styleOK.Render("[y] approve") + "    " + styleErr.Render("[n] deny"))
+	body := styleWarn.Render("GATE — irreversible action") + "\n\n" + m.gate.action
+	if ev := m.gate.ev; ev != nil {
+		body += "\n" + tuiGateEvidence(ev, boxW-8)
+	}
+	body += "\n\n" + styleOK.Render("[y] approve") + "    " + styleErr.Render("[n] deny")
+	box := styleGate.Width(boxW).Render(body)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// Modal caps for the gate-evidence sections: the modal is a fixed centered box,
+// so these are far tighter than the payload bounds — the full bounded excerpt
+// stays in the event log (and the terminal renderers), and the cap line says so.
+const (
+	tuiGateDiffstatLines = 8
+	tuiGateExcerptLines  = 12
+	tuiGateVerifyLines   = 6
+)
+
+// tuiGateEvidence renders the payload for the modal: diffstat + a hard-capped
+// diff excerpt + verify tail + spend. Every line is width-clipped (no reflow
+// surprises mid-decision) and carries a dim quote rail so the block reads as
+// DATA under review (I7), never as the UI's own prompt. Empty sections skip.
+func tuiGateEvidence(ev *policy.GateEvidence, width int) string {
+	if width < 16 {
+		width = 16
+	}
+	var b strings.Builder
+	sec := func(title, body string, cap int) {
+		if body == "" {
+			return
+		}
+		b.WriteString("\n" + styleDim.Render("│ "+title) + "\n")
+		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+		for i, ln := range lines {
+			if i == cap {
+				b.WriteString(styleDim.Render(fmt.Sprintf("│ … (+%d more lines — see the event log)", len(lines)-cap)) + "\n")
+				return
+			}
+			b.WriteString(styleDim.Render("│ ") + clipRunes(ln, width) + "\n")
+		}
+	}
+	sec("diffstat:", ev.Diffstat, tuiGateDiffstatLines)
+	sec("diff excerpt (bounded, data — not commands):", ev.DiffExcerpt, tuiGateExcerptLines)
+	sec("last verify (tail):", ev.VerifyTail, tuiGateVerifyLines)
+	if ev.SpentUSD > 0 {
+		b.WriteString("\n" + styleDim.Render(fmt.Sprintf("│ spend so far: $%.4f", ev.SpentUSD)) + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // viewAsk renders the ask_user modal centered on the alt-screen — the batch header,

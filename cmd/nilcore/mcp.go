@@ -187,12 +187,34 @@ func (t *mcpTool) listCatalog(ctx context.Context, server string) (string, error
 // server-controlled and untrusted: the loop guard.Wraps the SUCCESS path, so the error
 // path must fence the same untrusted content (I7) — otherwise a malicious server could
 // smuggle instructions through a failed call. Harness validation errors above are not
-// routed here, so only server-originated text is wrapped.
+// routed here, so only server-originated text is wrapped. Success text is bounded by
+// boundMCPResult here — the one seam all three success paths (tool call, resource
+// read, prompt render) flow through — so no single reply can flood the context.
 func fenceMCPErr(out string, err error) (string, error) {
 	if err != nil {
 		return "", errors.New(guard.Wrap("mcp error", err.Error()))
 	}
-	return out, nil
+	return boundMCPResult(out), nil
+}
+
+// maxMCPResultBytes bounds the text an MCP success returns to the model. MCP servers
+// are operator-configured but their OUTPUT volume is uncontrolled — one verbose tool
+// or a huge resource could otherwise consume the whole context window (web_fetch caps
+// at 64KB, browser text at 16KB; this matches the read tool's 48KB).
+const maxMCPResultBytes = 48 * 1024
+
+// boundMCPResult clips an oversized MCP result to its head plus a harness-authored
+// notice naming the true size. The notice is plain text INSIDE the result the loop
+// fences as untrusted data (I7) — it opens/closes no fence, so it un-fences nothing.
+// The operator CLI path (mcpCallMain) deliberately does NOT route through this: a
+// human reading stdout wants the whole reply; only the model-facing result is capped.
+func boundMCPResult(s string) string {
+	if len(s) <= maxMCPResultBytes {
+		return s
+	}
+	return s[:maxMCPResultBytes] + fmt.Sprintf(
+		"\n[mcp result truncated by the harness: showing the first %d bytes of %d total]",
+		maxMCPResultBytes, len(s))
 }
 
 // mcpCallMain implements `nilcore mcp-call <server> <tool> ['<json-args>']` — the

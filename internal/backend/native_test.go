@@ -139,12 +139,14 @@ type toolCapturingModel struct {
 	i         int
 	lastTools []model.Tool
 	lastMsgs  []model.Message
+	lastMax   int // maxTokens of the last call (the MaxOutputTokens plumbing)
 }
 
 func (c *toolCapturingModel) Model() string { return "fake" }
-func (c *toolCapturingModel) Complete(_ context.Context, _ string, msgs []model.Message, tools []model.Tool, _ int) (model.Response, error) {
+func (c *toolCapturingModel) Complete(_ context.Context, _ string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
 	c.lastTools = tools
 	c.lastMsgs = msgs
+	c.lastMax = maxTokens
 	if c.i >= len(c.responses) {
 		return model.Response{StopReason: "end_turn"}, nil
 	}

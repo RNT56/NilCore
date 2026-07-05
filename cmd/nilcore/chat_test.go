@@ -23,6 +23,7 @@ import (
 	"nilcore/internal/termui"
 	"nilcore/internal/tools"
 	"nilcore/internal/verb"
+	"nilcore/internal/verify"
 )
 
 // chat_test.go is the hermetic test of the `nilcore chat` REPL wiring (C3-T01). It
@@ -161,7 +162,7 @@ func TestChatREPLQueuesAndSteers(t *testing.T) {
 
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, termui.New(&out), nil) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(&out), nil, nil) }()
 
 	// Line 1 routes a drive; wait for Working.
 	r.next()
@@ -227,7 +228,7 @@ func TestChatREPLShutsDownOnCtxCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(ctx, sess, r, termui.New(io.Discard), nil) }()
+	go func() { done <- chatREPL(ctx, sess, r, termui.New(io.Discard), nil, nil) }()
 
 	// Cancel (Ctrl-C) and require a prompt return.
 	cancel()
@@ -253,7 +254,7 @@ func TestChatREPLStatusAndQuit(t *testing.T) {
 	r := newScriptReader("/status", "/quit")
 	var out strings.Builder
 	done := make(chan error, 1)
-	go func() { done <- chatREPL(context.Background(), sess, r, termui.New(&out), nil) }()
+	go func() { done <- chatREPL(context.Background(), sess, r, termui.New(&out), nil, nil) }()
 
 	r.next() // /status — reads phase, returns to prompt
 	r.next() // /quit — returns nil
@@ -665,6 +666,30 @@ func TestCapabilityForMode(t *testing.T) {
 				t.Errorf("%v: write-capable registry must advertise %q", m, name)
 			}
 		}
+	}
+}
+
+// TestChatNativeBackendOrientsAndCompacts locks FIX #24: the backend built for BOTH
+// `nilcore chat` and `nilcore tui` (chatNativeBackend) must wire the repo-orientation
+// map and the context-window resolver — exactly as buildBackend and the serve backend
+// do — so an interactive drive does not start blind (no repo map) and can proactively
+// compact (a non-nil CtxWindow) instead of only the one-shot overflow-400 recovery.
+func TestChatNativeBackendOrientsAndCompacts(t *testing.T) {
+	dir := t.TempDir()
+	d := chatDeps{
+		flags:    newChatFlags(dir),
+		provider: &chatFakeProvider{id: "fake"},
+		log:      newMemLog(t),
+		baseRepo: dir,
+	}
+	box := sandbox.NewContainer("podman", "img", dir)
+	n := chatNativeBackend(d, d.provider, advisorCfg{}, box, verify.Pass{}, session.NativeRun{Mode: session.ModeExecute})
+
+	if n.RepoContext == nil {
+		t.Error("RepoContext must be wired so the drive gets a repo map (not blind)")
+	}
+	if n.CtxWindow == nil {
+		t.Error("CtxWindow must be wired so the loop can proactively compact")
 	}
 }
 

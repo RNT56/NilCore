@@ -2,6 +2,9 @@ package server_test
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -265,6 +268,90 @@ func TestServeControlVerbPinsMode(t *testing.T) {
 	<-done
 }
 
+// TestServeApplyRefusedExplicitly locks FIX #17/#22 (b): /apply over a channel is
+// NEVER a silent no-op. It lands on the operator's real host HEAD (a local-only action
+// class, like /save, with no gate wiring on the serve path), so it is refused with an
+// explicit message rather than dropped.
+func TestServeApplyRefusedExplicitly(t *testing.T) {
+	fc := &fakeChannel{reqs: make(chan channel.TaskRequest, 2)}
+	drv := &blockingDriver{started: make(chan struct{}, 1), release: make(chan struct{}), steered: make(chan struct{}, 1)}
+	srv, _ := newServer(fc, allowlist{"u1": true}, drv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	fc.reqs <- channel.TaskRequest{Goal: "/apply", ThreadID: "t1", Sender: "u1"}
+	waitFor(t, func() bool { return fc.sawUpdateContaining("only available in the local terminal") },
+		"/apply over a channel did not reply (silent no-op)")
+
+	select {
+	case <-drv.started:
+		t.Fatal("/apply must not start a drive")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}
+
+// TestServeDiffNoBranchReplies locks FIX #16/#22 (b): /diff over a channel always
+// replies. With nothing kept it says so explicitly (never silent).
+func TestServeDiffNoBranchReplies(t *testing.T) {
+	fc := &fakeChannel{reqs: make(chan channel.TaskRequest, 2)}
+	drv := &blockingDriver{started: make(chan struct{}, 1), release: make(chan struct{}), steered: make(chan struct{}, 1)}
+	srv, _ := newServer(fc, allowlist{"u1": true}, drv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	fc.reqs <- channel.TaskRequest{Goal: "/diff", ThreadID: "t1", Sender: "u1"}
+	waitFor(t, func() bool { return fc.sawUpdateContaining("nothing to preview") },
+		"/diff with no kept branch did not reply (silent no-op)")
+
+	cancel()
+	<-done
+}
+
+// TestServeDiffPreviewsKeptBranch proves the acting arm of serve /diff: when a thread
+// carries a kept verified branch, /diff renders a bounded, read-only preview over the
+// channel (it never merges — that is /apply, which serve refuses).
+func TestServeDiffPreviewsKeptBranch(t *testing.T) {
+	repo := newServeGitRepo(t)
+	serveGitKeptBranch(t, repo, "nilcore/kept/serve-1", "changed\n")
+
+	fc := &fakeChannel{reqs: make(chan channel.TaskRequest, 2)}
+	rec := &factoryRec{sessions: map[string]*session.Session{}}
+	srv := &server.Server{
+		Channel: fc,
+		Auth:    allowlist{"u1": true},
+		NewSession: func(_ context.Context, threadID, sender string, out emit.Emitter, _ policy.Approver) *session.Session {
+			s := session.New(threadID, sender, repo, nil) // a real repo so /diff can render
+			s.State.Branch = "nilcore/kept/serve-1"       // a kept verified deliverable
+			s.Out = out
+			s.Router = fakeRouter{}
+			rec.mu.Lock()
+			rec.sessions[threadID] = s
+			rec.mu.Unlock()
+			return s
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	fc.reqs <- channel.TaskRequest{Goal: "/diff", ThreadID: "t1", Sender: "u1"}
+	waitFor(t, func() bool { return fc.sawUpdateContaining("nilcore/kept/serve-1") },
+		"/diff did not render the kept-branch preview")
+
+	cancel()
+	<-done
+}
+
 // TestUnauthorizedRefusedBeforeTurn proves the trust line: an unauthorized sender's
 // message is refused (logged + told) and NEVER reaches Turn — the driver is never
 // invoked, and no Session is created for the unauthorized sender's thread.
@@ -449,4 +536,48 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// --- git fixtures for the serve /diff acting-arm test --------------------------
+
+// serveGit runs raw git in dir for test fixture setup.
+func serveGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@nilcore.local",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@nilcore.local")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+// newServeGitRepo makes a repo on branch main with one committed file.
+func newServeGitRepo(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	serveGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serveGit(t, repo, "add", "-A")
+	serveGit(t, repo, "commit", "-q", "-m", "base")
+	return repo
+}
+
+// serveGitKeptBranch commits a change on branch and returns to main (a kept
+// verified branch that lands changes on the current HEAD).
+func serveGitKeptBranch(t *testing.T, repo, branch, body string) {
+	t.Helper()
+	serveGit(t, repo, "checkout", "-q", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serveGit(t, repo, "add", "-A")
+	serveGit(t, repo, "commit", "-q", "-m", "kept edit")
+	serveGit(t, repo, "checkout", "-q", "main")
 }

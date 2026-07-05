@@ -595,6 +595,65 @@ func TestSwarmNewLeavesHaveNoInit(t *testing.T) {
 	}
 }
 
+// TestShardRunCutsWorktreeFromBaseRef asserts the shardFn honors the harness-
+// resolved Shard.BaseRef as the worktree start-point (the dependency-aware base /
+// continue_from seam) instead of the old hard-coded "HEAD". Hermetic discriminator
+// (no sandbox needed): the worktree is cut BEFORE the nil-box fail-closed gate, so
+//
+//   - a shard with an UNRESOLVABLE BaseRef must fail AT THE CUT (a worktree error
+//     naming the start-point) — under the pre-fix hard-coded HEAD it would have
+//     sailed past the cut and failed later at the nil-box gate;
+//   - a shard whose BaseRef IS a real branch resolves the cut and fails at the
+//     nil-box gate ("no sandbox"), proving the ref was honored, not ignored.
+func TestShardRunCutsWorktreeFromBaseRef(t *testing.T) {
+	pre, _, err := preset.Resolve("ui")
+	if err != nil {
+		t.Fatalf("resolve ui: %v", err)
+	}
+	repo := newGoRepo(t)
+	// A "dependency branch" a dependent shard would be based on.
+	if out, err := exec.Command("git", "-C", repo, "branch", "dep-base").CombinedOutput(); err != nil {
+		t.Fatalf("git branch: %v (%s)", err, out)
+	}
+	sc := &shardContext{
+		deps:        swarmDeps{boot: testBoot(), log: discardLog(t)},
+		preset:      pre,
+		packName:    pre.VerifyPacks[0],
+		deliverable: deliverableSet{kind: pre.Kind},
+		pool:        testPool(t),
+		ledger:      budget.New(),
+		board:       newTestBoard(),
+		repo:        repo,
+		collateRoot: repo,
+		newEnv:      func(string) buildEnv { return buildEnv{Box: nil, Verifier: verify.Pass{}} },
+	}
+
+	// Unresolvable BaseRef ⇒ the failure happens AT the worktree cut and names it.
+	bad := sc.run(context.Background(), swarm.Shard{
+		ID: "swarm-test-base-0", Goal: "g", Kind: pre.Kind, Pack: pre.VerifyPacks[0],
+		Role: string(pre.Role), State: swarm.ShardQueued, BaseRef: "no-such-ref",
+	})
+	if bad.Passed {
+		t.Fatal("shard with an unresolvable BaseRef must not pass")
+	}
+	if bad.Err == nil || !strings.Contains(bad.Err.Error(), "worktree") || !strings.Contains(bad.Err.Error(), "no-such-ref") {
+		t.Fatalf("err = %v, want a worktree cut failure naming the BaseRef (proves the ref reached CreateFrom)", bad.Err)
+	}
+
+	// A real branch as BaseRef ⇒ the cut succeeds and the run proceeds to the
+	// nil-box fail-closed gate — the ref was honored.
+	good := sc.run(context.Background(), swarm.Shard{
+		ID: "swarm-test-base-1", Goal: "g", Kind: pre.Kind, Pack: pre.VerifyPacks[0],
+		Role: string(pre.Role), State: swarm.ShardQueued, BaseRef: "dep-base",
+	})
+	if good.Passed {
+		t.Fatal("nil-box shard must fail closed")
+	}
+	if good.Err == nil || !strings.Contains(good.Err.Error(), "no sandbox") {
+		t.Fatalf("err = %v, want the nil-box gate (the dep-base cut must have succeeded)", good.Err)
+	}
+}
+
 // --- test helpers -----------------------------------------------------------
 
 // testPool builds a real pool over the fake cred resolver (provider objects are

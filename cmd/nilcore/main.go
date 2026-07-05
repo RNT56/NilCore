@@ -1437,7 +1437,7 @@ func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) 
 	run := func(ctx context.Context, t backend.Task) (bool, error) {
 		newEnv := func(dir string) agent.Env {
 			box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
-			v := behavioralVerifier(box, *c.checkCmd)
+			v := orchestratorVerifier(box, *c.checkCmd, d.log, *c.logPath)
 			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo, d.boot.cfg)
 			return agent.Env{Backend: be, Verifier: v}
 		}
@@ -1634,8 +1634,10 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			applyContainerEgress(box, d.egress, d.egressProxyAddr, *d.flags.runtime)
 			applyContainerReadRoots(box, in.ReadRoots)
 			// Read-only modes ship nothing, so there is nothing to gate (I2) — a
-			// pass-through verifier; Execute/Auto get the real project verifier.
-			v := behavioralVerifier(box, *d.flags.checkCmd)
+			// pass-through verifier; Execute/Auto get the real project verifier
+			// (decorated with vcache/flake so serve drives get the same dedup + flake
+			// defusal as run).
+			v := orchestratorVerifier(box, *d.flags.checkCmd, d.log, *d.flags.logPath)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
@@ -1725,6 +1727,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if in.AskUser != nil {
 		n.AskUser = in.AskUser
 	}
+	// Same orientation + window seams as buildBackend's native case: serve/chat
+	// drives start with the map and compact before overflow, exactly like run.
+	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
+	n.CtxWindow = meter.CtxWindow
 	if adv.prov != nil {
 		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
@@ -2104,7 +2110,7 @@ func proxyBindAddr(prefer, runtime string) string {
 func envFactory(c commonFlags, prov model.Provider, cred func(string) string, adv advisorCfg, log *eventlog.Log, mem *memory.Memory, project string, cfg onboard.Config, blast *blastbudget.Budget) func(string) agent.Env {
 	return func(dir string) agent.Env {
 		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
-		v := behavioralVerifier(box, *c.checkCmd)
+		v := orchestratorVerifier(box, *c.checkCmd, log, *c.logPath)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project, cfg)
 		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
 		// the worktree checkout; load it once and prepend as trusted instructions on
@@ -2139,7 +2145,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 		}
 		adv := resolveAdvisor(name, b, c)
 		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
-		v := behavioralVerifier(box, *c.checkCmd)
+		v := orchestratorVerifier(box, *c.checkCmd, log, *c.logPath)
 		be := buildBackend(name, prov, b.cred, adv, box, v, log, *c.maxSteps, mem, project, b.cfg)
 		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
 		// once for the native backend (nil/empty ⇒ byte-identical; only native reads it).
@@ -2236,11 +2242,21 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			n.EscalateAfter = adv.escalateAfter
 		}
 		if mem != nil {
+			// Merged task-context view (LRN last mile): the lessons distiller writes
+			// to GLOBAL scope, so a project-only query would hide the agent's own
+			// distilled lessons. TaskContext folds both scopes under the same total
+			// record budget as before, newest-first, with the I7 labels intact.
 			n.MemoryContext = func(ctx context.Context, _ string) string {
-				blk, _ := mem.Context(ctx, memory.ScopeProject, project, "", 10)
+				blk, _ := mem.TaskContext(ctx, project, 10)
 				return blk
 			}
 		}
+		// Repo orientation + window awareness (upgrade program): the map spares the
+		// first steps of every drive from ls/cat structure discovery, and the window
+		// resolver lets the loop compact BEFORE a context overflow instead of dying
+		// on the 400. Both nil-safe seams; box.Workdir() is the per-task worktree.
+		n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
+		n.CtxWindow = meter.CtxWindow
 		// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
 		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
 		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;

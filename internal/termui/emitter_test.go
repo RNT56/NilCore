@@ -95,3 +95,64 @@ func TestConsoleEmitterNilSafe(t *testing.T) {
 	e.Emit(emit.Event{Kind: emit.KindToken, Text: "x"})
 	e.End() // none of these may panic
 }
+
+// A KindGate event carrying a structured GatePrompt renders the quote-railed
+// evidence block between the gate line and the y/n hint — with empty sections
+// skipped and the excerpt line-capped — while a payload-less gate keeps exactly
+// the two legacy lines (byte-identical fallback).
+func TestConsoleEmitterRendersGateEvidence(t *testing.T) {
+	var buf bytes.Buffer
+	e := NewEmitter(New(&buf), verb.Native)
+	e.Emit(emit.Event{Kind: emit.KindGate, Text: "promote-to-base main", Gate: &emit.GatePrompt{
+		Diffstat:   "2 file(s) changed, +9 −1\ninternal/x.go +9 −1",
+		VerifyTail: "all checks passed",
+		SpentUSD:   0.25,
+	}})
+	got := buf.String()
+	for _, want := range []string{
+		"⚠ GATE — irreversible: promote-to-base main",
+		"│ diffstat:",
+		"│ 2 file(s) changed, +9 −1",
+		"│ last verify (tail):",
+		"│ all checks passed",
+		"│ spend so far: $0.2500",
+		"approve? type y or n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gate evidence missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "diff excerpt") {
+		t.Errorf("empty excerpt section must be skipped:\n%s", got)
+	}
+
+	// Payload-less fallback: exactly the two legacy lines.
+	var buf2 bytes.Buffer
+	e2 := NewEmitter(New(&buf2), verb.Native)
+	e2.Emit(emit.Event{Kind: emit.KindGate, Text: "push main"})
+	want := "  ⚠ GATE — irreversible: push main\n  approve? type y or n\n"
+	if buf2.String() != want {
+		t.Errorf("payload-less gate drifted:\n got %q\nwant %q", buf2.String(), want)
+	}
+}
+
+// The evidence excerpt is line-capped with an explicit continuation marker so a
+// long diff never floods the conversation surface.
+func TestConsoleEmitterGateExcerptCapped(t *testing.T) {
+	var lines []string
+	for i := 0; i < maxGateExcerptLines+10; i++ {
+		lines = append(lines, "+padding")
+	}
+	var buf bytes.Buffer
+	e := NewEmitter(New(&buf), verb.Native)
+	e.Emit(emit.Event{Kind: emit.KindGate, Text: "promote", Gate: &emit.GatePrompt{
+		DiffExcerpt: strings.Join(lines, "\n"),
+	}})
+	got := buf.String()
+	if want := "(+10 more lines — see the gate prompt / event log)"; !strings.Contains(got, want) {
+		t.Errorf("missing cap marker %q in:\n%s", want, got)
+	}
+	if n := strings.Count(got, "+padding"); n != maxGateExcerptLines {
+		t.Errorf("excerpt lines rendered = %d, want %d", n, maxGateExcerptLines)
+	}
+}

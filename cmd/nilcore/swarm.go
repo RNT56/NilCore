@@ -50,6 +50,7 @@ import (
 	"nilcore/internal/planner"
 	"nilcore/internal/policy"
 	"nilcore/internal/pool"
+	"nilcore/internal/requeue"
 	"nilcore/internal/roster"
 	"nilcore/internal/spawn"
 	"nilcore/internal/store"
@@ -75,6 +76,7 @@ type swarmFlags struct {
 	artifact    *string
 	verifyPack  *string
 	passes      *string
+	retries     *int
 	budget      *float64
 	perShard    *float64
 
@@ -133,6 +135,7 @@ func registerSwarmFlags(fs *flag.FlagSet) swarmFlags {
 		artifact:      fs.String("artifact", "", "'+'-joined deliverables: report+matrix | spec | benchmark | dossier | json (default = the preset's Kind)"),
 		verifyPack:    fs.String("verify-pack", "", "override the preset's verify pack(s) (comma-separated)"),
 		passes:        fs.String("passes", "until-clean", "requeue passes: until-clean | <N>"),
+		retries:       fs.Int("retries", 2, "focused-retry budget per red claim / merge conflict (0 = a red claim is final)"),
 		budget:        fs.Float64("budget", 25.00, "global dollar ceiling for the whole run (a hard wall via the meter)"),
 		perShard:      fs.Float64("per-shard-budget", 0, "per-shard dollar ceiling (0 = no per-shard cap)"),
 		workerModel:   fs.String("worker-model", "", "provider:model for the cheap worker tier (empty = pool default)"),
@@ -168,15 +171,17 @@ func swarmMain(args []string) {
 	}
 
 	b := loadBoot(*sf.common.config)
-	applyConfigDefaults(sf.common, b.cfg, flagsSet(fs))
+	set := flagsSet(fs)
+	applyConfigDefaults(sf.common, b.cfg, set)
 	log := openLog(*sf.common.logPath)
 	defer log.Close()
 
 	swarmRun(swarmDeps{
-		flags: sf,
-		boot:  b,
-		log:   log,
-		dir:   mustAbs(*sf.common.dir),
+		flags:         sf,
+		boot:          b,
+		log:           log,
+		dir:           mustAbs(*sf.common.dir),
+		explicitFlags: set, // so an explicit --retries overrides the persisted ledger on --resume
 	})
 }
 
@@ -241,6 +246,13 @@ type swarmDeps struct {
 	// goal-based Sharder — so the caller's DependsOn edges become real Shard.Deps and the
 	// runner honors the DAG. nil (swarmMain) ⇒ the flag/preset-based sharder, unchanged.
 	tree *planner.Tree
+
+	// explicitFlags is the set of flag names the operator set on THIS invocation's command
+	// line (fs.Visit). buildSwarm reads it so an EXPLICIT --retries overrides the persisted
+	// ledger budget on --resume (Fix #13): without it, `state = *resumed` wholesale-adopts
+	// the old MaxAttempts and silently ignores a fresh --retries. nil ⇒ treat nothing as
+	// explicitly set (a test or a caller that did not thread the flag set, e.g. flows run).
+	explicitFlags map[string]bool
 }
 
 // swarmAssembly is the assembled swarm run: the Controller and the initial shard set
@@ -541,14 +553,42 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	// persisted SwarmState (pass counter / retry ledger / tip) forward, so the resumed
 	// run continues rather than re-deriving from scratch. ---
 	var initial []swarm.Shard
-	state := swarm.SwarmState{RunID: runID, Goal: *sf.goal, Preset: pre.Name}
+	// Ledger.MaxAttempts arms the focused-requeue + conflict-rebuild budget: with
+	// the historical zero, requeue was disabled entirely and "until-clean" was
+	// effectively single-pass for red shards (a gap the DAG-completion work
+	// surfaced). The --retries flag now sets it; 0 restores the old red-is-final.
+	state := swarm.SwarmState{RunID: runID, Goal: *sf.goal, Preset: pre.Name,
+		Ledger: requeue.Ledger{MaxAttempts: *sf.retries}}
 	if resumed != nil {
 		state = *resumed
-		failed, ferr := queue.Failed(context.Background(), &resumed.Ledger)
+		// Fix #13: `state = *resumed` adopts the PERSISTED Ledger.MaxAttempts wholesale, so
+		// a `--resume --retries N` would silently ignore N. When --retries was EXPLICITLY
+		// passed on THIS invocation, override the resumed budget with it (the operator asked
+		// for a different retry ceiling on the resume); otherwise the persisted value stands.
+		if d.explicitFlags["retries"] {
+			state.Ledger.MaxAttempts = *sf.retries
+		}
+		// Gate eligibility on state.Ledger (which now carries any --retries override), not the
+		// raw resumed one, so a widened budget actually re-admits shards the old ceiling had
+		// exhausted — the whole point of `--resume --retries N`.
+		failed, ferr := queue.Failed(context.Background(), &state.Ledger)
 		if ferr != nil {
 			return swarmAssembly{}, fmt.Errorf("swarm: resume: %w", ferr)
 		}
 		initial = failed
+		// Fix #10: a shard the interrupted process durably Marked StatusPassed whose branch
+		// was never folded (a crash between Mark and integrateGreen/SaveState, or a shard
+		// mid-conflict-rebuild) is NOT in queue.Failed (wrong status) and NOT in st.Merged —
+		// so a naive resume would leave its verified branch OFF the tip and exit 0 with the
+		// work silently dropped (I2). Re-seed those passed-but-unmerged shards as queued so
+		// the Controller re-runs and re-folds them (Release kept the branch; the Fn re-greens
+		// and integrateGreen lands it). A passed shard already in st.Merged is skipped — it
+		// is on the tip. resetForResume clears its terminal state so it dispatches afresh.
+		unfolded, uerr := resumeUnfoldedPassed(context.Background(), queue, resumed)
+		if uerr != nil {
+			return swarmAssembly{}, fmt.Errorf("swarm: resume: %w", uerr)
+		}
+		initial = append(initial, unfolded...)
 	} else {
 		shards, serr := buildInitialShards(context.Background(), d, sf, pre, deliverables, shardPack, pl, runID)
 		if serr != nil {
@@ -561,8 +601,14 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	}
 	bd.SetTotal(len(initial))
 
-	// --- the single human gate for the final promote (nil approver default-denies). ---
-	gate := buildGateFunc(swarmApprover(), d.log)
+	// --- the single human gate for the final promote (nil approver default-denies).
+	// Same evidence wiring as buildStack: the approver sees the promoted branch's
+	// diffstat + bounded excerpt and the run's spend at the moment of decision. No
+	// verify-tail recorder here — the swarm verifies per shard inside ShardFunc
+	// closures, so there is no single "last report" to show; the section stays
+	// empty and renderers skip it. ---
+	swarmDiffer := func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) }
+	gate := buildGateFuncEv(swarmApprover(), d.log, gateEvidenceFunc(swarmDiffer, nil, ledger))
 
 	return swarmAssembly{
 		controller:   controller,
@@ -694,11 +740,34 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		c.pool.SetShardCeiling(s.ID, c.perShard)
 	}
 
-	// One worktree per shard, branch task/<safe-id>, cut from the repo HEAD. The
-	// shared gitMu (build.go) serializes the worktree-add against concurrent shards.
+	// One worktree per ATTEMPT. The start-point honors the harness-resolved
+	// Shard.BaseRef — a dependency's verified branch, the integrated tip (multi-dep /
+	// conflict rebuild), or the shard's own preserved failed attempt (a focused
+	// retry's continue_from) — so a DAG dependent actually SEES the work it depends
+	// on instead of being cut blind from HEAD. Empty BaseRef ⇒ "HEAD", the prior
+	// behavior. The branch carries a fresh per-attempt suffix because Release KEEPS
+	// branches (that is what makes a preserved failed attempt continuable) and
+	// `worktree add -b` refuses an existing branch — a fixed name would fail every
+	// requeued attempt at the cut, and a retry must never advance the very ref its
+	// own base was cut from. The shared gitMu (build.go) serializes the worktree-add
+	// against concurrent shards.
+	startPoint := s.BaseRef
+	if startPoint == "" {
+		startPoint = "HEAD"
+	}
 	branch := "swarm/" + leafName(s.ID)
+	// Suffix the branch for any attempt that must NOT collide with an existing ref.
+	// s.Attempt>0 / s.BaseRef!="" catches an in-process retry or rebase. But a
+	// RESUME-LOADED pass-1 failure persists Attempt=0 and BaseRef="" (Fix #11), and its
+	// unsuffixed branch swarm/<leaf> ALREADY EXISTS from the prior process (Release keeps
+	// branches), so `git worktree add -b` would fail deterministically and the shard would
+	// recordFail without ever running. So also suffix whenever the target branch already
+	// exists — the branch check makes the resume-loaded case take a fresh, non-colliding ref.
+	if s.Attempt > 0 || s.BaseRef != "" || swarmBranchExists(ctx, c.repo, branch) {
+		branch += "-a" + shortID() // retry / rebased / resume-collision attempt: a fresh ref
+	}
 	gitMu.Lock()
-	wt, err := worktree.CreateFrom(ctx, c.repo, branch, leafName(s.ID), "HEAD")
+	wt, err := worktree.CreateFrom(ctx, c.repo, branch, leafName(s.ID), startPoint)
 	gitMu.Unlock()
 	if err != nil {
 		return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
@@ -752,15 +821,21 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	// Run the worker. A delegated coding backend (codex/claude-code) routes through
 	// buildBackend IN-BOX (I4); native runs through roster.NewWorker. Both are judged
 	// by the SAME governing verifier (gov) — the worker's self-report never ships (I2).
+	// The backend's prose Summary is captured (bounded) so a PASSED shard can hand its
+	// account to DAG dependents; it is model-authored prose the Controller's handoff
+	// digest fences via guard.Wrap (I7) — never a verdict, never control text.
+	var workerSummary string
 	goal := c.shardGoal(s)
 	task := backendTaskFor(s, goal, wt.Path())
 	if backendName := c.pool.CodeBackendFor(s.Role); backendName != "native" {
 		be := buildBackend(backendName, nil, c.deps.boot.cred, advisorCfg{}, env.Box, gov,
 			c.deps.log, defaultShardMaxSteps, nil, c.repo, c.deps.boot.cfg)
-		if _, rerr := be.Run(ctx, task); rerr != nil {
+		bres, rerr := be.Run(ctx, task)
+		if rerr != nil {
 			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("swarm shard: delegated backend: %w", rerr)})
 		}
+		workerSummary = bres.Summary
 	} else {
 		prof := c.preset.Profile
 		prof.Model = c.pool.WorkerFor(s.ID) // attach the LIVE worker provider (Resolve left it nil)
@@ -772,10 +847,12 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		// empty and keeps --network none.
 		prof.Egress = roster.EgressFor(prof, c.egress)
 		worker := roster.NewWorker(prof, env.Box, gov, c.deps.log, c.pool.WorkerFor(s.ID), nil)
-		if _, rerr := worker.Run(ctx, task); rerr != nil {
+		wres, rerr := worker.Run(ctx, task)
+		if rerr != nil {
 			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
 				Err: fmt.Errorf("swarm shard: worker: %w", rerr)})
 		}
+		workerSummary = wres.Summary
 	}
 
 	// The verifier — not the worker self-report — decides whether this shard ships (I2).
@@ -802,8 +879,10 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	}
 
 	// Green: the artifact is already collated above. On a code preset, commit the
-	// worktree and surface the branch for the Integrator.
-	res := spawn.Result{ID: s.ID, Passed: true, State: spawn.StatePassed}
+	// worktree and surface the branch for the Integrator. The bounded prose Summary
+	// rides along for the DAG handoff digest (fenced downstream — I7).
+	res := spawn.Result{ID: s.ID, Passed: true, State: spawn.StatePassed,
+		Summary: truncate(workerSummary, maxReportProseBytes)}
 	if c.preset.FanIn == preset.FanInMerge {
 		gitMu.Lock()
 		if _, _, cerr := wt.Commit(ctx, "feat("+leafName(s.ID)+"): "+truncate(goal, 60)); cerr == nil {
@@ -1044,6 +1123,49 @@ func loadResumeState(ctx context.Context, st *store.Store, log *eventlog.Log) (*
 	return &state, nil
 }
 
+// resumeUnfoldedPassed returns the run's durably-PASSED shards whose verified branch
+// never reached the integration tip (their id is NOT in the persisted SwarmState.Merged
+// set) — the shards a crash between Mark(passed) and integrateGreen/SaveState, or a
+// shard interrupted mid-conflict-rebuild, left stranded. queue.Failed does NOT return
+// them (they are in the swarm-passed status namespace, not swarm-failed), so without
+// this a resume would silently drop their verified work and exit 0 (I2, Fix #10). Each
+// is reset to a queued, first-attempt shard so the Controller re-runs and re-folds it
+// (Release kept the branch; the Fn re-greens and integrateGreen lands it). A nil/absent
+// resumed state means a fresh run — nothing to re-seed.
+func resumeUnfoldedPassed(ctx context.Context, q *swarm.Queue, resumed *swarm.SwarmState) ([]swarm.Shard, error) {
+	if resumed == nil {
+		return nil, nil
+	}
+	merged := make(map[string]bool, len(resumed.Merged))
+	for _, id := range resumed.Merged {
+		merged[id] = true
+	}
+	all, err := q.ShardsByRun(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resume: list shards: %w", err)
+	}
+	var out []swarm.Shard
+	for _, s := range all {
+		if s.State != swarm.ShardPassed || merged[s.ID] {
+			continue // not passed, or already folded onto the tip — nothing to re-fold
+		}
+		out = append(out, resetForResume(s))
+	}
+	return out, nil
+}
+
+// resetForResume re-arms a durably-passed-but-unfolded shard as a fresh queued,
+// first-attempt unit so the Controller dispatches it again. It clears the preserved
+// branch and base so the re-run cuts cleanly (the Fn mints a new branch on green) rather
+// than inheriting a stale ref, and zeroes Attempt so the retry budget starts fresh.
+func resetForResume(s swarm.Shard) swarm.Shard {
+	s.State = swarm.ShardQueued
+	s.Branch = ""
+	s.BaseRef = ""
+	s.Attempt = 0
+	return s
+}
+
 // boardMinInterval coalesces scoreboard_snapshot emits so a hot inner loop cannot
 // flood the log; the live==replay contract still holds (the LAST snapshot is final).
 const boardMinInterval = 250 * time.Millisecond
@@ -1055,6 +1177,24 @@ const defaultShardMaxSteps = 60
 // swarmRunID mints a short, process-unique run id for the swarm's shard/queue
 // namespace ("swarm/<runID>/<n>"). It reuses shortID's monotonic+nanosecond source.
 func swarmRunID() string { return "run-" + shortID() }
+
+// swarmBranchExists reports whether `branch` already exists in repo, via a hardened
+// `git rev-parse --verify` (I4 clamp, shared with the rest of cmd's host-side git). It
+// is used to decide whether a shard's target branch must take a fresh suffix: Release
+// keeps branches, so a resume-loaded pass-1 failure (persisted Attempt=0, BaseRef="")
+// would otherwise collide with its own prior unsuffixed branch and fail the worktree
+// add (Fix #11). A git error (missing ref, or any fault) is treated as "does not
+// exist" — the worktree-add then either succeeds on the clean name or fails loudly with
+// its own error, so a false negative never silently loses the shard.
+func swarmBranchExists(ctx context.Context, repo, branch string) bool {
+	if strings.TrimSpace(branch) == "" {
+		return false
+	}
+	// refs/heads/<branch> pins the lookup to a LOCAL branch, never a tag/remote of the
+	// same name, so the existence test matches exactly what `worktree add -b` would clash on.
+	err := hardenedGit(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch).Run()
+	return err == nil
+}
 
 // eventlogVerified reports whether the append-only log's hash chain verifies. A
 // broken chain forces the run RED (I5) — a swarm must not read green over a tampered

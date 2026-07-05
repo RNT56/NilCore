@@ -115,6 +115,17 @@ type SwarmState struct {
 	Pass   int            `json:"pass"`
 	Ledger requeue.Ledger `json:"ledger"`
 	TipSHA string         `json:"tip_sha,omitempty"`
+
+	// Merged is the set of shard ids whose verified branch has ALREADY been folded
+	// into the integration tip, in fold order. It is what lets integrateGreen fold
+	// only the NOT-yet-merged greens each pass (instead of re-merging the whole
+	// accumulated green set, spamming integration events) and what makes a green-
+	// but-unmerged shard (a merge conflict) DETECTABLE at termination (I2: verified
+	// work must never be silently dropped). Backward-compatible: absent in an old
+	// persisted blob ⇒ nil ⇒ nothing merged yet, which a resume reconciles by
+	// re-attempting the fold (the integrator is idempotent on an already-merged
+	// branch: it re-merges cleanly onto the tip that already contains it).
+	Merged []string `json:"merged,omitempty"`
 }
 
 // shardDetail is one shard's durable Detail blob: REFS + the verifier verdict, never
@@ -131,6 +142,7 @@ type shardDetail struct {
 	Deps    []string `json:"deps,omitempty"`
 	Attempt int      `json:"attempt"`
 	Branch  string   `json:"branch,omitempty"`
+	BaseRef string   `json:"base_ref,omitempty"`
 	Green   bool     `json:"green"`
 }
 
@@ -276,6 +288,7 @@ func (q *Queue) Mark(ctx context.Context, s Shard) error {
 	d.Deps = s.Deps
 	d.Attempt = s.Attempt
 	d.Branch = s.Branch
+	d.BaseRef = s.BaseRef
 	d.Green = (s.State == ShardPassed)
 
 	if err := q.putShard(ctx, s, d); err != nil {
@@ -297,6 +310,7 @@ func (q *Queue) writeShard(ctx context.Context, s Shard) error {
 		Deps:    s.Deps,
 		Attempt: s.Attempt,
 		Branch:  s.Branch,
+		BaseRef: s.BaseRef,
 		Green:   s.State == ShardPassed,
 	}
 	return q.putShard(ctx, s, d)
@@ -394,6 +408,7 @@ func shardFromRow(r store.Task) (Shard, error) {
 		State:   stateForStatus(r.Status),
 		Attempt: d.Attempt,
 		Branch:  d.Branch,
+		BaseRef: d.BaseRef,
 	}, nil
 }
 

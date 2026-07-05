@@ -69,6 +69,15 @@ type Shard struct {
 	State   ShardState    // current lifecycle state (set from verdict/scheduling)
 	Attempt int           // 0-based retry counter for this shard
 	Branch  string        // task branch the verified commit lives on (set on pass)
+
+	// BaseRef is the committish this shard's worktree is cut from. Empty means
+	// "HEAD" — the byte-identical prior behavior. The Controller/Runner set it so a
+	// DAG dependent is cut from its dependency's VERIFIED branch (single dep), from
+	// the integrated tip (multiple deps), from its own preserved failed-attempt
+	// branch (a focused retry, continue_from semantics), or from the integrated tip
+	// after a merge conflict (rebuild-on-tip). It is harness-authored routing data,
+	// never model-controlled (I7).
+	BaseRef string
 }
 
 // toSubtask maps a Shard DOWN to the frozen spawn.Subtask the existing scheduler

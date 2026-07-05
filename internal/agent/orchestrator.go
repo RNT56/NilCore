@@ -14,6 +14,7 @@ import (
 
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/guard"
 	"nilcore/internal/policy"
 	"nilcore/internal/project"
 	"nilcore/internal/route"
@@ -382,13 +383,22 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	if err != nil {
 		return Outcome{Backend: res.Backend, Summary: res.Summary}, fmt.Errorf("final verify: %w", err)
 	}
-	finalDetail := map[string]any{"passed": rep.Passed}
+	// Detail["class"] is the deterministic task-class bucket (trust.Classify), added
+	// ADDITIVELY (I5) so trust.Replay can fold this final_verify — the one per-task
+	// verifier verdict every deployment emits — into the per-(class, backend) trust
+	// cell. Backend attribution rides the event's existing top-level Backend field
+	// (res.Backend), the same field race_outcome uses, so no Detail["backend"] is
+	// needed. The class is a routing hint only; it never judges work (I2).
+	finalDetail := map[string]any{"passed": rep.Passed, "class": trust.Classify(t.Goal)}
+	failClass := ""
 	if !rep.Passed {
 		// LRN-T01: tag a failure with its STRUCTURAL fail-class (build/test/lint/…) so the
 		// distiller/lessons learning pipeline clusters by real class instead of bucketing
 		// everything as "unknown". Derived from the report's shape, never raw output (I7);
-		// empty on a pass, so it is added only to a failure.
-		finalDetail["fail_class"] = verify.FailClass(rep)
+		// empty on a pass, so it is added only to a failure. Kept in a local so the race
+		// escalation below can thread the same class to the racers.
+		failClass = verify.FailClass(rep)
+		finalDetail["fail_class"] = failClass
 	}
 	o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "final_verify", Detail: finalDetail})
 
@@ -406,7 +416,16 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	// and the race agree on N.
 	raceN := OracleRaceN(o.Oracle, trust.Classify(t.Goal), o.RaceN)
 	if !rep.Passed && (raceN > 1 || o.multiBackend()) {
-		if rout, ok := o.raceEscalate(ctx, t, raceN); ok {
+		// Thread the failed attempt's verifier evidence into the racers: without it
+		// every candidate receives the IDENTICAL blind Task and predictably repeats
+		// the first attempt's mistake — N expensive attempts, zero new information.
+		// One extra Constraints line (an EXISTING Task field — the contract stays
+		// frozen, I1) carries the structural fail-class and a bounded, fenced tail of
+		// the verifier output. rt is a value copy and withFailureEvidence copies the
+		// slice, so the caller's Task is never mutated.
+		rt := t
+		rt.Constraints = withFailureEvidence(t.Constraints, failClass, rep.Output)
+		if rout, ok := o.raceEscalate(ctx, rt, raceN); ok {
 			return rout, nil
 		}
 	}
@@ -555,6 +574,38 @@ func (o *Orchestrator) raceEscalateDetail(class string, base map[string]any, nam
 		base["cost"] = costs
 	}
 	return base
+}
+
+// raceEvidenceTailBytes bounds the verifier-output tail threaded into the race
+// candidates' constraints, so a huge verifier dump can never bloat every racer's
+// prompt. ~1500 bytes keeps the actionable tail (Go toolchain and test failures
+// end with the failing file:line) while staying a small fraction of any prompt.
+// The bound mirrors the verify package's own tail() shape (which is unexported).
+const raceEvidenceTailBytes = 1500
+
+// withFailureEvidence returns a COPY of constraints with ONE extra entry carrying
+// the failed first attempt's verifier evidence to the race candidates: the
+// structural fail-class and a bounded tail of the verifier output. Constraints
+// already surface to the model (the native loop appends them to the task prompt),
+// so this reaches the racers with no contract change (I1).
+//
+// I7 discipline: the framing sentence is HARNESS-authored control text, and the
+// two values embedded in it keep their trust levels straight — failClass is drawn
+// from verify.FailClass's FIXED vocabulary (harness-assigned, never raw output),
+// while the verifier tail (which echoes compiler/test output derived from repo
+// content — untrusted) goes INSIDE a guard.Wrap fence, so it stays data, never
+// instructions. Copying (never appending in place) keeps the caller's slice — and
+// any backing array shared with it — unmutated.
+func withFailureEvidence(constraints []string, failClass, verifierOutput string) []string {
+	tail := verifierOutput
+	if len(tail) > raceEvidenceTailBytes {
+		tail = "...(truncated)...\n" + tail[len(tail)-raceEvidenceTailBytes:]
+	}
+	line := fmt.Sprintf("a previous attempt failed verification (class=%s); verifier tail: %s",
+		failClass, guard.Wrap("verifier output", tail))
+	out := make([]string, 0, len(constraints)+1)
+	out = append(out, constraints...)
+	return append(out, line)
 }
 
 // runRace is the shared tail of both raceEscalate paths: judge the candidates by

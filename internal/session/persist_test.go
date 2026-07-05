@@ -357,3 +357,67 @@ func TestSessionWorkStateRoundTripsAndContinues(t *testing.T) {
 	close(contDrv.release)
 	s2.Wait()
 }
+
+// --- delivery loop: the kept verified branch survives a restart -----------------
+
+// TestKeptBranchRoundTrip is the delivery-loop persistence contract: a verified
+// drive's KEPT branch (DriveResult.Branch → WorkState.Branch) is persisted, a
+// restarted session restores it (so /diff and /apply keep working), and
+// ClearKeptBranch — the /apply-landed epilogue — clears it durably so a second
+// restart does not resurrect an already-merged branch.
+func TestKeptBranchRoundTrip(t *testing.T) {
+	st := newFakeStore()
+	ctx := context.Background()
+
+	drv := newFakeDriver(DriveResult{
+		Summary:  summarize.ContextSummary{Goal: "fix the typo"},
+		Branch:   "nilcore/kept/chat-local-1",
+		Verified: true,
+	})
+	s1 := New("conv-kept", "local", "/repo", nil)
+	s1.Store = st
+	s1.Router = &fakeRouter{route: RouteNative}
+	s1.Drivers = Drivers{Native: drv}
+	if err := s1.Turn(ctx, "fix the typo"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	<-drv.started
+	close(drv.release)
+	s1.Wait()
+	if got := s1.KeptBranch(); got != "nilcore/kept/chat-local-1" {
+		t.Fatalf("KeptBranch after fold = %q, want the kept branch", got)
+	}
+
+	// Restart: the kept branch must come back with the bounded state.
+	s2 := New("conv-kept", "local", "/repo", nil)
+	s2.Store = st
+	if !s2.Restore(ctx) {
+		t.Fatal("Restore reported restored=false after a persisted kept branch")
+	}
+	if got := s2.KeptBranch(); got != "nilcore/kept/chat-local-1" {
+		t.Fatalf("restored KeptBranch = %q, want the kept branch", got)
+	}
+
+	// /apply landed it: ClearKeptBranch clears AND persists the cleared state.
+	s2.ClearKeptBranch(ctx)
+	if got := s2.KeptBranch(); got != "" {
+		t.Fatalf("KeptBranch after clear = %q, want empty", got)
+	}
+	s3 := New("conv-kept", "local", "/repo", nil)
+	s3.Store = st
+	s3.Restore(ctx)
+	if got := s3.KeptBranch(); got != "" {
+		t.Fatalf("KeptBranch resurrected after clear+restart: %q", got)
+	}
+}
+
+// ClearKeptBranch with nothing carried is a no-op: no persist, no event.
+func TestClearKeptBranchEmptyNoop(t *testing.T) {
+	st := newFakeStore()
+	s := New("conv-noop", "local", "/repo", nil)
+	s.Store = st
+	s.ClearKeptBranch(context.Background())
+	if st.saveCount() != 0 {
+		t.Fatalf("ClearKeptBranch on an empty branch persisted %d times, want 0", st.saveCount())
+	}
+}

@@ -879,6 +879,12 @@ func stopReasonFromFinish(finish string) string {
 		return "tool_use"
 	case "stop":
 		return "end_turn"
+	case "length":
+		// OpenAI/OpenRouter/compat report output-limit truncation as "length";
+		// canonicalize to "max_tokens" so native.go's truncation salvage (gated on
+		// StopReason == "max_tokens") fires here as it does on Anthropic — without
+		// this the truncated turn only trips the "No tool call detected" nudge.
+		return "max_tokens"
 	default:
 		return finish
 	}

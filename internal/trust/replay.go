@@ -18,13 +18,14 @@ import (
 // self-eval suite (dozens of cases), so a legitimate report is never skipped.
 const maxSelfevalCases = 100000
 
-// raceEvent mirrors only the fields of an on-disk eventlog.Event that a
-// race_outcome carries trust signal in: the Backend that raced, the verifier's
-// pass/fail verdict (Detail["passed"]), and — added in Phase 16 — the task-class
-// bucket (Detail["class"]) and verifier-judged cost (Detail["cost"]) the router
-// writes. Every other field (time, seq, hash, …) is ignored by encoding/json —
-// the chain integrity is eventlog.Verify's job, not ours.
-type raceEvent struct {
+// trustEvent mirrors only the fields of an on-disk eventlog.Event that a
+// trust-bearing event (race_outcome, final_verify, selfeval_report) carries
+// signal in: the Backend it attributes, the verifier's pass/fail verdict
+// (Detail["passed"]), and — added in Phase 16 — the task-class bucket
+// (Detail["class"]) and verifier-judged cost (Detail["cost"]). Every other field
+// (time, seq, hash, …) is ignored by encoding/json — the chain integrity is
+// eventlog.Verify's job, not ours.
+type trustEvent struct {
 	Kind    string         `json:"kind"`
 	Backend string         `json:"backend"`
 	Detail  map[string]any `json:"detail"`
@@ -32,7 +33,10 @@ type raceEvent struct {
 
 // Replay builds a Ledger by replaying the append-only event log at logPath
 // READ-ONLY: it scans every JSONL line, folds each `race_outcome` event (Backend
-// + the verifier's Detail["passed"] verdict) into the per-backend scoreboard,
+// + the verifier's Detail["passed"] verdict) and each class-tagged `final_verify`
+// event (the orchestrator's one per-task final verifier verdict — the signal that
+// warms per-class cells on single-backend deployments, where races may never fire)
+// into the per-backend scoreboard,
 // then — and only then — runs eventlog.Verify on the same file. If the hash chain
 // is broken (tampered, reordered, dropped, or corrupt) it returns Verify's error
 // and a nil ledger: a log we cannot trust yields NO trustworthy ranking, so we
@@ -62,7 +66,7 @@ func Replay(logPath string) (*Ledger, error) {
 		if len(line) == 0 {
 			continue
 		}
-		var e raceEvent
+		var e trustEvent
 		if err := json.Unmarshal(line, &e); err != nil {
 			return nil, fmt.Errorf("event %d: parsing line: %w", n, err)
 		}
@@ -80,6 +84,33 @@ func Replay(logPath string) (*Ledger, error) {
 			class, _ := e.Detail["class"].(string)
 			cost, _ := e.Detail["cost"].(float64)
 			l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed, Cost: cost})
+		case "final_verify":
+			// The orchestrator's one per-task FINAL verifier verdict, class-tagged since
+			// Phase 16 upgrade. Folding it alongside race_outcome does NOT double-count a
+			// verified attempt: final_verify is emitted exactly ONCE per task, BEFORE any
+			// race escalation, and describes the FIRST attempt in its own worktree; every
+			// race_outcome describes a DIFFERENT, fresh attempt (a new run in a new
+			// worktree — even the same backend re-racing is a new sample). So each folded
+			// Outcome is one distinct verifier judgement, counted once.
+			//
+			// All three attribution fields are guarded, skip-not-panic, because a log
+			// line is untrusted until the chain check below passes (the forged-count
+			// lesson: never trust a field before allocating/acting on it):
+			//   - Backend must be present (an unattributable verdict carries no signal;
+			//     it rides the event's top-level backend field, same as race_outcome);
+			//   - Detail["class"] must be a non-empty string — a class-less final_verify
+			//     is the PRE-upgrade shape, and skipping it keeps old logs replaying to
+			//     the byte-identical ledger they produced before this fold existed;
+			//   - Detail["passed"] must be a real JSON bool. Unlike race_outcome (where a
+			//     missing verdict fails safe to "not a win"), a defaulted false HERE would
+			//     poison a backend's standing with a fabricated loss, so a garbage or
+			//     missing verdict skips the event entirely.
+			class, _ := e.Detail["class"].(string)
+			passed, ok := e.Detail["passed"].(bool)
+			if e.Backend == "" || class == "" || !ok {
+				continue
+			}
+			l.Record(Outcome{Backend: e.Backend, Class: class, Passed: passed})
 		case "selfeval_report":
 			// A verifier-judged self-eval report (emitted by flywheel selfeval.Fold ONLY
 			// over a verified chain, I5, and only for a verifier-judged report, I2) folds

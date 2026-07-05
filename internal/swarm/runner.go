@@ -125,6 +125,14 @@ func (r *Runner) runFlat(ctx context.Context, shards []Shard) map[string]spawn.R
 // extra locking here. RunSub adapts Fn over toSubtask — but Fn needs the full Shard
 // (Kind/Pack/Role route the verifier), so we look the Shard back up by id rather than
 // reconstruct it from the lossy Subtask.
+//
+// INTRA-PASS HANDOFF: before a dependent's Fn runs, its same-pass dependencies'
+// results (recorded in `done` under mu) resolve its BaseRef + goal digest via
+// resolveIntraPass — so a dependent released in a later wave is CUT FROM its
+// dependency's verified branch and told what the dependency established, rather
+// than being ordered-but-blind. The scheduler releases a node only after all its
+// deps completed, so the dep results are always recorded by the time the
+// dependent's RunSub runs; mu makes the map's cross-goroutine hand-off safe.
 func (r *Runner) runDAG(ctx context.Context, shards []Shard) map[string]spawn.Result {
 	byID := make(map[string]Shard, len(shards))
 	subs := make([]spawn.Subtask, 0, len(shards))
@@ -132,6 +140,9 @@ func (r *Runner) runDAG(ctx context.Context, shards []Shard) map[string]spawn.Re
 		byID[shards[i].ID] = shards[i]
 		subs = append(subs, toSubtask(shards[i]))
 	}
+
+	var mu sync.Mutex
+	done := make(map[string]spawn.Result, len(shards))
 
 	dag := spawn.DAGScheduler{
 		MaxConcurrent: r.Concurrency,
@@ -146,7 +157,14 @@ func (r *Runner) runDAG(ctx context.Context, shards []Shard) map[string]spawn.Re
 				return spawn.Result{ID: st.ID, Passed: false,
 					Err: fmt.Errorf("swarm runner: no shard for subtask %q", st.ID)}
 			}
-			return r.safeFn(rctx, s)
+			mu.Lock()
+			resolveIntraPass(&s, done)
+			mu.Unlock()
+			res := r.safeFn(rctx, s)
+			mu.Lock()
+			done[st.ID] = res
+			mu.Unlock()
+			return res
 		},
 	}
 	return dag.Run(ctx, subs)

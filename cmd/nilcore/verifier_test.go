@@ -12,6 +12,7 @@ import (
 	"nilcore/internal/eventlog"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/verify"
+	"nilcore/internal/verify/vcache"
 )
 
 // fakeVerifierBox is a hermetic sandbox.Sandbox stand-in for the wiring tests. Its
@@ -39,9 +40,39 @@ func (b *fakeVerifierBox) ExecWithEnv(_ context.Context, cmd string, env map[str
 
 func (b *fakeVerifierBox) Workdir() string { return b.dir }
 
-// TestVcacheDecorateGating proves the LRN-T05 verify-cache wiring is default-off
-// byte-identical and only wraps when fully opted in. The cache MECHANICS are tested in
-// internal/verify/vcache; here we only assert the gate the cmd layer owns.
+// setVerifyFlags pins all three decorator escape hatches for a subtest so no
+// ambient env leaks into the chain-shape assertions.
+func setVerifyFlags(t *testing.T, vcacheV, flakeV, tieredV string) {
+	t.Helper()
+	t.Setenv("NILCORE_VCACHE", vcacheV)
+	t.Setenv("NILCORE_FLAKEPROBE", flakeV)
+	t.Setenv("NILCORE_TIERED_VERIFY", tieredV)
+}
+
+// TestVerifyFlagEnabled pins the default-on parse idiom (mirrors NILCORE_KERNEL):
+// unset/anything ⇒ on; 0/off/false/no (any case/space) ⇒ off.
+func TestVerifyFlagEnabled(t *testing.T) {
+	tests := []struct {
+		val  string
+		want bool
+	}{
+		{"", true}, {"1", true}, {"yes", true}, {"on", true}, {"garbage", true},
+		{"0", false}, {"off", false}, {"false", false}, {"no", false},
+		{"OFF", false}, {" No ", false}, {"False", false},
+	}
+	for _, tc := range tests {
+		t.Setenv("NILCORE_VCACHE", tc.val)
+		if got := verifyFlagEnabled("NILCORE_VCACHE"); got != tc.want {
+			t.Errorf("verifyFlagEnabled(%q) = %v, want %v", tc.val, got, tc.want)
+		}
+	}
+}
+
+// TestVcacheDecorateGating proves the vcache stage is DEFAULT-ON (kernel
+// precedent), =0 is the escape hatch, and a missing input skips the stage. The
+// cache MECHANICS are tested in internal/verify/vcache; here we only assert the
+// gate the cmd layer owns. The other two stages are pinned OFF so this test sees
+// the vcache stage in isolation.
 func TestVcacheDecorateGating(t *testing.T) {
 	dir := t.TempDir()
 	box := &fakeVerifierBox{dir: dir}
@@ -53,13 +84,23 @@ func TestVcacheDecorateGating(t *testing.T) {
 	}
 	defer log.Close()
 
-	// Default-off: NILCORE_VCACHE unset ⇒ the base verifier is returned UNCHANGED.
-	t.Setenv("NILCORE_VCACHE", "")
-	if got := vcacheDecorate(base, box, "true", log, logPath); got != verify.Verifier(base) {
-		t.Fatal("NILCORE_VCACHE unset must return the base verifier unchanged (byte-identical)")
+	setVerifyFlags(t, "", "0", "0")
+	// DEFAULT-ON: env unset with a full config ⇒ a wrapped cache verifier.
+	if _, ok := vcacheDecorate(base, box, "true", log, logPath).(*vcache.Cache); !ok {
+		t.Fatal("NILCORE_VCACHE unset must default ON (wrap in *vcache.Cache)")
 	}
+	// Legacy opt-in value keeps working.
 	t.Setenv("NILCORE_VCACHE", "1")
-	// Opted in but missing a required input ⇒ still unchanged (cannot record/verify safely).
+	if _, ok := vcacheDecorate(base, box, "true", log, logPath).(*vcache.Cache); !ok {
+		t.Fatal("NILCORE_VCACHE=1 must keep the cache on")
+	}
+	// The escape hatch: =0 ⇒ base unchanged, byte-identical.
+	t.Setenv("NILCORE_VCACHE", "0")
+	if got := vcacheDecorate(base, box, "true", log, logPath); got != verify.Verifier(base) {
+		t.Fatal("NILCORE_VCACHE=0 must return the base verifier unchanged (byte-identical)")
+	}
+	// On but missing a required input ⇒ the stage is skipped (cannot record/verify safely).
+	t.Setenv("NILCORE_VCACHE", "")
 	if got := vcacheDecorate(base, box, "true", nil, logPath); got != verify.Verifier(base) {
 		t.Fatal("a nil log must return base unchanged")
 	}
@@ -69,9 +110,425 @@ func TestVcacheDecorateGating(t *testing.T) {
 	if got := vcacheDecorate(base, &fakeVerifierBox{dir: ""}, "true", log, logPath); got != verify.Verifier(base) {
 		t.Fatal("an empty workdir must return base unchanged")
 	}
-	// Fully opted in ⇒ a WRAPPED cache verifier, not the bare base.
-	if got := vcacheDecorate(base, box, "true", log, logPath); got == verify.Verifier(base) {
-		t.Fatal("NILCORE_VCACHE on with a full config must wrap the verifier")
+}
+
+// TestVerifyDecoratorChain pins the composed chain's shape and each stage's
+// escape hatch: tiered OUTERMOST, then flakeprobe, then vcache hugging base
+// (see vcacheDecorate for the order rationale), every stage default-on and
+// individually disabled by =0.
+func TestVerifyDecoratorChain(t *testing.T) {
+	dir := t.TempDir()
+	box := &fakeVerifierBox{dir: dir}
+	// A SOUND go-test command so the tiered layer can arm when it is opted in; the
+	// tiered flag is passed "1" in the subtests that expect the wrap (it is opt-in).
+	const cmd = "go test ./..."
+	base := verify.New(box, cmd)
+	logPath := filepath.Join(dir, "e.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	t.Run("tiered opted in => tiered(flakeprobe(vcache(base)))", func(t *testing.T) {
+		setVerifyFlags(t, "", "", "1")
+		got := vcacheDecorate(base, box, cmd, log, logPath)
+		tv, ok := got.(*verify.TieredVerifier)
+		if !ok {
+			t.Fatalf("outermost must be *verify.TieredVerifier, got %T", got)
+		}
+		if tv.ScopedRed == nil {
+			t.Fatal("the tiered wrap must carry a ScopedRed seam")
+		}
+		fp, ok := tv.Full.(*verify.FlakeProbe)
+		if !ok {
+			t.Fatalf("tiered.Full must be *verify.FlakeProbe, got %T", tv.Full)
+		}
+		if fp.OnFlaky == nil {
+			t.Fatal("a non-nil log must wire OnFlaky to the eventlog")
+		}
+		if _, ok := fp.Inner.(*vcache.Cache); !ok {
+			t.Fatalf("flakeprobe.Inner must be *vcache.Cache (innermost), got %T", fp.Inner)
+		}
+		// The wired callback appends the additive verify_flaky kind (I5) with the
+		// structural fail-class + content hash.
+		fp.OnFlaky("test", "hash123abc")
+		body := readFile(t, logPath)
+		for _, want := range []string{"verify_flaky", "hash123abc", "fail_class"} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("expected %q in the event log, got:\n%s", want, body)
+			}
+		}
+	})
+	t.Run("tiered default-off => probe outermost (no tiered layer)", func(t *testing.T) {
+		setVerifyFlags(t, "", "", "")
+		got := vcacheDecorate(base, box, cmd, log, logPath)
+		if _, ok := got.(*verify.FlakeProbe); !ok {
+			t.Fatalf("outermost must be *verify.FlakeProbe with tiered off by default, got %T", got)
+		}
+	})
+	t.Run("NILCORE_FLAKEPROBE=0 strips only the probe layer", func(t *testing.T) {
+		setVerifyFlags(t, "", "0", "1")
+		got := vcacheDecorate(base, box, cmd, log, logPath)
+		tv, ok := got.(*verify.TieredVerifier)
+		if !ok {
+			t.Fatalf("outermost must be *verify.TieredVerifier, got %T", got)
+		}
+		if _, ok := tv.Full.(*vcache.Cache); !ok {
+			t.Fatalf("tiered.Full must be *vcache.Cache with the probe off, got %T", tv.Full)
+		}
+	})
+	t.Run("all off => base unchanged (byte-identical escape hatch)", func(t *testing.T) {
+		setVerifyFlags(t, "0", "0", "0")
+		if got := vcacheDecorate(base, box, cmd, log, logPath); got != verify.Verifier(base) {
+			t.Fatal("all flags off must return base unchanged")
+		}
+	})
+	t.Run("nil log skips vcache + OnFlaky but keeps the probe", func(t *testing.T) {
+		setVerifyFlags(t, "", "", "0")
+		got := vcacheDecorate(base, box, cmd, nil, logPath)
+		fp, ok := got.(*verify.FlakeProbe)
+		if !ok {
+			t.Fatalf("outermost must be *verify.FlakeProbe, got %T", got)
+		}
+		if fp.Inner != verify.Verifier(base) {
+			t.Fatalf("with no log, flakeprobe must hug base directly, got %T", fp.Inner)
+		}
+		if fp.OnFlaky != nil {
+			t.Fatal("with no log there is nothing to wire OnFlaky to")
+		}
+	})
+}
+
+// TestTieredSoundnessGate proves the hardened I2-soundness gate: the tiered wrap
+// arms ONLY for a full-module `go test ./...` invocation — an opaque "make verify"
+// (unknown recipe) and a single-package `go test` are NOT sound and stay unwrapped.
+func TestTieredSoundnessGate(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		want bool
+	}{
+		{"go build ./... && go test ./...", true}, // verify.Detect's go.mod fallback
+		{"go test ./...", true},
+		{"gofmt -l . && go test -race ./...", true},
+		{"/usr/local/go/bin/go test ./...", true}, // path-invoked go is still go
+		{"go test -short -tags integration ./...", true},
+		{"make verify", false}, // opaque recipe: might run no tests / different flags ⇒ NOT sound
+		{"  make verify  ", false},
+		{"go test ./pkg", false}, // single-package run: scoped red need not be a subset of it
+		{"go test ./internal/foo", false},
+		{"true", false}, // verify.Detect's unknown-repo fallback
+		{"npm test", false},
+		{"cargo test ./...", false}, // "car|go test" — the go-test word-boundary check refuses it
+		{"mongo test", false},
+		{"pytest", false},
+		{"make check", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := tieredSound(tc.cmd); got != tc.want {
+			t.Errorf("tieredSound(%q) = %v, want %v", tc.cmd, got, tc.want)
+		}
+	}
+
+	// And the wiring honors it: an opaque "make verify" leaves the chain untiered
+	// even with the tiered flag opted in.
+	dir := t.TempDir()
+	box := &fakeVerifierBox{dir: dir}
+	base := verify.New(box, "make verify")
+	setVerifyFlags(t, "0", "", "1")
+	got := vcacheDecorate(base, box, "make verify", nil, "")
+	if _, ok := got.(*verify.TieredVerifier); ok {
+		t.Fatal("an opaque make-verify command must never be tiered-wrapped (soundness gate)")
+	}
+	if _, ok := got.(*verify.FlakeProbe); !ok {
+		t.Fatalf("the probe (command-agnostic) must still wrap, got %T", got)
+	}
+}
+
+// TestTieredVerifyOptIn pins the DEFAULT-OFF posture: the tiered layer wraps ONLY
+// when NILCORE_TIERED_VERIFY=1 is set (a sound go-test command); unset/anything else
+// leaves the chain untiered while vcache + flakeprobe stay default-on.
+func TestTieredVerifyOptIn(t *testing.T) {
+	dir := t.TempDir()
+	box := &fakeVerifierBox{dir: dir}
+	const cmd = "go test ./..." // a SOUND command, so only the opt-in flag decides
+	base := verify.New(box, cmd)
+
+	// Default (unset): NOT wrapped — the tiered fast path is opt-in.
+	setVerifyFlags(t, "0", "0", "")
+	if got := vcacheDecorate(base, box, cmd, nil, ""); base != got {
+		t.Fatalf("NILCORE_TIERED_VERIFY unset must NOT tier-wrap (opt-in); got %T", got)
+	}
+	// A non-opt-in value ("on the fence") is still off — only 1/on/true/yes arm it.
+	for _, off := range []string{"0", "off", "no", "garbage", "2"} {
+		setVerifyFlags(t, "0", "0", off)
+		if _, ok := vcacheDecorate(base, box, cmd, nil, "").(*verify.TieredVerifier); ok {
+			t.Fatalf("NILCORE_TIERED_VERIFY=%q must NOT arm the tiered wrap", off)
+		}
+	}
+	// The opt-in: =1 (and its synonyms) arm the tiered wrap over a sound command.
+	for _, on := range []string{"1", "on", "true", "yes", "TRUE"} {
+		setVerifyFlags(t, "0", "0", on)
+		if _, ok := vcacheDecorate(base, box, cmd, nil, "").(*verify.TieredVerifier); !ok {
+			t.Fatalf("NILCORE_TIERED_VERIFY=%q must arm the tiered wrap", on)
+		}
+	}
+}
+
+// scriptedExecBox replays one sandbox.Result (or error) per Exec call, recording
+// the command lines — hermetic plumbing for the scopedRedFunc tests.
+type scriptedExecBox struct {
+	dir  string
+	res  []sandbox.Result
+	errs []error
+	cmds []string
+}
+
+func (b *scriptedExecBox) Exec(_ context.Context, cmd string) (sandbox.Result, error) {
+	i := len(b.cmds)
+	b.cmds = append(b.cmds, cmd)
+	var r sandbox.Result
+	if i < len(b.res) {
+		r = b.res[i]
+	}
+	var e error
+	if i < len(b.errs) {
+		e = b.errs[i]
+	}
+	return r, e
+}
+
+func (b *scriptedExecBox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
+	return b.Exec(ctx, cmd)
+}
+
+func (b *scriptedExecBox) Workdir() string { return b.dir }
+
+// scopedTestTree creates a worktree root holding foo/ and bar/ Go packages plus a
+// root-level main.go, so the host-side existence probe has something real to read.
+func scopedTestTree(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, p := range []string{"foo/a.go", "bar/b.go", "main.go"} {
+		full := filepath.Join(root, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestScopedRedFunc drives the wired ScopedRed seam end to end over a scripted
+// sandbox: touched-package discovery, the targeted command shape (vet only for the
+// make-verify family), and the fall-through semantics on every inconclusive path.
+func TestScopedRedFunc(t *testing.T) {
+	const goDefault = "go build ./... && go test ./..."
+
+	t.Run("scoped red on a touched package", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\n"},
+			{ExitCode: 1, Stdout: "--- FAIL: TestX\nFAIL\tnilcore/foo"},
+		}}
+		failed, out, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || !failed {
+			t.Fatalf("want failed=true, got failed=%v err=%v", failed, err)
+		}
+		if !strings.Contains(out, "FAIL") {
+			t.Fatalf("scoped output must carry the failure, got %q", out)
+		}
+		if want := "go test ./foo"; box.cmds[1] != want {
+			t.Fatalf("scoped cmd = %q, want %q (no vet for a command that does not run vet)", box.cmds[1], want)
+		}
+	})
+	t.Run("explicit go vet in the command folds vet in", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\nbar/b.go\nmain.go\n"},
+			{ExitCode: 0},
+		}}
+		// A command that visibly runs vet AND is full-module go test.
+		failed, _, err := scopedRedFunc(box, "go vet ./... && go test ./...")(context.Background())
+		if err != nil || failed {
+			t.Fatalf("green scoped run must report failed=false, got failed=%v err=%v", failed, err)
+		}
+		// Dirs deduped, sorted, root as "." — and vet prefixed since the command runs vet.
+		if want := "go vet . ./bar ./foo && go test . ./bar ./foo"; box.cmds[1] != want {
+			t.Fatalf("scoped cmd = %q, want %q", box.cmds[1], want)
+		}
+	})
+	t.Run("go-test flags are replicated onto the scoped command", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\n"},
+			{ExitCode: 0},
+		}}
+		cmd := "go test -short -race -tags integration -count 1 ./..."
+		if _, _, err := scopedRedFunc(box, cmd)(context.Background()); err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		// The scoped run must test EXACTLY the subset the full command would (flags copied),
+		// else it could red on a test/build the full command never executes.
+		if want := "go test -short -race -tags integration -count 1 ./foo"; box.cmds[1] != want {
+			t.Fatalf("scoped cmd = %q, want %q (flags must be replicated)", box.cmds[1], want)
+		}
+	})
+	t.Run("a scoped package-LOAD error falls through to Full (not a subset red)", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\n"},
+			// A nested go.mod / unresolved import: nonzero, but no package failed a gated check.
+			{ExitCode: 1, Stderr: "no required module provides package nilcore/foo/bar; to add it:"},
+		}}
+		failed, _, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || failed {
+			t.Fatalf("a package-load error must be inconclusive (fall through), got failed=%v err=%v", failed, err)
+		}
+	})
+	t.Run("a bare 'go:' toolchain diagnostic falls through to Full", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\n"},
+			{ExitCode: 1, Stderr: "go: updates to go.mod needed; to update it:\n\tgo mod tidy"},
+		}}
+		failed, _, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || failed {
+			t.Fatalf("a toolchain diagnostic must fall through, got failed=%v err=%v", failed, err)
+		}
+	})
+	t.Run("a genuine compile error IS a provable subset red", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\n"},
+			{ExitCode: 1, Stderr: "# nilcore/foo\nfoo/a.go:3:1: syntax error: unexpected }"},
+		}}
+		failed, out, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || !failed {
+			t.Fatalf("a compile error in a touched package must short-circuit, got failed=%v err=%v", failed, err)
+		}
+		if !strings.Contains(out, "syntax error") {
+			t.Fatalf("scoped output must carry the compile error, got %q", out)
+		}
+	})
+	t.Run("empty diff falls through without a second exec", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{{ExitCode: 0, Stdout: ""}}}
+		failed, _, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || failed {
+			t.Fatalf("empty diff must be inconclusive, got failed=%v err=%v", failed, err)
+		}
+		if len(box.cmds) != 1 {
+			t.Fatalf("no scoped command may run on an empty diff, got %v", box.cmds)
+		}
+	})
+	t.Run("non-Go touched file is unscopable", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{
+			{ExitCode: 0, Stdout: "foo/a.go\ngo.mod\n"},
+		}}
+		failed, _, err := scopedRedFunc(box, goDefault)(context.Background())
+		if err != nil || failed {
+			t.Fatalf("a touched go.mod must fall through to Full, got failed=%v err=%v", failed, err)
+		}
+		if len(box.cmds) != 1 {
+			t.Fatalf("unscopable change must not run a scoped command, got %v", box.cmds)
+		}
+	})
+	t.Run("git faults surface as errors (decorator falls through)", func(t *testing.T) {
+		box := &scriptedExecBox{dir: scopedTestTree(t), res: []sandbox.Result{{ExitCode: 128}}}
+		if _, _, err := scopedRedFunc(box, goDefault)(context.Background()); err == nil {
+			t.Fatal("a non-zero git exit must be an error, never a verdict")
+		}
+	})
+}
+
+// TestGoTestFlags pins the flag replication: only flags that change WHICH tests/builds
+// run are copied (so the scoped subset matches the full command), in both the
+// space-separated and "=" value forms; unrelated tokens are dropped.
+func TestGoTestFlags(t *testing.T) {
+	tests := []struct {
+		cmd  string
+		want string
+	}{
+		{"go test ./...", ""},
+		{"go test -short ./...", "-short"},
+		{"go test -race ./...", "-race"},
+		{"go test -short -race ./...", "-short -race"},
+		{"go test -tags integration ./...", "-tags integration"},
+		{"go test -tags=integration ./...", "-tags=integration"},
+		{"go test -count 1 ./...", "-count 1"},
+		{"go test -count=1 ./...", "-count=1"},
+		{"go build ./... && go test -short -tags a,b -race ./...", "-short -tags a,b -race"},
+		{"go test -v -json ./...", ""}, // -v/-json don't change the subset ⇒ not copied
+	}
+	for _, tc := range tests {
+		if got := goTestFlags(tc.cmd); got != tc.want {
+			t.Errorf("goTestFlags(%q) = %q, want %q", tc.cmd, got, tc.want)
+		}
+	}
+}
+
+// TestScopedRedIsProvable tables the provable-red classifier: a genuine test/compile
+// failure is a shippable subset red; a package-load/resolution error or any other
+// ambiguous nonzero output is NOT (fall through to Full).
+func TestScopedRedIsProvable(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"test failure", "--- FAIL: TestX (0.01s)\nFAIL\tnilcore/foo\t0.02s", true},
+		{"bare FAIL line", "FAIL\tnilcore/foo", true},
+		{"compile error", "# nilcore/foo\nfoo/a.go:3:1: syntax error", true},
+		{"unresolved import", "no required module provides package nilcore/x; to add it:", false},
+		{"cannot find package", "cannot find package nilcore/x", false},
+		{"go.mod needs update", "go: updates to go.mod needed; run 'go mod tidy'", false},
+		{"missing go.sum", "missing go.sum entry for module providing package x", false},
+		{"bare go: diagnostic", "go: cannot find main module", false},
+		{"opaque nonzero", "some unrecognized failure", false},
+		{"empty", "", false},
+	}
+	for _, tc := range tests {
+		if got := scopedRedIsProvable(tc.output); got != tc.want {
+			t.Errorf("scopedRedIsProvable(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTouchedGoPackageDirs tables the file→package mapping, its hygiene refusals,
+// and the deleted-package skip.
+func TestTouchedGoPackageDirs(t *testing.T) {
+	root := scopedTestTree(t)
+	tests := []struct {
+		name  string
+		lines string
+		want  []string
+		ok    bool
+	}{
+		{"dedup + sort + ./ prefix", "foo/a.go\nfoo/zz.go\nbar/b.go\n", []string{"./bar", "./foo"}, true},
+		{"root package maps to .", "main.go\n", []string{"."}, true},
+		{"blank lines ignored", "\nfoo/a.go\n\n", []string{"./foo"}, true},
+		{".nilcore scratch ignored", ".nilcore/state.go\nfoo/a.go\n", []string{"./foo"}, true},
+		{"deleted package dir skipped", "foo/a.go\ngone/z.go\n", []string{"./foo"}, true},
+		{"nothing touched", "", nil, true},
+		{"non-go file unscopable", "foo/a.go\nMakefile\n", nil, false},
+		{"testdata input unscopable", "foo/testdata/in.json\n", nil, false},
+		{"shell metacharacters refused", "foo/$(rm).go\n", nil, false},
+		{"space refused", "foo/a b.go\n", nil, false},
+		{"leading dash refused", "-flag/x.go\n", nil, false},
+		{"dotdot refused", "foo/../bar/b.go\n", nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := touchedGoPackageDirs(root, tc.lines)
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("dirs = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("dirs = %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 

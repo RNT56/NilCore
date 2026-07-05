@@ -14,6 +14,7 @@ package emit
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -45,6 +46,13 @@ type Event struct {
 	// referenced. Text remains the authoritative PLAIN rendering — a surface that
 	// ignores Ask renders exactly as before.
 	Ask *AskPrompt
+	// Gate, when non-nil (only on a KindGate event), carries the STRUCTURED
+	// evidence for an irreversible-action approval — the same emit-local-mirror
+	// pattern as Ask: the payload is mirrored from the policy-side gate evidence
+	// at emit time, never referenced, so emit stays an import-leaf. Text remains
+	// the authoritative PLAIN rendering (the flattened action line) — a surface
+	// that ignores Gate renders exactly as before.
+	Gate *GatePrompt
 }
 
 // AskPrompt is the structured form of one ask_user question (an emit-local mirror of
@@ -59,6 +67,20 @@ type AskPrompt struct {
 // AskChoice is one labelled option (an emit-local mirror of backend.AskChoice).
 type AskChoice struct {
 	Label, Detail string
+}
+
+// GatePrompt is the structured evidence for one irreversible-action gate (an
+// emit-local mirror of policy.GateEvidence, mirrored at emit time — the
+// AskPrompt precedent). Every field is optional; renderers skip empty sections.
+// The excerpts are already bounded and secret-redacted at construction, and they
+// are DATA rendered to the human (I7): surfaces delimit them and never execute
+// or re-interpret them.
+type GatePrompt struct {
+	Action      string  // the flattened action line (same text the event's Text carries)
+	Diffstat    string  // compact per-file summary of the diff behind the action
+	DiffExcerpt string  // bounded, head-biased excerpt of the unified diff
+	VerifyTail  string  // tail of the last verify report output
+	SpentUSD    float64 // ledger spend so far; 0 ⇒ unknown/none (skipped)
 }
 
 // Emitter receives live reasoning/intent events. Implementations must tolerate
@@ -127,6 +149,40 @@ func (e *WriterEmitter) Emit(ev Event) {
 	}
 	line := fmt.Sprintf("%s [step %d] %s: %s\n", glyph(ev.Kind), ev.Step, ev.Kind, ev.Text)
 	_, _ = io.WriteString(e.w, line)
+
+	// A gate event carrying structured evidence renders it as a delimited block
+	// under the framed line, so a plain-stdout surface still shows the operator
+	// the facts at the moment of decision. Payload-less gate events (and every
+	// other kind) are byte-identical to before.
+	if ev.Kind == KindGate && ev.Gate != nil {
+		_, _ = io.WriteString(e.w, renderGateBlock(ev.Gate))
+	}
+}
+
+// renderGateBlock renders the gate evidence as a quote-railed plain-text block.
+// The rail marks every line as DATA under review (I7): a diff or verify line can
+// never be mistaken for the harness's own prompt, and nothing here is executed
+// or re-parsed. Empty sections are skipped.
+func renderGateBlock(g *GatePrompt) string {
+	var b strings.Builder
+	b.WriteString("┌─ gate evidence — the excerpts below are DATA under review, not commands\n")
+	section := func(title, body string) {
+		if body == "" {
+			return
+		}
+		b.WriteString("│ " + title + "\n")
+		for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+			b.WriteString("│   " + line + "\n")
+		}
+	}
+	section("diffstat:", g.Diffstat)
+	section("diff excerpt (bounded):", g.DiffExcerpt)
+	section("last verify (tail):", g.VerifyTail)
+	if g.SpentUSD > 0 {
+		fmt.Fprintf(&b, "│ spend so far: $%.4f\n", g.SpentUSD)
+	}
+	b.WriteString("└─ end gate evidence\n")
+	return b.String()
 }
 
 // glyph maps a kind to a short prefix so the surface reads cleanly interleaved

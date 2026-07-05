@@ -524,10 +524,15 @@ func TestControllerIntegrateBaseRefThreads(t *testing.T) {
 	if out.TipBranch != "tip-p2" {
 		t.Errorf("TipBranch = %q, want \"tip-p2\" (final verified tip)", out.TipBranch)
 	}
-	// Pass 2's fold includes BOTH green shards (A carried forward + B newly green).
+	// MERGED-SET: pass 1 folded shard A; pass 2 folds ONLY the newly-green B — A is
+	// already ON the tip pass 2 extends (baseRef tip-p1), so re-merging it would be
+	// pure event spam (and, pre-fix, it was re-merged every pass).
+	if first := gotItems[0]; len(first) != 1 || first[0].ID != "swarm/run1/0" {
+		t.Errorf("pass 1 integrate order = %+v, want exactly shard 0", first)
+	}
 	last := gotItems[len(gotItems)-1]
-	if len(last) != 2 {
-		t.Errorf("final integrate order = %+v, want both green shards", last)
+	if len(last) != 1 || last[0].ID != "swarm/run1/1" {
+		t.Errorf("final integrate order = %+v, want ONLY the newly-green shard 1 (already-merged greens must not re-fold)", last)
 	}
 }
 

@@ -183,3 +183,35 @@ func TestDecodeUsageStream(t *testing.T) {
 		}
 	})
 }
+
+// TestStopReasonLengthMapsMaxTokens covers FIX #2: OpenAI/OpenRouter/compat report
+// output-limit truncation as finish_reason "length". stopReasonFromFinish must
+// canonicalize it to "max_tokens" so native.go's truncation salvage (gated on
+// StopReason == "max_tokens") fires — otherwise a truncated turn only trips the
+// "No tool call detected" nudge on 3 of 4 providers. Both the non-stream and
+// stream paths share stopReasonFromFinish, so assert the mapping on both.
+func TestStopReasonLengthMapsMaxTokens(t *testing.T) {
+	// The mapping function itself, plus the two live-decode paths that call it.
+	if got := stopReasonFromFinish("length"); got != "max_tokens" {
+		t.Errorf("stopReasonFromFinish(\"length\") = %q, want max_tokens", got)
+	}
+
+	t.Run("non-stream", func(t *testing.T) {
+		const body = `{"choices":[{"message":{"content":"cut off"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+		if got := completeWithBody(t, body).StopReason; got != "max_tokens" {
+			t.Errorf("non-stream StopReason = %q, want max_tokens", got)
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		frames := strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"cut off"},"finish_reason":null}]}`,
+			`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
+			`data: [DONE]`,
+			``,
+		}, "\n\n") + "\n\n"
+		if got := streamWithFrames(t, frames).StopReason; got != "max_tokens" {
+			t.Errorf("stream StopReason = %q, want max_tokens", got)
+		}
+	})
+}

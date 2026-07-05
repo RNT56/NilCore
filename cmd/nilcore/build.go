@@ -445,6 +445,11 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		}
 	}
 
+	// vrec captures the tail of every verify report that runs through the loop's
+	// verifier seam and the supervisor's finish-verify, so the promote gate can
+	// show the operator the LAST verdict as evidence (populated below).
+	vrec := &verifyRecorder{}
+
 	sup := &super.Supervisor{
 		Model:     strong,
 		Roster:    rost,
@@ -453,7 +458,7 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		Spawn:     buildSpawnFunc(d, repo, exec, rost, msgBus, newEnv),
 		Code:      buildCodeFunc(d, repo, exec, newEnv),
 		Integrate: buildIntegrateFunc(intr),
-		Verify:    buildVerifyFunc(repo, newEnv, d.baseRef),
+		Verify:    vrec.wrapFunc(buildVerifyFunc(repo, newEnv, d.baseRef)),
 		// Answer closes the half-wired back-and-forth (CV-T02): a subagent's blocking
 		// ask_supervisor/request_review gets a REAL strong-model answer instead of the
 		// canned fallback. It reuses the SAME metered strong provider as Model, so the
@@ -522,17 +527,25 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		}
 	}
 
+	// Gate evidence (I5-additive): the promote gate shows the operator the SAME
+	// facts the model reviewer reads — a diffstat + bounded diff excerpt from the
+	// already-wired Differ, the tail of the last verify report (vrec, above), and
+	// the run's spend so far — instead of one flattened line. The payload rides
+	// GateAction.Evidence to opting-in approvers only; a legacy approver still
+	// receives the exact Describe() string.
+	differ := func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) }
+
 	loop := &project.Loop{
 		Goal:          d.goal,
 		Repo:          repo,
 		Log:           d.log,
 		Plan:          buildPlanFunc(d.goal),
 		RunSlice:      buildRunSliceFunc(sup),
-		Verifier:      func(dir string) verify.Verifier { return newEnv(dir).Verifier },
+		Verifier:      func(dir string) verify.Verifier { return vrec.wrap(newEnv(dir).Verifier) },
 		Advisor:       advisorFor(strong), // METERED strong: reflect-advisor spend must charge the budget wall (was raw d.strong — a budget-escape)
 		Reviewer:      strong,
-		Differ:        func(branch string) (string, error) { return worktree.Diff(context.Background(), repo, branch) },
-		Gate:          buildGateFunc(d.approver, d.log),
+		Differ:        differ,
+		Gate:          buildGateFuncEv(d.approver, d.log, gateEvidenceFunc(differ, vrec, ledger)),
 		MaxIterations: d.maxIter,
 		Budget:        ledger,
 		Deadline:      time.Time{}, // wall-clock is enforced by the ctx deadline in buildMain
@@ -1148,13 +1161,112 @@ func buildVerifyFunc(repo string, newEnv func(dir string) buildEnv, baseRef stri
 // Reversible throwaway merges/rollbacks inside the integrator never reach this:
 // they carry no GateAction (the structured-action fix for the Classify trap).
 func buildGateFunc(approver policy.Approver, log *eventlog.Log) func(a policy.GateAction) bool {
+	return buildGateFuncEv(approver, log, nil)
+}
+
+// buildGateFuncEv is buildGateFunc plus an OPTIONAL evidence source: when non-nil
+// it is consulted right before the approver so the operator decides the
+// irreversible step from the diffstat / verify / spend facts, not one flattened
+// line. nil (the swarm path, tests) keeps the gate byte-identical. The evidence
+// is attached only when the action does not already carry some (a caller-supplied
+// payload wins) and is informational-only — it never reaches Describe(), the
+// classifier, or the flat legacy approver string.
+func buildGateFuncEv(approver policy.Approver, log *eventlog.Log, evidence func(policy.GateAction) *policy.GateEvidence) func(a policy.GateAction) bool {
 	return func(a policy.GateAction) bool {
+		if evidence != nil && a.Evidence == nil {
+			a.Evidence = evidence(a)
+		}
 		allowed := policy.GateStructured(a, approver)
 		log.Append(eventlog.Event{Kind: "gate", Detail: map[string]any{
 			"action": a.Type.String(), "branch": a.Branch, "class": a.Class().String(), "allowed": allowed,
 		}})
 		return allowed
 	}
+}
+
+// gateEvidenceFunc assembles the promote-gate evidence from what the build stack
+// already holds: the wired Differ (the same diff route.Review reads), the last
+// recorded verify report tail, and the shared ledger's total spend. Every input
+// is best-effort — a differ error or a branch-less action just leaves that
+// section empty (renderers skip empty sections) and NEVER blocks the gate.
+func gateEvidenceFunc(differ func(string) (string, error), rec *verifyRecorder, ledger *budget.Ledger) func(policy.GateAction) *policy.GateEvidence {
+	return func(a policy.GateAction) *policy.GateEvidence {
+		var diff string
+		if differ != nil && a.Branch != "" {
+			if d, err := differ(a.Branch); err == nil {
+				diff = d
+			}
+		}
+		var spent float64
+		if ledger != nil {
+			_, spent = ledger.Total()
+		}
+		return policy.BuildEvidence(diff, rec.last(), spent)
+	}
+}
+
+// verifyRecorder keeps the most recent verify report so the promote gate can show
+// it as evidence. It records the verifier's OWN verdict + output tail — never a
+// backend self-report (I2 is about what GOVERNS; this is display-only data and
+// the gate's control flow never reads it). Concurrent Checks (integrator +
+// supervisor) may race to be "last"; either is a fresh, truthful report.
+type verifyRecorder struct {
+	mu   sync.Mutex
+	tail string
+}
+
+// record stores the report, prefixed with an explicit harness-authored verdict
+// line so a bare output tail can never misread as a pass.
+func (r *verifyRecorder) record(rep verify.Report) {
+	verdict := "[verify FAILED]"
+	if rep.Passed {
+		verdict = "[verify passed]"
+	}
+	r.mu.Lock()
+	r.tail = strings.TrimSpace(verdict + "\n" + rep.Output)
+	r.mu.Unlock()
+}
+
+// last returns the most recent report tail ("" before any verify ran). Nil-safe
+// so an unwired recorder degrades to an empty evidence section.
+func (r *verifyRecorder) last() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.tail
+}
+
+// wrap returns v with every successful Check recorded (a Check error records
+// nothing — there is no report to show).
+func (r *verifyRecorder) wrap(v verify.Verifier) verify.Verifier {
+	return recordingVerifier{inner: v, rec: r}
+}
+
+// wrapFunc is wrap for the supervisor's function-shaped Verify seam.
+func (r *verifyRecorder) wrapFunc(fn func(ctx context.Context) (verify.Report, error)) func(ctx context.Context) (verify.Report, error) {
+	return func(ctx context.Context) (verify.Report, error) {
+		rep, err := fn(ctx)
+		if err == nil {
+			r.record(rep)
+		}
+		return rep, err
+	}
+}
+
+// recordingVerifier is the verify.Verifier shape of the recorder wrap.
+type recordingVerifier struct {
+	inner verify.Verifier
+	rec   *verifyRecorder
+}
+
+func (v recordingVerifier) Check(ctx context.Context) (verify.Report, error) {
+	rep, err := v.inner.Check(ctx)
+	if err == nil {
+		v.rec.record(rep)
+	}
+	return rep, err
 }
 
 // answerSystem is the system prompt for the supervisor's reply to a subagent

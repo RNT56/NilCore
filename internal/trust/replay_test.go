@@ -44,7 +44,9 @@ func TestReplayFoldsRaceOutcomes(t *testing.T) {
 		{Task: "t1", Kind: "task_start"}, // ignored: not a race
 		raceEvt("t1", "native", true),
 		raceEvt("t1", "codex", false),
-		{Task: "t1", Kind: "final_verify", Detail: map[string]any{"passed": true}}, // ignored: wrong kind
+		// A PRE-upgrade final_verify (no backend, no class) is skipped — only the
+		// class-tagged, backend-attributed shape folds (see replay_finalverify_test.go).
+		{Task: "t1", Kind: "final_verify", Detail: map[string]any{"passed": true}},
 		raceEvt("t2", "native", true),
 		raceEvt("t2", "codex", true),
 	})
