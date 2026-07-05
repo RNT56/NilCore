@@ -66,13 +66,13 @@ The hook is an opt-in `agent.SelfAcceptFunc` on the orchestrator. **nil ⇒ byte
 ```sh
 # Attended run: the agent proposes checks for the goal; you approve/deny each at the gate,
 # and approved checks must pass for the run to be judged done.
-NILCORE_SELFACC=1 nilcore run -dir ./repo -goal "ship a /health endpoint that returns ok"
+NILCORE_SELFACC=1 nilcore -dir ./repo -goal "ship a /health endpoint that returns ok"
 
 # Cap how many checks the agent may author per run (default 5):
-NILCORE_SELFACC=1 NILCORE_SELFACC_MAX=3 nilcore run ...
+NILCORE_SELFACC=1 NILCORE_SELFACC_MAX=3 nilcore ...
 
 # Pre-approve a stable check set you authored (skips the gate — the file IS your approval):
-NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json nilcore run ...
+NILCORE_SELFACC=1 NILCORE_SELFACC_FILE=$PWD/approved.json nilcore ...
 
 # Amortized auto-approval for unattended autonomy (a proven (id+command) self-check
 # auto-approves within the envelope; first appearances + any command change still gate).

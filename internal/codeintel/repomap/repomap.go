@@ -39,7 +39,12 @@ func RepoMap(ctx context.Context, g *graph.Graph, budget int) ([]Entry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("repomap: load nodes: %w", err)
 	}
-	edges, err := g.Edges(ctx, "calls")
+	// CallEdges (not the raw Edges("calls")) resolves each edge's bare callee name to
+	// the matching QUALIFIED node id, so endpoints line up with Nodes()'s ids. Feeding
+	// the raw edges here would drop every edge in pageRank's `known[e.To]` filter (the
+	// raw to_id is a bare name absent from the qualified node set), leaving PageRank
+	// edge-less and every rank uniform.
+	edges, err := g.CallEdges(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("repomap: load edges: %w", err)
 	}

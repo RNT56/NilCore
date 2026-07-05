@@ -2049,19 +2049,20 @@ func selectSandbox(prefer, runtime, image, dir string) sandbox.Sandbox {
 	return box
 }
 
-// attachBlast wires the shared blast-radius budget onto a container sandbox so its
-// cumulative WALL-TIME axis is fenced (BR-T03). It is the single seam the env factories
-// use; a nil budget (no -blast-radius preset, the default) or a non-container backend
+// attachBlast wires the shared blast-radius budget onto the sandbox so its cumulative
+// WALL-TIME axis is fenced (BR-T03). It is the single seam the env factories use; a nil
+// budget (no -blast-radius preset, the default) or a backend that carries no Blast field
 // is returned UNCHANGED, so an unfenced run is byte-identical. The same *blastbudget
 // instance is shared across every worktree of a run, so the wall fence bounds the run,
 // not each box independently.
 //
-// KNOWN LIMITATION: the wall-time fence is wired into the container backend only (the
-// Blast field lives on *sandbox.Container). The host-native Linux namespace backend
-// (sandbox.Namespace, Phase 7) carries no wall fence, so under it the wall axis of
-// -blast-radius is not enforced (the host/irreversible/$ axes still apply, at the egress
-// proxy and the gate). The container backend is the default; this is a documented gap,
-// not a silent failure.
+// The wall-time fence now applies to BOTH sandbox backends: the container backend (the
+// Blast field on *sandbox.Container, handled inline here) AND the host-native Linux
+// namespace backend (*sandbox.Namespace, Phase 7, which grew an identical Blast field +
+// charge/reconcile logic). Because *sandbox.Namespace only exists under //go:build linux,
+// its wiring lives in the build-tagged attachNamespaceBlast helper (a no-op on non-Linux
+// hosts, where that type does not compile). Either way the host/irreversible/$ axes still
+// apply at the egress proxy and the gate.
 func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
 	if b == nil {
 		return box
@@ -2069,6 +2070,7 @@ func attachBlast(box sandbox.Sandbox, b *blastbudget.Budget) sandbox.Sandbox {
 	if c, ok := box.(*sandbox.Container); ok {
 		c.Blast = b
 	}
+	attachNamespaceBlast(box, b)
 	return box
 }
 

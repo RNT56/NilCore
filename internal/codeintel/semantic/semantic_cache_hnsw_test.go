@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"testing"
 )
@@ -33,6 +34,55 @@ func (c *countingEmbedder) Embed(_ context.Context, text string) ([]float32, err
 		}
 	}
 	return vec[:], nil
+}
+
+// TestModelTagInvalidatesCacheAcrossModelChange is the regression for the
+// mixed-vector-space bug: a persistent index (a real file) is built with one
+// embedding model, then re-opened under a DIFFERENT model. An unchanged symbol must
+// NOT reuse the first model's vector — the content-hash key folds in the model tag,
+// so the re-Add is a cache MISS and re-embeds. Without this, unchanged symbols keep
+// OLD-model vectors while new symbols get NEW-model vectors, mixing two spaces (and
+// possibly dimensions) in one HNSW graph.
+func TestModelTagInvalidatesCacheAcrossModelChange(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "sem.db")
+
+	// Build with model "m1": one embed for the symbol.
+	emb1 := &countingEmbedder{}
+	ix1, err := OpenModel(dbPath, emb1, "model-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ix1.Add(ctx, "Sym", "abcd"); err != nil {
+		t.Fatalf("Add under model-1: %v", err)
+	}
+	if emb1.calls != 1 {
+		t.Fatalf("model-1 first Add embed calls = %d, want 1", emb1.calls)
+	}
+	// Same model, unchanged text: cache hit (sanity that the model tag does not break
+	// the normal same-model cache).
+	if err := ix1.Add(ctx, "Sym", "abcd"); err != nil {
+		t.Fatalf("re-Add under model-1: %v", err)
+	}
+	if emb1.calls != 1 {
+		t.Fatalf("same-model unchanged re-Add embed calls = %d, want 1 (cache should hit)", emb1.calls)
+	}
+	ix1.Close()
+
+	// Re-open the SAME file under model "m2". The unchanged symbol must re-embed,
+	// because its stored hash was computed with the model-1 tag and now MISSES.
+	emb2 := &countingEmbedder{}
+	ix2, err := OpenModel(dbPath, emb2, "model-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ix2.Close()
+	if err := ix2.Add(ctx, "Sym", "abcd"); err != nil {
+		t.Fatalf("Add under model-2: %v", err)
+	}
+	if emb2.calls != 1 {
+		t.Fatalf("after model change, embed calls = %d, want 1 (a stale-model vector was reused)", emb2.calls)
+	}
 }
 
 // TestContentHashCacheSkipsUnchangedReAdd is the D2-T01 acceptance test: the

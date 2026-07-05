@@ -19,9 +19,11 @@ package verify
 //
 // WHY the conditions are narrow. A probe fires only when ALL hold:
 //
-//   - the inner verifier FAILED with FailClass == test (a structural label from
-//     enrich.go's fixed vocabulary — build/lint/browser reds are deterministic
-//     compiler/analyzer verdicts, not flake candidates);
+//   - the inner verifier FAILED and the failure looks like a TEST failure — either
+//     FailClass == test (enrich.go's structural first-line label) OR, when the recipe
+//     was opaque to first-line sniffing (FailClass == "other"), the full output
+//     carries a test-runner signature (isProbableTestFailure). A DETERMINISTIC
+//     build/lint/browser red is never a flake candidate and is never probed;
 //   - the worktree content hash equals the hash recorded at the IMMEDIATELY
 //     preceding Check (nothing changed between runs, so "the change broke it" is
 //     ruled out and "the test is flaky" is plausible);
@@ -36,6 +38,8 @@ package verify
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -109,7 +113,7 @@ func (p *FlakeProbe) Check(ctx context.Context) (Report, error) {
 	if !hashOK || !hadPrev || prev != hash {
 		return rep, nil
 	}
-	if FailClass(rep) != FailClassTest {
+	if !isProbableTestFailure(rep) {
 		return rep, nil
 	}
 
@@ -124,4 +128,78 @@ func (p *FlakeProbe) Check(ctx context.Context) (Report, error) {
 		p.OnFlaky(FailClassTest, hash)
 	}
 	return rep2, nil
+}
+
+// testRunnerSignatures are output shapes that mark a TEST-phase failure regardless of
+// what recipe line drove it. FailClass sniffs only the first command token of the
+// first line, so a test flake behind an opaque recipe (e.g. `make verify` whose first
+// output line is `make: *** [Makefile:12: test] Error 1`, or a wrapper script) is
+// classified as `other`/`build` and never probed. These substrings — the canonical
+// banners of go test, pytest, jest/vitest, and the make/target envelope around a test
+// target — recover those cases. They are matched as OPAQUE DATA to decide WHETHER to
+// re-run the real verifier; no byte is ever interpreted as an instruction (I7), and a
+// match only ever GRANTS one extra verifier run — the verifier alone still decides the
+// verdict (I2).
+var testRunnerSignatures = []string{
+	"--- fail:",     // go test failing test banner
+	"--- FAIL:",     // go test (as-emitted case)
+	"=== run",       // go test run marker
+	"=== RUN",       // (as-emitted case)
+	"panic: test",   // a panic inside a test binary
+	"failures=",     // pytest short summary ("2 passed, 1 failed" also below)
+	" failed,",      // pytest / jest summary fragment ("1 failed, 3 passed")
+	" failed]",      // make target envelope "[test] failed]"-style
+	"tests:",        // jest/vitest "Tests: 1 failed"
+	"test suites:",  // jest "Test Suites: 1 failed"
+	"pytest",        // pytest invocation echoed anywhere in the output
+	"go test",       // the go test command echoed on a later (non-first) line
+	"npm test",      // npm test echoed anywhere
+	"[test] error",  // make: *** [Makefile:NN: test] Error 1
+	"target `test'", // make "No rule to make target" / target-scoped errors
+	"running tests", // generic runner banner
+}
+
+// testTargetRe matches a make/just/task envelope that names a *test* target, e.g.
+// "make: *** [test] Error 1", "[Makefile:12: unit-test] Error 2", so a test failure
+// hidden behind a make recipe (whose first line is the make wrapper, not `go test`)
+// is still recognized. It is anchored to the bracketed-target + Error-code shape make
+// emits, not free prose, to keep it from matching arbitrary output.
+var testTargetRe = regexp.MustCompile(`(?i)\[[^\]]*test[^\]]*\]\s+error\b`)
+
+// isProbableTestFailure reports whether rep is a red that should be treated as a
+// (potentially flaky) TEST failure. It first trusts the structural FailClass; when
+// that is unavailable (the failing command hid behind an opaque recipe, so FailClass
+// returned "other"), it falls back to scanning the whole output for a test-runner
+// signature. It deliberately does NOT override a DETERMINISTIC non-test class
+// (build/lint/browser) — those verdicts are compiler/analyzer facts, never flakes, so
+// a build red that merely mentions the word "test" is not probed.
+func isProbableTestFailure(rep Report) bool {
+	if rep.Passed {
+		return false
+	}
+	switch FailClass(rep) {
+	case FailClassTest:
+		return true
+	case FailClassBuild, FailClassLint, FailClassBrowser:
+		// A deterministic, structurally-classified non-test red — never a flake.
+		return false
+	default:
+		// FailClassUnknown ("other"): the recipe was opaque to first-line sniffing.
+		// Scan the full output for a test-runner signature before giving up.
+		return outputLooksLikeTestFailure(rep.Output)
+	}
+}
+
+// outputLooksLikeTestFailure scans the ENTIRE output (not just the first recipe line)
+// for a test-runner signature. It is the broadened detection the fix adds: a test
+// flake behind an opaque `make verify` recipe is now probed, where first-line sniffing
+// alone would never have seen the `go test` banner buried below the make wrapper.
+func outputLooksLikeTestFailure(output string) bool {
+	lower := strings.ToLower(output)
+	for _, sig := range testRunnerSignatures {
+		if strings.Contains(lower, strings.ToLower(sig)) {
+			return true
+		}
+	}
+	return testTargetRe.MatchString(lower)
 }

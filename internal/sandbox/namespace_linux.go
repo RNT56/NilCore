@@ -32,9 +32,12 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"nilcore/internal/blastbudget"
 )
 
 // Control vars the parent sets on the re-exec'd child. They tell MaybeRunInit
@@ -55,6 +58,20 @@ const (
 // Landlock filesystem domain. It needs no container runtime, image, or daemon.
 type Namespace struct {
 	HostDir string // absolute, symlink-resolved path to the worktree
+
+	// Blast is the optional blast-radius budget (Phase 16, BR-T03), identical in
+	// meaning to *Container.Blast: when set, every exec is fenced on the cumulative
+	// sandbox WALL-TIME axis (pre-charge → context.WithTimeout bound → reconcile).
+	// This backend is Auto-preferred on Linux (Landlock + userns), so without it the
+	// -blast-radius wall ceiling would go silently unenforced on the DEFAULT backend.
+	// nil (the default) means no fence — behaviour and run args are byte-identical to
+	// a namespace sandbox without a budget.
+	Blast *blastbudget.Budget
+
+	// run is the exec seam, injected only in tests so the wall-time fence's
+	// charge/reconcile path is exercisable without a real re-exec. nil (the default)
+	// uses runReal, so production behaviour is unchanged.
+	run func(ctx context.Context, cmd string, env map[string]string) (Result, error)
 }
 
 func newNamespace(hostDir string) (Sandbox, error) {
@@ -75,7 +92,68 @@ func (n *Namespace) Exec(ctx context.Context, cmd string) (Result, error) {
 // ExecWithEnv re-execs this binary inside fresh namespaces and runs cmd under
 // Landlock. Per-run env (e.g. a delegated CLI's key, P2-T03) is forwarded to the
 // command only, never logged — matching the container backend's contract.
+//
+// When a blast-radius budget is attached (n.Blast != nil), the run is fenced on
+// the cumulative sandbox wall-time axis exactly like *Container.ExecWithEnv: a
+// per-exec bound (the context's remaining deadline, or defaultPerExecWall, capped
+// at the remaining wall budget) is pre-charged BEFORE the command runs. If that
+// charge is refused the real command NEVER runs and we return a non-zero Result (a
+// budget-refused command is a result, not a Go error). The bound also hard-caps the
+// in-flight run via context.WithTimeout. After the run, accounting is reconciled to
+// the actual elapsed time. With n.Blast == nil this whole block is skipped and the
+// run is byte-identical to a namespace sandbox without a budget.
 func (n *Namespace) ExecWithEnv(ctx context.Context, cmd string, env map[string]string) (Result, error) {
+	if n.Blast == nil {
+		return n.runOnce(ctx, cmd, env)
+	}
+
+	bound := execWallBound(ctx)
+	// Cap the pre-charge at the REMAINING wall budget so a single exec is
+	// hard-bounded to what's left, and a no-deadline ctx never spuriously refuses
+	// the first exec under a smaller ceiling. An already-exhausted budget refuses
+	// before the command runs. (Mirrors Container.ExecWithEnv.)
+	if u := n.Blast.Used(""); u.WallCeiling > 0 {
+		rem := u.WallCeiling - u.Wall
+		if rem <= 0 {
+			return Result{Stderr: "blast-radius: sandbox wall-time budget exhausted", ExitCode: 1}, nil
+		}
+		if rem < bound {
+			bound = rem
+		}
+	}
+	if err := n.Blast.ChargeWall(ctx, bound); err != nil {
+		if errors.Is(err, blastbudget.ErrWallCeiling) {
+			return Result{Stderr: "blast-radius: sandbox wall-time budget exhausted", ExitCode: 1}, nil
+		}
+		return Result{}, fmt.Errorf("blast wall pre-charge: %w", err)
+	}
+
+	fenceCtx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+
+	start := time.Now()
+	res, err := n.runOnce(fenceCtx, cmd, env)
+	// Reconcile: keep only the actual elapsed on the wall axis, credit the unused
+	// remainder, so the cumulative total never over-counts a fast exec.
+	actual := time.Since(start)
+	if actual > bound {
+		actual = bound
+	}
+	n.Blast.CreditWall(bound - actual)
+	return res, err
+}
+
+// runOnce dispatches to the injected exec seam (tests) or the real namespace exec.
+func (n *Namespace) runOnce(ctx context.Context, cmd string, env map[string]string) (Result, error) {
+	if n.run != nil {
+		return n.run(ctx, cmd, env)
+	}
+	return n.runReal(ctx, cmd, env)
+}
+
+// runReal re-execs this binary inside fresh namespaces and runs cmd under Landlock.
+// It is the production exec path; behaviour is identical to the pre-fence body.
+func (n *Namespace) runReal(ctx context.Context, cmd string, env map[string]string) (Result, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return Result{}, fmt.Errorf("locate self for sandbox re-exec: %w", err)
@@ -528,8 +606,14 @@ func userNSUsable() (string, bool) {
 	if v, ok := readSysctl("/proc/sys/kernel/unprivileged_userns_clone"); ok && v == "0" {
 		return "unprivileged user namespaces disabled (kernel.unprivileged_userns_clone=0)", false
 	}
-	if v, ok := readSysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); ok && v == "1" {
-		return "unprivileged user namespaces restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns=1)", false
+	// apparmor_restrict_unprivileged_userns is enabled for ANY nonzero value, not
+	// just 1: newer kernels use higher levels (e.g. 2) for the same restriction, so
+	// an ==1 test false-negatived those and let selection pick a backend that then
+	// EPERMs at clone. Treat any nonzero (and any unparseable-but-present) value as
+	// restricted, staying conservative (prefer a container fallback over a failing
+	// namespace exec). A literal "0" is the only value that means unrestricted.
+	if v, ok := readSysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"); ok && v != "0" {
+		return "unprivileged user namespaces restricted by AppArmor (kernel.apparmor_restrict_unprivileged_userns=" + v + ")", false
 	}
 	return "", true
 }

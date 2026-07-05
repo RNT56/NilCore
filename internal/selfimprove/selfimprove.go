@@ -45,23 +45,31 @@ func DefaultScope() Scope {
 // scope only if it matches an Allow prefix and no Deny prefix.
 func (s Scope) Check(p Proposal) (ok bool, reason string) {
 	for _, path := range p.Paths {
-		for _, d := range s.Deny {
-			if strings.HasPrefix(path, d) {
-				return false, "denied: " + path + " is a protected core/contract file"
-			}
-		}
-		allowed := false
-		for _, a := range s.Allow {
-			if strings.HasPrefix(path, a) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return false, "out of scope: " + path + " is not in the self-edit allow-list"
+		if ok, reason := s.CheckPath(path); !ok {
+			return false, reason
 		}
 	}
 	return true, ""
+}
+
+// CheckPath reports whether a single repo-relative path is in scope (allow-listed
+// and not deny-listed). It is the per-path law Check folds over, exported so the
+// EXECUTION-time guard (allowedRun) can screen every file the run actually touched
+// against the SAME allow/deny rule the proposal was pre-screened with — closing the
+// gap between "the proposal declared only these paths" and "the run only wrote
+// these paths".
+func (s Scope) CheckPath(path string) (ok bool, reason string) {
+	for _, d := range s.Deny {
+		if strings.HasPrefix(path, d) {
+			return false, "denied: " + path + " is a protected core/contract file"
+		}
+	}
+	for _, a := range s.Allow {
+		if strings.HasPrefix(path, a) {
+			return true, ""
+		}
+	}
+	return false, "out of scope: " + path + " is not in the self-edit allow-list"
 }
 
 // Flow runs the gated self-edit pipeline.
@@ -75,9 +83,22 @@ func (s Scope) Check(p Proposal) (ok bool, reason string) {
 // hook — one fence, one guarantee.
 type Flow struct {
 	Scope Scope
-	Run   func(ctx context.Context, goal string) (verified bool, err error) // run as a task (worktree + verify)
-	Gate  func(action string) bool                                          // human gate before merge
-	Log   *eventlog.Log
+	// Run executes the proposal's goal as a verified task (worktree + verify).
+	Run func(ctx context.Context, goal string) (verified bool, err error)
+	// Changed, when set, reports the repo-relative paths the run actually modified (e.g.
+	// a `git diff --name-only` over the run's worktree). Propose screens EVERY changed
+	// path against the scope AND the proposal's declared Paths and REFUSES to gate a run
+	// that touched anything outside them (fail-closed) — so the verifier of record and
+	// every other denied/undeclared file stay structurally unmodifiable at EXECUTION,
+	// closing the gap where the free-text Goal could otherwise steer the model to edit a
+	// file the proposal never declared. This is the enforcement the scope check alone
+	// cannot provide: Check validates what the proposal DECLARED; Changed validates what
+	// the run actually WROTE. Nil ⇒ the screen is skipped (byte-identical to before), so
+	// an unwired flow behaves exactly as today; a production wiring supplies it from the
+	// run's worktree diff (see cmd/nilcore/selfimprove.go).
+	Changed func(ctx context.Context) (paths []string, err error)
+	Gate    func(action string) bool // human gate before merge
+	Log     *eventlog.Log
 }
 
 // Propose runs the pipeline: scope-check → run as a verified task → human gate →
@@ -98,6 +119,25 @@ func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error)
 		return false, nil // the checks must pass — green is non-negotiable
 	}
 
+	// EXECUTION-time path enforcement (fail-closed): if the executor can report what the
+	// run actually modified, refuse to gate a run that touched ANY path outside the
+	// declared, in-scope allow-list. This keeps the verifier of record (internal/verify/,
+	// denied by DefaultScope) and every other undeclared/denied file structurally
+	// unmodifiable at execution, closing the gap where the free-text Goal could otherwise
+	// steer the model to edit a file the proposal never declared.
+	if f.Changed != nil {
+		changed, cerr := f.Changed(ctx)
+		if cerr != nil {
+			// Cannot prove the run stayed in scope ⇒ do NOT gate it (fail-closed).
+			f.Log.Append(eventlog.Event{Kind: "self_edit_scope_indeterminate", Detail: map[string]any{"error": cerr.Error()}})
+			return false, fmt.Errorf("self-edit scope check: %w", cerr)
+		}
+		if bad, why := outOfScope(f.Scope, p.Paths, changed); bad != "" {
+			f.Log.Append(eventlog.Event{Kind: "self_edit_scope_violation", Detail: map[string]any{"path": bad, "reason": why}})
+			return false, fmt.Errorf("self-edit rejected: %s", why)
+		}
+	}
+
 	// The measured-delta regression fence already ran at the loop level (the
 	// flywheel scores the frozen suite before/after the candidate and drops a
 	// non-improving one BEFORE proposing), so a candidate that reaches here is
@@ -110,4 +150,28 @@ func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error)
 	}
 	f.Log.Append(eventlog.Event{Kind: "self_edit_merged", Detail: map[string]any{"goal": p.Goal}})
 	return true, nil
+}
+
+// outOfScope returns the first changed path that is NOT permitted, with a reason,
+// or ("","") when every changed path is in scope. A path is permitted only when it
+// (a) passes the scope allow/deny law AND (b) was declared in the proposal's Paths —
+// so the run may write ONLY the files the proposal committed to up front. declared
+// is matched exactly (the proposal names concrete files); scope is the prefix law.
+func outOfScope(s Scope, declared, changed []string) (path, reason string) {
+	decl := make(map[string]bool, len(declared))
+	for _, d := range declared {
+		decl[d] = true
+	}
+	for _, c := range changed {
+		if c == "" {
+			continue
+		}
+		if ok, why := s.CheckPath(c); !ok {
+			return c, why
+		}
+		if !decl[c] {
+			return c, "out of scope: " + c + " was modified but not declared in the proposal's paths"
+		}
+	}
+	return "", ""
 }

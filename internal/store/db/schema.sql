@@ -10,7 +10,11 @@ CREATE TABLE IF NOT EXISTS events (
     backend TEXT,
     detail  TEXT,           -- JSON
     prev    TEXT,           -- hash chain (P2-T06)
-    hash    TEXT
+    hash    TEXT,
+    -- seq anchors each mirrored event to its log position (not insertion id), so the
+    -- mirror can reproduce ordering/gaps. migrateEventSeq() ALTERs this in on a DB that
+    -- predates the column; a fresh DB declares it here. -1 = "seq unknown" (legacy rows).
+    seq     INTEGER NOT NULL DEFAULT -1
 );
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task);
 

@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -44,6 +45,7 @@ import (
 	"nilcore/internal/swarm/board"
 	"nilcore/internal/swarm/preset"
 	"nilcore/internal/verify"
+	"nilcore/internal/worktree"
 )
 
 // fakeCred returns a non-empty key for ANTHROPIC_API_KEY so pool.Build can construct
@@ -651,6 +653,50 @@ func TestShardRunCutsWorktreeFromBaseRef(t *testing.T) {
 	}
 	if good.Err == nil || !strings.Contains(good.Err.Error(), "no sandbox") {
 		t.Fatalf("err = %v, want the nil-box gate (the dep-base cut must have succeeded)", good.Err)
+	}
+}
+
+// TestCommitFaultIsFatal is the false-green regression guard: on a verifier-green
+// code shard, a real commit FAULT must fail the shard (so it never surfaces a
+// branchless green that unmergedGreens/integrateGreen skip and requeue.Scan can't
+// see → a false Done, I2), while a clean tree (nil error) surfaces the branch.
+func TestCommitFaultIsFatal(t *testing.T) {
+	if !commitFaultIsFatal(errors.New("worktree commit: nothing writable")) {
+		t.Error("a commit error must fail the green code shard (false-green blocker)")
+	}
+	if commitFaultIsFatal(nil) {
+		t.Error("a clean/successful commit (nil error) must NOT fail the shard")
+	}
+}
+
+// TestShardCommitFaultFailsGreenShard drives a REAL commit fault through a real
+// worktree: after the worktree is cut, its .git link is removed so wt.Commit's
+// `git add -A` faults. The shard, though otherwise green, must record FAILED with no
+// branch rather than a passing branchless green.
+func TestShardCommitFaultFailsGreenShard(t *testing.T) {
+	repo := newGoRepo(t)
+	branch := "swarm/commit-fault"
+	gitMu.Lock()
+	wt, err := worktree.CreateFrom(context.Background(), repo, branch, "commit-fault", "HEAD")
+	gitMu.Unlock()
+	if err != nil {
+		t.Fatalf("CreateFrom: %v", err)
+	}
+	defer func() { gitMu.Lock(); _ = wt.Release(); gitMu.Unlock() }()
+
+	// Break the worktree so any git op inside it faults: remove the `.git` gitlink file.
+	if err := os.Remove(filepath.Join(wt.Path(), ".git")); err != nil {
+		t.Fatalf("break worktree: %v", err)
+	}
+	// A commit against the broken worktree must fault (the condition the fix keys on).
+	gitMu.Lock()
+	_, _, cerr := wt.Commit(context.Background(), "feat(x): change")
+	gitMu.Unlock()
+	if cerr == nil {
+		t.Fatal("expected wt.Commit to fault on a broken worktree; test premise invalid")
+	}
+	if !commitFaultIsFatal(cerr) {
+		t.Fatalf("a real commit fault (%v) must be fatal to the green shard", cerr)
 	}
 }
 

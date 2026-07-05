@@ -129,6 +129,32 @@ type Cache struct {
 	// repeatedly-scanned corrupt log emits a single signal, never a flood of identical
 	// events. It is presentational/observability only — it never affects a verdict.
 	corruptOnce sync.Once
+
+	// verifyMemo caches the result of the last successful eventlog.Verify keyed by a
+	// cheap fingerprint of the log file (its byte size AND its mod-time). This is what
+	// stops every cache hit from re-reading and re-hashing the whole log (the O(n^2)
+	// trap): the first lookup after a change pays the full eventlog.Verify; repeated
+	// lookups over the UNCHANGED log serve the memoized verdict for free.
+	//
+	// Soundness: the memo is trusted ONLY when the fingerprint is byte-identical to the
+	// one that verified. An append grows the size; an in-place edit (a tamper) bumps the
+	// mod-time — either misses the memo and forces a fresh full Verify, so the chain
+	// guarantee is re-affirmed for free across a genuinely-unchanged file but never
+	// ASSUMED across a mutation. It is a pure optimization: worst case it degrades to the
+	// old behavior (verify every lookup), it can never serve a hit the full Verify would
+	// have rejected. mu guards it against concurrent Checks.
+	mu             sync.Mutex
+	verifiedPrint  filePrint
+	verifiedOK     bool
+	haveVerifyMemo bool
+}
+
+// filePrint is a cheap change-detector for the log file: its byte size plus its
+// mod-time (Unix nanoseconds). An append changes size; an in-place rewrite/tamper
+// changes mtime. Equal prints ⇒ the file has not changed since it was last verified.
+type filePrint struct {
+	size  int64
+	mtime int64
 }
 
 // New builds a Cache from cfg, validating that every field a live cache needs is
@@ -193,8 +219,12 @@ func (c *Cache) Check(ctx context.Context) (verify.Report, error) {
 	// Lookup is the I2-critical step: it returns a hit ONLY from a chain-verified
 	// log. On any chain error it returns hit=false (fail-closed-to-recompute), so a
 	// broken/tampered chain can never short-circuit the verifier.
+	//
+	// A HIT appends NOTHING: a served replay is not new history, and recording one
+	// per hit both grew the append-only log without bound and forced the very next
+	// lookup to re-verify a longer chain — the O(n^2) trap the memo above closes. Only
+	// a genuine cache WRITE (an original inner-verifier pass, below) is recorded.
 	if hit := c.lookup(key); hit {
-		c.record(key, true, true)
 		return verify.Report{
 			Passed: true,
 			Output: "verify cache: replayed a chain-verified pass (key " + short(key) + ")",
@@ -231,12 +261,12 @@ func (c *Cache) key(ctx context.Context) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// record appends a cache event so this verdict is auditable and (when it is an
-// original pass) eligible for a future hit. It is fire-and-forget through the
-// nil-safe Append; a nil Log records nothing. `replay` distinguishes a fresh
-// recorded pass from a served hit purely for the audit trail — both are passes,
-// but only an original (replay=false) entry was ever produced by the inner
-// verifier and is therefore eligible to be matched later.
+// record appends a cache event so an ORIGINAL inner-verifier pass is auditable and
+// eligible for a future hit. It is fire-and-forget through the nil-safe Append; a
+// nil Log records nothing. A served hit is NOT recorded (see Check): only a genuine
+// cache write reaches here, so `replay` is always false — the field is still written
+// so recordMatches (which excludes replay=true) stays forward-compatible with any
+// externally-produced replay entry it might encounter.
 func (c *Cache) record(key string, passed, replay bool) {
 	if c.cfg.Log == nil {
 		return

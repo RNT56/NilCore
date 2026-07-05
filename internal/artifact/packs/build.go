@@ -77,12 +77,21 @@ func Build(name string, box sandbox.Sandbox, relPath string, schemaReg *schema.R
 		return PackPlan{}, fmt.Errorf("packs: build %q: %w", name, err)
 	}
 
+	// The worktree root relPath lives under bounds the evidence verifier's no-follow
+	// write-back check (see evverify.ArtifactVerifier.Root). When a box is present its
+	// Workdir IS that root; with a nil box we leave it empty and evverify falls back to
+	// relPath's own directory — still a correct at/below-root boundary.
+	var root string
+	if box != nil {
+		root = box.Workdir()
+	}
+
 	// Named[0] schema (structural, no network, no box) and Named[1] evidence (the I2
 	// per-claim gate). Both read the SAME relPath, so a shape defect short-circuits the
 	// whole verdict before any claim check runs.
 	named := []verify.NamedVerifier{
 		{Name: "schema", V: &schema.SchemaVerifier{Reg: schemaReg, RelPath: relPath}},
-		{Name: "evidence", V: &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: relPath}},
+		{Name: "evidence", V: &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: relPath, Root: root}},
 	}
 
 	// Named[2] optional raw child. Only code and ui add one; benchmark, audit, and the

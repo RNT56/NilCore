@@ -185,30 +185,54 @@ func (r *Resilient) Complete(ctx context.Context, system string, msgs []Message,
 // resilience and the loop sees a model.Streamer through the wrapper regardless of
 // what the underlying providers support.
 //
-// Live on attempt 0, no double-emit on retry: the first attempt (the ~99%
-// single-provider / no-retry case) forwards each delta to onChunk AS IT ARRIVES,
-// so the operator sees real incremental token streaming rather than one
-// end-of-stream burst. Only once a RETRY or failover begins (attempt > 0) does
-// the wrapper switch to buffer-and-discard — a retried attempt's deltas are
-// staged and never re-emitted, since attempt 0 already forwarded its own chunks
-// live. The net effect is exactly one committed sequence: live for the common
-// single-attempt path, and never a double-emit when an attempt is thrown away.
-// (The contract still holds: the concatenation of the forwarded chunks equals the
-// returned Response's output text.)
+// Live streaming that preserves the Streamer invariant "concatenation of all
+// forwarded Chunk.Text == returned output text", even across retry/failover:
+//
+//   - An attempt streams its deltas LIVE only while nothing has been forwarded yet.
+//     A transient failure BEFORE the first token (connection reset, 5xx, timeout
+//     before any byte) forwards nothing, so the next attempt is still eligible to
+//     stream live — the WINNING attempt is the one whose deltas the caller sees.
+//     This is the ~99% single-attempt path plus the "silent early failure then
+//     recover" path, both fully live and both invariant-holding (forwarded ==
+//     returned).
+//
+//   - Once a live delta HAS been forwarded, that text cannot be un-painted. If that
+//     attempt then fails, retrying/failing over would return the COMPLETE text —
+//     leaving forwarded (partial) ≠ returned (full), a double-paint. So the wrapper
+//     stops there and returns that attempt's PARTIAL Response (== exactly what was
+//     forwarded) alongside the error, rather than repainting a fresh full reply.
+//
+// The single `committed` flag below encodes both rules.
 func (r *Resilient) Stream(ctx context.Context, system string, msgs []Message, tools []Tool, maxTokens int, onChunk func(Chunk)) (Response, error) {
 	var errs []error
 	skipped := 0
-	// liveForward is the single, walk-wide "may still stream live" gate. It is true
-	// only for the very first attempt of the whole walk (attempt 0 of the first
-	// provider actually tried). The instant a second attempt begins — a retry OR a
-	// failover — attempt 0's chunks are already out on the wire, so we flip it off
-	// and every subsequent attempt buffers-and-discards. This gives live streaming
-	// on the ~99% single-attempt path while never re-emitting a thrown-away
-	// attempt's chunks. A nil onChunk stays nil (nothing to forward).
-	liveForward := true
+	// committed is the single walk-wide gate, and it does double duty:
+	//
+	//   1. Live-forward gate. An attempt forwards its deltas LIVE to onChunk iff
+	//      nothing has been committed yet (!committed). This keeps live streaming on
+	//      the common no-retry path, AND — unlike a fixed "only attempt 0 is live"
+	//      gate — lets a fresh attempt stream live after an EARLIER attempt failed
+	//      WITHOUT painting anything (a transient failure before the first token). So
+	//      the winning attempt is always the one that streams, and forwarded text is
+	//      never empty against a non-empty returned Response.
+	//
+	//   2. Double-paint fence. The instant a live (non-empty) delta is forwarded,
+	//      committed flips true. If that same attempt then fails, a retry/failover
+	//      would assemble and return the COMPLETE text — so the already-painted
+	//      partial would no longer equal the returned text. To hold the contract
+	//      invariant (concatenation of forwarded Chunk.Text == returned output text)
+	//      we do NOT retry or fail over once committed; we surface that attempt's
+	//      PARTIAL Response (== exactly what was forwarded) together with the error.
+	//
+	// A nil onChunk never forwards anything, so committed never flips and every
+	// attempt is eligible to retry/fail over exactly as Complete does.
+	committed := false
 	live := func(c Chunk) {
 		if onChunk != nil {
 			onChunk(c)
+		}
+		if c.Text != "" {
+			committed = true
 		}
 	}
 	for i, p := range r.providers {
@@ -217,9 +241,17 @@ func (r *Resilient) Stream(ctx context.Context, system string, msgs []Message, t
 			errs = append(errs, fmt.Errorf("provider %d (%s): breaker open", i, p.Model()))
 			continue
 		}
-		resp, err := r.streamWithRetry(ctx, p, r.breakers[i], &liveForward, live, system, msgs, tools, maxTokens)
+		resp, err := r.streamWithRetry(ctx, p, r.breakers[i], &committed, live, system, msgs, tools, maxTokens)
 		if err == nil {
 			return resp, nil
+		}
+		// Live text was already painted this walk: failing over (or fast-failing to a
+		// zeroed Response) would break the forwarded==returned invariant. Surface this
+		// attempt's PARTIAL resp (== what was forwarded) with the error, no failover.
+		// This is checked BEFORE the terminal-APIError fast-fail so a partial that was
+		// already streamed is never discarded.
+		if committed {
+			return resp, fmt.Errorf("provider %d (%s): %w", i, p.Model(), err)
 		}
 		// Terminal *APIError: fail fast, no failover (same as Complete).
 		if apiErr := terminalAPIError(err); apiErr != nil {
@@ -241,12 +273,12 @@ func (r *Resilient) Stream(ctx context.Context, system string, msgs []Message, t
 }
 
 // streamWithRetry is the streaming twin of callWithRetry: same retry/backoff and
-// breaker bookkeeping. liveForward is the walk-wide gate owned by Stream: the very
-// first attempt of the whole walk forwards chunks live through onChunk; the instant
-// a second attempt (retry OR failover) begins it is flipped off and every later
-// attempt buffers-and-discards, so a thrown-away attempt's chunks are never
-// re-emitted.
-func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker, liveForward *bool, onChunk func(Chunk), system string, msgs []Message, tools []Tool, maxTokens int) (Response, error) {
+// breaker bookkeeping. committed is the walk-wide gate owned by Stream (see Stream's
+// doc): an attempt forwards live only while committed is false (nothing painted
+// yet), and the instant committed flips true a subsequent failure stops the walk
+// (no retry/failover) and returns the partial resp — so the caller never sees a
+// partial repainted as a fresh full reply.
+func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker, committed *bool, onChunk func(Chunk), system string, msgs []Message, tools []Tool, maxTokens int) (Response, error) {
 	var lastErr error
 	for attempt := 0; attempt <= r.opts.MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -254,11 +286,12 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 				return Response{}, fmt.Errorf("backoff interrupted: %w", err)
 			}
 		}
-		// Only the walk's very first attempt forwards live; capture that decision
-		// then close the gate so every later attempt (this provider's retry or a
-		// failover) buffers-and-discards and can never re-emit attempt 0's chunks.
-		forwardLive := *liveForward
-		*liveForward = false
+		// Forward live only while nothing has been painted yet: the first attempt of
+		// the whole walk streams live, and so does a later attempt IF every earlier
+		// attempt failed before emitting a token. Once any delta is forwarded (below)
+		// committed flips true and every subsequent attempt buffers-and-discards, so a
+		// thrown-away attempt's chunks are never re-emitted.
+		forwardLive := !*committed
 		resp, err := r.streamOnce(ctx, p, forwardLive, onChunk, system, msgs, tools, maxTokens)
 		if err == nil {
 			b.recordSuccess()
@@ -266,6 +299,12 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 		}
 		lastErr = err
 		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
+		// Live text was already painted: retrying would return the full text after a
+		// partial was shown (double-paint), breaking the forwarded==returned invariant.
+		// Return this attempt's PARTIAL resp (== what was forwarded) with the error.
+		if *committed {
+			return resp, fmt.Errorf("attempt %d (partial already streamed): %w", attempt+1, err)
+		}
 		// A terminal *APIError cannot succeed on a retry — return it as-is so the
 		// caller's terminal check fires and stops the walk (no retry, no failover).
 		if isTerminalAPIError(err) {
@@ -287,17 +326,17 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 }
 
 // streamOnce runs a single streaming attempt with the optional per-call timeout.
-// When forwardLive is true (the walk's very first attempt) it forwards each delta
-// to onChunk LIVE, so the operator sees incremental tokens in the common
-// single-provider / no-retry case. When forwardLive is false (any retry or
-// failover) it buffers-and-discards: the deltas are staged but never emitted,
-// because the walk's first attempt already forwarded its own chunks — this
-// preserves the no-double-emit guarantee when a prior attempt is thrown away. A
-// non-streaming provider is driven via Complete and its assembled reply replayed
-// as a single chunk, so it satisfies the streaming contract too. On a context
-// cancellation the underlying provider returns the PARTIAL assembled Response
-// alongside ctx.Err(); streamOnce passes that partial resp back (not a zeroed one)
-// so a mid-stream steer preserves it.
+// When forwardLive is true (nothing has been painted yet on this walk) it forwards
+// each delta to onChunk LIVE, so the operator sees incremental tokens on the common
+// single-provider / no-retry path — and on a later attempt when every earlier one
+// failed before painting a token. When forwardLive is false (a prior attempt already
+// painted) it buffers-and-discards: the deltas are staged but never emitted, so a
+// thrown-away attempt's chunks are never re-emitted (no double-emit). A non-streaming
+// provider is driven via Complete and its assembled reply replayed as a single
+// chunk, so it satisfies the streaming contract too. On a context cancellation the
+// underlying provider returns the PARTIAL assembled Response alongside ctx.Err();
+// streamOnce passes that partial resp back (not a zeroed one) so a mid-stream steer
+// preserves it.
 func (r *Resilient) streamOnce(ctx context.Context, p Provider, forwardLive bool, onChunk func(Chunk), system string, msgs []Message, tools []Tool, maxTokens int) (Response, error) {
 	cctx := ctx
 	if r.opts.CallTimeout > 0 {
@@ -306,8 +345,8 @@ func (r *Resilient) streamOnce(ctx context.Context, p Provider, forwardLive bool
 		defer cancel()
 	}
 
-	// First attempt forwards live; a retry/failover buffers-and-discards (the first
-	// attempt already emitted its own chunks, so re-emitting here would double-emit).
+	// Forward live while nothing has been painted yet; once a prior attempt painted,
+	// buffer-and-discard so a thrown-away attempt's chunks are never re-emitted.
 	sink := func(Chunk) {} // discard by default
 	if forwardLive && onChunk != nil {
 		sink = onChunk

@@ -192,12 +192,28 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 	if err != nil {
 		return nil
 	}
+	// Resolve the effective embedding model up front so it can namespace BOTH the DB
+	// path and the content-hash cache. Changing NILCORE_EMBED_MODEL must never mix two
+	// embedding spaces (different models — and possibly different vector dimensions) in
+	// one HNSW graph: unchanged symbols would keep OLD-model vectors (cache hit) while
+	// new symbols get NEW-model vectors. Namespacing the DB by model isolates each
+	// model in its own file (a model switch starts a clean index / forces a rebuild);
+	// the model is also folded into the cache key inside the Index (semantic.OpenModel).
+	model := os.Getenv("NILCORE_EMBED_MODEL")
+	if model == "" {
+		model = embed.DefaultModel
+	}
+	baseURL := os.Getenv("NILCORE_EMBED_BASE_URL")
+	// The DB path is keyed by (workdir, model): a workdir hash keeps per-repo indexes
+	// separate, and a model tag in the filename keeps two models' vector spaces apart.
 	sum := sha256.Sum256([]byte(workdir))
-	dbPath := filepath.Join(cache, "nilcore", "semantic", hex.EncodeToString(sum[:8])+".db")
+	modelSum := sha256.Sum256([]byte(model))
+	dbName := hex.EncodeToString(sum[:8]) + "-" + hex.EncodeToString(modelSum[:6]) + ".db"
+	dbPath := filepath.Join(cache, "nilcore", "semantic", dbName)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil
 	}
-	ix, err := semantic.Open(dbPath, embed.NewOpenAI(key, os.Getenv("NILCORE_EMBED_MODEL")))
+	ix, err := semantic.OpenModel(dbPath, embed.NewOpenAIWithBase(key, model, baseURL), model)
 	if err != nil {
 		return nil
 	}
@@ -213,15 +229,16 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 		if rerr != nil || len(b) == 0 {
 			continue
 		}
-		// Index per-SYMBOL, keyed by symbol NAME — NOT per-file keyed by path. The
-		// retrieval graph keys its nodes by symbol name (graph.BuildFile), and the
-		// fusion step resolves a semantic hit via fileOf[hit.ID] and expands it through
-		// Graph.Callees/Callers(hit.ID). A file-path key never matches a symbol-name
-		// node, so a path-keyed index made the semantic lens silently dead (it resolved
-		// to no file and got no graph-neighbour expansion). Keying by symbol name puts
-		// the index in the graph's id space and matches the docs ("embeddings over whole
-		// symbols"). Add is content-hash cached (D2-T01): an unchanged symbol body does
-		// not re-embed.
+		// Index per-SYMBOL, keyed by symbol NAME — NOT per-file keyed by path. Graph
+		// nodes carry a QUALIFIED id (NodeID(file,recv,name)), so retrieve resolves a
+		// bare-name semantic hit to the matching qualified node(s) via its name index
+		// (retrieve.byName) and expands them through Graph.Callees/Callers. A file-path
+		// key would never match a symbol node, so a path-keyed index made the semantic
+		// lens silently dead (it resolved to no node and got no graph-neighbour
+		// expansion). Keying by symbol name keeps the index in the graph's NAME space —
+		// the resolvable bridge to the qualified nodes — and matches the docs
+		// ("embeddings over whole symbols"). Add is content-hash cached (D2-T01): an
+		// unchanged symbol body does not re-embed.
 		syms, serr := ast.Symbols(path)
 		if serr != nil || len(syms) == 0 {
 			continue

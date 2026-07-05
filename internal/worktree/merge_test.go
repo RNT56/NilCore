@@ -85,3 +85,30 @@ func TestMergeConflictAbortsClean(t *testing.T) {
 		t.Errorf("c.txt = %q (err=%v), want dep1's X (abort restored the pre-merge tip)", body, err)
 	}
 }
+
+// A git FAULT (merging an unknown ref) must NOT masquerade as a content conflict:
+// git fails without ever entering the merge state (no MERGE_HEAD), so Merge must
+// return conflict=false and a non-nil error — distinct from the true-conflict path.
+func TestMergeFaultIsNotConflict(t *testing.T) {
+	requireGit(t)
+	ctx := context.Background()
+	repo := initRepo(t)
+
+	wt, err := CreateFrom(ctx, repo, "rebase/z", "rb3", "HEAD")
+	if err != nil {
+		t.Fatalf("CreateFrom: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	conflict, err := wt.Merge(ctx, "no-such-branch", "merge missing")
+	if err == nil {
+		t.Fatal("merging an unknown ref must be a Go error (a fault), not a silent (false,nil)")
+	}
+	if conflict {
+		t.Errorf("a git fault must NOT be reported as a content conflict (conflict=%v)", conflict)
+	}
+	// The fault left no merge state to abort — the tree stays clean.
+	if st := strings.TrimSpace(gitOut(t, wt.Path(), "status", "--porcelain")); st != "" {
+		t.Errorf("worktree not clean after a merge fault: %q", st)
+	}
+}

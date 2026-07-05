@@ -195,6 +195,59 @@ func TestReadClipsSingleOversizedLine(t *testing.T) {
 	}
 }
 
+// TestReadRefusesFinalComponentSymlinkSwap is the adversarial regression for the
+// read-side TOCTOU (I4): a sandboxed process swaps an in-tree file name for a symlink
+// pointing at an out-of-worktree secret after the confinement check. ReadTool now
+// opens with O_NOFOLLOW (via worktreefs.ReadConfined), so the swapped-in link is
+// refused and the secret's bytes never reach the model.
+func TestReadRefusesFinalComponentSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOP SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A same-named file swapped for a symlink to the outside secret.
+	link := filepath.Join(dir, "innocent.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	got, err := run(t, ReadTool{}, dir, `{"path":"innocent.txt"}`)
+	if err == nil {
+		t.Fatalf("ReadTool must refuse a final-component symlink; got %q", got)
+	}
+	if strings.Contains(got, "TOP SECRET") {
+		t.Fatal("confinement breached: the outside secret leaked through a symlink read")
+	}
+}
+
+// TestEditRefusesFinalComponentSymlinkSwap: EditTool likewise reads via O_NOFOLLOW,
+// so it cannot be tricked into reading (and then rewriting through) a symlink swapped
+// in at the final component after the confinement check.
+func TestEditRefusesFinalComponentSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET DATA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "target.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	if _, err := run(t, EditTool{}, dir, `{"path":"target.txt","old":"SECRET","new":"X"}`); err == nil {
+		t.Fatal("EditTool must refuse a final-component symlink read")
+	}
+	// The outside secret must be untouched.
+	got, err := os.ReadFile(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "SECRET DATA" {
+		t.Fatal("confinement breached: the outside secret was modified through a symlink")
+	}
+}
+
 func TestReadDescriptionTeachesPaging(t *testing.T) {
 	// The description is how the model learns the recovery move — both variants
 	// (worktree-only and with read roots) must teach offset/limit + the marker.

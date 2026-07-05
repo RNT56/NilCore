@@ -20,11 +20,14 @@
 //     context is guard.Wrap-fenced; the supervisor reads typed control fields and
 //     fenced data, never obeying instructions a subagent emits.
 //
-// Termination rests ONLY on count/depth/deadline rails (the budget rail is wired
-// but, per design risk #1, is a soft addition): MaxDepth (leaf roles cannot
-// spawn), a tree-wide atomic MaxAgents counter, MaxFanout per decomposition,
-// MaxRounds, and the root context deadline. Total nodes <= MaxFanout^MaxDepth <=
-// MaxAgents — finite and operator-visible.
+// Termination rests ONLY on count/depth/deadline rails: MaxDepth (leaf roles
+// cannot spawn), a tree-wide atomic MaxAgents counter, MaxFanout per
+// decomposition, MaxRounds, and the root context deadline. Total nodes <=
+// MaxFanout^MaxDepth <= MaxAgents — finite and operator-visible. The dollar
+// budget is NOT a supervisor rail: it is enforced at the metered provider (§7),
+// which surfaces budget.ErrCeiling from a model call; the loop treats that as a
+// clean stop on the last verified tip (design risk #1 — the budget is a soft
+// addition applied at the wiring site, not a count rail this package owns).
 package super
 
 import (
@@ -197,7 +200,14 @@ type Supervisor struct {
 	// from -concurrency; every other surface leaves it 0 ⇒ serial.
 	Concurrency int
 
-	Budget *budget.Ledger // shared ledger; charged at the wiring site via meter (§7)
+	// Budget, if set, is the shared dollar ledger every metered tier charges through
+	// (planner + workers) at the wiring site. The HARD dollar wall is the metered
+	// provider's own ceiling (it surfaces budget.ErrCeiling from a model call, which the
+	// loop below turns into a clean "budget" stop on the last verified tip — §7). super
+	// itself keeps NO count rail off this ledger; it READS it only to record the run's
+	// live spend on the terminal super_done event (spent()), so the audit trail shows how
+	// much a run cost. nil ⇒ no spend recorded, byte-identical.
+	Budget *budget.Ledger
 
 	// Inbox, if set, is the conversational front door's user→agent seam (C1-T04),
 	// mirroring backend.Native's Inbox gate (C1-T03). At each round boundary the
@@ -832,10 +842,18 @@ func (s *Supervisor) depthCap() int {
 }
 
 // outcome builds the terminal Outcome from run state. Done/Verified are ALWAYS the
-// caller-supplied verifier verdict, never a model claim (I2).
+// caller-supplied verifier verdict, never a model claim (I2). When a shared Budget
+// ledger is wired, the run's live spend is folded into the super_done event so the
+// audit trail records how much the run cost (the ledger is READ, never a count rail —
+// the hard wall stays the metered provider's ErrCeiling).
 func (s *Supervisor) outcome(st *runState, done bool, reason string, rounds int) Outcome {
-	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_done",
-		Detail: map[string]any{"done": done, "reason": reason, "rounds": rounds, "spawned": st.spawned}})
+	detail := map[string]any{"done": done, "reason": reason, "rounds": rounds, "spawned": st.spawned}
+	if s.Budget != nil {
+		tokens, dollars := s.Budget.Total()
+		detail["spent_tokens"] = tokens
+		detail["spent_dollars"] = dollars
+	}
+	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_done", Detail: detail})
 	return Outcome{
 		Done:     done,
 		Verified: done,

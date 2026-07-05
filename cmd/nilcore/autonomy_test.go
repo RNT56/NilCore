@@ -110,8 +110,9 @@ func TestWakeFeederFiresAndDisarms(t *testing.T) {
 }
 
 // TestWakeFeederSkipsNotDueAndFiresAtMostOnce: a not-yet-due wake is never delivered,
-// and a due wake fires exactly once across many ticks (deliver-then-disarm + the
-// in-flight guard prevent a re-fire) while the future wake stays armed.
+// and a due wake fires exactly once across many ticks (Registry.Claim durably disarms
+// the wake on the winning fire, so no later tick re-claims it) while the future wake
+// stays armed.
 func TestWakeFeederSkipsNotDueAndFiresAtMostOnce(t *testing.T) {
 	store := &fakeWakeStore{}
 	reg := wake.New(store, nil)
@@ -143,5 +144,49 @@ func TestWakeFeederSkipsNotDueAndFiresAtMostOnce(t *testing.T) {
 	}
 	if store.armed() != 1 {
 		t.Errorf("the future (not-due) wake must stay armed, armed=%d", store.armed())
+	}
+}
+
+// TestWakeFeederSingleFireAcrossPollers is the finding's guarantee: two feeders over
+// the SAME registry (as two serve pollers, or serve's own runWaker + this feeder,
+// would be) must fire a due wake AT MOST ONCE — Registry.Claim is the durable,
+// atomic single-fire gate, not a per-process in-memory guard. Exactly one delivery
+// lands across both channels, and the wake is durably disarmed.
+func TestWakeFeederSingleFireAcrossPollers(t *testing.T) {
+	store := &fakeWakeStore{}
+	reg := wake.New(store, nil)
+	if _, err := reg.Arm(context.Background(), "shared", "s", 0, "once"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	chA := make(chan autosrc.Wake, 4)
+	chB := make(chan autosrc.Wake, 4)
+	go wakeFeeder(ctx, reg, chA, time.Millisecond)
+	go wakeFeeder(ctx, reg, chB, time.Millisecond)
+
+	var got []autosrc.Wake
+	deadline := time.After(2 * time.Second)
+	// Collect for a window long enough for many ticks on both feeders.
+	drain := time.After(200 * time.Millisecond)
+loop:
+	for {
+		select {
+		case w := <-chA:
+			got = append(got, w)
+		case w := <-chB:
+			got = append(got, w)
+		case <-drain:
+			break loop
+		case <-deadline:
+			break loop
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("wake fired %d times across two pollers, want exactly 1 (durable at-most-once): %+v", len(got), got)
+	}
+	if store.armed() != 0 {
+		t.Errorf("the fired wake must be durably disarmed, armed=%d", store.armed())
 	}
 }

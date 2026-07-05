@@ -78,6 +78,48 @@ func TestRepoMapRanksHubTop(t *testing.T) {
 	}
 }
 
+// TestRepoMapResolvesQualifiedEdges is the regression guard for the qualified-id
+// migration: real BuildFile stores nodes under QUALIFIED ids (NodeID(file,recv,name))
+// while a `calls` edge's to_id is the BARE callee name. RepoMap must consume CallEdges
+// (which resolves the bare name to the qualified node) — feeding it the raw Edges("calls")
+// drops every edge (the bare to_id is absent from the qualified node set), leaving
+// PageRank edge-less and every rank uniform. Here the hub (two incoming calls) must still
+// STRICTLY out-rank the others. (seedHub uses bare ids where both edge forms coincide, so
+// it cannot catch this — this test uses the real keying.)
+func TestRepoMapResolvesQualifiedEdges(t *testing.T) {
+	aID := graph.NodeID("x.go", "", "a")
+	bID := graph.NodeID("x.go", "", "b")
+	cID := graph.NodeID("x.go", "", "c")
+	nodes := []graph.Node{
+		{ID: aID, Kind: "func", Name: "a", File: "x.go"},
+		{ID: bID, Kind: "func", Name: "b", File: "x.go"},
+		{ID: cID, Kind: "func", Name: "c", File: "x.go"},
+	}
+	// To carries the BARE callee name, exactly as BuildFile records a call edge.
+	edges := []graph.Edge{
+		{From: aID, To: "b", Kind: "calls"},
+		{From: cID, To: "b", Kind: "calls"},
+		{From: aID, To: "c", Kind: "calls"},
+	}
+	g := buildGraph(t, nodes, edges)
+
+	entries, err := RepoMap(context.Background(), g, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("RepoMap returned %d entries, want 3", len(entries))
+	}
+	if entries[0].ID != bID {
+		t.Errorf("top entry = %q, want the hub %q — call edges were dropped (uniform ranks), i.e. raw Edges not CallEdges. full = %v",
+			entries[0].ID, bID, ids(entries))
+	}
+	if entries[0].Score <= entries[len(entries)-1].Score {
+		t.Errorf("hub score %v not strictly above the lowest %v — resolved call edges did not drive PageRank",
+			entries[0].Score, entries[len(entries)-1].Score)
+	}
+}
+
 func TestRepoMapBudgetCaps(t *testing.T) {
 	g := seedHub(t)
 	ctx := context.Background()

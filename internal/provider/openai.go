@@ -667,6 +667,14 @@ type oaiStreamChunk struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *oaiUsage `json:"usage"`
+	// Error carries an in-band error envelope. An OpenAI-compatible / OpenRouter
+	// server that fails MID-stream (after a 200 OK) emits a `data: {"error":{...}}`
+	// frame and then closes the connection, often with NO trailing [DONE]. Without
+	// this field the frame decodes to empty Choices/nil Usage, is skipped, and the
+	// stream reaches a clean EOF — a partial/empty Response silently treated as
+	// success, defeating retry/failover. Decoding it lets the assembler surface a
+	// typed, correctly-classified error (I7: the envelope is parsed as data only).
+	Error *streamErrorEnvelope `json:"error"`
 }
 
 // oaiToolCallDelta is a streamed tool-call fragment. id and function.name arrive
@@ -735,6 +743,7 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 		servedModel string // last non-empty top-level "model" seen across frames
 		toolCalls   = map[int]*oaiStreamToolCall{}
 		toolOrder   []int // tool-call indices in first-seen order, for stable assembly
+		gotContent  bool  // saw any content/usage frame (text, tool call, usage, or finish)
 	)
 
 	assemble := func() model.Response {
@@ -789,6 +798,16 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 			return assemble(), fmt.Errorf("decode stream chunk: %w", err)
 		}
 
+		// In-band error frame: an OpenAI-compatible / OpenRouter server that fails
+		// MID-stream after a 200 OK emits `data: {"error":{...}}` and closes (often
+		// with no [DONE]). Surface it as a typed, classified error so the resilience
+		// wrapper retries a transient failure (overloaded / rate-limited / server
+		// error) and fast-fails a terminal one — instead of returning the partial
+		// assembly as a false success.
+		if chunk.Error != nil {
+			return assemble(), chunk.Error.toAPIError()
+		}
+
 		// The served-model id rides every frame (including the trailing usage-only
 		// frame); keep the last non-empty one for the assembled Response.
 		if chunk.Model != "" {
@@ -797,6 +816,7 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 		// The trailing usage-only frame carries no choices.
 		if chunk.Usage != nil {
 			out.Usage = chunk.Usage.toModelUsage()
+			gotContent = true
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -805,15 +825,18 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 		choice := chunk.Choices[0]
 		if choice.FinishReason != "" {
 			finish = choice.FinishReason
+			gotContent = true
 		}
 		if choice.Delta.Content != "" {
 			hasText = true
+			gotContent = true
 			textBuf = append(textBuf, choice.Delta.Content...)
 			if onChunk != nil {
 				onChunk(model.Chunk{Text: choice.Delta.Content})
 			}
 		}
 		for _, tcd := range choice.Delta.ToolCalls {
+			gotContent = true
 			tc, seen := toolCalls[tcd.Index]
 			if !seen {
 				tc = &oaiStreamToolCall{}
@@ -842,7 +865,21 @@ func assembleOpenAIStream(ctx context.Context, body io.Reader, onChunk func(mode
 		return assemble(), fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clean EOF without an explicit [DONE]: return what we assembled.
+	// EOF without an explicit [DONE]. If at least one content/usage/finish frame
+	// arrived, the stream is a (possibly truncated) real reply — return it as a
+	// clean success, mirroring the non-stream and Anthropic paths (the native loop's
+	// truncation salvage depends on a partial tool_use surviving as a nil-error
+	// Response). But an EOF with NOTHING received is a broken connection dressed up
+	// as a 200: returning it as success would defeat retry/failover, so surface a
+	// retryable error instead.
+	if !gotContent {
+		return assemble(), &model.APIError{
+			StatusCode: 502,
+			Retryable:  true,
+			Type:       "stream_truncated",
+			Message:    "openai stream closed with no content before [DONE]",
+		}
+	}
 	return assemble(), nil
 }
 

@@ -52,18 +52,31 @@ func TestPresetArgs(t *testing.T) {
 		preset      router.Preset
 		goal, dir   string
 		swarmPreset string
+		fwd         commonForward
 		want        []string
 	}{
-		{"run carries goal+dir", router.Run, "do a thing", "./repo", "", []string{"-goal", "do a thing", "-dir", "./repo"}},
-		{"build carries goal+dir", router.Build, "make it", ".", "", []string{"-goal", "make it", "-dir", "."}},
-		{"swarm forwards -dir too", router.Swarm, "audit all", "./other", "", []string{"-goal", "audit all", "-dir", "./other"}},
-		{"swarm adds -preset when given", router.Swarm, "audit all", ".", "research", []string{"-goal", "audit all", "-dir", ".", "-preset", "research"}},
-		{"swarm ignores a blank -preset", router.Swarm, "audit all", ".", "   ", []string{"-goal", "audit all", "-dir", "."}},
-		{"decompose carries goal+dir", router.Decompose, "a and b", "./repo", "", []string{"-goal", "a and b", "-dir", "./repo"}},
+		{"run carries goal+dir", router.Run, "do a thing", "./repo", "", commonForward{}, []string{"-goal", "do a thing", "-dir", "./repo"}},
+		{"build carries goal+dir", router.Build, "make it", ".", "", commonForward{}, []string{"-goal", "make it", "-dir", "."}},
+		{"swarm forwards -dir too", router.Swarm, "audit all", "./other", "", commonForward{}, []string{"-goal", "audit all", "-dir", "./other"}},
+		{"swarm adds -preset when given", router.Swarm, "audit all", ".", "research", commonForward{}, []string{"-goal", "audit all", "-dir", ".", "-preset", "research"}},
+		{"swarm ignores a blank -preset", router.Swarm, "audit all", ".", "   ", commonForward{}, []string{"-goal", "audit all", "-dir", "."}},
+		{"decompose carries goal+dir", router.Decompose, "a and b", "./repo", "", commonForward{}, []string{"-goal", "a and b", "-dir", "./repo"}},
+		// Common flags forward through to the preset when set.
+		{"forwards common flags", router.Run, "g", ".", "",
+			commonForward{verify: "go test ./...", log: "e.jsonl", sandbox: "namespace", runtime: "docker", image: "img:1", config: "c.json"},
+			[]string{"-goal", "g", "-dir", ".", "-verify", "go test ./...", "-log", "e.jsonl", "-sandbox", "namespace", "-runtime", "docker", "-image", "img:1", "-config", "c.json"}},
+		// Blank common flags are omitted (preset keeps its default).
+		{"omits blank common flags", router.Run, "g", ".", "",
+			commonForward{verify: "  ", log: ""},
+			[]string{"-goal", "g", "-dir", "."}},
+		// Common-flag forwarding composes with swarm's -preset.
+		{"common flags + swarm preset", router.Swarm, "g", ".", "research",
+			commonForward{log: "e.jsonl"},
+			[]string{"-goal", "g", "-dir", ".", "-log", "e.jsonl", "-preset", "research"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := presetArgs(c.preset, c.goal, c.dir, c.swarmPreset)
+			got := presetArgs(c.preset, c.goal, c.dir, c.swarmPreset, c.fwd)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("presetArgs = %v, want %v", got, c.want)
 			}

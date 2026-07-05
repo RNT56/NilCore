@@ -61,11 +61,18 @@ import (
 // mirror the closed ShardState set so a row's Status is the durable projection of
 // its in-memory state.
 const (
-	// StatusRun marks the single run row that carries SwarmState. It is the only
-	// non-terminal swarm status InFlightSwarm scans for, so an interrupted run is
-	// resumable while a finished one (its row left at StatusRun is acceptable; the
-	// Controller decides convergence from the artifacts, not the row).
+	// StatusRun marks the single run row that carries SwarmState WHILE the run is in
+	// flight. It is the only non-terminal run status InFlightSwarm scans for, so an
+	// interrupted run is resumable. On a clean converge the row is moved to
+	// StatusRunDone (MarkConverged) so a later --resume does NOT re-adopt a finished
+	// run and re-drive it (a converged run has nothing red left, so resuming it would
+	// spin a no-op pass and mislead the operator).
 	StatusRun = "swarm-run"
+	// StatusRunDone marks a run row whose loop CONVERGED (the green terminal exit). It
+	// is deliberately outside the set InFlightSwarm scans, so a converged run is not
+	// discoverable as "interrupted" by --resume. Only a clean converge sets it; a
+	// capped/red/exhausted run stays StatusRun (its still-red shards ARE resumable).
+	StatusRunDone = "swarm-run-done"
 	// StatusQueued is a shard placed on the worklist, not yet dispatched.
 	StatusQueued = "swarm-queued"
 	// StatusRunning is a shard a worker is currently building.
@@ -213,6 +220,30 @@ func (q *Queue) SaveState(ctx context.Context, st SwarmState) error {
 		Detail: string(detail),
 	}); err != nil {
 		return fmt.Errorf("swarm queue: save run state: %w", err)
+	}
+	return nil
+}
+
+// MarkConverged moves the run row to the terminal StatusRunDone status while
+// preserving its SwarmState Detail (the same crash-atomic full-record write SaveState
+// uses), so a converged run is no longer discoverable by InFlightSwarm and a later
+// --resume will not re-adopt and re-drive it. It is idempotent (re-marking an already-
+// done run rewrites the same terminal row) and a no-op-safe on a run row that was never
+// persisted (UpsertTask creates it). Called ONCE by the Controller on the green
+// converged exit — every other termination leaves the row at StatusRun so its still-red
+// shards stay resumable.
+func (q *Queue) MarkConverged(ctx context.Context, st SwarmState) error {
+	detail, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("swarm queue: marshal converged run state: %w", err)
+	}
+	if err := q.store.UpsertTask(ctx, store.Task{
+		ID:     q.runRowID(),
+		Goal:   st.Goal,
+		Status: StatusRunDone,
+		Detail: string(detail),
+	}); err != nil {
+		return fmt.Errorf("swarm queue: mark converged: %w", err)
 	}
 	return nil
 }

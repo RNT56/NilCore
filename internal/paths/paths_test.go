@@ -21,6 +21,37 @@ func TestConfigDir(t *testing.T) {
 	}
 }
 
+// ConfigDir hosts the secrets vault + master key, so its resolved path must stay STABLE
+// across releases. On Linux, XDG keeps config and data distinct. On macOS they DELIBERATELY
+// share ~/Library/Application Support (os.UserConfigDir): macOS has no XDG-style split, and
+// relocating config to ~/Library/Preferences would orphan an already-provisioned secrets
+// vault on upgrade (a fresh master key would be minted, silently losing every stored
+// secret). This test guards against re-introducing that relocation.
+func TestConfigDirIsStableSecretsHome(t *testing.T) {
+	cfg, err := ConfigDir()
+	if err != nil {
+		t.Fatalf("ConfigDir: %v", err)
+	}
+	data, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir: %v", err)
+	}
+	if runtime.GOOS == "darwin" {
+		// Both under Application Support (the deliberate, secret-preserving collapse).
+		if !strings.Contains(cfg, filepath.Join("Library", "Application Support", app)) {
+			t.Errorf("macOS ConfigDir = %q, want under Library/Application Support/%s (relocating it orphans the secrets vault)", cfg, app)
+		}
+		if !strings.Contains(data, filepath.Join("Library", "Application Support", app)) {
+			t.Errorf("macOS DataDir = %q, want under Library/Application Support/%s", data, app)
+		}
+		return
+	}
+	// Linux/XDG: config and data remain distinct.
+	if cfg == data {
+		t.Errorf("ConfigDir and DataDir collapsed to the same path %q on non-darwin", cfg)
+	}
+}
+
 func TestDataDirXDG(t *testing.T) {
 	if runtime.GOOS == "darwin" {
 		dir, err := DataDir()

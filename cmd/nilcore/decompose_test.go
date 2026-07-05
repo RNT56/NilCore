@@ -42,6 +42,74 @@ func TestDecomposePlan(t *testing.T) {
 	}
 }
 
+func TestClampSubGoals(t *testing.T) {
+	cases := []struct {
+		name string
+		subs []string
+		max  int
+		want []string
+	}{
+		{"fits exactly", []string{"a", "b", "c"}, 3, []string{"a", "b", "c"}},
+		{"under limit", []string{"a", "b"}, 5, []string{"a", "b"}},
+		{"unbounded max=0", []string{"a", "b", "c", "d"}, 0, []string{"a", "b", "c", "d"}},
+		{"unbounded max<0", []string{"a", "b", "c"}, -1, []string{"a", "b", "c"}},
+		// 5 sub-goals, max 3: first 2 stay, the last 3 batch into one child.
+		{"overflow batched", []string{"a", "b", "c", "d", "e"}, 3, []string{"a", "b", "c and d and e"}},
+		// The exact 10→8 default-flag scenario the bug fataled on.
+		{"ten into eight", []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 8,
+			[]string{"1", "2", "3", "4", "5", "6", "7", "8 and 9 and 10"}},
+		{"max 1 batches all", []string{"a", "b", "c"}, 1, []string{"a and b and c"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := clampSubGoals(c.subs, c.max)
+			if len(got) != len(c.want) {
+				t.Fatalf("clampSubGoals(%v, %d) = %v (len %d), want %v (len %d)",
+					c.subs, c.max, got, len(got), c.want, len(c.want))
+			}
+			if c.max > 0 && len(got) > c.max {
+				t.Fatalf("clampSubGoals(%v, %d) returned %d children, exceeds max", c.subs, c.max, len(got))
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("clampSubGoals(%v, %d)[%d] = %q, want %q", c.subs, c.max, i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestDecomposeEnvelopeClampsOversizedPlan: a goal that segments into MORE sub-goals than
+// -max-children must NOT abort the run via the kernel's fail-closed MaxChildren guard — it
+// degrades gracefully (the overflow batched into the last child) and the run still verifies.
+// Before the fix this scenario fataled the whole command on valid input.
+func TestDecomposeEnvelopeClampsOversizedPlan(t *testing.T) {
+	repo := initEquivGitRepo(t)
+	base := baseBranch(t, repo)
+	runChild := func(_ context.Context, subGoal, taskID string) (string, bool, error) {
+		br := "child-" + taskID
+		addChildBranch(t, repo, base, br, taskID+".txt", subGoal+"\n")
+		return br, true, nil
+	}
+	alwaysGreen := func(context.Context, string) (bool, error) { return true, nil }
+
+	// A 5-item goal with max-children=3: previously len(children)=5 > MaxChildren=3 ⇒
+	// kernel.Recursive hard-errors ⇒ decomposeMain fatals. Now it clamps to 3 children.
+	env, st := decomposeEnvelope("root", repo, runChild, alwaysGreen, 3, nil, nil)
+	out, err := kernel.Run(context.Background(), env,
+		kernel.Node{ID: "root", Goal: "a and b and c and d and e"})
+	if err != nil {
+		t.Fatalf("decompose Run must not error on an oversized plan: %v", err)
+	}
+	if !out.Verified {
+		t.Fatalf("decompose outcome not verified: %+v", out)
+	}
+	if st.res.merged != 3 {
+		t.Fatalf("merged %d, want 3 (clamped to max-children)", st.res.merged)
+	}
+	defer func() { _ = st.wt.Cleanup() }()
+}
+
 func git(t *testing.T, repo string, args ...string) {
 	t.Helper()
 	full := append([]string{"-c", "user.email=t@nilcore.local", "-c", "user.name=t"}, args...)

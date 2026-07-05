@@ -67,18 +67,26 @@ func mintBlastBudget(preset string, log *eventlog.Log) *blastbudget.Budget {
 // rebuildBlastDay re-loads the current UTC day's already-spent auto-approval dollars
 // from the append-only log into a fresh budget, so the per-day $ ceiling survives a
 // process restart (the rate window and trust view already rebuild from the log per
-// decision; this closes the same gap for the $ axis). It sums every `auto_approve`
-// event's `dollars.charged` whose Time is today and pre-charges that total. Best-effort
-// and READ-ONLY: a missing/unreadable log or a malformed line just contributes nothing
-// (a fresh install has no prior spend). A nil budget or empty path is a no-op.
+// decision; this closes the same gap for the $ axis). It sums each `auto_approve`
+// event's ACTUAL charged spend whose Time is today and pre-charges that total.
+// Best-effort and READ-ONLY: a missing/unreadable log or a malformed line just
+// contributes nothing (a fresh install has no prior spend). A nil budget or empty path
+// is a no-op.
+//
+// ACTUAL SPEND, not the ceiling. graapprove now records the ACTUAL per-action dollar
+// cost it charged in `dollars.charged` (previously it charged — and logged — the whole
+// clause CEILING per action, which both self-exhausted a smaller blast day budget and
+// made per-day $ accounting coarse). We sum that actual value. For forward/backward
+// compatibility with logs written before that change, we prefer an explicit
+// `dollars.actual_usd` when present and otherwise fall back to `dollars.charged`; both
+// now carry the actual spend, so the sum reflects real dollars either way.
 //
 // CONSERVATIVE BY DESIGN: it counts EVERY auto-approval that occurred today, including
 // any taken while a prior run was unfenced (`-blast-radius off`, so no budget was
-// charged at the time). The log records `dollars.charged` regardless of whether a budget
-// was attached, and the spend genuinely happened, so a newly-fenced run accounts for the
-// day's full auto-approval $ rather than under-counting it — the fail-safe direction for
-// a ceiling. (There is no over-count within a process: the live charge happens for NEW
-// decisions, the rebuild only re-establishes PAST ones at mint time.)
+// charged at the time). The spend genuinely happened, so a newly-fenced run accounts
+// for the day's full auto-approval $ rather than under-counting it — the fail-safe
+// direction for a ceiling. (There is no over-count within a process: the live charge
+// happens for NEW decisions, the rebuild only re-establishes PAST ones at mint time.)
 func rebuildBlastDay(b *blastbudget.Budget, logPath string) {
 	if b == nil || logPath == "" {
 		return
@@ -106,14 +114,28 @@ func rebuildBlastDay(b *blastbudget.Budget, logPath string) {
 			continue
 		}
 		if d, ok := e.Detail["dollars"].(map[string]any); ok {
-			if charged, ok := d["charged"].(float64); ok {
-				sum += charged
-			}
+			sum += autoApprovalActualUSD(d)
 		}
 	}
 	if sum > 0 {
 		_ = b.ChargeAutoApprovalDollars(context.Background(), today, sum)
 	}
+}
+
+// autoApprovalActualUSD reads the ACTUAL dollars an auto_approve event charged from its
+// `dollars` sub-object. It prefers the explicit `actual_usd` field (emitted on a
+// dollar-bearing auto-approval) and otherwise falls back to `charged` — which, after
+// the graapprove actual-spend fix, also carries the actual amount. A missing/non-float
+// value contributes 0. This is the single place the per-day $ accounting reads a
+// spend figure, so the "which field is the actual spend" decision lives in one spot.
+func autoApprovalActualUSD(dollars map[string]any) float64 {
+	if v, ok := dollars["actual_usd"].(float64); ok {
+		return v
+	}
+	if v, ok := dollars["charged"].(float64); ok {
+		return v
+	}
+	return 0
 }
 
 // blastSink adapts the run's append-only log to blastbudget.Sink: metadata-only

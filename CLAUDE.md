@@ -160,7 +160,7 @@ docs/
   PERSONA.md           ← the running agent's voice, autonomy, and behavior
   TASKS.md             ← the work queue: master DAG + in-depth task specs
   SWARM.md             ← Phase 12: verified swarm mode (`nilcore swarm`) design + task DAG
-cmd/nilcore/           ← entrypoint (run · build · serve · chat · swarm · browse · desktop · report · …)
+cmd/nilcore/           ← entrypoint (do · build · serve · chat · swarm · browse · desktop · report · …; single-task run is the flag form `nilcore -goal …`)
 cmd/tools/             ← image-/host-baked fat drivers (nilcore-browser, nilcore-desktop[-darwin])
 internal/
   model/               ← provider-agnostic Messages client + BuiltinTool seam (stdlib only)

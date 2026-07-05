@@ -84,6 +84,31 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.migrateMemoryUnique(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateEventSeq(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateEventSeq adds the events.seq column that anchors each mirrored event to its
+// authoritative position in the append-only log. Without it the SQLite mirror keeps
+// insertion order but LOSES the Seq anchor, so the mirror cannot reproduce ordering or
+// detect a GAP (a dropped event): id is a local auto-increment, not the log's Seq. The
+// add is additive and idempotent — guarded by hasColumn because SQLite's ALTER TABLE
+// ADD COLUMN has no IF NOT EXISTS form — so Open is safe every start and safe on a DB
+// that predates the column. Legacy rows get the DEFAULT (-1 = "seq unknown"), which a
+// gap check reads as "not anchored" rather than mistaking it for real position 0.
+func (s *Store) migrateEventSeq(ctx context.Context) error {
+	has, err := s.hasColumn(ctx, "events", "seq")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := s.db.ExecContext(ctx,
+			`ALTER TABLE events ADD COLUMN seq INTEGER NOT NULL DEFAULT -1`); err != nil {
+			return fmt.Errorf("add events.seq: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -228,8 +253,13 @@ func (s *Store) Close() error { return s.db.Close() }
 
 const tsFmt = time.RFC3339Nano
 
-// Event mirrors an eventlog record for persistence.
+// Event mirrors an eventlog record for persistence. Seq is the event's authoritative
+// position in the append-only log (eventlog.Event.Seq) — persisting it lets the SQLite
+// mirror reproduce ordering and detect a GAP (a dropped event) rather than relying on
+// the local auto-increment id, which is a per-row counter, not the log's position. A
+// legacy row written before the seq column exists reads back as -1 ("seq unknown").
 type Event struct {
+	Seq     uint64
 	Time    time.Time
 	Task    string
 	Kind    string
@@ -239,21 +269,24 @@ type Event struct {
 	Hash    string
 }
 
-// InsertEvent appends an event.
+// InsertEvent appends an event, persisting its Seq anchor alongside the chain fields
+// so the mirror can reproduce log ordering / gaps (not just insertion order).
 func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (ts, task, kind, backend, detail, prev, hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		e.Time.UTC().Format(tsFmt), e.Task, e.Kind, e.Backend, e.Detail, e.Prev, e.Hash)
+		`INSERT INTO events (ts, task, kind, backend, detail, prev, hash, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.Time.UTC().Format(tsFmt), e.Task, e.Kind, e.Backend, e.Detail, e.Prev, e.Hash, int64(e.Seq))
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
 }
 
-// EventsByTask returns a task's events in insertion order.
+// EventsByTask returns a task's events ordered by their log Seq (the authoritative
+// order), falling back to insertion id so legacy rows whose seq is the -1 sentinel
+// still return deterministically.
 func (s *Store) EventsByTask(ctx context.Context, task string) ([]Event, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT ts, task, kind, backend, detail, prev, hash FROM events WHERE task = ? ORDER BY id`, task)
+		`SELECT ts, task, kind, backend, detail, prev, hash, seq FROM events WHERE task = ? ORDER BY seq, id`, task)
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
 	}
@@ -262,8 +295,12 @@ func (s *Store) EventsByTask(ctx context.Context, task string) ([]Event, error) 
 	for rows.Next() {
 		var e Event
 		var ts string
-		if err := rows.Scan(&ts, &e.Task, &e.Kind, &e.Backend, &e.Detail, &e.Prev, &e.Hash); err != nil {
+		var seq int64
+		if err := rows.Scan(&ts, &e.Task, &e.Kind, &e.Backend, &e.Detail, &e.Prev, &e.Hash, &seq); err != nil {
 			return nil, err
+		}
+		if seq >= 0 {
+			e.Seq = uint64(seq)
 		}
 		e.Time, _ = time.Parse(tsFmt, ts)
 		out = append(out, e)
@@ -283,30 +320,27 @@ type Memory struct {
 
 // PutMemory inserts or updates a memory record keyed by (scope, project, mkey),
 // returning the affected row's id. The "key" is a real key: a changed value for an
-// existing (scope, project, mkey) REPLACES the row (ON CONFLICT) rather than leaving
-// a stale duplicate behind, so recall never surfaces both the old and current value
-// for the same key. LastInsertId is only meaningful on a fresh insert, so on an
-// update path we look the row's id up to return it.
+// existing (scope, project, mkey) REPLACES the row (ON CONFLICT) rather than leaving a
+// stale duplicate behind, so recall never surfaces both the old and current value for
+// the same key.
+//
+// The id comes from RETURNING id, evaluated for BOTH the insert and the ON CONFLICT
+// UPDATE branch, so the caller always gets the id of THIS logical row. LastInsertId is
+// unreliable here: on the update branch no new row is inserted, so it returns the
+// connection's LAST successful insert rowid — which, on the store's single shared
+// connection, may be an UNRELATED prior row. RETURNING closes that stale-rowid hole.
 func (s *Store) PutMemory(ctx context.Context, m Memory) (int64, error) {
 	if m.Created.IsZero() {
 		m.Created = time.Now().UTC()
 	}
-	res, err := s.db.ExecContext(ctx,
+	var id int64
+	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO memory (scope, project, mkey, mvalue, created) VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(scope, project, mkey) DO UPDATE SET mvalue=excluded.mvalue, created=excluded.created`,
-		m.Scope, m.Project, m.Key, m.Value, m.Created.UTC().Format(tsFmt))
+		 ON CONFLICT(scope, project, mkey) DO UPDATE SET mvalue=excluded.mvalue, created=excluded.created
+		 RETURNING id`,
+		m.Scope, m.Project, m.Key, m.Value, m.Created.UTC().Format(tsFmt)).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("put memory: %w", err)
-	}
-	if id, err := res.LastInsertId(); err == nil && id > 0 {
-		return id, nil
-	}
-	// Update path: no new row, so resolve the existing id by its logical key.
-	var id int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM memory WHERE scope=? AND project=? AND mkey=?`,
-		m.Scope, m.Project, m.Key).Scan(&id); err != nil {
-		return 0, fmt.Errorf("put memory: resolve id: %w", err)
 	}
 	return id, nil
 }

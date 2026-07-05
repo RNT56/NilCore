@@ -33,6 +33,10 @@ jobs:
         run: |
           out="nilcore-${GOOS}-${GOARCH}"
           go build -trimpath -ldflags "-s -w" -o "dist/${out}" ./cmd/nilcore
+          # Publish a per-binary SHA-256 so the curl|sh installer can verify integrity
+          # before running the downloaded binary. The file holds "<hash>  <asset>" so a
+          # consumer can `sha256sum -c` it directly.
+          ( cd dist && sha256sum "${out}" > "${out}.sha256" )
       - uses: actions/upload-artifact@v4
         with:
           name: nilcore-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -48,10 +52,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Aggregate a signed-off checksums manifest
+        # One SHA256SUMS covering every binary, alongside the per-binary .sha256 files,
+        # so a consumer can verify the whole release set at once.
+        run: |
+          ( cd dist && sha256sum nilcore-* 2>/dev/null | grep -v '\.sha256$' > SHA256SUMS || true )
+          echo "--- SHA256SUMS ---"; cat dist/SHA256SUMS
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        # Create the release with the binaries; if it already exists, upload to it.
+        # Create the release with the binaries + checksums; if it already exists, upload to it.
         run: |
           gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --generate-notes \
             || gh release upload "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber

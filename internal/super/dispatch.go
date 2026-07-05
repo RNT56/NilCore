@@ -562,6 +562,12 @@ func (s *Supervisor) doAwait(ctx context.Context, st *runState, b modelToolUse) 
 	for _, h := range st.handles {
 		b2.WriteString(s.renderReport(h.Result))
 		b2.WriteByte('\n')
+		// await_results is the cohort's read point: once its outcome has been surfaced
+		// to the model the handle is FOLDED and stops counting against MaxFanout, so a
+		// following decomposition wave gets a fresh fanout budget (concurrent-per-wave,
+		// not a cumulative run cap). The handle stays in st.handles for integration/
+		// snapshot/history — only outstanding() drops it.
+		h.Folded = true
 	}
 	s.Log.Append(eventlog.Event{Task: supervisorTask, Kind: "super_await",
 		Detail: map[string]any{"results": len(st.handles)}})
@@ -621,6 +627,13 @@ func (s *Supervisor) recordIntegration(ctx context.Context, st *runState, result
 	for _, r := range results {
 		if r.Merged && r.Verified {
 			st.nodeStates[r.ID] = "merged"
+			// A handle whose branch is now on the integration tip is FOLDED: its work is
+			// consumed, so it no longer counts against the live MaxFanout budget. This lets
+			// a supervisor that integrates each wave before spawning the next keep spawning
+			// within the per-wave cap instead of hitting a cumulative run-wide ceiling.
+			if h, ok := st.handles[r.ID]; ok {
+				h.Folded = true
+			}
 		} else {
 			st.nodeStates[r.ID] = "failed"
 		}
@@ -681,12 +694,23 @@ func (s *Supervisor) denySpawn(toolID string, spec SubagentSpec, reason string) 
 	return errf(toolID, "spawn refused ("+reason+"). Re-plan within the rails: do more yourself with code, or narrow the decomposition.")
 }
 
-// outstanding counts subagents that have been spawned but not yet folded away. With
-// synchronous spawning every handle is Done, so this bounds total spawns this run
-// against MaxFanout — the conservative reading (never exceed fanout even across a
-// wave). It is the live-cohort size the fanout rail caps.
+// outstanding counts subagents that have been spawned but whose result the
+// supervisor has NOT yet folded away — the live cohort the MaxFanout rail caps.
+// Spawning is synchronous, so every handle is Done the instant it is recorded; a
+// handle is "folded" (and stops counting here) once its result is READ via
+// await_results or MERGED via integrate. This makes MaxFanout mean
+// concurrently-outstanding-per-wave (the documented semantics) rather than a
+// cumulative cap over the whole run — before this fix, len(st.handles) only ever
+// grew, so with the default -max-fanout=8 every spawn past the 8th was refused
+// for the rest of the run even though the earlier cohort had already been folded.
 func (s *Supervisor) outstanding(st *runState) int {
-	return len(st.handles)
+	n := 0
+	for _, h := range st.handles {
+		if !h.Folded {
+			n++
+		}
+	}
+	return n
 }
 
 // mergeOrder returns the passing branches to integrate, in a dependency-respecting

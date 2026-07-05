@@ -7,12 +7,17 @@ package tools
 // machinery in the forward direction (forwardReachable).
 //
 // HONEST LIMITS (surfaced in the output header, not hidden): the graph is the
-// FUNCTION call graph keyed by bare symbol name, so (a) it only reasons about
-// funcs/methods — types/vars/consts are out of scope; (b) a function passed as a
-// value, invoked via an interface, or reached by reflection can be a FALSE
-// POSITIVE; (c) same-named functions in different packages collapse. Output is
-// therefore an advisory list of CANDIDATES to confirm (LSP/human) before deleting,
-// never an authority — exactly the posture the verifier-owns-truth thesis wants.
+// FUNCTION call graph. Nodes carry a QUALIFIED id (file+recv+name) so same-named
+// symbols in different files are distinct, but a call site names a callee only by its
+// BARE name, so reachability is still resolved name-first (forwardReachable keys its
+// reached set by bare name). Consequences: (a) it only reasons about funcs/methods —
+// types/vars/consts are out of scope; (b) a function passed as a value, invoked via an
+// interface, or reached by reflection can be a FALSE POSITIVE; (c) a call to an
+// ambiguous bare name reaches EVERY same-named definition (a safe over-approximation
+// for a "what is dead?" lens — it never flags a reachable symbol dead just because a
+// namesake elsewhere is the real callee). Output is therefore an advisory list of
+// CANDIDATES to confirm (LSP/human) before deleting, never an authority — exactly the
+// posture the verifier-owns-truth thesis wants.
 
 import (
 	"context"

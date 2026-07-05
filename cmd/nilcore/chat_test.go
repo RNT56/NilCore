@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"nilcore/internal/budget"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/graapprove"
 	"nilcore/internal/inbox"
 	"nilcore/internal/model"
 	"nilcore/internal/onboard"
@@ -569,6 +571,14 @@ func TestApplyContainerEgress(t *testing.T) {
 		t.Errorf("docker --add-host = %v", dock.ExtraHosts)
 	}
 
+	// Idempotent: re-applying to the same box (the env factory runs per drive on a
+	// reused *Container) must NOT accumulate duplicate --add-host entries.
+	applyContainerEgress(dock, egress, "0.0.0.0:54321", "docker")
+	applyContainerEgress(dock, egress, "0.0.0.0:54321", "docker")
+	if len(dock.ExtraHosts) != 1 {
+		t.Errorf("repeated docker egress duplicated --add-host: %v", dock.ExtraHosts)
+	}
+
 	// Empty allowlist ⇒ untouched (default-deny stays).
 	deny := sandbox.NewContainer("podman", "img", "/work")
 	applyContainerEgress(deny, policy.Egress{}, "", "podman")
@@ -871,4 +881,87 @@ func waitGoroutines(want int) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return runtime.NumGoroutine()
+}
+
+// TestApplyTrustScopeMatchesGateScope locks the /apply earned-trust bucket to the
+// SAME (action,scope) the gate reads. graapprove.BuildTrust tallies boundary_outcomes
+// by (Detail["action"], Detail["scope"]) and GradedApprover consults
+// Tally({promote-to-base, scopeFor(action)==action.Branch}) — the merge TARGET (base).
+// Recording the boundary_outcome under the kept SOURCE branch (the earlier bug) filed
+// trust in a bucket the gate never reads, so chat /apply could never accumulate
+// graduated auto-approval. Here we assert (a) the boundary_outcome's scope equals the
+// gate event's branch (both = base "main"), (b) it equals the captured GateAction's
+// Branch, and (c) BuildTrust folds a green Tally into exactly that scope key.
+func TestApplyTrustScopeMatchesGateScope(t *testing.T) {
+	repo := newDeliveryRepo(t)
+	addKeptBranch(t, repo, "nilcore/kept/chat-local-42", "changed\n")
+	sess := deliverySession(repo, "nilcore/kept/chat-local-42")
+
+	logPath := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cap := &captureApprover{}
+	var out strings.Builder
+	applyKeptBranch(context.Background(), sess, cap, log, consoleDeliverSink(termui.New(&out)))
+	log.Close()
+
+	if cap.got.Type != policy.PromoteToBase || cap.got.Branch != "main" {
+		t.Fatalf("gate action = {%v,%q}, want {PromoteToBase,main}", cap.got.Type, cap.got.Branch)
+	}
+
+	// Parse the log: find the boundary_outcome and the gate event and compare scopes.
+	var boundaryScope, boundaryAction, gateBranch string
+	var boundaryPassed bool
+	b, rerr := os.ReadFile(logPath)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e struct {
+			Kind   string         `json:"kind"`
+			Detail map[string]any `json:"detail"`
+		}
+		if jerr := json.Unmarshal([]byte(line), &e); jerr != nil {
+			t.Fatalf("parse event %q: %v", line, jerr)
+		}
+		switch e.Kind {
+		case "boundary_outcome":
+			boundaryAction, _ = e.Detail["action"].(string)
+			boundaryScope, _ = e.Detail["scope"].(string)
+			boundaryPassed, _ = e.Detail["passed"].(bool)
+		case "gate":
+			gateBranch, _ = e.Detail["branch"].(string)
+		}
+	}
+
+	if boundaryAction != policy.PromoteToBase.String() {
+		t.Errorf("boundary action = %q, want %q", boundaryAction, policy.PromoteToBase.String())
+	}
+	if !boundaryPassed {
+		t.Error("boundary_outcome.passed must be true (the verifier kept this branch)")
+	}
+	// The load-bearing assertion: the recorded scope IS the gated scope.
+	if boundaryScope != gateBranch {
+		t.Errorf("recorded scope %q != gated scope %q — trust files in a bucket the gate never reads",
+			boundaryScope, gateBranch)
+	}
+	if boundaryScope != cap.got.Branch {
+		t.Errorf("recorded scope %q != GateAction.Branch %q (scopeFor)", boundaryScope, cap.got.Branch)
+	}
+
+	// End-to-end: BuildTrust must fold a green tally into exactly the key the gate reads.
+	view, verr := graapprove.BuildTrust(logPath)
+	if verr != nil || !view.ChainOK {
+		t.Fatalf("BuildTrust: err=%v chainOK=%v", verr, view.ChainOK)
+	}
+	tally := view.Tally(graapprove.ScopeKey{Type: policy.PromoteToBase.String(), Scope: cap.got.Branch})
+	if tally.Green != 1 {
+		t.Errorf("gated scope key earned Green=%d, want 1 — /apply trust does not accrue for the gate", tally.Green)
+	}
 }

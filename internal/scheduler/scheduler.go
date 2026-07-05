@@ -4,10 +4,16 @@
 // calls run at once: excess tasks queue instead of overrunning the cap, and a
 // caller can block until the whole queue has drained.
 //
-// The design is deliberately tiny — a buffered channel as the FIFO queue plus a
-// worker pool sized to maxConcurrent — so the only state worth trusting is the
-// concurrency invariant, which the tests assert with the -race detector and
-// atomic counters.
+// The design is deliberately tiny — an UNBOUNDED internal FIFO queue (a slice
+// guarded by a mutex + condition variable) feeding a worker pool sized to
+// maxConcurrent. The queue is unbounded on purpose: every production caller
+// submits ALL ready work BEFORE calling Start (internal/spawn runWave,
+// internal/swarm runFlat), so no worker drains during Submit. A fixed-size buffer
+// would deadlock the (buffer+1)-th pre-Start Submit forever; an unbounded queue
+// makes Submit non-blocking for any pre-Start volume while the cap on *running*
+// tasks is still enforced by the worker pool, not the queue depth. The only state
+// worth trusting is the concurrency invariant, which the tests assert with the
+// -race detector and atomic counters.
 package scheduler
 
 import (
@@ -25,11 +31,10 @@ type Task struct {
 	Run func(ctx context.Context) error
 }
 
-// Scheduler is a FIFO queue fronting a bounded worker pool. The zero value is
-// not usable; construct one with New.
+// Scheduler is an unbounded FIFO queue fronting a bounded worker pool. The zero
+// value is not usable; construct one with New.
 type Scheduler struct {
 	maxConcurrent int
-	queue         chan Task
 
 	startOnce sync.Once
 	wg        sync.WaitGroup // tracks in-flight + queued tasks until drained
@@ -37,6 +42,15 @@ type Scheduler struct {
 	inFlight atomic.Int64 // currently running
 	maxSeen  atomic.Int64 // high-water mark of inFlight
 	ran      atomic.Int64 // tasks that completed Run
+
+	// qmu guards the FIFO queue and the closed flag; qcond wakes a worker when a
+	// task is enqueued or the queue is closed. This unbounded slice-backed queue
+	// replaces a fixed-size channel so Submit never blocks the producer, however
+	// many tasks are submitted before Start (the submit-all-then-Start pattern).
+	qmu    sync.Mutex
+	qcond  *sync.Cond
+	queue  []Task // FIFO: append to the tail, pop from the head
+	closed bool   // set by Wait once the final task has drained; no more enqueues
 
 	mu   sync.Mutex
 	errs []error // first errors returned by tasks, in completion order
@@ -48,20 +62,21 @@ func New(maxConcurrent int) *Scheduler {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	return &Scheduler{
-		maxConcurrent: maxConcurrent,
-		// Buffer generously so Submit never blocks the producer for the common
-		// case; backpressure that matters (the cap on *running* tasks) is
-		// enforced by the worker pool, not the queue depth.
-		queue: make(chan Task, 1024),
-	}
+	s := &Scheduler{maxConcurrent: maxConcurrent}
+	s.qcond = sync.NewCond(&s.qmu)
+	return s
 }
 
 // Submit enqueues t. It is safe to call before or after Start, and from many
-// goroutines. Submit must not be called after Wait has returned.
+// goroutines, at ANY volume — the queue is unbounded, so Submit never blocks the
+// producer (the running-task cap is the worker pool's job, not the queue depth).
+// Submit must not be called after Wait has returned.
 func (s *Scheduler) Submit(t Task) {
 	s.wg.Add(1)
-	s.queue <- t
+	s.qmu.Lock()
+	s.queue = append(s.queue, t)
+	s.qmu.Unlock()
+	s.qcond.Signal()
 }
 
 // Start begins processing with maxConcurrent workers. It is idempotent — only
@@ -77,8 +92,21 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 // worker pulls tasks FIFO and runs them, tracking the in-flight high-water mark.
+// It blocks on the condition variable while the queue is empty and exits only once
+// the queue is both closed (Wait ran) AND drained, so no task is dropped.
 func (s *Scheduler) worker(ctx context.Context) {
-	for t := range s.queue {
+	for {
+		s.qmu.Lock()
+		for len(s.queue) == 0 && !s.closed {
+			s.qcond.Wait()
+		}
+		if len(s.queue) == 0 && s.closed {
+			s.qmu.Unlock()
+			return
+		}
+		t := s.queue[0]
+		s.queue = s.queue[1:]
+		s.qmu.Unlock()
 		s.run(ctx, t)
 	}
 }
@@ -124,12 +152,19 @@ func (s *Scheduler) recordErr(err error) {
 }
 
 // Wait blocks until every submitted task has finished (or been skipped on
-// cancellation), then closes the queue so the workers exit. It must be called
-// exactly once, after the final Submit. The returned error joins every error
-// returned by a task (nil if all succeeded).
+// cancellation), then closes the queue and wakes every idle worker so they exit.
+// It must be called exactly once, after the final Submit. The returned error joins
+// every error returned by a task (nil if all succeeded).
 func (s *Scheduler) Wait() error {
 	s.wg.Wait()
-	close(s.queue)
+
+	// Mark the queue closed and Broadcast so every worker blocked in qcond.Wait
+	// observes the close and returns (the queue is already drained — wg.Wait only
+	// returns once every submitted task completed run, and run pops before it runs).
+	s.qmu.Lock()
+	s.closed = true
+	s.qmu.Unlock()
+	s.qcond.Broadcast()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

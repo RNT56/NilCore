@@ -292,6 +292,45 @@ func TestInFlightSwarmFindsRunRow(t *testing.T) {
 	}
 }
 
+// TestMarkConvergedRemovesFromInFlight asserts that a converged run's row is moved to a
+// terminal status so InFlightSwarm no longer discovers it — a later --resume must not
+// re-adopt a finished run. LoadState still round-trips its state (the row is preserved).
+func TestMarkConvergedRemovesFromInFlight(t *testing.T) {
+	ctx := context.Background()
+	q := NewQueue(openStore(t), nil, "run1")
+	st := SwarmState{RunID: "run1", Goal: "g", Pass: 3, TipSHA: "abc"}
+	if err := q.SaveState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	// While in flight, the run is discoverable.
+	rows, err := q.InFlightSwarm(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("in-flight before converge = %d rows, want 1", len(rows))
+	}
+	// Converge: the row moves to the terminal status.
+	if err := q.MarkConverged(ctx, st); err != nil {
+		t.Fatalf("MarkConverged: %v", err)
+	}
+	rows, err = q.InFlightSwarm(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("in-flight after converge = %d rows, want 0 (must not re-adopt a finished run)", len(rows))
+	}
+	// The state is preserved (the row still exists, just terminal).
+	got, err := q.LoadState(ctx)
+	if err != nil {
+		t.Fatalf("LoadState after converge: %v", err)
+	}
+	if got.Pass != 3 || got.TipSHA != "abc" {
+		t.Errorf("LoadState after converge = %+v, want Pass=3 TipSHA=abc preserved", got)
+	}
+}
+
 // TestLoadStateMissingRun asserts a missing run row surfaces sql.ErrNoRows so the caller
 // distinguishes "no such run" from a corrupt blob.
 func TestLoadStateMissingRun(t *testing.T) {

@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,6 +55,7 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 		return fmt.Errorf("mcp wrapper dir: %w", err)
 	}
 	want := make(map[string]bool, len(tools))
+	taken := newSlugSet()
 	for _, t := range tools {
 		desc := map[string]any{
 			"server":      server,
@@ -66,9 +68,12 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 		// t.Name is UNTRUSTED server output (tools/list) — treat it as data (I7). slug()
 		// strips every path separator (→ '_'), so the filename can never traverse out of
 		// dir (mirrors the resource/prompt paths below; the operator-trusted registry name
-		// is hardened the same way via singleSegment). The descriptor's "tool" field keeps
-		// the ORIGINAL name so the model still invokes the correct tool.
-		fname := slug(t.Name, t.Name) + ".json"
+		// is hardened the same way via singleSegment). slug() is non-injective (many runes
+		// fold to '_'), so DISTINCT tool names can collide to one base — uniqueSlug then
+		// disambiguates with a short hash of the original name so no tool's descriptor is
+		// silently overwritten. The descriptor's "tool" field keeps the ORIGINAL name so
+		// the model still invokes the correct tool.
+		fname := taken.assign(t.Name, t.Name) + ".json"
 		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}
@@ -113,6 +118,7 @@ func GenerateResourceWrappers(base, server string, resources []Resource) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mcp resource dir: %w", err)
 	}
+	taken := newSlugSet()
 	for _, r := range resources {
 		desc := map[string]any{
 			"server":      server,
@@ -122,7 +128,10 @@ func GenerateResourceWrappers(base, server string, resources []Resource) error {
 			"mimeType":    r.MIMEType,
 			"invoke":      fmt.Sprintf(`call the "mcp" tool: {"server":%q,"resource":%q}`, server, r.URI),
 		}
-		if err := writeDescriptor(filepath.Join(dir, slug(r.Name, r.URI)+".json"), desc); err != nil {
+		// Key disambiguation on the URI (globally unique per resource) so two resources
+		// whose display names slug alike don't overwrite each other.
+		fname := taken.assign(slug(r.Name, r.URI), r.URI) + ".json"
+		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}
 	}
@@ -139,6 +148,7 @@ func GeneratePromptWrappers(base, server string, prompts []Prompt) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mcp prompt dir: %w", err)
 	}
+	taken := newSlugSet()
 	for _, p := range prompts {
 		desc := map[string]any{
 			"server":      server,
@@ -146,7 +156,8 @@ func GeneratePromptWrappers(base, server string, prompts []Prompt) error {
 			"description": p.Description,
 			"invoke":      fmt.Sprintf(`call the "mcp" tool: {"server":%q,"prompt":%q,"args":{…}}`, server, p.Name),
 		}
-		if err := writeDescriptor(filepath.Join(dir, slug(p.Name, p.Name)+".json"), desc); err != nil {
+		fname := taken.assign(p.Name, p.Name) + ".json"
+		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}
 	}
@@ -162,6 +173,41 @@ func writeDescriptor(path string, desc map[string]any) error {
 		return fmt.Errorf("write descriptor %s: %w", filepath.Base(path), err)
 	}
 	return nil
+}
+
+// slugSet allocates collision-free descriptor filenames. slug() is non-injective — many
+// distinct labels fold to the same base (every illegal rune → '_') — so without this two
+// different tool/resource/prompt names could produce one filename and the second write
+// would silently clobber the first, dropping a tool from the on-disk descriptor set.
+type slugSet struct {
+	used map[string]string // base slug -> the ORIGINAL identity that first claimed it
+}
+
+func newSlugSet() *slugSet { return &slugSet{used: map[string]string{}} }
+
+// assign returns a unique, filesystem-safe base name for (prefer, alt). It slugs the
+// label, then — if that base was already taken by a DIFFERENT original identity — appends
+// a short deterministic hash of this identity so the two never collide. Re-assigning the
+// SAME identity (e.g. an idempotent regen of the same tool) returns the same base, so the
+// descriptor set stays stable across runs.
+func (s *slugSet) assign(prefer, alt string) string {
+	base := slug(prefer, alt)
+	identity := prefer + "\x00" + alt
+	if owner, ok := s.used[base]; ok && owner != identity {
+		// Collision with a different name: disambiguate deterministically. Trim so the
+		// base+suffix stays within the 100-char cap slug() enforces.
+		sum := sha256.Sum256([]byte(identity))
+		suffix := "_" + fmt.Sprintf("%x", sum)[:8]
+		trimmed := base
+		if len(trimmed)+len(suffix) > 100 {
+			trimmed = trimmed[:100-len(suffix)]
+		}
+		base = trimmed + suffix
+		// The disambiguated base is derived from a hash, so a second-order collision is
+		// astronomically unlikely; still record it so an exact re-run is idempotent.
+	}
+	s.used[base] = identity
+	return base
 }
 
 // slug derives a filesystem-safe descriptor name from a preferred label, falling back

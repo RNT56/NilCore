@@ -200,9 +200,19 @@ func (f *FileStore) open(enc string) (string, error) {
 
 // MasterKeyFromFile reads a 32-byte master key from a 0600 key file, provisioning
 // a fresh random one if the file does not exist (headless-VPS default).
+//
+// SECURITY (I3): the key sits beside the vault, so its 0600 mode is the only thing
+// guarding every stored secret. Permissions are checked and tightened BEFORE the
+// bytes are read — a loose key file (backup restore, rsync without -p, a bad umask)
+// is chmod'd back to 0600 and RE-VERIFIED before we read it, so we never read a key
+// while it is still world/group-readable and then "self-heal" too late (the old
+// TOCTOU: another process could read the plaintext key in the window between read
+// and chmod). If the file remains group/other-readable after the tighten attempt
+// (e.g. we are not the owner, or an OS that ignores chmod bits), we refuse rather
+// than silently loading a persistently-exposed key.
 func MasterKeyFromFile(keyPath string) ([]byte, error) {
-	b, err := os.ReadFile(keyPath)
-	if errors.Is(err, os.ErrNotExist) {
+	fi, statErr := os.Stat(keyPath)
+	if errors.Is(statErr, os.ErrNotExist) {
 		key := make([]byte, 32)
 		if _, err := io.ReadFull(rand.Reader, key); err != nil {
 			return nil, err
@@ -215,18 +225,31 @@ func MasterKeyFromFile(keyPath string) ([]byte, error) {
 		}
 		return key, nil
 	}
+	if statErr != nil {
+		return nil, fmt.Errorf("stat master key: %w", statErr)
+	}
+
+	// Tighten-then-verify BEFORE reading. A regular file loosened past 0600 is
+	// chmod'd back and re-stat'd; if it is still group/other-readable we refuse.
+	if fi.Mode().IsRegular() && fi.Mode().Perm()&0o077 != 0 {
+		if chErr := os.Chmod(keyPath, 0o600); chErr != nil {
+			return nil, fmt.Errorf("master key file %s is group/other-readable and could not be tightened to 0600: %w", keyPath, chErr)
+		}
+		fi2, reErr := os.Stat(keyPath)
+		if reErr != nil {
+			return nil, fmt.Errorf("re-stat master key after tighten: %w", reErr)
+		}
+		if fi2.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("master key file %s remains group/other-readable (%04o) after tightening; refusing to load an exposed key", keyPath, fi2.Mode().Perm())
+		}
+	}
+
+	b, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("read master key: %w", err)
 	}
 	if len(b) < 32 {
 		return nil, fmt.Errorf("master key file %s shorter than 32 bytes", keyPath)
-	}
-	// Self-heal a key file loosened by an external action (backup restore, rsync
-	// without -p, a bad umask): the key sits beside the vault, so its 0600 mode is
-	// the only thing guarding every stored secret. Best-effort — a chmod we cannot
-	// perform (not the owner) still lets the key load.
-	if fi, statErr := os.Stat(keyPath); statErr == nil && fi.Mode().Perm()&0o077 != 0 {
-		_ = os.Chmod(keyPath, 0o600)
 	}
 	return b[:32], nil
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"nilcore/internal/eventlog"
 	"nilcore/internal/verify"
@@ -253,6 +254,217 @@ func TestCorruptLineEmitsOneTimeDiagnostic(t *testing.T) {
 	got := strings.Count(string(data), kindCacheCorrupt)
 	if got != 1 {
 		t.Fatalf("want exactly one %q diagnostic across repeated lookups, got %d:\n%s", kindCacheCorrupt, got, data)
+	}
+}
+
+// countEvents returns how many JSONL lines the log at path currently holds. Used to
+// assert a cache HIT appends nothing (no unbounded per-hit growth).
+func countEvents(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestHitAppendsNothing: a cache HIT must not append any event. Recording a replay
+// per hit grew the append-only log without bound AND forced the next lookup to
+// re-verify a longer chain (the O(n^2) trap). The first Check (miss) writes exactly
+// one cache event; every subsequent hit over the same log leaves the event count
+// unchanged.
+func TestHitAppendsNothing(t *testing.T) {
+	inner := &spy{report: verify.Report{Passed: true}}
+	log, path := freshLog(t)
+	c, err := New(baseConfig(inner, log, path, "content-A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Miss: records exactly one original cache-pass event.
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	log.Flush()
+	afterMiss := countEvents(t, path)
+
+	// A run of hits must not grow the log at all.
+	for i := 0; i < 5; i++ {
+		rep, err := c.Check(context.Background())
+		if err != nil || !rep.Passed {
+			t.Fatalf("hit %d = %+v, %v; want a pass", i, rep, err)
+		}
+		log.Flush()
+		if got := countEvents(t, path); got != afterMiss {
+			t.Fatalf("hit %d appended an event: log grew from %d to %d", i, afterMiss, got)
+		}
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Fatalf("hits must not re-run inner; inner ran %d times, want 1", got)
+	}
+}
+
+// TestHitMemoizesChainVerify: after the first hit verifies the chain, subsequent
+// hits over the UNCHANGED log serve the memoized verdict without re-reading the
+// whole file. We assert the memo is populated at the size it verified and reused: a
+// second hit does not re-run inner and the memoized size matches the log's actual
+// size (the append-only invariant that makes skipping the re-verify sound).
+func TestHitMemoizesChainVerify(t *testing.T) {
+	inner := &spy{report: verify.Report{Passed: true}}
+	log, path := freshLog(t)
+	c, err := New(baseConfig(inner, log, path, "content-A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Miss records the pass; a first hit verifies the chain and populates the memo.
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	haveMemo, memoOK, memoSize := c.haveVerifyMemo, c.verifiedOK, c.verifiedPrint.size
+	c.mu.Unlock()
+	if !haveMemo || !memoOK {
+		t.Fatalf("a chain-verified hit must memoize the verdict: haveMemo=%v ok=%v", haveMemo, memoOK)
+	}
+	log.Flush()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memoSize != fi.Size() {
+		t.Fatalf("memo size %d must equal the unchanged log size %d", memoSize, fi.Size())
+	}
+
+	// A further hit over the same log serves from the memo (no inner call).
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Fatalf("memoized hits must not re-run inner; inner ran %d, want 1", got)
+	}
+}
+
+// TestGrowthInvalidatesMemo: an append after a memoized verify (a new original pass
+// for a different key) changes the log size, so the next lookup must NOT trust the
+// stale memo — it re-verifies at the new size. We prove this by appending a genuine
+// event out-of-band, then confirming a hit still succeeds (the fresh verify passed
+// over the grown, still-intact chain) and the memo advanced to the new size.
+func TestGrowthInvalidatesMemo(t *testing.T) {
+	inner := &spy{report: verify.Report{Passed: true}}
+	log, path := freshLog(t)
+	c, err := New(baseConfig(inner, log, path, "content-A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Check(context.Background()); err != nil { // miss -> record + memo
+		t.Fatal(err)
+	}
+	if _, err := c.Check(context.Background()); err != nil { // hit -> memo populated
+		t.Fatal(err)
+	}
+	log.Flush()
+	fi, _ := os.Stat(path)
+	sizeBefore := fi.Size()
+
+	// Append a real, chain-valid event so the log genuinely grows.
+	log.Append(eventlog.Event{Task: "T-test", Kind: "note", Detail: map[string]any{"x": 1}})
+	log.Flush()
+	fi2, _ := os.Stat(path)
+	if fi2.Size() == sizeBefore {
+		t.Fatal("test setup: appended event did not grow the log")
+	}
+
+	// Next hit must re-verify at the new size (the grown chain still verifies) and
+	// advance the memo — never serve against the stale size.
+	if rep, err := c.Check(context.Background()); err != nil || !rep.Passed {
+		t.Fatalf("post-growth hit = %+v, %v; want a pass over the still-intact chain", rep, err)
+	}
+	c.mu.Lock()
+	memoSize := c.verifiedPrint.size
+	c.mu.Unlock()
+	if memoSize != fi2.Size() {
+		t.Fatalf("memo must advance to the grown size %d, got %d", fi2.Size(), memoSize)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Fatalf("the grown chain still verifies, so no recompute; inner ran %d, want 1", got)
+	}
+}
+
+// TestInPlaceTamperInvalidatesMemo proves the memo is SOUND against an in-place
+// same-size tamper: the fingerprint folds in mod-time, so a rewrite that keeps the byte
+// count identical still bumps mtime, misses the memo, forces a fresh eventlog.Verify,
+// sees the broken chain, and recomputes. A size-only memo would have wrongly served the
+// stale pass.
+func TestInPlaceTamperInvalidatesMemo(t *testing.T) {
+	inner := &spy{report: verify.Report{Passed: true}}
+	log, path := freshLog(t)
+	c, err := New(baseConfig(inner, log, path, "content-A"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Miss records the pass; a hit verifies + memoizes the chain-verified verdict.
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// In-place tamper that PRESERVES the byte length so the size is unchanged — only an
+	// mtime bump can distinguish it. An equal-length swap of the recorded toolchain
+	// string breaks the chain hash (the value no longer matches what was hashed).
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := string(data)
+	tampered := strings.Replace(orig, "go1.25.0", "go9.99.9", 1)
+	if tampered == orig {
+		t.Fatal("test setup: equal-length tamper found nothing to change")
+	}
+	if len(tampered) != len(orig) {
+		t.Fatalf("test setup: tamper changed length %d->%d (must be equal for this test)", len(orig), len(tampered))
+	}
+	if err := os.WriteFile(path, []byte(tampered), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Force mtime forward so a coarse filesystem clock still registers the change.
+	future := time.Now().Add(time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if eventlog.Verify(path) == nil {
+		t.Fatal("test setup: equal-length tamper did not break the chain")
+	}
+
+	// A fresh cache over the tampered log: the physically-present matching line must NOT
+	// be served, because the broken chain fails Verify. (Fresh cache = no in-memory memo
+	// from the pre-tamper file; this asserts the on-disk soundness end to end.)
+	inner2 := &spy{report: verify.Report{Passed: true}}
+	c2, _ := New(Config{
+		Inner: inner2, Log: nil, LogPath: path,
+		Hash: fixedHash("content-A"), VerifierID: "make verify", Toolchain: "go1.25.0",
+	})
+	rep, err := c2.Check(context.Background())
+	if err != nil || !rep.Passed {
+		t.Fatalf("recompute Check = %+v, %v; want a fresh pass", rep, err)
+	}
+	if got := inner2.calls.Load(); got != 1 {
+		t.Fatalf("an in-place tamper must force recompute; inner ran %d, want 1", got)
 	}
 }
 

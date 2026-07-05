@@ -136,8 +136,15 @@ func TestDeadCode(t *testing.T) {
 	if !strings.Contains(out, "orphan") {
 		t.Errorf("expected orphan flagged dead:\n%s", out)
 	}
-	if strings.Contains(out, " helper ") || strings.Contains(out, "Used") {
-		t.Errorf("reachable funcs should not be flagged:\n%s", out)
+	// helper is reached transitively (Used → helper) and Used is exported: neither may
+	// be flagged. The graph keys nodes by QUALIFIED id but a callee edge names the bare
+	// callee, so a transitively-reached symbol must be recognized by its bare name — a
+	// regression here surfaces helper as a false-positive "dead" candidate.
+	if strings.Contains(out, "func helper") {
+		t.Errorf("helper is called by Used and must not be flagged dead:\n%s", out)
+	}
+	if strings.Contains(out, "Used") {
+		t.Errorf("exported Used must not be flagged dead:\n%s", out)
 	}
 }
 

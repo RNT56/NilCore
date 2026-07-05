@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -84,10 +85,26 @@ func Run() int { return helper() + helper() }
 	if err := g.BuildFile(ctx, path); err != nil { // rebuild must not duplicate
 		t.Fatal(err)
 	}
+	// Callees now returns QUALIFIED ids (the same-name-collision fix); resolve the bare
+	// callee name from the returned id so the behavioral assertion ("Run calls helper,
+	// deduped") is unchanged.
 	callees, _ := g.Callees(ctx, "Run")
-	if len(callees) != 1 || callees[0] != "helper" {
-		t.Errorf("Run callees = %v, want [helper] (deduped)", callees)
+	if names := nodeNames(callees); len(names) != 1 || names[0] != "helper" {
+		t.Errorf("Run callees = %v (names %v), want one 'helper' (deduped)", callees, names)
 	}
+}
+
+// nodeNames extracts the bare name from each qualified node id (NodeID = file NUL
+// recv NUL name), sorted, so a behavioral assertion about WHICH symbols are involved
+// stays independent of the qualified-id encoding.
+func nodeNames(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		_, _, name := SplitID(id)
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestBuildFilePrunesRemovedSymbols is the regression for the additive-only bug:
@@ -106,8 +123,8 @@ func TestBuildFilePrunesRemovedSymbols(t *testing.T) {
 	if err := g.BuildFile(ctx, path); err != nil {
 		t.Fatal(err)
 	}
-	if callees, _ := g.Callees(ctx, "Run"); len(callees) != 1 || callees[0] != "helper" {
-		t.Fatalf("v1 Run callees = %v, want [helper]", callees)
+	if callees, _ := g.Callees(ctx, "Run"); len(nodeNames(callees)) != 1 || nodeNames(callees)[0] != "helper" {
+		t.Fatalf("v1 Run callees = %v, want one 'helper'", callees)
 	}
 
 	// v2: helper deleted, Run no longer calls it.
@@ -122,7 +139,7 @@ func TestBuildFilePrunesRemovedSymbols(t *testing.T) {
 	}
 	nodes, _ := g.Nodes(ctx)
 	for _, n := range nodes {
-		if n.ID == "helper" {
+		if n.Name == "helper" {
 			t.Errorf("deleted symbol 'helper' still present after re-index: %+v", n)
 		}
 	}

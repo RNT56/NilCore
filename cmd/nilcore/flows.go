@@ -241,22 +241,43 @@ func flowsValidate(doc flowDoc, flow agenticflows.Flow) int {
 // flowTree lifts a flow's agent_task subtasks (topologically ordered, with DependsOn +
 // provenance already resolved by AgentTaskSubtasks) into a planner.Tree the swarm
 // TreeSharder can shard directly. Each subtask becomes a PlanTask carrying its id, goal,
-// and dependency edges verbatim; the tree Goal carries the flow title + agentic-flows
-// provenance for the run report. This is the single place the flow→DAG mapping lives, so
-// it is unit-testable without standing up a full swarm.
-func flowTree(doc flowDoc, subs []spawn.Subtask) planner.Tree {
+// dependency edges, and a CONTRACT-FIRST Acceptance criterion (flowAcceptance) — a flow
+// node carries no explicit acceptance field, but leaving it empty would waive the
+// contract-first discipline planner.Tree.Validate enforces, so we synthesize an honest,
+// verifier-anchored criterion from the node's goal. The tree Goal carries the flow title
+// + agentic-flows provenance for the run report. It returns an error when the resulting
+// tree is not contract-valid (e.g. a missing id/goal survived the adapter), so an
+// unconsumable flow fails loudly here rather than shipping an unvalidated plan. This is
+// the single place the flow→DAG mapping lives, so it is unit-testable without a swarm.
+func flowTree(doc flowDoc, subs []spawn.Subtask) (planner.Tree, error) {
 	tasks := make([]planner.PlanTask, 0, len(subs))
 	for _, s := range subs {
-		tasks = append(tasks, planner.PlanTask{ID: s.ID, Goal: s.Goal, DependsOn: s.DependsOn})
+		tasks = append(tasks, planner.PlanTask{
+			ID: s.ID, Goal: s.Goal, DependsOn: s.DependsOn, Acceptance: flowAcceptance(s.Goal),
+		})
 	}
 	runGoal := doc.Title
 	if runGoal == "" {
 		runGoal = doc.ID
 	}
-	return planner.Tree{
+	tree := planner.Tree{
 		Goal:  fmt.Sprintf("%s — agentic-flows source: %s@%s", runGoal, doc.ID, doc.Version),
 		Tasks: tasks,
 	}
+	if err := tree.Validate(); err != nil {
+		return planner.Tree{}, fmt.Errorf("flow %s@%s: invalid task tree: %w", doc.ID, doc.Version, err)
+	}
+	return tree, nil
+}
+
+// flowAcceptance synthesizes a contract-first Acceptance criterion for a flow agent_task
+// (which carries none of its own): the node's goal is achieved AND the shard's typed
+// artifact passes the swarm's per-claim verifier — the SAME gate the run actually
+// enforces (I2), stated up front so the plan is contract-valid. The goal is clipped so a
+// long description never bloats the criterion; it is inert DATA (I7), only embedded.
+func flowAcceptance(goal string) string {
+	g := strings.ReplaceAll(strings.TrimSpace(goal), "\n", " ")
+	return "the stated work is completed (\"" + truncFlow(g, 120) + "\") and its typed artifact passes the shard verifier"
 }
 
 // flowsRun executes a consumable flow's agent_task DAG through the verified swarm path
@@ -282,7 +303,11 @@ func flowsRun(doc flowDoc, flow agenticflows.Flow, dir string) {
 		os.Exit(1)
 	}
 
-	tree := flowTree(doc, subs)
+	tree, err := flowTree(doc, subs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Default swarm flags (unparsed ⇒ registration defaults), targeted at the flow's repo
 	// with the code preset. preset + dir are set AFTER applyConfigDefaults so the

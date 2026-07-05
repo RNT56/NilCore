@@ -61,19 +61,27 @@ func ImpactSet(ctx context.Context, g *graph.Graph, changed string) ([]string, e
 	return out, nil
 }
 
-// AffectedTests returns the ImpactSet members whose name starts with "Test" —
-// the tests that should be re-run for a change to `changed`.
+// AffectedTests returns the ImpactSet members whose (bare) name starts with "Test" —
+// the tests that should be re-run for a change to `changed`. `changed` may be a bare
+// symbol name ("Target") or a qualified id; ImpactSet resolves it and returns qualified
+// caller ids, so the "Test" filter runs on the bare NAME (via graph.SplitID), not the
+// qualified id — the id embeds the file path, so "id starts with Test" would never hit.
+// The bare test names are returned (deduped) so consumers can drive `go test -run`.
 func AffectedTests(ctx context.Context, g *graph.Graph, changed string) ([]string, error) {
 	impacted, err := ImpactSet(ctx, g, changed)
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
 	var tests []string
 	for _, id := range impacted {
-		if strings.HasPrefix(id, "Test") {
-			tests = append(tests, id)
+		name := graph.DisplayName(id)
+		if strings.HasPrefix(name, "Test") && !seen[name] {
+			seen[name] = true
+			tests = append(tests, name)
 		}
 	}
+	sort.Strings(tests)
 	return tests, nil
 }
 

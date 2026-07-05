@@ -218,4 +218,64 @@ func TestRotateLog(t *testing.T) {
 			t.Error("want error for negative maxBytes, got nil")
 		}
 	})
+
+	// Rotation must be LOSSLESS (I5): a second rotation must NOT overwrite the first
+	// generation. ".1" holds the newest rotation, ".2" the older one — both survive.
+	t.Run("two rotations preserve both generations", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "events.log")
+		gen1Body := []byte("FIRST-GENERATION-0123456789") // >8 bytes so it rotates
+
+		// First fill + rotate: this content becomes generation .1.
+		if err := os.WriteFile(path, gen1Body, 0o644); err != nil {
+			t.Fatalf("seed gen1: %v", err)
+		}
+		if err := RotateLog(path, 8); err != nil {
+			t.Fatalf("first RotateLog: %v", err)
+		}
+
+		// Second fill + rotate: DIFFERENT content. gen1 must cascade .1 -> .2, and the
+		// new content lands in .1. Nothing is destroyed.
+		gen2Body := []byte("SECOND-GENERATION-ABCDEFGHIJ")
+		if err := os.WriteFile(path, gen2Body, 0o644); err != nil {
+			t.Fatalf("seed gen2: %v", err)
+		}
+		if err := RotateLog(path, 8); err != nil {
+			t.Fatalf("second RotateLog: %v", err)
+		}
+
+		// .1 is the newest rotation (gen2); .2 is the older one (gen1) — both intact.
+		got1, err := os.ReadFile(path + ".1")
+		if err != nil {
+			t.Fatalf("read .1: %v", err)
+		}
+		if !reflect.DeepEqual(got1, gen2Body) {
+			t.Errorf(".1 = %q, want newest generation %q", got1, gen2Body)
+		}
+		got2, err := os.ReadFile(path + ".2")
+		if err != nil {
+			t.Fatalf("read .2 (must survive the second rotation): %v", err)
+		}
+		if !reflect.DeepEqual(got2, gen1Body) {
+			t.Errorf(".2 = %q, want the preserved first generation %q", got2, gen1Body)
+		}
+
+		// A third rotation cascades again: .2 -> .3, .1 -> .2, new -> .1. All three live.
+		gen3Body := []byte("THIRD-GENERATION-KLMNOPQRST")
+		if err := os.WriteFile(path, gen3Body, 0o644); err != nil {
+			t.Fatalf("seed gen3: %v", err)
+		}
+		if err := RotateLog(path, 8); err != nil {
+			t.Fatalf("third RotateLog: %v", err)
+		}
+		for suffix, want := range map[string][]byte{".1": gen3Body, ".2": gen2Body, ".3": gen1Body} {
+			got, err := os.ReadFile(path + suffix)
+			if err != nil {
+				t.Fatalf("read %s: %v", suffix, err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("%s = %q, want %q", suffix, got, want)
+			}
+		}
+	})
 }

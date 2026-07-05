@@ -88,24 +88,3 @@ func TestAuthorizedDenyByDefault(t *testing.T) {
 		t.Error("empty allowlist must deny everyone")
 	}
 }
-
-func TestGuardedApprove(t *testing.T) {
-	log, path := openLog(t)
-	defer log.Close()
-	a := channel.NewAuthorized(&seqChannel{}, []string{"alice"}, log)
-
-	if !a.GuardedApprove("alice", true) {
-		t.Error("authorized approval should pass")
-	}
-	if a.GuardedApprove("alice", false) {
-		t.Error("authorized denial should stay a denial")
-	}
-	if a.GuardedApprove("intruder", true) {
-		t.Error("unauthorized approval must be ignored")
-	}
-	log.Close()
-	b, _ := os.ReadFile(path)
-	if !strings.Contains(string(b), "unauthorized_gate") {
-		t.Errorf("unauthorized gate attempt not logged: %s", b)
-	}
-}

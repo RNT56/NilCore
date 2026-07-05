@@ -101,6 +101,56 @@ func TestMasterKeyFromFile(t *testing.T) {
 	}
 }
 
+// A key file loosened past 0600 must be tightened BEFORE its bytes are read (no
+// TOCTOU), and after the load its perms must be exactly 0600 — never left loose.
+func TestMasterKeyFromFileTightensBeforeRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX perms")
+	}
+	keyPath := filepath.Join(t.TempDir(), "master.key")
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	if err := os.WriteFile(keyPath, raw, 0o644); err != nil { // deliberately world-readable
+		t.Fatalf("seed loose key: %v", err)
+	}
+	k, err := MasterKeyFromFile(keyPath)
+	if err != nil {
+		t.Fatalf("load loose key: %v", err)
+	}
+	if !bytes.Equal(k, raw) {
+		t.Errorf("loaded key mismatch")
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Errorf("key still group/other-readable after load: %04o", info.Mode().Perm())
+	}
+}
+
+// A provisioned (fresh) key file must be created 0600 and load without any perm
+// complaint — the not-exist branch stays intact after the tighten-before-read
+// reorder.
+func TestMasterKeyFromFileProvisionsTight(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX perms")
+	}
+	keyPath := filepath.Join(t.TempDir(), "nested", "master.key")
+	if _, err := MasterKeyFromFile(keyPath); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("provisioned key perms = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestMasterKeyFromPassphrase(t *testing.T) {
 	salt := []byte("nilcore-salt")
 	a := MasterKeyFromPassphrase("correct horse", salt, 1000)
@@ -278,7 +328,14 @@ func (f *fakeKeychain) run(name string, args []string, stdin string) (string, er
 		}
 		return v, nil
 	case name == "security" && args[0] == "add-generic-password":
-		f.store[keyOf(svc, acct)] = flag("-w") // macOS passes the value on argv via -w
+		// SECURITY (I3): the value must arrive on STDIN, not argv. A trailing bare
+		// `-w` (no following value) tells `security` to read the password from its
+		// prompt / stdin. Reject any `-w` that carries a value on argv, so this fake
+		// enforces the off-argv contract the round-trip relies on.
+		if flag("-w") != "" {
+			return "", &exec.ExitError{} // value leaked onto argv — must never happen
+		}
+		f.store[keyOf(svc, acct)] = stdin
 		return "", nil
 	case name == "secret-tool" && args[0] == "store":
 		f.store[keyOf(svc, acct)] = stdin // linux passes the value on stdin
@@ -323,6 +380,41 @@ func TestKeychainStoreRoundTrip(t *testing.T) {
 	}
 	if _, err := k.Get("ANTHROPIC_API_KEY"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("after delete Get = %v, want ErrNotFound", err)
+	}
+}
+
+// TestKeychainSetKeepsSecretOffArgv pins invariant I3 for the macOS keychain: the
+// plaintext value must be fed on STDIN, never placed on argv where a same-user `ps`
+// could read it. It captures the exact (args, stdin) the store hands the CLI and
+// asserts the secret appears only in stdin. GOOS-gated to the darwin code path.
+func TestKeychainSetKeepsSecretOffArgv(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("darwin-only keychain argv contract (GOOS=%s)", runtime.GOOS)
+	}
+	const secret = "sk-must-not-hit-argv-987"
+	var gotArgs []string
+	var gotStdin string
+	k := KeychainStore{
+		Service: "nilcore-test-throwaway",
+		run: func(name string, args []string, stdin string) (string, error) {
+			gotArgs, gotStdin = args, stdin
+			return "", nil
+		},
+	}
+	if err := k.Set("ANTHROPIC_API_KEY", secret); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	for _, a := range gotArgs {
+		if strings.Contains(a, secret) {
+			t.Fatalf("secret leaked onto argv: %q", gotArgs)
+		}
+	}
+	// The trailing `-w` must be the LAST arg with no value after it (the prompt form).
+	if len(gotArgs) == 0 || gotArgs[len(gotArgs)-1] != "-w" {
+		t.Errorf("args must end in a bare -w (prompt/stdin form), got %q", gotArgs)
+	}
+	if gotStdin != secret {
+		t.Errorf("stdin = %q, want the secret fed on stdin", gotStdin)
 	}
 }
 

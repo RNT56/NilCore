@@ -20,7 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
+
+// connectTimeout bounds the SHARED connect+initialize handshake behind a single-flight
+// reservation. It is detached from any individual caller's request ctx: the first caller
+// starts the handshake, but its cancellation must never fail the OTHER callers waiting on
+// the same reservation (each still honors its own ctx while it waits). Generous, so a
+// slow-but-live server still comes up.
+const connectTimeout = 30 * time.Second
 
 // Manager owns the live MCP connections for a process.
 type Manager struct {
@@ -63,8 +71,10 @@ func (m *Manager) get(ctx context.Context, server string) (*Client, bool, error)
 	if c, ok := m.conns[server]; ok {
 		m.mu.Unlock()
 		// A concurrent in-flight connect may still be completing. Honor OUR ctx while we
-		// wait: a slow server stuck on `initialize` (bound to the FIRST caller's ctx) must
-		// not make every subsequent caller block on <-c.ready past its own deadline.
+		// wait: a slow server stuck on `initialize` (bounded by the DETACHED handshake ctx)
+		// must not make every subsequent caller block on <-c.ready past its own deadline.
+		// The handshake's own cancellation is independent of any caller, so one caller's
+		// cancel never lands a context.Canceled in c.err for the others.
 		select {
 		case <-c.ready:
 		case <-ctx.Done():
@@ -84,9 +94,18 @@ func (m *Manager) get(ctx context.Context, server string) (*Client, bool, error)
 	m.conns[server] = c
 	m.mu.Unlock()
 
+	// The shared connect+initialize runs under a DETACHED ctx (derived from the Manager's
+	// procCtx, NOT this caller's request ctx) with its own bounded timeout. This is the
+	// single-flight handshake every concurrent caller for this server waits on, so binding
+	// it to the first caller's ctx would let THAT caller's cancellation set c.err to a
+	// context.Canceled and fail unrelated waiters (which withRetry won't retry — it only
+	// retries errDeliveryFailed). Each waiter still honors its OWN ctx while it blocks on
+	// <-c.ready above; only the shared handshake itself is decoupled.
+	hctx, hcancel := context.WithTimeout(m.procCtx, connectTimeout)
+	defer hcancel()
 	client, stop, err := connect(m.procCtx, spec) // subprocess bound to Manager lifetime
 	if err == nil {
-		if ierr := client.Initialize(ctx); ierr != nil { // request ctx bounds the handshake
+		if ierr := client.Initialize(hctx); ierr != nil { // detached handshake ctx
 			stop()
 			err = fmt.Errorf("mcp init %q: %w", server, ierr)
 		}
@@ -166,8 +185,9 @@ func (m *Manager) GetPrompt(ctx context.Context, server, name string, args json.
 
 // ListTools returns a configured server's advertised tools (name, description,
 // inputSchema), reusing the live connection. It backs the model's `list` discovery
-// action: the descriptors GenerateWrappers writes live in the base repo, which the
-// model's worktree-rooted file tools cannot see, so discovery must go through the tool.
+// action: the descriptors GenerateWrappers writes live under the host descriptor base
+// (a cache dir), which the model's worktree-rooted file tools cannot see, so discovery
+// must go through the tool.
 func (m *Manager) ListTools(ctx context.Context, server string) ([]Tool, error) {
 	c, _, err := m.get(ctx, server)
 	if err != nil {
@@ -200,10 +220,14 @@ func (m *Manager) Discover(ctx context.Context, base string, withResources bool)
 		}
 		if withResources {
 			if res, rerr := c.ListResources(ctx); rerr == nil {
-				_ = GenerateResourceWrappers(base, spec.Name, res)
+				if werr := GenerateResourceWrappers(base, spec.Name, res); werr != nil {
+					errs = append(errs, fmt.Errorf("%s resources: %w", spec.Name, werr))
+				}
 			}
 			if pr, perr := c.ListPrompts(ctx); perr == nil {
-				_ = GeneratePromptWrappers(base, spec.Name, pr)
+				if werr := GeneratePromptWrappers(base, spec.Name, pr); werr != nil {
+					errs = append(errs, fmt.Errorf("%s prompts: %w", spec.Name, werr))
+				}
 			}
 		}
 	}

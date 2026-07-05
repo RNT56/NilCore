@@ -201,9 +201,9 @@ func applyRenameAtomic(workdir string, changes []renameChange) error {
 		snaps = append(snaps, snap{abs: p, data: prior})
 	}
 	for i, c := range changes {
-		if werr := writeNoFollow(snaps[i].abs, c.bytes); werr != nil {
+		if werr := writeNoFollow(workdir, snaps[i].abs, c.bytes); werr != nil {
 			for j := 0; j < i; j++ { // restore the files already written
-				_ = writeNoFollow(snaps[j].abs, snaps[j].data)
+				_ = writeNoFollow(workdir, snaps[j].abs, snaps[j].data)
 			}
 			return fmt.Errorf("rename_symbol: write %s failed, rolled back: %w", c.rel, werr)
 		}

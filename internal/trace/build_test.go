@@ -182,6 +182,91 @@ func TestBuild_CleanChainVerdict(t *testing.T) {
 	}
 }
 
+// TestBuild_TolerantOfTornFinalLine proves the trace CLI does not abort against a
+// LIVE, in-progress log whose final line is a torn/partial write. It reads up to the
+// last COMPLETE record and returns a trace over those, instead of erroring out.
+func TestBuild_TolerantOfTornFinalLine(t *testing.T) {
+	path := writeLog(t, realisticRun())
+
+	// Simulate the writer mid-append: a partial JSON fragment with no trailing newline
+	// tacked onto the end of the file, exactly as a crash/in-flight write would leave it.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"seq":99,"kind":"model_ca`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tr, err := Build(path, "T")
+	if err != nil {
+		t.Fatalf("Build over a live log with a torn final line must not abort, got err: %v", err)
+	}
+	// The KEY guarantee: the complete records still produce a structural trace. Before
+	// the fix, scan() returned a parse error on the torn line and Build aborted with no
+	// trace at all.
+	if len(tr.Steps) == 0 {
+		t.Fatal("expected the complete records to still produce a trace")
+	}
+	// All ten complete records survived the parse (the torn 11th fragment was dropped).
+	if got := tr.Counts["task_start"]; got != 1 {
+		t.Fatalf("complete records should be fully parsed; task_start count = %d, want 1", got)
+	}
+	if got := tr.Counts["integration_merge"]; got != 1 {
+		t.Fatalf("final complete record should be present; integration_merge count = %d, want 1", got)
+	}
+	// (eventlog.Verify still judges the raw file's chain — a trailing torn line makes it
+	// report a break — but that is a trust verdict, not an abort: the structure is shown.)
+}
+
+// TestBuild_InteriorCorruptionStillErrors proves the tolerance is scoped to the FINAL
+// line only: an unparseable INTERIOR line is a genuine corruption we must surface.
+func TestBuild_InteriorCorruptionStillErrors(t *testing.T) {
+	path := writeLog(t, realisticRun())
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the FIRST line into non-JSON, then keep the rest — an interior fragment.
+	lines := splitLines(string(data))
+	if len(lines) < 3 {
+		t.Fatalf("test setup: too few lines (%d)", len(lines))
+	}
+	lines[0] = "this is not json at all"
+	if err := os.WriteFile(path, []byte(joinLines(lines)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(path, "T"); err == nil {
+		t.Fatal("an unparseable INTERIOR line must surface as a parse error, not be tolerated")
+	}
+}
+
+func splitLines(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
+}
+
+func joinLines(lines []string) string {
+	s := ""
+	for _, l := range lines {
+		s += l + "\n"
+	}
+	return s
+}
+
 func TestBuild_CorruptedChainFailsClosed(t *testing.T) {
 	path := writeLog(t, realisticRun())
 

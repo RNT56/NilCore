@@ -79,23 +79,31 @@ type Fact struct {
 
 // Query returns the graph neighborhood of symbol fused with memory hits. Memory
 // is surfaced with provenance "lead" (it points where to look), alongside the
-// structural graph facts.
+// structural graph facts. Callees/Callers return QUALIFIED node ids (the same-name
+// collision fix), so each is projected to its human-facing DISPLAY name (bare name,
+// or "recv.name" for a method) via graph.DisplayName — the Fact and its Detail never
+// leak the file path or NUL delimiters a qualified id carries.
 func (ix *Index) Query(ctx context.Context, symbol string) ([]Fact, error) {
 	var facts []Fact
+	// The queried symbol is displayed by its own bare name too (the caller may pass a
+	// qualified id or a bare name; normalize for the human-readable Detail).
+	symName := graph.DisplayName(symbol)
 
 	callees, err := ix.Graph.Callees(ctx, symbol)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range callees {
-		facts = append(facts, Fact{Symbol: c, Provenance: "graph", Detail: symbol + " calls " + c})
+		name := graph.DisplayName(c)
+		facts = append(facts, Fact{Symbol: name, Provenance: "graph", Detail: symName + " calls " + name})
 	}
 	callers, err := ix.Graph.Callers(ctx, symbol)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range callers {
-		facts = append(facts, Fact{Symbol: c, Provenance: "graph", Detail: c + " calls " + symbol})
+		name := graph.DisplayName(c)
+		facts = append(facts, Fact{Symbol: name, Provenance: "graph", Detail: name + " calls " + symName})
 	}
 
 	if ix.Memory != nil {

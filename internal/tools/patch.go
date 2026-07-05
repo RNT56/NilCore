@@ -135,7 +135,11 @@ func (PatchTool) Run(_ context.Context, workdir string, input json.RawMessage) (
 	}
 	snaps := make([]snap, 0, len(actions))
 	for _, a := range actions {
-		b, err := os.ReadFile(a.abs)
+		// O_NOFOLLOW read (readNoFollow): a.abs is confined by validateOp's safePath, but
+		// a plain os.ReadFile would follow a final-component symlink swapped in after that
+		// check and snapshot an out-of-worktree file (I4 TOCTOU). readNoFollow refuses a
+		// swapped-in link; a missing file still surfaces as os.IsNotExist (ENOENT).
+		b, err := readNoFollow(a.abs)
 		if err == nil {
 			snaps = append(snaps, snap{abs: a.abs, existed: true, data: b})
 		} else if os.IsNotExist(err) {
@@ -151,7 +155,7 @@ func (PatchTool) Run(_ context.Context, workdir string, input json.RawMessage) (
 		for _, s := range snaps {
 			var rerr error
 			if s.existed {
-				rerr = worktreefs.WriteConfined(s.abs, s.data, 0)
+				rerr = worktreefs.WriteConfined(workdir, s.abs, s.data, 0)
 			} else if err := os.Remove(s.abs); err != nil && !os.IsNotExist(err) {
 				rerr = err
 			}
@@ -179,7 +183,7 @@ func (PatchTool) Run(_ context.Context, workdir string, input json.RawMessage) (
 				return "", failClosed("delete "+a.rel, err)
 			}
 		} else {
-			if err := worktreefs.WriteConfined(a.abs, a.data, a.mode); err != nil {
+			if err := worktreefs.WriteConfined(workdir, a.abs, a.data, a.mode); err != nil {
 				return "", failClosed("write "+a.rel, err)
 			}
 		}
@@ -223,7 +227,11 @@ func validateOp(workdir string, op patchOp) ([]fileAction, error) {
 		if serr != nil {
 			return nil, fmt.Errorf("stat: %w", serr)
 		}
-		cur, err := os.ReadFile(abs)
+		// O_NOFOLLOW read (readNoFollow): abs is confined by safePath above, but a plain
+		// os.ReadFile would follow a final-component symlink swapped in after that check
+		// and read an out-of-worktree file (I4 TOCTOU). readNoFollow refuses a swapped-in
+		// link instead.
+		cur, err := readNoFollow(abs)
 		if err != nil {
 			return nil, fmt.Errorf("read: %w", err)
 		}

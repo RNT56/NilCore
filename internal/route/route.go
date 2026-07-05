@@ -45,19 +45,47 @@ type Candidate struct {
 // Race runs all candidates concurrently and returns the result of the first whose
 // verifier passes — the verifier is the judge, so a black-box backend can only
 // win by actually making the checks green. ok is false if none passed.
+//
+// Loser cancellation (index-aware, determinism-preserving): each candidate runs under
+// its OWN cancellable child of ctx. When a candidate's verifier passes it cancels only
+// the STRICTLY-HIGHER-index candidates — never a lower-index one, which could still turn
+// out to be the winner. The winner is always the lowest-index passing candidate, chosen
+// after every goroutine returns. That candidate is only ever cancelled by a lower-index
+// passer — of which, being the lowest passer, there is none — so it always runs to
+// completion and the result is deterministic regardless of finish order, while doomed
+// higher-index work still stops early (its Backend.Run honors ctx). (A whole-race cancel
+// on the first passer, by contrast, could cut short a lower-index candidate that would
+// have won, making the selected winner depend on race timing.) A loser cut short logs
+// its own race_outcome (typically a cancelled run_error) — an honest audit record that
+// it was pre-empted, not a hidden pass.
 func Race(ctx context.Context, candidates []Candidate, log *eventlog.Log) (backend.Result, bool) {
 	type outcome struct {
 		res    backend.Result
 		passed bool
 	}
 	results := make([]outcome, len(candidates))
+
+	// Per-candidate cancellable contexts: a passing candidate cancels only the
+	// higher-index ones (see the determinism argument above). All are cancelled on
+	// return (defer) so no context leaks even when none pass.
+	ctxs := make([]context.Context, len(candidates))
+	cancels := make([]context.CancelFunc, len(candidates))
+	for i := range candidates {
+		ctxs[i], cancels[i] = context.WithCancel(ctx)
+	}
+	defer func() {
+		for _, c := range cancels {
+			c()
+		}
+	}()
+
 	var wg sync.WaitGroup
 	for i := range candidates {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			c := candidates[i]
-			res, err := c.Backend.Run(ctx, c.Task)
+			res, err := c.Backend.Run(ctxs[i], c.Task)
 			passed := false
 			// Distinguish the three not-passed reasons in the audit trail (I5): a backend
 			// run error, a verifier infrastructure error, and a clean verify miss are very
@@ -67,7 +95,7 @@ func Race(ctx context.Context, candidates []Candidate, log *eventlog.Log) (backe
 			var failReason string
 			if err != nil {
 				failReason = "run_error: " + err.Error()
-			} else if rep, verr := c.Verifier.Check(ctx); verr != nil {
+			} else if rep, verr := c.Verifier.Check(ctxs[i]); verr != nil {
 				failReason = "verify_error: " + verr.Error()
 			} else {
 				passed = rep.Passed
@@ -76,6 +104,16 @@ func Race(ctx context.Context, candidates []Candidate, log *eventlog.Log) (backe
 				}
 			}
 			results[i] = outcome{res, passed}
+			// A passer cancels ONLY the strictly-higher-index siblings: they can no longer
+			// beat a lower-index passer, so their remaining compute is wasted. A lower-index
+			// candidate is never cancelled here, so the lowest-index passer (the eventual
+			// winner) always runs to completion — keeping selection deterministic regardless
+			// of finish order. cancel funcs are idempotent, so overlapping passers are safe.
+			if passed {
+				for j := i + 1; j < len(candidates); j++ {
+					cancels[j]()
+				}
+			}
 			detail := map[string]any{"passed": passed}
 			if failReason != "" {
 				detail["reason"] = failReason

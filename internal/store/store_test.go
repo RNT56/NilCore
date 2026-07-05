@@ -110,6 +110,136 @@ func TestMemoryUpsertReplaces(t *testing.T) {
 	}
 }
 
+// TestPutMemoryUpdateReturnsCorrectID is the stale-rowid regression: on the ON
+// CONFLICT UPDATE branch no new row is inserted, so LastInsertId would return the
+// connection's LAST insert rowid — an UNRELATED row if some other insert ran in
+// between. RETURNING id must instead give the id of the logical row we upserted. We
+// force the hazard: create key A, then insert an unrelated event/memory row (bumping
+// the connection's last-insert rowid), then UPDATE key A and confirm the returned id
+// is still A's own row id.
+func TestPutMemoryUpdateReturnsCorrectID(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+
+	idA, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "A", Value: "a1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated insert on the SAME shared connection advances last_insert_rowid to a
+	// row that is NOT key A — the exact condition under which the old LastInsertId path
+	// would have returned the wrong id on the update below.
+	if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "B", Value: "b1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertEvent(ctx, Event{Time: time.Now(), Task: "t", Kind: "noise"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now UPDATE key A (ON CONFLICT branch). The returned id must be A's own id.
+	idA2, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "A", Value: "a2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idA2 != idA {
+		t.Fatalf("update returned a stale/unrelated id: got %d, want A's id %d", idA2, idA)
+	}
+	// And the value actually replaced in A's row.
+	got, err := s.QueryMemory(ctx, "project", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range got {
+		if m.Key == "A" {
+			if m.ID != idA {
+				t.Errorf("A row id = %d, want %d", m.ID, idA)
+			}
+			if m.Value != "a2" {
+				t.Errorf("A value = %q, want a2", m.Value)
+			}
+		}
+	}
+}
+
+// TestEventSeqPersisted proves the mirror now carries the log Seq anchor: an event
+// inserted with a Seq reads back with that same Seq, and EventsByTask orders by Seq
+// (not just insertion id), so the SQLite backing can reproduce ordering / detect gaps.
+func TestEventSeqPersisted(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+
+	// Insert out of Seq order to prove ordering comes from Seq, not insertion id.
+	for _, seq := range []uint64{2, 0, 1} {
+		if err := s.InsertEvent(ctx, Event{
+			Seq: seq, Time: time.Now(), Task: "t", Kind: "step",
+			Detail: `{}`, Hash: "h", Prev: "p",
+		}); err != nil {
+			t.Fatalf("insert seq %d: %v", seq, err)
+		}
+	}
+	evs, err := s.EventsByTask(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 3 {
+		t.Fatalf("got %d events, want 3", len(evs))
+	}
+	for i, e := range evs {
+		if e.Seq != uint64(i) {
+			t.Errorf("event[%d].Seq = %d, want %d (ordered by log Seq, not insertion id)", i, e.Seq, i)
+		}
+	}
+}
+
+// TestEventSeqLegacyDBSentinel proves an events row written before the seq column
+// existed migrates cleanly and reads back as the -1 sentinel → Seq 0-with-unknown,
+// surfaced as Seq==0 here but never mistaken for a real anchor by a gap check (the
+// column default is -1). We create a legacy events table, insert a row, then Open
+// (which adds the column) and confirm the read does not error.
+func TestEventSeqLegacyDBSentinel(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy_events.db")
+
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-seq events table (no seq column), matching the historical schema.
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, task TEXT,
+		kind TEXT NOT NULL, backend TEXT, detail TEXT, prev TEXT, hash TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	// Populate the non-null-in-practice columns the way a real InsertEvent does (the
+	// mirror never writes SQL NULLs), so the read-back exercises the seq migration, not
+	// a NULL-scan artifact.
+	if _, err := legacy.ExecContext(ctx,
+		`INSERT INTO events (ts, task, kind, backend, detail, prev, hash) VALUES (?, 't', 'legacy', '', '', '', '')`,
+		time.Now().UTC().Format(tsFmt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path) // migrateEventSeq adds the seq column with DEFAULT -1
+	if err != nil {
+		t.Fatalf("Open of legacy events DB (seq migration): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	evs, err := s.EventsByTask(ctx, "t")
+	if err != nil {
+		t.Fatalf("EventsByTask over migrated legacy DB: %v", err)
+	}
+	if len(evs) != 1 || evs[0].Kind != "legacy" {
+		t.Fatalf("legacy row lost in migration: %+v", evs)
+	}
+	// The -1 sentinel reads back as Seq 0 (unknown anchor), never a spurious position.
+	if evs[0].Seq != 0 {
+		t.Errorf("legacy row Seq = %d, want 0 (unknown-anchor sentinel maps to 0)", evs[0].Seq)
+	}
+}
+
 // TestMemoryUniqueMigration is the legacy-DB path: a memory table created WITHOUT the
 // UNIQUE(scope,project,mkey) constraint, holding duplicate-key rows, must on Open be
 // rebuilt to carry the constraint and collapse duplicates to the newest row per key —

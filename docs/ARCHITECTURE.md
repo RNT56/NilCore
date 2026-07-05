@@ -48,7 +48,7 @@ The native loop exposes three tiers of tools, all registered through one registr
 
 This follows Anthropic's *Code execution with MCP* guidance (Nov 2025), which reported up to a ~98% token reduction versus loading every tool definition and routing each intermediate result through context. NilCore is unusually well-suited to it: it is *already* a sandboxed code-execution environment, so MCP-as-code reuses the container, the structured filesystem tools, and the same context discipline as summarize-and-handover — keep bulk data out of the model's window.
 
-**MCP trust boundary:** MCP servers are third-party and their **output is untrusted** (I7 — fenced as data, never instructions). But the *server set itself is operator-configured* (`mcp.json` / `$NILCORE_MCP_CONFIG`), **never model-emitted**: the model only selects a configured server + tool/resource/prompt + JSON args, all carried as data. Descriptors are generated **deterministically from each server's declared schema** (not model-written). Invocation runs **host-side** through `internal/mcp.Manager` (a recorded I4 relaxation — see §Execution model): the model cannot add a server or run an arbitrary program; it can only call the operator's sanctioned surface, which is exactly where `setupMCP` already spawns servers for discovery. HTTP auth lives in operator-supplied `headers` resolved host-side (I3 — never to the model). Every call is audited. MCP is a sanctioned scope (invariant I6, stdlib-only — JSON-RPC over `net/http`/stdio), in `internal/mcp`.
+**MCP trust boundary:** MCP servers are third-party and their **output is untrusted** (I7 — fenced as data, never instructions). But the *server set itself is operator-configured* (`mcp.json` / `$NILCORE_MCP_CONFIG`), **never model-emitted**: the model only selects a configured server + tool/resource/prompt + JSON args, all carried as data. Descriptors are generated **deterministically from each server's declared schema** (not model-written). Invocation runs **host-side** through `internal/mcp.Manager` (a recorded I4 relaxation — see §Execution model): the model cannot add a server or run an arbitrary program; it can only call the operator's sanctioned surface, which is exactly where `setupMCP` already spawns servers for discovery. HTTP auth lives in operator-supplied `headers` resolved host-side via `{{secret:NAME}}` (SecretStore) / `{{env:NAME}}` placeholders — an unresolved placeholder is a hard error, never sent as a literal — so a bearer token stays out of `mcp.json` and never reaches the model (I3). Generated descriptors live under the OS cache dir (`<user-cache>/nilcore/mcp/<workdir-digest>`, override `NILCORE_MCP_DESC_DIR`), not the operator's checkout. Every call is audited. MCP is a sanctioned scope (invariant I6, stdlib-only — JSON-RPC over `net/http`/stdio), in `internal/mcp`.
 
 ## Advisor-Executor (two-tier models)
 
@@ -527,7 +527,7 @@ capability+cost manifest) is honored as-is by `reconcile`. The string heuristic
 (`fallback`), never an overrule of a parseable proposal. Routing is still a
 dispatcher, never a rail — every route terminates in the same verifier (I2) and the
 same conversation budget ceiling, so a mis-route can only cost money, never defeat a
-rail. `nilcore run` gains an optional default-OFF `-auto-supervise` seam that wires
+rail. The single-task run (`nilcore -goal …`) gains an optional default-OFF `-auto-supervise` seam that wires
 the SAME classifier (when a native provider exists) to let a complex goal scale up to
 the supervised loop; off ⇒ byte-identical single-task run.
 
