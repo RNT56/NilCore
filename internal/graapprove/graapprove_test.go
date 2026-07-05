@@ -1053,7 +1053,7 @@ func TestFallThroughForwardsEvidenceToStructuredHuman(t *testing.T) {
 	if !human.structCalled {
 		t.Fatal("fall-through must use the human's structured seam when available")
 	}
-	if human.recHuman.called {
+	if human.called {
 		t.Fatal("structured forward must not ALSO hit the flat Approve path")
 	}
 	if human.got.Evidence != ev {
