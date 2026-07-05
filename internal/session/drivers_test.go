@@ -393,6 +393,33 @@ func TestSessionContinueReentersActiveDriver(t *testing.T) {
 	}
 }
 
+// TestSessionEmptyBranchPreservesKeptBranch locks the fold invariant FIX #15 relies
+// on: a drive that returns an EMPTY Branch must NOT clear a previously-kept branch in
+// WorkState. A non-converged supervise/project drive now deliberately surfaces no
+// branch (its raw integrate/<sha> tip is swept by cleanup); if the fold overwrote
+// State.Branch with "", the still-existing nilcore/kept/ deliverable would lose its
+// /diff and /apply targets. So an empty Branch is a no-op on State.Branch.
+func TestSessionEmptyBranchPreservesKeptBranch(t *testing.T) {
+	run := func(_ context.Context, _ NativeRun) (DriveOutcome, error) {
+		// A not-Done drive: verified=false, and (per FIX #15) an EMPTY Branch.
+		return DriveOutcome{Summary: "made partial progress", Verified: false}, nil
+	}
+	s := New("chat-local", "local", "/repo", nil)
+	s.Router = &fakeRouter{route: RouteNative}
+	s.Drivers = Drivers{Native: NewNativeDriver(run, nil, s.ID)}
+	s.State.Branch = "nilcore/kept/chat-local-1" // a prior verified deliverable
+
+	if err := s.Turn(context.Background(), "keep going"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	s.Wait()
+	waitPhase(t, s, Idle)
+
+	if s.State.Branch != "nilcore/kept/chat-local-1" {
+		t.Fatalf("State.Branch = %q after an empty-branch drive, want the prior kept branch intact", s.State.Branch)
+	}
+}
+
 // --- foldOutcome: bounded fold, summarize fallback, verdict pass-through ----------
 
 func TestFoldOutcomeWithoutModelKeepsGoalAndVerdict(t *testing.T) {

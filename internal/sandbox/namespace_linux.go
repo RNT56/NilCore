@@ -102,8 +102,9 @@ func (n *Namespace) ExecWithEnv(ctx context.Context, cmd string, env map[string]
 	// in the parent, so sandboxInit can mask the credential paths beneath them
 	// (~/.ssh, secrets.vault + secrets.key, …) before the command runs. An
 	// unresolvable root simply masks nothing under it — the fail-closed contract
-	// applies to mask failures on paths that provably exist (see
-	// maskSensitivePaths), not to a host with no resolvable HOME.
+	// applies to MOUNT failures on paths that provably stat (see
+	// maskSensitivePaths), not to a host with no resolvable HOME nor to a
+	// credential path we cannot even stat (already unreadable to the command).
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
 		c.Env = append(c.Env, envMaskHome+"="+home)
 	}
@@ -216,9 +217,10 @@ func sandboxInit(workdir, maskHome, maskCfg string) error {
 	// HERE — after the MS_PRIVATE remount (the masks never propagate back to the
 	// host) and BEFORE Landlock and seccomp, because a Landlock-restricted thread
 	// is denied all filesystem-topology changes and the seccomp filter denylists
-	// mount(2), so a later mask would EPERM. Fail-closed like Landlock: any mask
-	// failure on an existing path aborts the exec (exit 126 via MaybeRunInit)
-	// rather than run the command with a credential path exposed.
+	// mount(2), so a later mask would EPERM. Fail-closed like Landlock: a MOUNT
+	// failure on a path that stat'd successfully aborts the exec (exit 126 via
+	// MaybeRunInit) rather than run with a credential path exposed. A path we
+	// cannot stat is skipped — it is already unreadable to the same-uid command.
 	if err := maskSensitivePaths(buildMaskSet(maskHome, maskCfg, workdir)); err != nil {
 		return fmt.Errorf("mask credential paths: %w", err)
 	}
@@ -312,8 +314,19 @@ func nilcoreConfigDir() (string, error) {
 // read and write. An operator who points the worktree at (or under) a
 // credential path has made that exposure explicitly.
 //
-// Pure (no I/O): existence is the applier's concern, which keeps this
-// table-testable on any OS that can compile the file.
+// Symlinks are resolved before that overlap check (resolveForOverlap): on a
+// symlinked-home host (/home → /var/home) or when a mask target is itself a
+// symlink, a lexical prefix test on the UNRESOLVED candidate would miss an
+// overlap with the already-symlink-resolved workdir and plant a tmpfs over the
+// worktree ⇒ chdir fails / worktree hidden ⇒ exit 126. Resolving both sides
+// consistently makes the comparison — and the returned mask paths — reflect the
+// real filesystem the mounts and Landlock actually see. Resolution is
+// best-effort (EvalSymlinks, falling back to Clean) because a credential path
+// need not exist; a non-existent target simply keeps its cleaned form.
+//
+// Not pure (best-effort EvalSymlinks I/O), but the resolution is a no-op on
+// paths that don't exist or aren't symlinks, so the table tests below still
+// exercise the full selection logic on any OS that can compile the file.
 func buildMaskSet(home, configDir, workdir string) []string {
 	var candidates []string
 	if configDir != "" {
@@ -321,25 +334,30 @@ func buildMaskSet(home, configDir, workdir string) []string {
 	}
 	if home != "" {
 		for _, rel := range []string{
-			".ssh",                // private keys, known_hosts
-			".aws",                // cloud credentials
-			".gnupg",              // signing keys
-			".netrc",              // machine/login/password triplets (curl, git)
-			".config/gh",          // GitHub CLI OAuth token
-			".docker/config.json", // registry auths
-			".codex",              // delegated-CLI credentials (Codex)
-			".claude",             // delegated-CLI credentials (Claude Code)
-			".claude.json",        // delegated-CLI state (Claude Code)
+			".ssh",                    // private keys, known_hosts
+			".aws",                    // cloud credentials
+			".gnupg",                  // signing keys
+			".netrc",                  // machine/login/password triplets (curl, git)
+			".git-credentials",        // git credential.helper=store: plaintext user/pass/PAT
+			".config/git/credentials", // XDG variant of the git credential store
+			".config/gh",              // GitHub CLI OAuth token
+			".docker/config.json",     // registry auths
+			".codex",                  // delegated-CLI credentials (Codex)
+			".claude",                 // delegated-CLI credentials (Claude Code)
+			".claude.json",            // delegated-CLI state (Claude Code)
 		} {
 			candidates = append(candidates, filepath.Join(home, rel))
 		}
 	}
-	wd := filepath.Clean(workdir)
+	// The workdir arg is already symlink-resolved by the parent (newNamespace),
+	// but resolve it again so the comparison is correct even if a caller passes an
+	// unresolved path, and so both sides go through identical normalization.
+	wd := resolveForOverlap(workdir)
 	excludeWD := filepath.IsAbs(wd)
 	seen := make(map[string]bool, len(candidates))
 	out := make([]string, 0, len(candidates))
 	for _, c := range candidates {
-		c = filepath.Clean(c)
+		c = resolveForOverlap(c)
 		if !filepath.IsAbs(c) || seen[c] {
 			continue
 		}
@@ -350,6 +368,22 @@ func buildMaskSet(home, configDir, workdir string) []string {
 		out = append(out, c)
 	}
 	return out
+}
+
+// resolveForOverlap normalizes a path for the workdir-overlap comparison and for
+// the mask target itself: it follows symlinks so a symlinked home or a symlinked
+// credential path compares (and later mounts) against its real location. It is
+// best-effort — a path that does not exist yet cannot be EvalSymlinks'd, so it
+// falls back to filepath.Clean. Non-absolute inputs are returned cleaned and are
+// filtered out by the absolute-path guard in the caller.
+func resolveForOverlap(p string) string {
+	if p == "" {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
 }
 
 // pathContains reports whether child is parent or lies beneath it. Both paths
@@ -379,17 +413,32 @@ func pathContains(parent, child string) bool {
 // means a parent component is a file, so the path cannot exist either).
 // Targets are processed in order, so a candidate nested inside an
 // already-masked directory stats as absent and is skipped, never
-// double-mounted. Any other stat or mount failure is returned and the caller
-// aborts the exec — fail-closed, exactly like a Landlock failure — because the
-// alternative is running the command with a credential path exposed.
+// double-mounted.
+//
+// ANY stat failure skips the target rather than aborting: a stat that fails
+// with EACCES/EPERM (e.g. a root-owned mode-700 ~/.docker left by `sudo docker
+// login`) means the path is unreachable to us — but the command runs at the
+// SAME uid with the SAME credentials, so it cannot traverse or read it either.
+// An unstatable path is therefore already unreadable to the command; skipping
+// it is as safe as masking it, and failing closed there would brick the whole
+// backend (exit 126) over a path the model was never going to reach. A stat
+// error does not PROVE the target exists, so it does not trigger fail-closed.
+//
+// Fail-closed applies only to a genuine MOUNT failure on a path that DID stat
+// successfully — a provably-existing credential target we could not mask. The
+// caller then aborts the exec (exit 126 via MaybeRunInit), exactly like a
+// Landlock failure, because the alternative is running with that path exposed.
 func maskSensitivePaths(targets []string) error {
 	for _, target := range targets {
 		fi, err := os.Stat(target)
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			continue
-		}
 		if err != nil {
-			return fmt.Errorf("stat %s: %w", target, err)
+			// Unreachable-to-us (or absent): already unreadable to the command,
+			// which shares our uid. Skip, with a one-line notice for the non-absent
+			// cases so an operator can see a credential path went unmasked.
+			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+				fmt.Fprintf(os.Stderr, "nilcore sandbox: skip unstatable mask target %s: %v\n", target, err)
+			}
+			continue
 		}
 		if fi.IsDir() {
 			if err := unix.Mount("tmpfs", target, "tmpfs",

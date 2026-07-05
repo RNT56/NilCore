@@ -43,6 +43,7 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/session"
 	"nilcore/internal/wake"
+	"nilcore/internal/worktree"
 )
 
 // SessionFactory builds a fully-wired conversational Session for one thread. The
@@ -251,6 +252,18 @@ func (s *Server) applyControl(ctx context.Context, th *thread, req channel.TaskR
 		// it rather than acting. (The verb is still parsed centrally so both front
 		// doors agree on what it IS; only the terminal ACTS on it.)
 		reply("/save is only available in the local terminal, not over a channel.")
+	case session.CtrlDiff:
+		// Read-only preview of the thread's kept verified branch. Safe over a channel
+		// (it renders, never merges), so — unlike /apply — it acts here. No kept branch
+		// ⇒ an explicit "nothing to preview", never a silent no-op.
+		s.applyDiffPreview(ctx, th, reply)
+	case session.CtrlApply:
+		// /apply lands a branch onto the operator's REAL host HEAD — the same
+		// local-operator-only action class as /save (a remote principal must never drive
+		// a host-side merge), and the serve path has no PromoteToBase wiring to gate it
+		// through. So it is refused EXPLICITLY, mirroring /save, rather than silently
+		// dropped. The verified branch is still kept for the local terminal to /apply.
+		reply("/apply is only available in the local terminal, not over a channel — the verified branch is kept; run /apply there.")
 	case session.CtrlQuestions:
 		// Dial how often the agent asks clarifying questions over this thread — the
 		// deterministic sibling of telling it "ask me fewer questions" in prose.
@@ -322,6 +335,33 @@ func (s *Server) applyAdd(ctx context.Context, th *thread, req channel.TaskReque
 	}
 	th.sess.AddReadRoot(resolved)
 	reply("added read-only context root: " + resolved)
+}
+
+// serveDiffPreviewBytes bounds the /diff render over a channel so a large kept
+// change cannot flood the thread; the full diff stays on the branch (mirrors the
+// REPL's chatDiffPreviewBytes budget).
+const serveDiffPreviewBytes = 16 << 10
+
+// applyDiffPreview replies with a bounded, read-only preview of the thread's kept
+// verified branch against the base HEAD. No kept branch / no changes / a preview
+// error all reply EXPLICITLY (never a silent no-op) so the remote operator always
+// gets an answer. It never merges — /apply is the (locally-gated) landing verb.
+func (s *Server) applyDiffPreview(ctx context.Context, th *thread, reply func(string)) {
+	branch := th.sess.KeptBranch()
+	if branch == "" {
+		reply("nothing to preview — no verified work is kept yet (run a task in /execute or /auto mode).")
+		return
+	}
+	preview, err := worktree.DiffPreview(ctx, th.sess.RepoDir(), branch, serveDiffPreviewBytes)
+	if err != nil {
+		reply("cannot preview " + branch + ": " + err.Error())
+		return
+	}
+	if preview == "" {
+		reply("branch " + branch + " lands no changes on the current HEAD.")
+		return
+	}
+	reply("kept branch: " + branch + "  (/apply in the local terminal to merge)\n" + preview)
 }
 
 // isURL reports whether a /add argument is an http(s) URL (vs a filesystem path).

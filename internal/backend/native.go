@@ -696,6 +696,29 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			continue
 		}
 
+		// TRUNCATION SANITIZE (item 3c, defense-in-depth ahead of the belt at the
+		// dispatch loop below). A clean EOF mid-tool_use — a proxy that closes the
+		// SSE stream without message_stop — assembles a tool_use Block whose Input is
+		// a PARTIAL, INVALID json.RawMessage, with err==nil and StopReason "" (not
+		// "max_tokens"), so neither the error path nor the max_tokens salvage fires.
+		// That poisoned Input is about to be recorded verbatim into history; on the
+		// NEXT step buildAnthropicRequest json.Marshal's it and fails PERMANENTLY
+		// ("error calling MarshalJSON for type json.RawMessage"), killing every
+		// remaining step — the belt below can never recover because the poisoned turn
+		// is already immutable history. So repair the blocks IN PLACE before line 700:
+		// any tool_use whose Input is non-empty but not valid JSON gets its Input
+		// replaced with "{}", keeping history always marshalable. Their IDs are
+		// tracked so the dispatch loop returns the belt's corrective tool_result for
+		// each (never executing a zero-arg call) and the model re-emits the tool.
+		truncatedIDs := map[string]bool{}
+		for j := range resp.Content {
+			b := &resp.Content[j]
+			if b.Type == "tool_use" && len(b.Input) > 0 && !json.Valid(b.Input) {
+				truncatedIDs[b.ID] = true
+				b.Input = json.RawMessage("{}")
+			}
+		}
+
 		// Record the assistant turn verbatim so the conversation stays coherent.
 		msgs = append(msgs, model.Message{Role: "assistant", Content: resp.Content})
 
@@ -766,7 +789,10 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			// via stop sequences or vendor quirks even without stop_reason
 			// "max_tokens"). Every handler below decodes with `_ =` and would act on
 			// zero values; a clear error naming the likely cause is recoverable.
-			if len(b.Input) > 0 && !json.Valid(b.Input) {
+			// truncatedIDs also catches blocks the sanitize step above rewrote to "{}"
+			// (a mid-tool_use EOF), so they get the same corrective result here instead
+			// of dispatching a zero-arg call.
+			if truncatedIDs[b.ID] || (len(b.Input) > 0 && !json.Valid(b.Input)) {
 				results = append(results, errorResult(b.ID,
 					"tool input is not valid JSON — the call was likely truncated at the output-token limit; re-emit it in smaller pieces"))
 				continue
@@ -1441,15 +1467,19 @@ const (
 
 // selfBoundedTools are registry tools that already impose their OWN output bound
 // with a tool-specific truncation notice and recovery move (read's line-window
-// paging, browser_view's excerpt cap, web_fetch/web_search's byte caps). Their
-// deliberate bounds sit ABOVE the backstop clip, and clobbering e.g. read's
-// "[truncated at line N — re-read with offset=N]" notice would break the model's
-// paging protocol — so the dispatch-site backstop passes them through verbatim.
+// paging, browser_view's excerpt cap, web_fetch/web_search's byte caps, mcp's
+// 48KB boundMCPResult notice). Their deliberate bounds sit ABOVE the backstop
+// clip, and clobbering e.g. read's "[truncated at line N — re-read with
+// offset=N]" notice would break the model's paging protocol — so the
+// dispatch-site backstop passes them through verbatim. Without "mcp" here the
+// backstop re-clips every >8KB MCP result to 2KB head+6KB tail with a recovery
+// notice ("use outline/read_symbol/search") that is nonsense for an MCP tool.
 var selfBoundedTools = map[string]bool{
 	"read":         true,
 	"browser_view": true,
 	"web_fetch":    true,
 	"web_search":   true,
+	"mcp":          true,
 }
 
 // clipToolOutput bounds rendered tool output to head + tail around an explicit

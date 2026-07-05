@@ -101,6 +101,41 @@ func TestTieredVerifier(t *testing.T) {
 	}
 }
 
+// TestTieredScopedRedTailBounded pins FIX #6: an oversized scoped-red body is
+// clipped to the same ~4000-byte tail every full-verify red enforces (verify.go),
+// so it never lands unclipped in the model conversation. The marker stays at the
+// head and the FAILING tail (where go-test prints its assertions) is preserved.
+func TestTieredScopedRedTailBounded(t *testing.T) {
+	head := strings.Repeat("x", 10000) // noise that must be clipped away
+	tailMsg := "\n--- FAIL: TestImportant\nassert failed at the very end"
+	big := head + tailMsg
+	full := &stubFull{rep: Report{Passed: true}}
+	tv := &TieredVerifier{
+		Full:      full,
+		ScopedRed: func(context.Context) (bool, string, error) { return true, big, nil },
+	}
+	rep, err := tv.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Passed {
+		t.Fatal("a scoped red must stay red")
+	}
+	if !strings.HasPrefix(rep.Output, ScopedRedMarker+"\n") {
+		t.Fatalf("marker must stay at the head, got %q", rep.Output[:40])
+	}
+	// Bounded: the marker line + a <=4000-byte tail, never the full 10k+ dump.
+	if len(rep.Output) > len(ScopedRedMarker)+1+scopedOutputTail+len("...(truncated)...\n") {
+		t.Fatalf("scoped output must be tail-bounded, got %d bytes", len(rep.Output))
+	}
+	if !strings.Contains(rep.Output, "assert failed at the very end") {
+		t.Fatal("the FAILING tail must be preserved")
+	}
+	if strings.Count(rep.Output, "x") >= 10000 {
+		t.Fatal("the oversized head must be clipped, not shipped verbatim")
+	}
+}
+
 // TestTieredVerifierGuards pins the wiring-bug guards: a nil Full errors (with or
 // without a scoped seam), and an erroring Full propagates.
 func TestTieredVerifierGuards(t *testing.T) {

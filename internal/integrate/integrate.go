@@ -175,6 +175,24 @@ func (it *Integrator) Integrate(ctx context.Context, order []MergeItem) (*worktr
 func (it *Integrator) mergeOne(ctx context.Context, dir string, env Env, item MergeItem, preSHA string) MergeResult {
 	res := MergeResult{ID: item.ID, Branch: item.Branch, PreSHA: preSHA, SHA: preSHA}
 
+	// IDEMPOTENT NO-OP MERGE. If the branch tip is already an ancestor of the current
+	// integration tip, the tip ALREADY contains this branch's work — a verifier-green
+	// shard that committed nothing (no tracked-file change: .nilcore/artifacts is
+	// gitignored, or a DAG dependent cut from its dep's already-satisfied branch)
+	// surfaces its dep branch (an ancestor of the tip), and a `git merge --no-ff
+	// --no-commit` of it reports "Already up to date", stages nothing, and the follow-up
+	// `commit` then fails with "nothing to commit". That must NOT be read as a conflict:
+	// the work IS on the tip, so this fold is a SUCCESS (Merged && Verified) with the tip
+	// unchanged. Detecting it up-front keeps the run from burning rebuild attempts and
+	// exiting `unmerged`/exit-1 on a genuinely complete run (I2 the other way: a no-op is
+	// not a dropped merge). A branch that is NOT an ancestor falls through to a real merge.
+	if it.branchContained(ctx, dir, item.Branch, preSHA) {
+		res.Merged, res.Verified = true, true // work already on the tip; tip SHA unchanged
+		it.Log.Append(eventlog.Event{Task: item.ID, Kind: "integration_merge",
+			Detail: map[string]any{"branch": item.Branch, "pre_sha": preSHA, "sha": preSHA, "noop": true}})
+		return res
+	}
+
 	// --no-ff keeps a distinct merge commit per branch so a later rollback is one
 	// reset; --no-commit lets us re-verify before the merge is recorded. (We do
 	// commit clean merges below; verify-then-reset gives per-branch granularity.) The
@@ -290,6 +308,20 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 		return string(out), fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
+}
+
+// branchContained reports whether item.Branch is already an ancestor of tip (the
+// current integration tip): true iff `git merge-base --is-ancestor <branch> <tip>`
+// exits 0. When true, merging the branch would be a no-op ("Already up to date"),
+// so mergeOne treats the fold as an idempotent success rather than a conflict. A
+// git error (unresolvable ref, tooling fault) returns false so the caller falls
+// through to a real merge attempt and surfaces the failure there rather than here.
+func (it *Integrator) branchContained(ctx context.Context, dir, branch, tip string) bool {
+	if branch == "" || tip == "" {
+		return false
+	}
+	_, err := git(ctx, dir, "merge-base", "--is-ancestor", branch, tip)
+	return err == nil
 }
 
 // wtHead reads the current HEAD sha of the integration worktree directly (rather

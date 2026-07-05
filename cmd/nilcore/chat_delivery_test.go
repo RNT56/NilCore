@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"nilcore/internal/policy"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
 	"nilcore/internal/verb"
@@ -342,9 +343,50 @@ func TestChatREPLApplyGateViaLines(t *testing.T) {
 		t.Error("WorkState.Branch must clear after the approved apply")
 	}
 	s := out.String()
-	if !strings.Contains(s, "gate — promote-to-base nilcore/kept/chat-local-1") ||
+	// The gate must name the merge TARGET (main), not the kept source — that is what
+	// the I2 "never auto-approve main/prod" floor keys off (GradedApprover.scopeFor
+	// reads GateAction.Branch). The source rides in the detail; the result names it.
+	if !strings.Contains(s, "gate — promote-to-base main") ||
+		!strings.Contains(s, "from nilcore/kept/chat-local-1 to main") ||
 		!strings.Contains(s, "applied nilcore/kept/chat-local-1") {
 		t.Errorf("REPL did not surface the gate + result; got:\n%s", s)
+	}
+}
+
+// captureApprover records the exact GateAction it is asked to approve (via the
+// StructuredApprover opt-in GateStructured uses) so a test can assert what the
+// "never auto-approve main/prod" floor actually sees. It approves, so the apply
+// proceeds and the recorded action is the one that flowed through the gate.
+type captureApprover struct{ got policy.GateAction }
+
+func (c *captureApprover) Approve(string) bool { return true }
+func (c *captureApprover) ApproveStructured(a policy.GateAction) bool {
+	c.got = a
+	return true
+}
+
+// TestApplyGateActionBranchIsTarget locks FIX #14: on a repo checked out on main,
+// /apply must build a GateAction whose Branch is the merge TARGET (main) — the value
+// GradedApprover.scopeFor keys the structural main/prod floor off — NOT the harmless
+// kept source. The source rides in Detail for the audit trail. Were Branch the kept
+// name, an operator envelope allowing nilcore/kept/* could auto-merge into main.
+func TestApplyGateActionBranchIsTarget(t *testing.T) {
+	repo := newDeliveryRepo(t)
+	addKeptBranch(t, repo, "nilcore/kept/chat-local-9", "changed\n")
+	sess := deliverySession(repo, "nilcore/kept/chat-local-9")
+
+	cap := &captureApprover{}
+	var out strings.Builder
+	applyApplyVerb(context.Background(), sess, termui.New(&out), cap, nil)
+
+	if cap.got.Type != policy.PromoteToBase {
+		t.Fatalf("gate action type = %v, want PromoteToBase", cap.got.Type)
+	}
+	if cap.got.Branch != "main" {
+		t.Errorf("gate Branch = %q, want the merge TARGET %q (so isProtectedBase fires)", cap.got.Branch, "main")
+	}
+	if !strings.Contains(cap.got.Detail, "nilcore/kept/chat-local-9") {
+		t.Errorf("gate Detail must carry the source branch; got %q", cap.got.Detail)
 	}
 }
 

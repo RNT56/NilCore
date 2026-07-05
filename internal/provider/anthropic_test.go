@@ -222,6 +222,98 @@ func TestAnthropicCachedTokens(t *testing.T) {
 	})
 }
 
+// TestAnthropicStreamCumulativeDeltaUsage covers FIX #4: on a server-side-tool
+// turn (the web_search builtin) message_delta usage is CUMULATIVE and restates the
+// full input/cache tally that message_start understated. The assembler must fold
+// that input side, not just OutputTokens, so the streaming path meters identically
+// to Complete instead of under-charging the budget wall.
+func TestAnthropicStreamCumulativeDeltaUsage(t *testing.T) {
+	// message_start reports only the pre-tool prompt (2 fresh); message_delta then
+	// restates the cumulative total after the server-side web_search (input_tokens
+	// 40 + cache_read 60 = 100 total prompt) alongside the output tally.
+	frames := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":40,"output_tokens":9,"cache_read_input_tokens":60}}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	resp, err := assembleAnthropicStream(context.Background(), strings.NewReader(frames), nil)
+	if err != nil {
+		t.Fatalf("assembleAnthropicStream: %v", err)
+	}
+	// Cumulative fold: 40 fresh + 60 cache-read = 100, not message_start's 2.
+	if resp.Usage.InputTokens != 100 {
+		t.Errorf("InputTokens = %d, want 100 (cumulative message_delta 40+60 folded)", resp.Usage.InputTokens)
+	}
+	if resp.Usage.CachedTokens != 60 {
+		t.Errorf("CachedTokens = %d, want 60 (cache_read from message_delta)", resp.Usage.CachedTokens)
+	}
+	if resp.Usage.OutputTokens != 9 {
+		t.Errorf("OutputTokens = %d, want 9", resp.Usage.OutputTokens)
+	}
+}
+
+// TestAnthropicStreamDeltaNoInputPreservesStart guards the gate in FIX #4: an
+// ordinary message_delta omits the input-side fields, so the message_start total
+// must survive untouched (no zeroing) — preserving Complete-vs-Stream parity.
+func TestAnthropicStreamDeltaNoInputPreservesStart(t *testing.T) {
+	frames := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":1,"cache_read_input_tokens":5}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	resp, err := assembleAnthropicStream(context.Background(), strings.NewReader(frames), nil)
+	if err != nil {
+		t.Fatalf("assembleAnthropicStream: %v", err)
+	}
+	if resp.Usage.InputTokens != 16 { // 11 fresh + 5 cache-read from message_start
+		t.Errorf("InputTokens = %d, want 16 (message_start survives an input-less delta)", resp.Usage.InputTokens)
+	}
+	if resp.Usage.CachedTokens != 5 {
+		t.Errorf("CachedTokens = %d, want 5 (message_start survives)", resp.Usage.CachedTokens)
+	}
+}
+
+// TestAnthropicStreamEOFMidToolUse covers FIX #1 at the assembler seam: a proxy
+// that closes the SSE stream mid-tool_use (no content_block_stop, no message_stop)
+// leaves a PARTIAL tool_use Input that is not valid JSON, err==nil, StopReason "".
+// The native loop's sanitize step (tested in the backend package) depends on this
+// exact shape, so pin it here.
+func TestAnthropicStreamEOFMidToolUse(t *testing.T) {
+	frames := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"write"}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a"}}` + "\n\n"
+	// Stream ends here — clean EOF, no message_stop.
+
+	resp, err := assembleAnthropicStream(context.Background(), strings.NewReader(frames), nil)
+	if err != nil {
+		t.Fatalf("assembleAnthropicStream: unexpected err on clean EOF: %v", err)
+	}
+	if resp.StopReason != "" {
+		t.Errorf("StopReason = %q, want \"\" (no message_delta arrived)", resp.StopReason)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != "tool_use" {
+		t.Fatalf("Content = %+v, want a single tool_use block", resp.Content)
+	}
+	if json.Valid(resp.Content[0].Input) {
+		t.Errorf("Input = %s, want INVALID JSON (partial, truncated mid-call)", resp.Content[0].Input)
+	}
+}
+
 func TestAnthropicStream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") != "k" {

@@ -19,6 +19,8 @@ func homeMasks(home string) []string {
 		filepath.Join(home, ".aws"),
 		filepath.Join(home, ".gnupg"),
 		filepath.Join(home, ".netrc"),
+		filepath.Join(home, ".git-credentials"),
+		filepath.Join(home, ".config", "git", "credentials"),
 		filepath.Join(home, ".config", "gh"),
 		filepath.Join(home, ".docker", "config.json"),
 		filepath.Join(home, ".codex"),
@@ -141,6 +143,76 @@ func TestPathContains(t *testing.T) {
 		if got := pathContains(tt.parent, tt.child); got != tt.want {
 			t.Errorf("pathContains(%q, %q) = %v, want %v", tt.parent, tt.child, got, tt.want)
 		}
+	}
+}
+
+// TestBuildMaskSetSymlinkOverlap covers FIX #20: a candidate that only overlaps
+// the worktree AFTER symlink resolution must still be excluded. We build a real
+// symlink (linkHome -> realHome) and place the worktree under realHome/.claude;
+// buildMaskSet is called with the SYMLINK path for the .claude candidate but the
+// already-resolved worktree, so a purely lexical prefix check would miss the
+// overlap and mask the worktree. resolveForOverlap must catch it.
+func TestBuildMaskSetSymlinkOverlap(t *testing.T) {
+	realHome := t.TempDir()
+	linkHome := filepath.Join(t.TempDir(), "home-link")
+	if err := os.Symlink(realHome, linkHome); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Worktree lives under the REAL home's .claude; give the parent its resolved form.
+	wt := filepath.Join(realHome, ".claude", "worktrees", "wt")
+	if err := os.MkdirAll(wt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Home is passed as the SYMLINK path, so .claude resolves to realHome/.claude
+	// only via resolveForOverlap — a lexical check on linkHome/.claude would not
+	// prefix-match the resolved worktree.
+	got := buildMaskSet(linkHome, "", wt)
+	claudeReal := filepath.Join(realHome, ".claude")
+	for _, m := range got {
+		if m == claudeReal || strings.HasPrefix(m, claudeReal+"/") {
+			t.Fatalf("worktree-overlapping .claude must be excluded after symlink resolution, got %v", got)
+		}
+	}
+	// A sibling credential path (~/.netrc) must still be present (resolved).
+	wantNetrc := filepath.Join(realHome, ".netrc")
+	if err := os.WriteFile(wantNetrc, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = buildMaskSet(linkHome, "", wt)
+	found := false
+	for _, m := range got {
+		if m == wantNetrc {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sibling ~/.netrc should still be masked (resolved), got %v", got)
+	}
+}
+
+// TestMaskSensitivePathsSkipsUnstatable covers FIX #18: a target whose stat fails
+// with something other than ENOENT/ENOTDIR (here EACCES via a mode-000 parent) is
+// skipped, not fatal — the command shares our uid, so an unstatable path is already
+// unreadable to it. Fail-closed is reserved for mount failures on statable paths.
+func TestMaskSensitivePathsSkipsUnstatable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not block stat, cannot induce EACCES")
+	}
+	base := t.TempDir()
+	locked := filepath.Join(base, "locked") // mode 000: traversal into it is EACCES
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) }) // let TempDir cleanup remove it
+	target := filepath.Join(locked, "config.json")    // stat(target) => EACCES
+
+	// Sanity: confirm the stat really fails with a non-ENOENT/ENOTDIR error, else
+	// the test is not exercising the skip branch.
+	if _, err := os.Stat(target); err == nil {
+		t.Skip("stat unexpectedly succeeded (test runs with elevated traversal rights)")
+	}
+	if err := maskSensitivePaths([]string{target}); err != nil {
+		t.Fatalf("unstatable target must be skipped, not fatal: %v", err)
 	}
 }
 

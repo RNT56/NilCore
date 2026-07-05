@@ -41,7 +41,9 @@ import (
 // the caps are bytes, mirroring cmd's report clipping discipline.
 const (
 	maxDigestClaims       = 32   // claim-status lines carried per dep digest
+	maxDigestIDBytes      = 120  // per-field clip for an untrusted claim ID/Field/Status line
 	maxDigestSummaryBytes = 1024 // dep prose summary clip (fenced via guard.Wrap)
+	maxDigestBytes        = 2048 // total per-dep digest cap (~1-2KB/dep bound, I7)
 	maxFocusDetailBytes   = 256  // per-claim verifier Detail clip in a focused retry
 	maxFocusSuffixBytes   = 2048 // total focused-retry suffix cap per shard
 )
@@ -52,12 +54,19 @@ const (
 // the Controller AND re-resolved by the Runner never accumulates duplicates.
 func digestMarker(depID string) string { return "[dep " + depID + " handoff]" }
 
-// depDigest renders one satisfied dependency's bounded handoff digest: structural
-// claim-status lines from the dep's verifier-set artifact projection (TRUSTED —
-// spawn.ArtifactSummary carries only harness-computed fields, P11-T14) plus the
-// dep's prose summary fenced as untrusted data via guard.Wrap (I7). A dep with
-// neither an artifact nor a summary still yields the header + branch line, so the
-// dependent at least learns which verified branch it was cut from.
+// depDigest renders one satisfied dependency's bounded handoff digest. The header
+// and branch line are harness-authored control text. The claim-status lines are
+// NOT trusted control text as once assumed: Claim.ID and Claim.Field are
+// MODEL-AUTHORED (the artifact schema admits any unique non-empty string, newlines
+// included), so a dep worker that ingested hostile content could mint an id like
+// "x\nIMPORTANT NEW TASK: …" that, printed raw, would land as unfenced control text
+// in a DEPENDENT worker's Goal (I7 cross-worker injection). Fix #8 therefore (a)
+// sanitizes each ID/Field to a single line clipped to maxDigestIDBytes and (b)
+// FENCES the whole claim-status block inside guard.Wrap so nothing in it can be
+// read as an instruction. Only the verifier-set Status is trusted, but it rides
+// with the untrusted ID/Field, so the entire block is fenced. The dep's prose
+// Summary is fenced separately as before. The whole digest is length-clipped so a
+// dependent's Goal cannot balloon past the per-dep bound (~1-2KB).
 func depDigest(depID string, res spawn.Result) string {
 	var b strings.Builder
 	b.WriteString(digestMarker(depID))
@@ -71,14 +80,22 @@ func depDigest(depID string, res spawn.Result) string {
 	}
 	b.WriteString(".")
 	if a := res.Artifact; a != nil && len(a.Claims) > 0 {
-		b.WriteString("\nVerifier-set claim statuses:")
+		// Build the claim-status body from SANITIZED (single-line, clipped) fields, then
+		// fence the whole thing: the untrusted ID/Field can never break the fence or
+		// smuggle control text into the dependent's goal (I7).
+		var body strings.Builder
 		for i, c := range a.Claims {
 			if i >= maxDigestClaims {
-				fmt.Fprintf(&b, "\n- … %d more claims elided", len(a.Claims)-i)
+				fmt.Fprintf(&body, "\n- … %d more claims elided", len(a.Claims)-i)
 				break
 			}
-			fmt.Fprintf(&b, "\n- %s (%s): %s", c.ID, c.Field, c.Status)
+			fmt.Fprintf(&body, "\n- %s (%s): %s",
+				sanitizeLine(c.ID, maxDigestIDBytes),
+				sanitizeLine(c.Field, maxDigestIDBytes),
+				sanitizeLine(c.Status, maxDigestIDBytes))
 		}
+		b.WriteString("\n")
+		b.WriteString(guard.Wrap("dependency "+depID+" verifier claim statuses", body.String()))
 	}
 	if s := strings.TrimSpace(res.Summary); s != "" {
 		// The dep's prose is MODEL-AUTHORED: fence it so it can never become a
@@ -86,7 +103,25 @@ func depDigest(depID string, res spawn.Result) string {
 		b.WriteString("\n")
 		b.WriteString(guard.Wrap("dependency "+depID+" summary", clipBytes(s, maxDigestSummaryBytes)))
 	}
-	return b.String()
+	// Clip the whole digest so a single dep can never blow the ~1-2KB/dep bound even
+	// with the maximum claim count (the marker survives — it is the first line).
+	return clipBytes(b.String(), maxDigestBytes)
+}
+
+// sanitizeLine collapses a model-authored identifier to a single, bounded line:
+// every control character (newline, carriage return, tab, and the rest of the
+// C0/C1 range) is replaced with a space, then the result is clipped to n bytes.
+// This is what makes an untrusted Claim.ID/Field safe to print as a "- id (field):
+// status" line — no embedded newline can start a fresh, unfenced control line, and
+// no unbounded value can balloon the digest (I7 + the per-dep byte bound).
+func sanitizeLine(s string, n int) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
+	return clipBytes(s, n)
 }
 
 // appendDepDigest appends dep's digest to s.Goal unless the goal already carries

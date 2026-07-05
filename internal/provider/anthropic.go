@@ -521,6 +521,18 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 			if ev.Usage.OutputTokens != 0 {
 				out.Usage.OutputTokens = ev.Usage.OutputTokens
 			}
+			// message_delta usage is CUMULATIVE. On a server-side-tool turn (the
+			// web_search builtin) it restates the FULL input/cache tally that
+			// message_start understated, so the input side must fold here too —
+			// otherwise a streaming web-search turn under-charges the budget wall
+			// and under-fills the context gauge vs Complete. Mirror toModelUsage's
+			// disjoint→total fold, gated on the input-side fields being non-zero so
+			// an ordinary message_delta (which omits them) leaves the message_start
+			// total untouched, preserving the Complete-vs-Stream identical accounting.
+			if in := ev.Usage.InputTokens + ev.Usage.CacheReadInputTokens + ev.Usage.CacheCreationInputTokens; in != 0 {
+				out.Usage.InputTokens = in
+				out.Usage.CachedTokens = ev.Usage.CacheReadInputTokens
+			}
 
 		case "message_stop":
 			return finish(), nil

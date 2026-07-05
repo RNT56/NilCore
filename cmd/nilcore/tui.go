@@ -29,6 +29,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"nilcore/internal/emit"
+	"nilcore/internal/eventlog"
 	"nilcore/internal/policy"
 	"nilcore/internal/session"
 	"nilcore/internal/termui"
@@ -134,7 +135,10 @@ func tuiMain(args []string) {
 		greeting = append(greeting, styleDim.Render("web access is off — pass -allow-egress <host> to enable /add <url> + web tools"))
 	}
 
-	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), em, gates, greeting), tea.WithAltScreen())
+	// The TUI shares the chat session; /apply reuses the SAME gated PromoteToBase core
+	// the REPL uses, driven by this modal approver (ap) and audit log — no duplicated
+	// gate logic.
+	p := tea.NewProgram(newTUIModel(ctx, sess, prov.Model(), em, gates, ap, log, greeting), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fatal(err)
 	}
@@ -252,11 +256,13 @@ func (a *tuiApprover) approve(req gateReq) bool {
 // --- model ---
 
 type tuiModel struct {
-	ctx     context.Context
-	sess    *session.Session
-	model   string // provider:model, for the header
-	emitter *tuiEmitter
-	gates   chan gateReq
+	ctx      context.Context
+	sess     *session.Session
+	model    string // provider:model, for the header
+	emitter  *tuiEmitter
+	gates    chan gateReq
+	approver policy.Approver // the modal approver, for the /apply PromoteToBase gate
+	log      *eventlog.Log   // the audit log, for /apply's boundary + gate events
 
 	vp viewport.Model
 	ta textarea.Model
@@ -335,7 +341,7 @@ func (a *askModal) hint() string {
 	}
 }
 
-func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq, greeting []string) tuiModel {
+func newTUIModel(ctx context.Context, sess *session.Session, model string, emitter *tuiEmitter, gates chan gateReq, approver policy.Approver, log *eventlog.Log, greeting []string) tuiModel {
 	ta := textarea.New()
 	ta.Placeholder = "talk to the agent — it picks the machine and works while you type"
 	ta.Prompt = "❯ "
@@ -345,6 +351,7 @@ func newTUIModel(ctx context.Context, sess *session.Session, model string, emitt
 	ta.Focus()
 	return tuiModel{
 		ctx: ctx, sess: sess, model: model, emitter: emitter, gates: gates,
+		approver: approver, log: log,
 		ta:    ta,
 		lines: greeting, // seed the transcript (resume note + intro + web status)
 		spin:  verb.New(1, verb.General),
@@ -655,6 +662,28 @@ func (m tuiModel) applyControl(c session.Control) (tea.Model, tea.Cmd) {
 			m.append(styleWarn.Render("  cancelling current run…"))
 			go m.sess.Cancel()
 		}
+	case session.CtrlQuestions:
+		// Dial how often the agent asks clarifying questions — the deterministic sibling
+		// of "ask me fewer questions" in prose, exactly like the REPL door.
+		if ack, err := m.sess.SetAskLevelSpec(c.Arg); err != nil {
+			m.append(styleWarn.Render("  " + err.Error()))
+		} else {
+			m.append(styleInfo.Render("  " + ack))
+		}
+	case session.CtrlDiff:
+		// Read-only preview of the kept verified branch — runs the SAME core the REPL
+		// door uses (chat.go's diffKeptBranch), rendered onto the transcript. Synchronous:
+		// it takes no gate and moves nothing.
+		diffKeptBranch(m.ctx, m.sess, m.transcriptSink())
+	case session.CtrlApply:
+		// Land the kept verified branch behind the SAME structured PromoteToBase gate the
+		// REPL uses (chat.go's applyKeptBranch) — no duplicated gate logic. It BLOCKS on
+		// the modal approver, which is driven by THIS Update loop, so it must run off-loop:
+		// the goroutine routes its output back through the emitter (the sanctioned
+		// goroutine→model bridge) so the transcript stays the single render path.
+		go func() {
+			applyKeptBranch(m.ctx, m.sess, m.approver, m.log, m.emitterSink())
+		}()
 	}
 	m.refresh()
 	return m, nil
@@ -807,6 +836,42 @@ func (m *tuiModel) commitStream() {
 	if m.stream.Len() > 0 {
 		m.append("  " + styleStream.Render(strings.TrimRight(m.stream.String(), "\n")))
 		m.stream.Reset()
+	}
+}
+
+// tuiDeliverKind is a synthetic emit Kind used only to carry a pre-styled delivery
+// line (from an off-loop /apply goroutine) into the transcript verbatim: onEvent's
+// default case appends ev.Text unchanged, so styling is applied at the source.
+const tuiDeliverKind = "tui_deliver"
+
+// styleDeliverLine maps a delivery-verb severity to the TUI's transcript styling —
+// shared by both the synchronous /diff sink and the /apply emitter sink so the two
+// render identically.
+func styleDeliverLine(sev deliverSev, line string) string {
+	switch sev {
+	case sevInfo:
+		return styleInfo.Render(line)
+	case sevWarn:
+		return styleWarn.Render(line)
+	default:
+		return styleDim.Render(line)
+	}
+}
+
+// transcriptSink is a deliverSink that appends styled lines straight onto the
+// transcript. It is safe ONLY on the Update goroutine (mutates m.lines), so it backs
+// the synchronous, read-only /diff verb.
+func (m *tuiModel) transcriptSink() deliverSink {
+	return func(sev deliverSev, line string) { m.append(styleDeliverLine(sev, line)) }
+}
+
+// emitterSink is a deliverSink that routes styled lines through the session emitter —
+// the sanctioned goroutine→model bridge — so an off-loop /apply goroutine's output
+// lands in the transcript without touching m.lines from another goroutine. The line
+// is pre-styled and carried under tuiDeliverKind, which onEvent renders verbatim.
+func (m *tuiModel) emitterSink() deliverSink {
+	return func(sev deliverSev, line string) {
+		m.emitter.Emit(emit.Event{Kind: tuiDeliverKind, Text: styleDeliverLine(sev, line)})
 	}
 }
 

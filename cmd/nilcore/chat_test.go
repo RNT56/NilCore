@@ -23,6 +23,7 @@ import (
 	"nilcore/internal/termui"
 	"nilcore/internal/tools"
 	"nilcore/internal/verb"
+	"nilcore/internal/verify"
 )
 
 // chat_test.go is the hermetic test of the `nilcore chat` REPL wiring (C3-T01). It
@@ -665,6 +666,30 @@ func TestCapabilityForMode(t *testing.T) {
 				t.Errorf("%v: write-capable registry must advertise %q", m, name)
 			}
 		}
+	}
+}
+
+// TestChatNativeBackendOrientsAndCompacts locks FIX #24: the backend built for BOTH
+// `nilcore chat` and `nilcore tui` (chatNativeBackend) must wire the repo-orientation
+// map and the context-window resolver — exactly as buildBackend and the serve backend
+// do — so an interactive drive does not start blind (no repo map) and can proactively
+// compact (a non-nil CtxWindow) instead of only the one-shot overflow-400 recovery.
+func TestChatNativeBackendOrientsAndCompacts(t *testing.T) {
+	dir := t.TempDir()
+	d := chatDeps{
+		flags:    newChatFlags(dir),
+		provider: &chatFakeProvider{id: "fake"},
+		log:      newMemLog(t),
+		baseRepo: dir,
+	}
+	box := sandbox.NewContainer("podman", "img", dir)
+	n := chatNativeBackend(d, d.provider, advisorCfg{}, box, verify.Pass{}, session.NativeRun{Mode: session.ModeExecute})
+
+	if n.RepoContext == nil {
+		t.Error("RepoContext must be wired so the drive gets a repo map (not blind)")
+	}
+	if n.CtxWindow == nil {
+		t.Error("CtxWindow must be wired so the loop can proactively compact")
 	}
 }
 

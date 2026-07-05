@@ -39,7 +39,7 @@ func typeLine(t *testing.T, m tuiModel, line string) tuiModel {
 // readyTUI builds a sized, ready TUI model over a real (log-free) Session.
 func readyTUI(t *testing.T, sess *session.Session) tuiModel {
 	t.Helper()
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil, nil, nil)
 	return drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 }
 
@@ -50,7 +50,7 @@ func TestTUIGreetingAndModeIndicator(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
 	sess.SetMode(session.ModePlan)
 	greeting := []string{"↻ resumed the previous conversation", "nilcore tui — talk to the agent"}
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), greeting)
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil, nil, greeting)
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	if joined := strings.Join(m.lines, "\n"); !strings.Contains(joined, "resumed the previous conversation") {
@@ -65,7 +65,7 @@ func TestTUIGreetingAndModeIndicator(t *testing.T) {
 // into one line, and a framed event commits that line and appends its own.
 func TestTUIFoldsEvents(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "anthropic:claude-x", newTUIEmitter(), make(chan gateReq), nil)
+	m := newTUIModel(context.Background(), sess, "anthropic:claude-x", newTUIEmitter(), make(chan gateReq), nil, nil, nil)
 
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	if !m.ready {
@@ -92,7 +92,7 @@ func TestTUIFoldsEvents(t *testing.T) {
 // back to the blocked Approve call.
 func TestTUIGateModal(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil, nil, nil)
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	reply := make(chan bool, 1)
@@ -149,7 +149,7 @@ func TestTUIEmitterKeepsFramesNonBlocking(t *testing.T) {
 // (the defensive split that stops two turns merging into one transcript line).
 func TestTUIBatchFoldsAndSplitsTurns(t *testing.T) {
 	sess := session.New("t", "local", t.TempDir(), nil)
-	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil)
+	m := newTUIModel(context.Background(), sess, "m", newTUIEmitter(), make(chan gateReq), nil, nil, nil)
 	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	m = drive(t, m, emitBatchMsg([]emit.Event{
@@ -268,5 +268,69 @@ func TestTUIMiscVerbs(t *testing.T) {
 	}
 	if !strings.Contains(joined, "context cleared") {
 		t.Error("/clear did not confirm")
+	}
+}
+
+// TestTUIDiffVerb locks FIX #16/#22 (a): /diff is a real verb in the TUI, not a
+// silent no-op. Over a repo with a kept verified branch it renders the branch name +
+// preview into the transcript (the same diffKeptBranch core the REPL uses).
+func TestTUIDiffVerb(t *testing.T) {
+	repo := newDeliveryRepo(t)
+	addKeptBranch(t, repo, "nilcore/kept/chat-local-1", "changed\n")
+	sess := deliverySession(repo, "nilcore/kept/chat-local-1")
+	m := readyTUI(t, sess)
+
+	m = typeLine(t, m, "/diff")
+	joined := strings.Join(m.lines, "\n")
+	if !strings.Contains(joined, "nilcore/kept/chat-local-1") {
+		t.Errorf("/diff produced no kept-branch preview (silent no-op?):\n%s", joined)
+	}
+}
+
+// TestTUIDiffVerbNoBranch proves /diff is never silent even with nothing kept: it
+// explicitly reports there is nothing to preview.
+func TestTUIDiffVerbNoBranch(t *testing.T) {
+	sess := session.New("t", "local", t.TempDir(), nil)
+	m := readyTUI(t, sess)
+
+	m = typeLine(t, m, "/diff")
+	if joined := strings.Join(m.lines, "\n"); !strings.Contains(joined, "nothing to preview") {
+		t.Errorf("/diff with no kept branch must say so, not stay silent:\n%s", joined)
+	}
+}
+
+// TestTUIApplyVerb locks FIX #17/#22 (a): /apply is a real, gated action in the TUI,
+// not a silent no-op. It runs the SAME gated PromoteToBase core the REPL uses
+// (applyKeptBranch), off the Update loop, routing its result back through the emitter.
+// A plain (non-structured) approver resolves the gate inline, so the goroutine
+// completes without the modal; its "applied …" line is then drained and folded.
+func TestTUIApplyVerb(t *testing.T) {
+	repo := newDeliveryRepo(t)
+	tip := addKeptBranch(t, repo, "nilcore/kept/chat-local-1", "changed\n")
+	sess := deliverySession(repo, "nilcore/kept/chat-local-1")
+	em := newTUIEmitter()
+	m := newTUIModel(context.Background(), sess, "m", em, make(chan gateReq), allowApprover{}, nil, nil)
+	m = drive(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// /apply launches the gated apply on a goroutine (it emits its outcome).
+	m = typeLine(t, m, "/apply")
+
+	// Wait for the emitter to carry the apply's result line, then fold it in.
+	select {
+	case <-em.wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("/apply emitted nothing — a silent no-op")
+	}
+	m = drive(t, m, emitBatchMsg(em.drain()))
+
+	joined := strings.Join(m.lines, "\n")
+	if !strings.Contains(joined, "applied nilcore/kept/chat-local-1") {
+		t.Errorf("/apply did not surface its outcome:\n%s", joined)
+	}
+	if got := deliveryGit(t, repo, nil, "rev-parse", "HEAD"); got != tip {
+		t.Errorf("main tip = %s, want the applied kept tip %s", got, tip)
+	}
+	if sess.KeptBranch() != "" {
+		t.Error("WorkState.Branch must clear after the applied /apply")
 	}
 }

@@ -23,6 +23,8 @@ import (
 // verifyFlagEnabled mirrors the NILCORE_KERNEL default-on idiom (kernel.go,
 // kernelEnabled): the feature is the norm, the env var is an instant escape hatch.
 // Unset/anything ⇒ on; 0/off/false/no ⇒ off, byte-identical to the undecorated path.
+// It is the gate for vcache and flakeprobe, both of which are I2-safe by
+// construction (only ever replay/re-run the REAL verifier) and so default ON.
 func verifyFlagEnabled(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
 	case "0", "off", "false", "no":
@@ -32,16 +34,33 @@ func verifyFlagEnabled(name string) bool {
 	}
 }
 
+// verifyFlagOptIn is the DEFAULT-OFF converse, the honest posture for a feature that
+// is not generically sound. Only 1/on/true/yes turns it on; unset/anything else ⇒
+// off. It gates NILCORE_TIERED_VERIFY: a scoped `go vet`/`go test` red is a provable
+// subset of the full verify ONLY under narrow conditions (a full-module `go test
+// ./...` command, replicated flags, a genuine test/compile red — not a package-load
+// error). Since we cannot prove that for an arbitrary repo, the tiered fast path is
+// opt-in, not default-on — a false red must never ship as the verdict by default.
+func verifyFlagOptIn(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "on", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 // vcacheDecorate composes the verify decorator chain around base (the name is kept
 // stable for its build.go call site; it grew from the original vcache-only wrap).
 // verifierID is the RESOLVED verify command (build.go passes verifyCmd), which both
-// keys the cache and drives the tiered soundness gate. All three stages are
-// DEFAULT-ON (kernel precedent: each is I2-safe by construction and equivalently
-// escape-hatched), each with its own kill switch:
+// keys the cache and drives the tiered soundness gate. vcache and flakeprobe are
+// DEFAULT-ON (kernel precedent: each is I2-safe by construction — it only ever
+// replays or re-runs the REAL verifier); tiered is DEFAULT-OFF (opt-in), the honest
+// posture since a generically-sound scoped-red subset check is not feasible:
 //
-//	NILCORE_VCACHE=0         — disable the chain-verified pass-replay cache
-//	NILCORE_FLAKEPROBE=0     — disable the one-shot flaky-test re-run
-//	NILCORE_TIERED_VERIFY=0  — disable the scoped fast red path
+//	NILCORE_VCACHE=0         — disable the chain-verified pass-replay cache (default on)
+//	NILCORE_FLAKEPROBE=0     — disable the one-shot flaky-test re-run     (default on)
+//	NILCORE_TIERED_VERIFY=1  — ENABLE the scoped fast red path            (default OFF)
 //
 // DECORATOR ORDER (outermost → innermost): tiered → flakeprobe → vcache → base.
 //
@@ -111,36 +130,41 @@ func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string
 		v = fp
 	}
 
-	// Stage 3 (outermost): the tiered scoped-red fast path, gated on SOUNDNESS
-	// (tieredSound): a scoped `go vet`/`go test` red is only a true project red
-	// when the project's own verify runs Go tests, so the wrap is enabled only for
-	// the Go-default verify-command family. Only the full verifier can PASS.
-	if verifyFlagEnabled("NILCORE_TIERED_VERIFY") && hasBox && tieredSound(verifierID) {
+	// Stage 3 (outermost): the tiered scoped-red fast path — DEFAULT-OFF (opt-in),
+	// double-gated on the opt-in flag AND SOUNDNESS (tieredSound). A scoped
+	// `go vet`/`go test` red is a PROVABLE project red only when the resolved verify
+	// command is itself a full-module `go test ./...` run whose flags we replicate;
+	// an opaque "make verify" recipe is NOT wrapped (it may run no tests / different
+	// flags). Only the full verifier can PASS.
+	if verifyFlagOptIn("NILCORE_TIERED_VERIFY") && hasBox && tieredSound(verifierID) {
 		v = &verify.TieredVerifier{Full: v, ScopedRed: scopedRedFunc(box, verifierID)}
 	}
 	return v
 }
 
-// tieredSound is the I2-soundness gate for the tiered wrap: a scoped go-test red
-// may only short-circuit the full verify when it is guaranteed to be a subset of
-// what the full verify would find. That holds for the Go-default verify-command
-// family only:
+// tieredSound is the I2-soundness gate for the tiered wrap: a scoped go-test red may
+// only short-circuit the full verify when it is PROVABLY a subset of what the full
+// verify would find. That requires the resolved verify command to be a full-module
+// `go test ./...` invocation:
 //
-//   - a command containing "go test" (verify.Detect's go.mod fallback is
-//     "go build ./... && go test ./..."): `go test <pkgs>` compiles and tests a
-//     subset of the same packages, so its red is the full command's red;
-//   - exactly the default "make verify" (verify.New's zero-command default and
-//     Detect's Makefile-verify-target hit): NilCore's own convention (CLAUDE.md §3)
-//     defines it as build+vet+test. A repo whose verify target diverges has
-//     NILCORE_TIERED_VERIFY=0 as the escape hatch — and even then the failure mode
-//     is a marked false red costing one loop iteration, never a false PASS (only
-//     the full verifier can pass, so I2's "done" authority is structurally intact).
+//   - it must contain `go test` as a command (word-boundary match), AND
+//   - it must run over the whole module (`./...`), so every package the scoped
+//     `go test <touched-pkgs>` compiles/tests is one the full command compiles/tests
+//     too — making the scoped red a strict subset (verify.Detect's go.mod fallback
+//     "go build ./... && go test ./..." is the canonical hit).
 //
-// Any other command (npm test, cargo test, pytest, "true", a custom script) leaves
-// the verifier UNWRAPPED — we cannot prove a Go-scoped red is that project's red.
+// An opaque "make verify" is deliberately NOT armed. Its recipe is unknown from this
+// layer: it might run no tests, `go test -short`, or a bespoke script, so a scoped
+// `go vet`/`go test` red could red on something the recipe never gates — a FALSE red
+// shipped as the verdict. Correctness beats latency; when the command is not a
+// transparent full-module go-test run we fall through to the full verify.
+//
+// Any other command (npm test, cargo test, pytest, "true", `go test ./pkg` on a
+// single package, a custom script) leaves the verifier UNWRAPPED — we cannot prove a
+// scoped Go red is that project's red.
 func tieredSound(verifyCmd string) bool {
 	c := strings.TrimSpace(verifyCmd)
-	return c == "make verify" || containsGoTest(c)
+	return containsGoTest(c) && strings.Contains(c, "./...")
 }
 
 // containsGoTest reports whether cmd invokes `go test` as a COMMAND — the match
@@ -169,12 +193,13 @@ func isWordByte(b byte) bool {
 }
 
 // scopedRedFunc builds the TieredVerifier.ScopedRed seam: discover the packages
-// touched since the run baseline via git, then run a targeted vet/test over just
-// those packages — all through the SAME sandbox exec path the full verifier uses
-// (I4: nothing here executes on the host). Every inconclusive outcome (git fault,
-// unscopable change, no touched Go packages) returns failed=false or an error,
-// which the decorator treats as "fall through to Full" — under-scoping can only
-// cost speed, never correctness.
+// touched since the run baseline via git, then run a targeted `go test` (with the
+// real command's flags replicated) over just those packages — all through the SAME
+// sandbox exec path the full verifier uses (I4: nothing here executes on the host).
+// Every inconclusive outcome (git fault, unscopable change, no touched Go packages,
+// an AMBIGUOUS nonzero exit that is not a genuine test/compile red) returns
+// failed=false or an error, which the decorator treats as "fall through to Full" —
+// under-scoping and ambiguity can only cost speed, never correctness.
 //
 // Baseline note: the diff is `git diff --name-only HEAD` (uncommitted work) plus
 // untracked files — the simplest baseline reachable from this wiring layer. If the
@@ -182,13 +207,23 @@ func isWordByte(b byte) bool {
 // through to the full verify: a too-small touched set is always sound, because a
 // scoped GREEN never decides anything.
 //
-// `go vet` is folded into the scoped command only when the resolved verify command
-// visibly runs vet (or is the default "make verify", which does — CLAUDE.md §3);
-// for a plain "go build && go test" project a vet-only red would NOT be a project
-// red, so there the scoped check is `go test` alone (whose red is always a project
-// red for the gated family, since go test compiles its packages).
+// FLAG REPLICATION: the scoped `go test` copies the full command's go-test flags
+// (-short/-tags/-count/-race) via goTestFlags, so the scoped run tests EXACTLY what
+// the full `go test ./...` would over those packages. Dropping -short (or -tags)
+// would let the scoped run red on a test/build the full command never executes — a
+// false red. `go vet` is folded in only when the resolved command visibly runs it
+// (for a plain "go test ./..." project a vet-only red is NOT a project red, so the
+// scoped check is `go test` alone — whose red is always a subset red, since go test
+// compiles its packages).
+//
+// PROVABLE-RED GATE: a nonzero scoped exit is treated as a short-circuit red ONLY
+// when scopedRedIsProvable confirms it is a genuine TEST FAILURE or COMPILE error in
+// a touched package. A package-LOAD/resolution error (a nested go.mod, an unknown
+// import, `go: ...`) exits nonzero without any package having failed a test the full
+// command would gate — so it falls through to Full rather than shipping as a red.
 func scopedRedFunc(box sandbox.Sandbox, verifyCmd string) func(ctx context.Context) (bool, string, error) {
-	includeVet := strings.Contains(verifyCmd, "go vet") || strings.TrimSpace(verifyCmd) == "make verify"
+	includeVet := strings.Contains(verifyCmd, "go vet")
+	flags := goTestFlags(verifyCmd)
 	return func(ctx context.Context) (failed bool, output string, err error) {
 		// (a) Touched files since the run baseline, through the sandbox git.
 		res, err := box.Exec(ctx, "git diff --name-only HEAD && git ls-files --others --exclude-standard")
@@ -203,9 +238,15 @@ func scopedRedFunc(box sandbox.Sandbox, verifyCmd string) func(ctx context.Conte
 			return false, "", nil // unscopable or nothing touched ⇒ Full decides
 		}
 
-		// (b) The targeted red-detector over exactly the touched packages.
+		// (b) The targeted red-detector over exactly the touched packages, with the
+		// full command's flags replicated so it runs the same subset the full does.
 		list := strings.Join(pkgs, " ")
-		cmd := "go test " + list
+		test := "go test"
+		if flags != "" {
+			test += " " + flags
+		}
+		test += " " + list
+		cmd := test
 		if includeVet {
 			cmd = "go vet " + list + " && " + cmd
 		}
@@ -214,8 +255,95 @@ func scopedRedFunc(box sandbox.Sandbox, verifyCmd string) func(ctx context.Conte
 			return false, "", err
 		}
 		out := strings.TrimSpace(r.Stdout + "\n" + r.Stderr)
-		return r.ExitCode != 0, out, nil
+		if r.ExitCode == 0 {
+			return false, out, nil // scoped green decides nothing ⇒ Full
+		}
+		// A nonzero exit is a verdict-worthy red ONLY if it is a PROVABLE subset red.
+		// An ambiguous nonzero (package-load/resolution error, a vet-only nit the full
+		// command would not gate) is inconclusive ⇒ fall through to Full.
+		if !scopedRedIsProvable(out) {
+			return false, "", nil
+		}
+		return true, out, nil
 	}
+}
+
+// goTestFlags extracts the go-test flags from the resolved verify command so the
+// scoped `go test` replicates the full run's behavior over the touched packages.
+// Only the flags that change WHICH tests/builds run (and can thus flip a red) are
+// copied — -short, -tags <v>/-tags=<v>, -count <v>/-count=<v>, -race. A dropped flag
+// would make the scoped run diverge from the full command's subset and red falsely
+// (e.g. -short skips a long test the full command also skips). It scans the whitespace
+// tokens of the command; the verify command is a harness-resolved string (verify.Detect
+// / operator-set), not model-authored, so a simple token scan is sufficient here.
+func goTestFlags(verifyCmd string) string {
+	toks := strings.Fields(verifyCmd)
+	var out []string
+	for i := 0; i < len(toks); i++ {
+		t := toks[i]
+		switch {
+		case t == "-short" || t == "-race":
+			out = append(out, t)
+		case t == "-tags" || t == "-count":
+			// space-separated value form: "-tags integration".
+			out = append(out, t)
+			if i+1 < len(toks) {
+				out = append(out, toks[i+1])
+				i++
+			}
+		case strings.HasPrefix(t, "-tags=") || strings.HasPrefix(t, "-count="):
+			out = append(out, t) // "=" form carries its own value.
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// scopedRedIsProvable reports whether a nonzero `go test` output is a GENUINE test
+// failure or compile error in a touched package — the only red we may ship as the
+// verdict (a strict subset of what the full `go test ./...` would find). It returns
+// false for a package-LOAD/resolution error, which exits nonzero WITHOUT any package
+// having failed a gated check: a nested go.mod, an unresolved import, a missing
+// module — the full command would surface these too, but as its OWN red, not this
+// scoped run's, so shipping the scoped red here could mislabel a non-subset failure.
+// On any ambiguity we return false and let Full decide (correctness > latency).
+//
+// go test's output is structured enough to classify structurally:
+//   - a genuine failure prints "--- FAIL", "FAIL\t<pkg>", or a compile error
+//     "<file>.go:NN: ..." under a "# <pkg>" build header ⇒ provable subset red;
+//   - a load/resolution error prints a top-level "go: ..." line (module/toolchain)
+//     or "no required module provides package" / "cannot find package" with NO test
+//     or build failure ⇒ NOT provable ⇒ fall through.
+func scopedRedIsProvable(output string) bool {
+	// Load/resolution markers: a bare `go:` line or an unresolved-package message is a
+	// toolchain/module fault, not a package's own test/compile red.
+	loadMarkers := []string{
+		"no required module provides package",
+		"cannot find package",
+		"go.mod file not found",
+		"malformed module path",
+		"unknown directive",
+		"updates to go.mod needed",
+		"missing go.sum entry",
+	}
+	for _, m := range loadMarkers {
+		if strings.Contains(output, m) {
+			return false
+		}
+	}
+	// A genuine test failure or a compile error in a package.
+	if strings.Contains(output, "--- FAIL") ||
+		strings.Contains(output, "\nFAIL") || strings.HasPrefix(output, "FAIL") ||
+		strings.Contains(output, ".go:") { // "<file>.go:NN:" compile-error location
+		return true
+	}
+	// A line beginning "go:" (module/toolchain diagnostic) with no failure above ⇒ load.
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "go: ") {
+			return false
+		}
+	}
+	// Anything else nonzero is ambiguous — fall through to Full.
+	return false
 }
 
 // touchedGoPackageDirs maps a git name-list (one path per line, relative to the
@@ -324,6 +452,21 @@ func dirHasGoFiles(root, dir string) bool {
 // supplied by behavioralVerifierWithLog (and reused by P11-T16's env.Verifier).
 func behavioralVerifier(box sandbox.Sandbox, cmd string) verify.Verifier {
 	return behavioralVerifierWithLog(box, cmd, nil)
+}
+
+// orchestratorVerifier is the verifier for the single-task orchestrator paths
+// (run / serve / chat / resume): the behavioral verifier wrapped by vcacheDecorate,
+// exactly as buildEnvFactory does for the build/swarm paths. Wiring it here is what
+// makes the shipped verify decorators actually reach these paths — the ONE verifier
+// instance is shared by the native backend's finish-verify AND the orchestrator's
+// post-run re-verify, so vcache REPLAYS the identical-content pass (killing the 2x
+// full verify on every green run) and FlakeProbe re-runs the real verifier once when
+// the orchestrator's final verify reddens on content a preceding check just passed —
+// defusing the N-worktree race a coin-flip test would otherwise trigger (RaceN lives
+// only on these paths). I2 is intact: only the full verifier ever produces a PASS,
+// and every decorator is nil/flag-gated (see vcacheDecorate).
+func orchestratorVerifier(box sandbox.Sandbox, cmd string, log *eventlog.Log, logPath string) verify.Verifier {
+	return vcacheDecorate(behavioralVerifierWithLog(box, cmd, log), box, cmd, log, logPath)
 }
 
 // behavioralVerifierWithLog is the log-bearing form of behavioralVerifier: when a

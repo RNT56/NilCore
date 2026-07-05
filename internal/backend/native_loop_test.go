@@ -109,6 +109,73 @@ func TestNativeOversizedRunOutputClippedHeadTail(t *testing.T) {
 	}
 }
 
+// bigResultTool is a registry tool returning a fixed (oversized) body, for
+// exercising the dispatch-site clip backstop against a named tool.
+type bigResultTool struct {
+	name string
+	out  string
+}
+
+func (b bigResultTool) Name() string            { return b.name }
+func (b bigResultTool) Description() string     { return "big" }
+func (b bigResultTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (b bigResultTool) Run(context.Context, string, json.RawMessage) (string, error) {
+	return b.out, nil
+}
+
+// TestNativeMCPResultNotReClipped covers FIX #3: the mcp tool self-bounds its own
+// result (boundMCPResult, 48KB, with an mcp-specific notice), so it belongs in
+// selfBoundedTools. Without that entry the dispatch-site backstop re-clips every
+// >8KB mcp result to 2KB head + 6KB tail with a "use outline/read_symbol/search"
+// notice that is nonsense for an MCP tool. Assert the big body passes through
+// verbatim (no elision marker) — and that an ordinary unbounded tool at the same
+// size still IS clipped, so the exemption is specific to mcp.
+func TestNativeMCPResultNotReClipped(t *testing.T) {
+	// 16KB body — well above clipHeadBytes+clipTailBytes (8KB) so the backstop would
+	// fire if mcp were not exempt. A sentinel in the middle proves nothing was elided.
+	body := strings.Repeat("A", 8<<10) + "MIDDLE-SENTINEL" + strings.Repeat("B", 8<<10)
+
+	run := func(toolName string) string {
+		m := &toolCapturingModel{responses: []model.Response{
+			{Content: []model.Block{toolUse("u1", toolName, map[string]string{})}, StopReason: "tool_use"},
+			{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+		}}
+		n := &Native{
+			Model:    m,
+			Box:      &recordingBox{},
+			Verifier: okVerifier{},
+			Tools:    tools.NewRegistry(bigResultTool{name: toolName, out: body}),
+			MaxSteps: 5,
+		}
+		if _, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"}); err != nil {
+			t.Fatalf("Run(%s): %v", toolName, err)
+		}
+		for _, c := range toolResultContents(m.lastMsgs) {
+			if strings.Contains(c, toolName+" output") {
+				return c
+			}
+		}
+		t.Fatalf("no %s tool_result found", toolName)
+		return ""
+	}
+
+	// mcp: passes through — the 16KB body and its middle survive, no clip marker.
+	mcp := run("mcp")
+	if strings.Contains(mcp, "elided") || strings.Contains(mcp, "outline/read_symbol/search") {
+		t.Errorf("mcp result was re-clipped by the backstop (should be self-bounded): %q", clip(mcp, 200))
+	}
+	if !strings.Contains(mcp, "MIDDLE-SENTINEL") {
+		t.Error("mcp result body was truncated; the whole body must pass through")
+	}
+
+	// Control: an unbounded tool of the same size still gets clipped, proving the
+	// exemption is specific to selfBoundedTools and the backstop is otherwise live.
+	other := run("some_unbounded_tool")
+	if !strings.Contains(other, "elided") {
+		t.Error("an unbounded tool's oversized result must still be clipped by the backstop")
+	}
+}
+
 // --- Item 2: structured tools enter the advisor trail --------------------------
 
 // stubPathTool is a minimal registry tool for exercising the dispatch path.
@@ -246,6 +313,67 @@ func TestNativeInvalidToolInputRejectedBeforeDispatch(t *testing.T) {
 	}
 	if !sawErr {
 		t.Error("invalid tool input must yield a clear errorResult naming likely truncation")
+	}
+}
+
+// TestNativeEOFMidToolUseSanitizedNotTerminal covers FIX #1: a clean EOF mid
+// tool_use (a proxy closing the SSE stream without message_stop) yields a tool_use
+// whose Input is a PARTIAL, INVALID json.RawMessage with StopReason "" — not
+// "max_tokens", so the max_tokens salvage never fires. Before the sanitize step
+// that poisoned Input was recorded verbatim, and the NEXT step's request marshal
+// failed PERMANENTLY, killing the run. The fix repairs the Input to "{}" before
+// recording, so history stays marshalable and the loop surfaces a corrective turn.
+func TestNativeEOFMidToolUseSanitizedNotTerminal(t *testing.T) {
+	poisoned := model.Response{
+		Content: []model.Block{
+			{Type: "text", Text: "Editing the file"},
+			// Partial JSON, err==nil, StopReason "" — the exact assembleAnthropicStream
+			// shape on a mid-tool_use EOF (see TestAnthropicStreamEOFMidToolUse).
+			{Type: "tool_use", ID: "u1", Name: "edit", Input: json.RawMessage(`{"path":"a.go","old":"x`)},
+		},
+		StopReason: "",
+	}
+	m := &toolCapturingModel{responses: []model.Response{
+		poisoned,
+		{Content: []model.Block{toolUse("u2", "finish", map[string]string{"summary": "done"})}, StopReason: "tool_use"},
+	}}
+	n := &Native{Model: m, Box: &recordingBox{}, Verifier: okVerifier{}, MaxSteps: 5}
+	res, err := n.Run(context.Background(), Task{ID: "t", Goal: "x"})
+	// The whole point: no terminal "marshal request" error, and the loop finishes.
+	if err != nil {
+		t.Fatalf("Run must not die on a poisoned tool_use turn: %v", err)
+	}
+	if !res.SelfClaimed {
+		t.Error("loop must recover past the truncated tool_use and finish")
+	}
+	// The recorded assistant turn's poisoned Input was repaired to valid JSON so the
+	// next step's request marshals — the model's Complete would never have been
+	// called a second time otherwise.
+	if m.i < 2 {
+		t.Fatalf("model called %d times; the second step never ran (marshal died)", m.i)
+	}
+	var sawSanitized, sawNotice bool
+	for _, msg := range m.lastMsgs {
+		for _, b := range msg.Content {
+			if b.Type == "tool_use" && b.ID == "u1" {
+				if !json.Valid(b.Input) {
+					t.Errorf("recorded tool_use Input still invalid: %s", b.Input)
+				}
+				sawSanitized = true
+			}
+		}
+	}
+	for _, c := range toolResultContents(m.lastMsgs) {
+		// The belt's corrective result reaches the model instead of a zero-arg call.
+		if strings.Contains(c, "not valid JSON") && strings.Contains(c, "truncated") {
+			sawNotice = true
+		}
+	}
+	if !sawSanitized {
+		t.Error("the poisoned tool_use must be recorded with a sanitized (marshalable) Input")
+	}
+	if !sawNotice {
+		t.Error("the truncated tool_use must surface the belt's corrective tool_result, not a zero-arg call")
 	}
 }
 

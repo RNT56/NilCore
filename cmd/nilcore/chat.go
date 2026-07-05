@@ -730,7 +730,7 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 			// Bind /add'd context roots into a container READ-ONLY so the execute-mode
 			// shell can read them too (the file tools already see them host-side).
 			applyContainerReadRoots(box, in.ReadRoots)
-			v := behavioralVerifier(box, *d.flags.common.checkCmd)
+			v := orchestratorVerifier(box, *d.flags.common.checkCmd, d.log, *d.flags.common.logPath)
 			if in.Mode.ReadOnly() {
 				v = verify.Pass{}
 			}
@@ -969,57 +969,103 @@ func (a replApprover) Approve(action string) bool {
 	}
 }
 
-// applyDiffVerb implements /diff: a bounded, read-only preview (diffstat + diff
-// head) of the kept verified branch against the operator's current HEAD. No kept
-// branch ⇒ a friendly pointer at how work gets kept.
-func applyDiffVerb(ctx context.Context, sess chatSession, con *termui.Console) {
-	st := con.Style()
+// deliverSev is the severity of a delivery-verb line, so a front door can style it
+// (dim/info/warn) without the shared core knowing anything about termui or the TUI.
+type deliverSev int
+
+const (
+	sevDim deliverSev = iota
+	sevInfo
+	sevWarn
+)
+
+// deliverSink renders one delivery-verb line at a severity. The REPL implements it
+// over a termui.Console, the TUI over its transcript — so the /diff and /apply cores
+// (including the single PromoteToBase gate call) live once and both front doors agree
+// by construction (the same reason ParseControl is shared across doors).
+type deliverSink func(sev deliverSev, line string)
+
+// diffKeptBranch is the console-agnostic core of /diff: a bounded, read-only preview
+// (diffstat + diff head) of the kept verified branch against the operator's current
+// HEAD. No kept branch ⇒ a friendly pointer at how work gets kept.
+func diffKeptBranch(ctx context.Context, sess chatSession, out deliverSink) {
 	branch := sess.KeptBranch()
 	if branch == "" {
-		con.Line(st.Dim("  nothing to preview — no verified work is kept yet (run a task in /execute or /auto mode)"))
+		out(sevDim, "  nothing to preview — no verified work is kept yet (run a task in /execute or /auto mode)")
 		return
 	}
 	preview, err := worktree.DiffPreview(ctx, sess.RepoDir(), branch, chatDiffPreviewBytes)
 	if err != nil {
-		con.Line(st.Warn("  cannot preview " + branch + ": " + err.Error()))
+		out(sevWarn, "  cannot preview "+branch+": "+err.Error())
 		return
 	}
 	if preview == "" {
-		con.Line(st.Dim("  branch " + branch + " lands no changes on your current HEAD"))
+		out(sevDim, "  branch "+branch+" lands no changes on your current HEAD")
 		return
 	}
-	con.Line(st.Info("  kept branch: "+branch) + st.Dim("  (/apply to merge)"))
-	con.Line(preview)
+	out(sevInfo, "  kept branch: "+branch+"  (/apply to merge)")
+	out(sevDim, preview)
 }
 
-// applyApplyVerb implements /apply: land the kept verified branch onto the base
-// branch BEHIND the structured PromoteToBase gate — the exact action class and
-// approver flow watch/schedule/build's promote paths use (GateStructured over a
-// wrapAutoApprove'd approver; earned trust may auto-resolve within the shipped
-// envelope, a nil/denying approver fails closed). On approval it fast-forwards or
-// merges; a conflict reports cleanly and keeps the branch with no partial state.
-func applyApplyVerb(ctx context.Context, sess chatSession, con *termui.Console, gate policy.Approver, log *eventlog.Log) {
+// applyDiffVerb implements /diff on the REPL surface: it runs the shared core and
+// styles each line onto the termui.Console.
+func applyDiffVerb(ctx context.Context, sess chatSession, con *termui.Console) {
+	diffKeptBranch(ctx, sess, consoleDeliverSink(con))
+}
+
+// consoleDeliverSink adapts a termui.Console to a deliverSink (REPL styling).
+func consoleDeliverSink(con *termui.Console) deliverSink {
 	st := con.Style()
+	return func(sev deliverSev, line string) {
+		switch sev {
+		case sevInfo:
+			con.Line(st.Info(line))
+		case sevWarn:
+			con.Line(st.Warn(line))
+		default:
+			con.Line(st.Dim(line))
+		}
+	}
+}
+
+// applyApplyVerb implements /apply on the REPL surface: it runs the shared core and
+// styles each line onto the termui.Console.
+func applyApplyVerb(ctx context.Context, sess chatSession, con *termui.Console, gate policy.Approver, log *eventlog.Log) {
+	applyKeptBranch(ctx, sess, gate, log, consoleDeliverSink(con))
+}
+
+// applyKeptBranch is the console-agnostic core of /apply: land the kept verified
+// branch onto the base branch BEHIND the structured PromoteToBase gate — the exact
+// action class and approver flow watch/schedule/build's promote paths use
+// (GateStructured over a wrapAutoApprove'd approver; earned trust may auto-resolve
+// within the shipped envelope, a nil/denying approver fails closed). On approval it
+// fast-forwards or merges; a conflict reports cleanly and keeps the branch with no
+// partial state. Both front doors (REPL + TUI) call this, so the single gate lives
+// once and neither door can drift from the other.
+//
+// The gate call (GateStructured) BLOCKS on the human/modal, so the caller must not
+// run this on a goroutine the modal event loop needs (the TUI runs it off-loop).
+func applyKeptBranch(ctx context.Context, sess chatSession, gate policy.Approver, log *eventlog.Log, out deliverSink) {
 	branch := sess.KeptBranch()
 	if branch == "" {
-		con.Line(st.Dim("  nothing to apply — no verified work is kept yet (run a task in /execute or /auto mode)"))
+		out(sevDim, "  nothing to apply — no verified work is kept yet (run a task in /execute or /auto mode)")
 		return
 	}
 	// Applying moves the operator's real HEAD; do it only between drives so the gate
 	// prompt never fights a streaming run for the terminal (and a mid-drive queue
 	// line is never eaten as a gate answer).
 	if sess.PhaseNow() != session.Idle {
-		con.Line(st.Warn("  a run is in flight — wait for it (or /cancel) before applying"))
+		out(sevWarn, "  a run is in flight — wait for it (or /cancel) before applying")
 		return
 	}
 	repo := sess.RepoDir()
 	base, err := baseBranchName(ctx, repo)
 	if err != nil {
-		con.Line(st.Warn("  cannot apply: " + err.Error()))
+		out(sevWarn, "  cannot apply: "+err.Error())
 		return
 	}
 	if _, rerr := chatGit(ctx, repo, "rev-parse", "--verify", "--quiet", branch+"^{commit}"); rerr != nil {
-		con.Line(st.Warn("  cannot apply: branch " + branch + " no longer exists (pruned or merged already)"))
+		out(sevWarn, "  cannot apply: branch "+branch+" no longer exists (pruned or merged already)")
 		return
 	}
 
@@ -1027,31 +1073,38 @@ func applyApplyVerb(ctx context.Context, sess chatSession, con *termui.Console, 
 	// the branch is only ever kept when the verifier passed, so passed=true is the
 	// verifier's verdict on this tip — never a self-report (I2).
 	emitBoundaryOutcome(log, policy.PromoteToBase.String(), branch, true)
-	action := policy.GateAction{Type: policy.PromoteToBase, Branch: branch,
-		Detail: "apply verified chat work to " + base}
+	// I2 floor: GateAction.Branch MUST be the merge TARGET (the base being advanced),
+	// not the harmless kept source. GradedApprover.scopeFor keys the structural
+	// "never auto-approve main/prod" floor (isProtectedBase / isProd / DenyBranches)
+	// off a.Branch — if that were the nilcore/kept/… source, an operator envelope
+	// allowing nilcore/kept/* would let earned trust auto-merge INTO main with no
+	// human. PromoteToBase.Branch is documented as the target, so this is also the
+	// correct value; the source branch rides in Detail for the audit trail.
+	action := policy.GateAction{Type: policy.PromoteToBase, Branch: base,
+		Detail: "apply verified chat work from " + branch + " to " + base}
 	allowed := policy.GateStructured(action, gate)
 	log.Append(eventlog.Event{Kind: "gate", Detail: map[string]any{
 		"action": action.Type.String(), "branch": action.Branch,
 		"class": action.Class().String(), "allowed": allowed,
 	}})
 	if !allowed {
-		con.Line(st.Warn("  apply denied — branch kept: " + branch + " (/diff to review, /apply to retry)"))
+		out(sevWarn, "  apply denied — branch kept: "+branch+" (/diff to review, /apply to retry)")
 		return
 	}
 
 	tip, conflict, merr := mergeKeptBranch(ctx, repo, branch)
 	switch {
 	case conflict:
-		con.Line(st.Warn("  merge conflict — nothing was changed; branch kept: " + branch))
-		con.Line(st.Dim("  resolve it manually (git merge " + branch + ") or run a follow-up task"))
+		out(sevWarn, "  merge conflict — nothing was changed; branch kept: "+branch)
+		out(sevDim, "  resolve it manually (git merge "+branch+") or run a follow-up task")
 	case merr != nil:
-		con.Line(st.Warn("  apply failed — branch kept: " + merr.Error()))
+		out(sevWarn, "  apply failed — branch kept: "+merr.Error())
 	default:
 		// Landed: the commits are reachable from base, so the kept ref is redundant —
 		// reclaim it and clear the carried state (persisted, so a restart agrees).
 		worktree.DeleteBranch(ctx, repo, branch)
 		sess.ClearKeptBranch(ctx)
-		con.Line(st.Info("  applied " + branch + " — " + base + " is now at " + shortSHA(tip)))
+		out(sevInfo, "  applied "+branch+" — "+base+" is now at "+shortSHA(tip))
 	}
 }
 
@@ -1179,6 +1232,14 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 		MaxSteps:     *d.flags.common.maxSteps,
 		Seed:         in.Seed,
 	}
+	// Repo orientation + window awareness (upgrade program), exactly as buildBackend
+	// (run/watch) and the serve backend already wire: without these the interactive
+	// chat/TUI drive starts BLIND (no repo map ⇒ ls/cat structure discovery on every
+	// first step) and never proactively compacts (nil CtxWindow ⇒ only the one-shot
+	// overflow-400 recovery). box.Workdir() is the same per-task worktree the backend
+	// is built against; both are nil-safe seams.
+	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
+	n.CtxWindow = meter.CtxWindow
 	if in.Inbox != nil {
 		n.Inbox = in.Inbox
 	}
@@ -1250,9 +1311,14 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 			return session.DriveOutcome{}, err
 		}
 		// Pin a converged tip under nilcore/kept/ BEFORE the deferred cleanup sweeps
-		// the integrate/ prefix, so the verified work stays /diff- and /apply-able
-		// (an un-pinnable / unverified tip keeps the raw name — best-effort).
-		branch := o.Branch
+		// the integrate/ prefix, so the verified work stays /diff- and /apply-able.
+		// Only a Done drive yields a surfaced branch: a non-converged drive's raw
+		// integrate/<sha> tip is DELETED by the deferred stack.cleanup(), and folding
+		// that dead name into State.Branch would silently overwrite a still-existing,
+		// previously-kept nilcore/kept/ deliverable — breaking its /diff and /apply and
+		// losing its prune protection. So a not-Done drive surfaces an empty branch,
+		// leaving the prior kept work untouched.
+		var branch string
 		if o.Done {
 			branch = pinKeptBranch(ctx, d.baseRepo, o.Branch, d.log)
 		}
@@ -1282,8 +1348,10 @@ func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
 			return session.DriveOutcome{}, err
 		}
 		// Pin a converged tip before the deferred cleanup sweeps integrate/ — same
-		// delivery discipline as the supervised drive above.
-		branch := o.Branch
+		// delivery discipline as the supervised drive above: only a Done drive surfaces
+		// a branch, so a non-converged drive's swept integrate/<sha> name never
+		// overwrites a previously-kept nilcore/kept/ deliverable in State.Branch.
+		var branch string
 		if o.Done {
 			branch = pinKeptBranch(ctx, d.baseRepo, o.Branch, d.log)
 		}

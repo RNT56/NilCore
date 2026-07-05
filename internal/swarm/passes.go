@@ -192,6 +192,26 @@ type Controller struct {
 	// the exhausted rail alone would never catch. It is run-scoped loop state, reset by
 	// Run, so a Controller stays reusable across runs.
 	noProgress int
+
+	// term is the run-scoped termination-honesty bookkeeping finish reads to fold any
+	// UNRESOLVED planned shard (a DAG dependent that was Skipped and never re-ran) into
+	// Remaining and force Done=false — so the run can never report Done=true while a
+	// planned node was silently dropped (I2). It is set at the top of Run (so a Controller
+	// stays reusable) and shared by reference with the loop's own maps.
+	term termAccounting
+}
+
+// termAccounting is the run's planned-work ledger for the termination-honesty backstop:
+// which shards the run committed to (planned), which ran red and exhausted their budget
+// (exhaustedFail), and every shard definition ever seen (allShards). finish counts a
+// planned shard that is neither passed, merged, nor exhausted-failed as UNRESOLVED and
+// refuses a green verdict while any remain (I2 — no false converge over a skipped node).
+type termAccounting struct {
+	planned       map[string]bool
+	exhaustedFail map[string]bool
+	allShards     map[string]Shard
+	passed        map[string]spawn.Result
+	merged        map[string]bool
 }
 
 // Run executes the multi-pass loop from the initial shard set and returns the terminal
@@ -238,6 +258,36 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 	// spam integration events, so it is excluded from the fold until the shard re-runs
 	// and produces a FRESH branch (the fold criterion; run-scoped in-memory state).
 	conflictStale := make(map[string]bool)
+
+	// allShards is every shard the run ever saw (the initial set plus any conflict/
+	// dependent re-includes), keyed by id, so the termination backstop and the
+	// dependent re-inclusion can recover a full Shard definition (Deps/Kind/Pack/Role)
+	// for a node that is NOT in the current pass's slice. It is the run's shard registry.
+	allShards := make(map[string]Shard, len(initial))
+	for i := range initial {
+		allShards[initial[i].ID] = initial[i]
+	}
+	// planned is the id set of every shard from the INITIAL set — the work the run
+	// committed to. TERMINATION HONESTY (I2): the run may not report Done=true while any
+	// planned shard is neither merged nor terminally-exhausted-failed. A DAG dependent
+	// that was Skipped (its dep failed) writes no artifact, so requeue.Scan is blind to
+	// it; without this set a run could converge on an empty worklist having NEVER run a
+	// planned node. exhaustedFail records planned shards that ran, verified RED, and spent
+	// their retry budget — the only honest way a planned node leaves the run un-merged.
+	planned := make(map[string]bool, len(initial))
+	for i := range initial {
+		planned[initial[i].ID] = true
+	}
+	exhaustedFail := make(map[string]bool)
+
+	// Share the accounting maps (by reference) with finish's termination-honesty backstop
+	// so it sees every mutation the loop makes without threading them through finish's
+	// signature at each of its many call sites.
+	c.term = termAccounting{
+		planned: planned, exhaustedFail: exhaustedFail, allShards: allShards,
+		passed: passed, merged: merged,
+	}
+
 	var board Scoreboard
 
 	// prevRemaining anchors the no-progress detector: a pass that leaves the remaining
@@ -289,10 +339,18 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 			s := current[i]
 			res := results[s.ID]
 			green := res.Passed && res.Err == nil
+			// A DAG dependent whose dependency failed is SKIPPED by the scheduler: it never
+			// ran, wrote no artifact, and was NOT verified red — so it must NOT be counted as
+			// a failure (that would spend the board's Failed tally on work that never
+			// happened) and must NOT be marked ShardFailed. It is tracked as skipped so the
+			// dependent re-inclusion (below) and the termination backstop can re-run it once
+			// its dep greens (I2: a skipped planned node is not "done").
+			skipped := res.State == spawn.StateSkipped
 			_, wasPassed := passed[s.ID]
 
 			board.Checked++
-			if green {
+			switch {
+			case green:
 				board.Passed++
 				if st.Pass > 1 && !wasPassed {
 					board.RetryPass++ // red in a prior pass, green now
@@ -300,7 +358,18 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 				s.State = ShardPassed
 				s.Branch = res.Branch
 				passed[s.ID] = res
-			} else {
+				// A FRESH green result replaces passed[s.ID] with a NEW branch that has not
+				// been merge-attempted yet, so any stale conflict verdict against the shard's
+				// PRIOR branch is now moot: clear it so integrateGreen folds the fresh branch.
+				// This delete belongs ONLY here (Fix #9): on a RED/SKIPPED re-run of a
+				// conflict-rebuild shard, passed[s.ID] STILL holds the OLD green result with
+				// the rolled-back branch — clearing the stale mark there would resurrect that
+				// known-conflicting branch for a doomed re-merge, burning the merge Ledger.
+				delete(conflictStale, s.ID)
+			case skipped:
+				// Never ran (dep failed): a re-runnable non-terminal state, not a red verdict.
+				s.State = ShardSkipped
+			default:
 				board.Failed++
 				s.State = ShardFailed
 				// KEEP the preserved failed-attempt branch (the shardFn commits the red
@@ -312,11 +381,9 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 					s.Branch = res.Branch
 				}
 			}
-			// A fresh result supersedes any stale conflict verdict recorded against the
-			// shard's PRIOR branch — the new branch has not been merge-attempted yet.
-			delete(conflictStale, s.ID)
 			s.Attempt = st.Pass - 1
-			current[i] = s // write back: requeueSet reads Branch/State from here
+			current[i] = s      // write back: requeueSet reads Branch/State from here
+			allShards[s.ID] = s // keep the run's shard registry current
 			if err := c.Queue.Mark(ctx, s); err != nil {
 				return c.finish(ctx, st, board, passed, merged, ReasonError, false), err
 			}
@@ -369,15 +436,22 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 
 		// --- convergence: an empty worklist AND no green work stranded off the tip ---
 		if len(after.Units) == 0 {
-			if len(conflictRetry) > 0 {
-				// Everything is verifier-green but some verified branch is NOT on the tip
-				// and retains rebuild budget: converging now would silently drop it (I2).
-				// Run another pass for the rebuilds — still under the operator's pass cap
-				// (and the hard cap / budget rails at the loop top).
+			// A skipped DAG dependent whose dep has since greened is INVISIBLE to Scan (it
+			// wrote no artifact), so an empty worklist does NOT prove the planned work ran.
+			// Re-run every planned shard still unresolved (skipped, or otherwise never-
+			// merged/never-exhausted): the DAG scheduler re-skips it harmlessly if its dep is
+			// still red, and runs it once the dep is green. This is what makes A←B (A red pass
+			// 1 ⇒ B skipped) re-run B on pass 2 after A greens, instead of a false converge (I2).
+			pending := c.pendingPlanned(planned, passed, merged, exhaustedFail, allShards, st.TipSHA)
+			if len(conflictRetry) > 0 || len(pending) > 0 {
+				// Some verified branch is off the tip with rebuild budget, and/or a planned
+				// node never ran: converging now would silently drop work (I2). Run another
+				// pass — still under the operator's pass cap (and the hard/budget rails at the
+				// loop top). At the cap, surface the honest non-green exit, never a false converge.
 				if !c.Policy.UntilClean && st.Pass >= c.effectiveMaxPasses() {
 					return c.finish(ctx, st, board, passed, merged, ReasonPasses, false), nil
 				}
-				current = conflictRetry
+				current = append(conflictRetry, pending...)
 				continue
 			}
 			if unmergedGreens(c.Integrate != nil, passed, merged) > 0 {
@@ -413,6 +487,26 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		// permits — so the persisted Ledger durably reflects the attempt just spent.
 		eligibleIDs := c.bumpAndSelect(after, &st.Ledger)
 
+		// Record which planned shards have now terminally exhausted their retry budget:
+		// they have a red Unit in `after` but did NOT survive the bump into eligibleIDs.
+		// The termination backstop reads this so a planned shard that ran, verified red,
+		// and spent its budget is an HONEST non-green resolution — not a node the empty-
+		// worklist path must keep re-running.
+		markExhaustedFail(after, eligibleIDs, planned, exhaustedFail)
+
+		// Persist the ledger AGAIN now that bumpAndSelect (above) has spent this pass's
+		// red-claim attempts (Fix #12). The pass-boundary SaveState ran BEFORE that bump,
+		// so without this second write the bump would only reach disk on the NEXT pass's
+		// boundary — and a crash in between (or an exit at the passes/exhausted rail below,
+		// which return without a further SaveState) would resume with this pass's spent
+		// attempts forgotten and grant extra retries. Persisting HERE, before those exit
+		// rails, mirrors conflictRequeue's "spend the attempts, then persist with this
+		// pass" discipline. The Pass counter is unchanged, so re-persisting the same
+		// snapshot with the fuller ledger is safe and idempotent.
+		if err := c.Queue.SaveState(ctx, st); err != nil {
+			return c.finish(ctx, st, board, passed, merged, ReasonError, false), err
+		}
+
 		// Passes rail FIRST when bounded: if not until-clean and the pass count reached
 		// the permitted maximum, the OPERATOR CAP is what stopped the run — report
 		// `passes`, not `exhausted`, even if the ledger is also out of budget (the cap is
@@ -438,7 +532,14 @@ func (c *Controller) Run(ctx context.Context, st SwarmState, initial []Shard) (O
 		// The focused goals read the SAME post-bump Ledger bumpAndSelect wrote, so the
 		// plan's exhaustion view matches the eligible set.
 		focus := focusedGoals(after, &st.Ledger)
-		current = append(c.requeueSet(current, eligibleIDs, baseGoal, focus), conflictRetry...)
+		next := append(c.requeueSet(current, eligibleIDs, baseGoal, focus), conflictRetry...)
+		// Also re-include the not-yet-resolved DEPENDENTS of the requeued red set: a shard
+		// whose dep is red was Skipped this pass, wrote no artifact, and is invisible to
+		// Scan — so requeueSet alone never re-runs it. Adding it back (reset to queued,
+		// BaseRef re-resolved by prepareShards next pass) means once its dep greens it
+		// actually runs; while the dep stays red the DAG scheduler re-skips it harmlessly.
+		requeuedNow := idSet(next)
+		current = append(next, c.pendingDependents(requeuedNow, planned, passed, merged, exhaustedFail, allShards)...)
 	}
 }
 
@@ -463,6 +564,18 @@ func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard
 	if out.Done && unmerged > 0 {
 		out.Done, out.Reason = false, ReasonUnmerged
 	}
+	// TERMINATION HONESTY for the DAG (Fix #21): count every planned shard that never
+	// reached an honest terminal disposition — a dependent that was Skipped (its dep
+	// failed) and, for whatever reason (cap/budget/ctx hit first), never re-ran. Such a
+	// node wrote no artifact, so board.Remaining (derived from Scan) is blind to it. Fold
+	// it into Remaining and force Done=false: the run must never report Done=true/
+	// Remaining=0 while a planned node was silently dropped (I2).
+	if unresolved := c.unresolvedPlanned(); unresolved > 0 {
+		out.Remaining += unresolved
+		if out.Done {
+			out.Done, out.Reason = false, ReasonUnmerged
+		}
+	}
 	// On a clean converge there is nothing red and nothing stranded; force Remaining to
 	// 0 so the Outcome and the Done flag agree even if a late Scan raced an in-flight
 	// write.
@@ -476,6 +589,32 @@ func (c *Controller) finish(ctx context.Context, st SwarmState, board Scoreboard
 		"failed": board.Failed, "retry_pass": board.RetryPass,
 	})
 	return out
+}
+
+// unresolvedPlanned counts the planned shards that never reached an honest terminal
+// disposition (Fix #21 backstop): a planned node is UNRESOLVED unless it is merged,
+// verifier-green (in passed), or ran red and exhausted its budget (exhaustedFail). A
+// Skipped dependent that never re-ran is exactly the unresolved case Scan cannot see.
+// A verifier-green-but-unmerged shard is NOT counted here (unmergedGreens owns it), so
+// the two counters never double-count the same shard. The zero value of c.term (no Run
+// yet) yields 0, keeping finish safe if ever called without loop setup.
+func (c *Controller) unresolvedPlanned() int {
+	n := 0
+	for id := range c.term.planned {
+		// A green-with-branch-but-unmerged shard is accounted by unmergedGreens; skip it
+		// here so it is counted once, not twice.
+		if res, ok := c.term.passed[id]; ok {
+			if res.Branch != "" && !c.term.merged[id] {
+				continue // owned by the unmergedGreens tally
+			}
+			continue // otherwise resolved (green/merged)
+		}
+		if c.term.merged[id] || c.term.exhaustedFail[id] {
+			continue
+		}
+		n++ // planned, never passed, never merged, never exhausted-failed ⇒ dropped
+	}
+	return n
 }
 
 // unmergedGreens counts the verifier-green shards whose branch has NOT been folded
@@ -494,6 +633,120 @@ func unmergedGreens(integrating bool, passed map[string]spawn.Result, merged map
 		}
 	}
 	return n
+}
+
+// planResolved reports whether a planned shard has reached an HONEST terminal
+// disposition — merged into the tip, verifier-green (collate presets: green with no
+// branch is done; a green-with-branch that is unmerged is handled by unmergedGreens,
+// not here), or ran red and exhausted its retry budget. A shard that is none of these
+// (Skipped because its dep failed, or otherwise never-run) is UNRESOLVED: the run may
+// not converge Done=true while it is outstanding (I2 — never a false green).
+func planResolved(id string, passed map[string]spawn.Result, merged, exhaustedFail map[string]bool) bool {
+	if merged[id] || exhaustedFail[id] {
+		return true
+	}
+	if _, ok := passed[id]; ok {
+		return true // verifier-green (unmerged-with-branch is caught separately)
+	}
+	return false
+}
+
+// pendingPlanned returns the not-yet-resolved planned shards, freshly reset to
+// ShardQueued with BaseRef cleared so prepareShards re-resolves their dep base next
+// pass. It is called on the EMPTY-worklist path: a skipped dependent wrote no
+// artifact, so Scan cannot see it — this is the only place such a node re-enters the
+// loop. The order follows the id sort so the re-run set is stable. tipSHA is unused
+// today (prepareShards re-resolves from passed/tip on dispatch) but kept in the
+// signature so a future direct base-resolve has it to hand.
+func (c *Controller) pendingPlanned(planned map[string]bool, passed map[string]spawn.Result, merged, exhaustedFail map[string]bool, allShards map[string]Shard, tipSHA string) []Shard {
+	_ = tipSHA
+	var out []Shard
+	for _, id := range sortedIDs(planned) {
+		if planResolved(id, passed, merged, exhaustedFail) {
+			continue
+		}
+		if s, ok := allShards[id]; ok {
+			out = append(out, resetToQueued(s))
+		}
+	}
+	return out
+}
+
+// pendingDependents returns the not-yet-resolved planned shards whose Deps intersect
+// the set of shards already being requeued this pass (requeuedNow), excluding any
+// already in that set. These are the DAG dependents that were Skipped when their dep
+// went red: adding them back (reset to queued) means they actually run once the dep
+// greens, while the DAG scheduler re-skips them harmlessly if the dep is still red.
+// Without this, a skipped dependent — invisible to Scan — would never re-run and the
+// run could converge missing its planned work (I2).
+func (c *Controller) pendingDependents(requeuedNow, planned map[string]bool, passed map[string]spawn.Result, merged, exhaustedFail map[string]bool, allShards map[string]Shard) []Shard {
+	var out []Shard
+	for _, id := range sortedIDs(planned) {
+		if requeuedNow[id] || planResolved(id, passed, merged, exhaustedFail) {
+			continue
+		}
+		s, ok := allShards[id]
+		if !ok {
+			continue
+		}
+		depOnRequeued := false
+		for _, dep := range s.Deps {
+			if requeuedNow[dep] {
+				depOnRequeued = true
+				break
+			}
+		}
+		if depOnRequeued {
+			out = append(out, resetToQueued(s))
+		}
+	}
+	return out
+}
+
+// resetToQueued returns a copy of s re-armed for another pass: ShardQueued state and
+// an empty BaseRef so prepareShards re-resolves its dependency base fresh (the dep's
+// verified branch / integrated tip) rather than a stale one. Its Goal is left at the
+// canonical value — the Controller re-composes per-pass suffixes on a copy at dispatch.
+func resetToQueued(s Shard) Shard {
+	s.State = ShardQueued
+	s.BaseRef = ""
+	return s
+}
+
+// markExhaustedFail records, into exhaustedFail, every planned shard that has a red
+// Unit in `after` but did NOT survive the ledger bump into eligibleIDs — i.e. it ran,
+// verified red, and spent its retry budget. The termination backstop treats such a
+// shard as honestly resolved (non-green) rather than a node to keep re-running.
+func markExhaustedFail(after requeue.Worklist, eligibleIDs []string, planned, exhaustedFail map[string]bool) {
+	eligible := make(map[string]bool, len(eligibleIDs))
+	for _, id := range eligibleIDs {
+		eligible[id] = true
+	}
+	for _, u := range after.Units {
+		if planned[u.ArtifactID] && !eligible[u.ArtifactID] {
+			exhaustedFail[u.ArtifactID] = true
+		}
+	}
+}
+
+// idSet projects a shard slice onto the set of its ids.
+func idSet(shards []Shard) map[string]bool {
+	m := make(map[string]bool, len(shards))
+	for i := range shards {
+		m[shards[i].ID] = true
+	}
+	return m
+}
+
+// sortedIDs returns the keys of an id set in lexical order, for deterministic
+// re-inclusion ordering (the same stable-emit discipline mergeOrder uses).
+func sortedIDs(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // integrateGreen folds the NOT-yet-merged green branches through the IntegrateFunc,
