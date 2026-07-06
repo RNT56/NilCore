@@ -189,3 +189,101 @@ func TestBuildFileReferencesEdges(t *testing.T) {
 		t.Errorf("after re-index, references still include helper: %v (stale reference not pruned)", got)
 	}
 }
+
+// TestRemoveFilePrunesNodesAndIncomingEdges proves RemoveFile — the delete/rename
+// counterpart to BuildFile — drops a gone file's symbol nodes AND the dangling edges
+// pointing INTO them from a surviving file (the one thing BuildFile deliberately does
+// NOT do). This is the guarantee the native-loop delete/rename wiring relies on.
+func TestRemoveFilePrunesNodesAndIncomingEdges(t *testing.T) {
+	dir := t.TempDir()
+	gone := filepath.Join(dir, "gone.go")
+	keep := filepath.Join(dir, "keep.go")
+	g := openMem(t)
+	ctx := context.Background()
+
+	if err := os.WriteFile(gone, []byte("package p\nfunc Gone() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// keep.go's User calls Gone, so there is an incoming `calls` edge into gone.go.
+	if err := os.WriteFile(keep, []byte("package p\nfunc User() { Gone() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.BuildFile(ctx, keep); err != nil {
+		t.Fatal(err)
+	}
+	if callees, _ := g.Callees(ctx, "User"); len(nodeNames(callees)) != 1 || nodeNames(callees)[0] != "Gone" {
+		t.Fatalf("pre-remove User callees = %v, want [Gone]", nodeNames(callees))
+	}
+
+	// Remove gone.go: its node drops and the incoming edge no longer dangles.
+	if err := g.RemoveFile(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+	nodes, _ := g.Nodes(ctx)
+	for _, n := range nodes {
+		if n.Name == "Gone" {
+			t.Errorf("removed file's symbol 'Gone' still present: %+v", n)
+		}
+	}
+	if callees, _ := g.Callees(ctx, "User"); len(callees) != 0 {
+		t.Errorf("post-remove User callees = %v, want [] (dangling in-edge pruned)", nodeNames(callees))
+	}
+	// The surviving file's own symbol is untouched.
+	var sawUser bool
+	for _, n := range nodes {
+		if n.Name == "User" {
+			sawUser = true
+		}
+	}
+	if !sawUser {
+		t.Error("surviving file's symbol 'User' was wrongly removed")
+	}
+}
+
+// TestRemoveFileKeepsBareNameEdgeStillLive is the survivor guard: a bare-name
+// incoming `calls` edge must NOT be pruned when ANOTHER file still defines that name,
+// or the removal would break a call relationship that is still live for the survivor.
+func TestRemoveFileKeepsBareNameEdgeStillLive(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a.go")
+	b := filepath.Join(dir, "b.go")
+	caller := filepath.Join(dir, "caller.go")
+	g := openMem(t)
+	ctx := context.Background()
+
+	// Both a.go and b.go define Dup; caller.go calls Dup (a bare-name edge that fans
+	// out to both definitions).
+	if err := os.WriteFile(a, []byte("package p\nfunc Dup() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("package q\nfunc Dup() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(caller, []byte("package p\nfunc C() { Dup() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{a, b, caller} {
+		if err := g.BuildFile(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Remove a.go. b.go still defines Dup, so the caller's bare-name edge must stay.
+	if err := g.RemoveFile(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	callees, _ := g.Callees(ctx, "C")
+	if got := nodeNames(callees); len(got) != 1 || got[0] != "Dup" {
+		t.Errorf("post-remove C callees = %v, want [Dup] (edge still live via the survivor)", got)
+	}
+	// And the survivor's Dup node is the one that resolves.
+	for _, id := range callees {
+		file, _, _ := SplitID(id)
+		if file == a {
+			t.Errorf("callee resolved to the REMOVED file %q: %q", a, id)
+		}
+	}
+}

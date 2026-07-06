@@ -141,8 +141,9 @@ func (r *Roster) Resolve(role Role) (Profile, bool) {
 	return p, ok
 }
 
-// Roles lists the roles in the catalog (unordered) — for enumeration in tests
-// and wiring. It never exposes the underlying map.
+// Roles lists the roles in the catalog (unordered) — the enumeration primitive over
+// the catalog (used to assert per-role invariants and the exact default-catalog size).
+// It never exposes the underlying map.
 func (r *Roster) Roles() []Role {
 	if r == nil {
 		return nil

@@ -1,9 +1,11 @@
 // Package desktopsession is the host-side handle to a persistent, in-sandbox
 // virtual desktop the agent drives across many turns (Phase CU, Pillar 1). It is
 // the sibling of internal/browsersession: the same one-long-lived-Exec + file-queue
-// transport on the shared /work mount, the same version-stamped stale-ref guard and
-// host-side {{secret}} substitution — but the daemon is `nilcore-desktop --serve`
-// driving an Xvfb X11 desktop instead of a headless browser.
+// transport on the shared /work mount, the same version-stamped stale-ref guard,
+// host-side {{secret}} substitution, and host-side secret-reflow scrub (a secret typed
+// into a non-password field is redacted from every subsequent observation, I3) — but the
+// daemon is `nilcore-desktop --serve` driving an Xvfb X11 desktop instead of a headless
+// browser.
 //
 // The desktop run itself is CI-only (no X11 in unit tests); the Session logic (ref
 // checks, secret substitution, act/observation marshaling, error handling) is
@@ -16,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"nilcore/internal/desktopwire"
 	"nilcore/internal/sandbox"
@@ -40,7 +43,21 @@ type Session struct {
 	secrets SecretResolver
 	latest  desktopwire.Observation
 	closed  bool
+
+	// typedSecrets is the set of RESOLVED secret VALUES this session has typed onto the
+	// desktop. Every observation returned to the model is scrubbed of any occurrence of
+	// one of these values (I3): a {{secret:NAME}} the model typed via OpType reflows back
+	// as plaintext on the next auto-snapshot (Observation.Text/Title + Ref.Name/Value —
+	// cmd/tools/nilcore-desktop/a11y.go populates Ref.Value raw) if the field is not a
+	// password input; the in-sandbox snapshot masks nothing here. This host-side redaction
+	// is field-type-independent and closes that reflow — the sibling of
+	// browsersession.Session.typedSecrets.
+	typedSecrets map[string]struct{}
 }
+
+// secretSentinel is the fixed replacement for a scrubbed secret value in a returned
+// observation. It is the only thing the model ever sees where a typed secret would be.
+const secretSentinel = "«secret»"
 
 const defaultDriver = "nilcore-desktop"
 
@@ -122,11 +139,16 @@ func (s *Session) do(ctx context.Context, a desktopwire.Act) (desktopwire.Observ
 	if err != nil {
 		return desktopwire.Observation{}, err
 	}
-	s.latest = resp.Observation
+	// Host-side secret scrub (I3): redact any typed secret value that reflowed into the
+	// observation before it becomes the model's view (latest) or is returned. The driver's
+	// a11y dump populates Ref.Value/Name and Text/Title raw, so a secret typed into a
+	// non-password field would otherwise reach the model as plaintext.
+	obs := s.scrubObservation(resp.Observation)
+	s.latest = obs
 	if resp.Error != "" {
-		return resp.Observation, fmt.Errorf("desktop act %q failed: %s", a.Op, resp.Error)
+		return obs, fmt.Errorf("desktop act %q failed: %s", a.Op, resp.Error)
 	}
-	return resp.Observation, nil
+	return obs, nil
 }
 
 // validateRef rejects a ref-based act whose ref is absent from the latest snapshot,
@@ -171,6 +193,7 @@ func (s *Session) substituteSecrets(a desktopwire.Act) (desktopwire.Act, error) 
 			missing = name
 			return m
 		}
+		s.rememberSecret(v) // scrub this value from every future observation (I3)
 		return v
 	})
 	if missing != "" {
@@ -178,6 +201,64 @@ func (s *Session) substituteSecrets(a desktopwire.Act) (desktopwire.Act, error) 
 	}
 	a.Text = out
 	return a, nil
+}
+
+// rememberSecret records a resolved secret value so scrubObservation can redact it from
+// every subsequent observation. A trivially short value is ignored — scrubbing a 1–2
+// char value would corrupt unrelated screen text for no security gain (a real secret is
+// never that short); empty values are likewise skipped. Mirrors browsersession.rememberSecret.
+func (s *Session) rememberSecret(v string) {
+	if len(v) < 3 {
+		return
+	}
+	if s.typedSecrets == nil {
+		s.typedSecrets = make(map[string]struct{})
+	}
+	s.typedSecrets[v] = struct{}{}
+}
+
+// scrubObservation replaces every occurrence of a previously-typed secret value in the
+// observation (Text, Title, Console, and every Ref Name/Value) with secretSentinel,
+// before the observation is recorded as latest and returned to the model. This is the
+// host-side backstop for secret reflow (I3): it is independent of the field's input type,
+// so a secret typed into a text/API-key/TOTP field — which the driver's a11y dump does
+// NOT mask — never reaches the model as plaintext. Mirrors browsersession.scrubObservation.
+func (s *Session) scrubObservation(o desktopwire.Observation) desktopwire.Observation {
+	if len(s.typedSecrets) == 0 {
+		return o
+	}
+	scrub := func(in string) string {
+		if in == "" {
+			return in
+		}
+		out := in
+		for v := range s.typedSecrets {
+			if strings.Contains(out, v) {
+				out = strings.ReplaceAll(out, v, secretSentinel)
+			}
+		}
+		return out
+	}
+	o.Text = scrub(o.Text)
+	o.Title = scrub(o.Title)
+	o.FocusedWindow = scrub(o.FocusedWindow)
+	if len(o.Console) > 0 {
+		cs := make([]string, len(o.Console))
+		for i, c := range o.Console {
+			cs[i] = scrub(c)
+		}
+		o.Console = cs
+	}
+	if len(o.Refs) > 0 {
+		rs := make([]desktopwire.Ref, len(o.Refs))
+		for i, r := range o.Refs {
+			r.Name = scrub(r.Name)
+			r.Value = scrub(r.Value)
+			rs[i] = r
+		}
+		o.Refs = rs
+	}
+	return o
 }
 
 func newID() (string, error) {

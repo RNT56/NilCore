@@ -10,6 +10,7 @@ import (
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/trust"
 )
 
 // RTE-T05 — wiring the nil-safe TrustOracle into the orchestrator's candidate-build,
@@ -147,6 +148,81 @@ func TestOracleReordersMultiBackendCandidates(t *testing.T) {
 	}
 	if !sawSelect {
 		t.Error("expected a backend_select event when the Oracle is wired")
+	}
+}
+
+// TestCostAwareOracleReordersRunOrder is the end-to-end proof of the cost-aware
+// routing wiring (RTE-T06): a REAL TrustRouteOracle built with a non-nil CostFunc,
+// over a warm ledger where both configured backends have equally cleared the
+// confidence bar, makes the orchestrator run the CHEAPER backend first — and a
+// COST-BLIND oracle over the identical ledger runs the other one (name order). Same
+// ledger, same candidates: the ONLY difference is whether a cost func was supplied,
+// so a change in which backend runs proves the supplied cost func changed routing
+// order (previously dead because the composition passed a nil cost).
+func TestCostAwareOracleReordersRunOrder(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	// Warm ledger: "aexpensive" and "zcheap" both 9/10 on the "feature" class, so both
+	// clear the confidence bar with an identical smoothed rate — the tie the cost
+	// dimension breaks. Names chosen so cost-blind (name order) puts aexpensive first.
+	newLedger := func() *trust.Ledger {
+		l := trust.New()
+		for i := 0; i < 10; i++ {
+			l.Record(trust.Outcome{Backend: "aexpensive", Class: "feature", Passed: i < 9})
+			l.Record(trust.Outcome{Backend: "zcheap", Class: "feature", Passed: i < 9})
+		}
+		return l
+	}
+	// zcheap is cheaper (via a real PricerCost over a stub pricer + model-id resolver).
+	pricer := stubPricer{rate: map[string]float64{"expensive-model": 1.00, "cheap-model": 0.10}}
+	modelID := func(backend string) string {
+		switch backend {
+		case "aexpensive":
+			return "expensive-model"
+		case "zcheap":
+			return "cheap-model"
+		default:
+			return ""
+		}
+	}
+	cost := agent.PricerCost(pricer, modelID, 1000, 1000)
+
+	run := func(t *testing.T, oracle agent.TrustOracle) string {
+		t.Helper()
+		repo := initGitRepo(t)
+		logPath := filepath.Join(t.TempDir(), "events.log")
+		lg, err := eventlog.Open(logPath)
+		if err != nil {
+			t.Fatalf("eventlog.Open: %v", err)
+		}
+		defer lg.Close()
+		orch := &agent.Orchestrator{
+			BaseRepo: repo,
+			Log:      lg,
+			// "add a feature" classifies as the "feature" class the ledger is warm on.
+			Backends: []string{"aexpensive", "zcheap"},
+			NewEnvFor: func(_, name string) agent.Env {
+				return agent.Env{Backend: &fakeBackend{name: name}, Verifier: &fakeVerifier{passed: true}}
+			},
+			Oracle: oracle,
+		}
+		out, err := orch.Execute(context.Background(), backend.Task{ID: "cost", Goal: "add a feature"})
+		if err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+		return out.Backend
+	}
+
+	// Cost-aware: the cheaper backend runs first.
+	if got := run(t, agent.NewTrustRouteOracle(newLedger(), cost)); got != "zcheap" {
+		t.Errorf("cost-aware oracle ran %q first, want zcheap (cheapest of the cleared tier)", got)
+	}
+	// Cost-blind over the SAME ledger: the tie falls to name order ⇒ aexpensive first.
+	// Proves the ONLY thing that flipped the order was supplying a cost func.
+	if got := run(t, agent.NewTrustRouteOracle(newLedger(), nil)); got != "aexpensive" {
+		t.Errorf("cost-blind oracle ran %q first, want aexpensive (name-order tie-break)", got)
 	}
 }
 

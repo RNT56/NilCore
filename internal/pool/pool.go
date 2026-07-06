@@ -340,13 +340,14 @@ func (p *Pool) SetGlobalCeiling(dollars float64) {
 	p.globalCeil = dollars
 }
 
-// Usage returns the run-wide token and dollar totals from the shared ledger —
-// the live cost the scoreboard prints.
+// Usage returns the run-wide token and dollar totals from the shared ledger — the
+// read side of the metered pool, the natural pair of the SetGlobalCeiling write side.
 func (p *Pool) Usage() (tokens int, dollars float64) { return p.ledger.Total() }
 
-// Spent returns the tokens and dollars charged against a single scope key. Pass a
-// scope as returned by Scope(shardID), or the literal planner/verifier scopes.
-// An unknown scope reports zero.
+// Spent returns the tokens and dollars charged against a single scope key — the
+// per-scope read side that mirrors SetShardCeiling's per-scope cap. Pass a scope as
+// returned by Scope(shardID), or the literal planner/verifier scopes. An unknown
+// scope reports zero.
 func (p *Pool) Spent(scope string) (tokens int, dollars float64) { return p.ledger.Spent(scope) }
 
 // Headroom reports the remaining dollars before `scope` (or, if smaller, the

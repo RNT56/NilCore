@@ -26,6 +26,13 @@ func TestTuningIsZero(t *testing.T) {
 		{ParallelToolCalls: &yes},
 		{OpenRouterReferer: "https://app"},
 		{OpenRouterTitle: "App"},
+		{ResponseFormat: &ResponseFormat{Name: "s"}},
+		{ToolChoice: json.RawMessage(`"auto"`)},
+		{OpenRouterProvider: &OpenRouterProvider{Sort: "price"}},
+		{OpenRouterModels: []string{"a/b"}},
+		{OpenRouterReasoning: &OpenRouterReasoning{Effort: "high"}},
+		{OpenRouterTransforms: []string{"middle-out"}},
+		{OpenRouterPlugins: []OpenRouterPlugin{{ID: "web"}}},
 	}
 	for i, tn := range nonZero {
 		if tn.IsZero() {
@@ -158,6 +165,82 @@ func TestResolveWithTuningAnthropicUntouched(t *testing.T) {
 	}
 	if _, ok := p.(*Anthropic); !ok {
 		t.Fatalf("provider type = %T, want *Anthropic", p)
+	}
+}
+
+// captureTuningBody resolves spec with the given key + tuning, points the adapter
+// at a capture server, sends one Complete, and returns the decoded request body.
+func captureTuningBody(t *testing.T, spec, keyEnv string, tuning Tuning) map[string]json.RawMessage {
+	t.Helper()
+	p, err := ResolveWithTuning(spec, staticEnv(keyEnv, "k"), tuning)
+	if err != nil {
+		t.Fatalf("ResolveWithTuning(%q): %v", spec, err)
+	}
+	oa, ok := p.(*OpenAI)
+	if !ok {
+		t.Fatalf("provider type = %T, want *OpenAI", p)
+	}
+	var body map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+	oa.baseURL = srv.URL
+	if _, err := oa.Complete(context.Background(), "sys",
+		[]model.Message{{Role: "user", Content: []model.Block{{Type: "text", Text: "go"}}}}, nil, 100); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	return body
+}
+
+// TestResolveWithTuningResponseFormatAndToolChoice proves the OpenAI-family
+// response_format and tool_choice knobs ride the request body when set on a Tuning.
+func TestResolveWithTuningResponseFormatAndToolChoice(t *testing.T) {
+	body := captureTuningBody(t, "openai:gpt-4o", "OPENAI_API_KEY", Tuning{
+		ResponseFormat: &ResponseFormat{Name: "answer", Strict: true, Schema: json.RawMessage(`{"type":"object"}`)},
+		ToolChoice:     json.RawMessage(`"required"`),
+	})
+	assertJSONString(t, body, "tool_choice", `"required"`)
+	rf, ok := body["response_format"]
+	if !ok {
+		t.Fatalf("body missing response_format: %v", body)
+	}
+	want := `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object"}}}`
+	if !jsonEqual(t, rf, json.RawMessage(want)) {
+		t.Errorf("response_format = %s, want %s", rf, want)
+	}
+}
+
+// TestResolveWithTuningOpenRouterExtras proves each OpenRouter routing extra
+// (provider, models, reasoning, transforms, plugins) reaches the request body as a
+// top-level key when set on a Tuning against the OpenRouter base.
+func TestResolveWithTuningOpenRouterExtras(t *testing.T) {
+	body := captureTuningBody(t, "openrouter:x/y", "OPENROUTER_API_KEY", Tuning{
+		OpenRouterProvider:   &OpenRouterProvider{Sort: "throughput"},
+		OpenRouterModels:     []string{"a/b", "c/d"},
+		OpenRouterReasoning:  &OpenRouterReasoning{Effort: "high", Exclude: boolPtr(true)},
+		OpenRouterTransforms: []string{"middle-out"},
+		OpenRouterPlugins:    []OpenRouterPlugin{{ID: "web", MaxResults: 3}},
+	})
+
+	// provider carries the default-true require_parameters injected for a present
+	// provider object, alongside the set sort.
+	if raw, ok := body["provider"]; !ok || !jsonEqual(t, raw, json.RawMessage(`{"require_parameters":true,"sort":"throughput"}`)) {
+		t.Errorf("provider = %s, want sort+require_parameters", raw)
+	}
+	if raw, ok := body["models"]; !ok || !jsonEqual(t, raw, json.RawMessage(`["a/b","c/d"]`)) {
+		t.Errorf("models = %s", raw)
+	}
+	if raw, ok := body["reasoning"]; !ok || !jsonEqual(t, raw, json.RawMessage(`{"effort":"high","exclude":true}`)) {
+		t.Errorf("reasoning = %s", raw)
+	}
+	if raw, ok := body["transforms"]; !ok || !jsonEqual(t, raw, json.RawMessage(`["middle-out"]`)) {
+		t.Errorf("transforms = %s", raw)
+	}
+	if raw, ok := body["plugins"]; !ok || !jsonEqual(t, raw, json.RawMessage(`[{"id":"web","max_results":3}]`)) {
+		t.Errorf("plugins = %s", raw)
 	}
 }
 

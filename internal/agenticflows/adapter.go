@@ -34,7 +34,6 @@ type Node struct {
 	Type        string
 	Title       string
 	Description string
-	Agent       string
 	Tool        string
 }
 

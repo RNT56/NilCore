@@ -204,7 +204,7 @@ func browseMain(args []string) {
 	// The tool surface: the stateful browse tool (no shell — a browse agent has no
 	// arbitrary-execution path, structurally). In extraction mode, record_finding
 	// writes verifier-gated findings. Optionally read-only repo tools.
-	bt := &browseragent.BrowseTool{Sess: sess, MaxSteps: *bf.maxSteps, EventSink: browseEventSink(log)}
+	bt := buildBrowseTool(sess, *bf.maxSteps, browseEventSink(log), approver)
 	reg := tools.NewRegistry(bt)
 	if extractID != "" {
 		reg.Register(&browseragent.FindingTool{Root: absDir, ArtifactID: extractID, Title: *bf.goal, Sess: sess})
@@ -244,6 +244,17 @@ func browseMain(args []string) {
 		fatal(fmt.Errorf("browse: %w", err))
 	}
 	fmt.Println(strings.TrimSpace(out.Summary))
+}
+
+// buildBrowseTool constructs the stateful browse tool with its per-action irreversible
+// gate wired in. The console approver (also the Rule-of-Two session gate) is passed as
+// BrowseTool.Approver so browseragent.irreversibleTarget routes a purchase/pay/delete/
+// accept-terms click (or an Enter-to-submit on such a page) through the human gate.
+// Without an Approver, browseragent's per-action check fails CLOSED on EVERY irreversible
+// action — a production tool built without one would dead-block them permanently rather
+// than gate them. Extracted so the wiring is unit-testable (the approver is non-nil).
+func buildBrowseTool(sess browseragent.Session, maxSteps int, sink browseragent.EventSink, approver browseragent.Approver) *browseragent.BrowseTool {
+	return &browseragent.BrowseTool{Sess: sess, MaxSteps: maxSteps, EventSink: sink, Approver: approver}
 }
 
 // ternary is a tiny helper for the capguard reason map.

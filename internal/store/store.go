@@ -87,6 +87,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err := s.migrateEventSeq(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateObjectiveCadence(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 

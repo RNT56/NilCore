@@ -291,7 +291,6 @@ func TestHitAppendsNothing(t *testing.T) {
 	if _, err := c.Check(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	log.Flush()
 	afterMiss := countEvents(t, path)
 
 	// A run of hits must not grow the log at all.
@@ -300,7 +299,6 @@ func TestHitAppendsNothing(t *testing.T) {
 		if err != nil || !rep.Passed {
 			t.Fatalf("hit %d = %+v, %v; want a pass", i, rep, err)
 		}
-		log.Flush()
 		if got := countEvents(t, path); got != afterMiss {
 			t.Fatalf("hit %d appended an event: log grew from %d to %d", i, afterMiss, got)
 		}
@@ -337,7 +335,6 @@ func TestHitMemoizesChainVerify(t *testing.T) {
 	if !haveMemo || !memoOK {
 		t.Fatalf("a chain-verified hit must memoize the verdict: haveMemo=%v ok=%v", haveMemo, memoOK)
 	}
-	log.Flush()
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -373,13 +370,11 @@ func TestGrowthInvalidatesMemo(t *testing.T) {
 	if _, err := c.Check(context.Background()); err != nil { // hit -> memo populated
 		t.Fatal(err)
 	}
-	log.Flush()
 	fi, _ := os.Stat(path)
 	sizeBefore := fi.Size()
 
 	// Append a real, chain-valid event so the log genuinely grows.
 	log.Append(eventlog.Event{Task: "T-test", Kind: "note", Detail: map[string]any{"x": 1}})
-	log.Flush()
 	fi2, _ := os.Stat(path)
 	if fi2.Size() == sizeBefore {
 		t.Fatal("test setup: appended event did not grow the log")

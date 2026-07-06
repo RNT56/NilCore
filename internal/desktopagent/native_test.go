@@ -18,7 +18,19 @@ func TestTranslateNative(t *testing.T) {
 		want func(desktopwire.Act) bool
 	}{
 		{`{"action":"screenshot"}`, desktopwire.OpObserve, nil},
-		{`{"action":"left_click","coordinate":[100,200]}`, desktopwire.OpClick, func(a desktopwire.Act) bool { return len(a.Coordinate) == 2 && a.Coordinate[0] == 100 }},
+		{`{"action":"left_click","coordinate":[100,200]}`, desktopwire.OpClick, func(a desktopwire.Act) bool {
+			return len(a.Coordinate) == 2 && a.Coordinate[0] == 100 && a.Button == desktopwire.ButtonLeft && a.Count == 1
+		}},
+		// Each click variant must carry its real button/count — not collapse to a left click.
+		{`{"action":"double_click","coordinate":[1,2]}`, desktopwire.OpClick, func(a desktopwire.Act) bool { return a.Button == desktopwire.ButtonLeft && a.Count == 2 }},
+		{`{"action":"triple_click","coordinate":[1,2]}`, desktopwire.OpClick, func(a desktopwire.Act) bool { return a.Button == desktopwire.ButtonLeft && a.Count == 3 }},
+		{`{"action":"right_click","coordinate":[1,2]}`, desktopwire.OpClick, func(a desktopwire.Act) bool { return a.Button == desktopwire.ButtonRight && a.Count == 1 }},
+		{`{"action":"middle_click","coordinate":[1,2]}`, desktopwire.OpClick, func(a desktopwire.Act) bool { return a.Button == desktopwire.ButtonMiddle && a.Count == 1 }},
+		{`{"action":"left_click_drag","start_coordinate":[1,2],"coordinate":[9,9]}`, desktopwire.OpDrag, func(a desktopwire.Act) bool {
+			return len(a.Coordinate) == 2 && a.Coordinate[0] == 1 && len(a.To) == 2 && a.To[0] == 9 && a.Button == desktopwire.ButtonLeft
+		}},
+		{`{"action":"left_mouse_down","coordinate":[3,4]}`, desktopwire.OpMouseDown, func(a desktopwire.Act) bool { return a.Coordinate[0] == 3 && a.Button == desktopwire.ButtonLeft }},
+		{`{"action":"left_mouse_up","coordinate":[3,4]}`, desktopwire.OpMouseUp, func(a desktopwire.Act) bool { return a.Coordinate[0] == 3 && a.Button == desktopwire.ButtonLeft }},
 		{`{"action":"type","text":"hi"}`, desktopwire.OpType, func(a desktopwire.Act) bool { return a.Text == "hi" }},
 		{`{"action":"key","text":"ctrl+s"}`, desktopwire.OpKey, func(a desktopwire.Act) bool { return a.Key == "ctrl+s" }},
 		{`{"action":"scroll","scroll_direction":"down","scroll_amount":3}`, desktopwire.OpScroll, func(a desktopwire.Act) bool { return a.Dir == "down" && a.Amount == 3 }},

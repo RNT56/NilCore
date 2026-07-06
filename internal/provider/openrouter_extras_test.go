@@ -151,12 +151,12 @@ func TestOpenAIPathUnaffected(t *testing.T) {
 // caller did not set it.
 func TestOpenRouterProviderObject(t *testing.T) {
 	got := captureWire(t, func(base string) *OpenAI {
-		return newOpenRouterAt(base, "x/y", WithOpenRouterProvider(&openRouterProvider{
+		return newOpenRouterAt(base, "x/y", WithOpenRouterProvider(&OpenRouterProvider{
 			Order:          []string{"openai", "anthropic"},
 			AllowFallbacks: boolPtr(false),
 			DataCollection: "deny",
 			Sort:           "throughput",
-			MaxPrice:       &openRouterMaxPrice{Prompt: f64Ptr(1.5), Completion: f64Ptr(0)},
+			MaxPrice:       &OpenRouterMaxPrice{Prompt: f64Ptr(1.5), Completion: f64Ptr(0)},
 		}))
 	}, false)
 
@@ -171,7 +171,7 @@ func TestOpenRouterProviderObject(t *testing.T) {
 // preserved (NOT clobbered by the default-true rule).
 func TestOpenRouterRequireParametersOverride(t *testing.T) {
 	got := captureWire(t, func(base string) *OpenAI {
-		return newOpenRouterAt(base, "x/y", WithOpenRouterProvider(&openRouterProvider{
+		return newOpenRouterAt(base, "x/y", WithOpenRouterProvider(&OpenRouterProvider{
 			RequireParameters: boolPtr(false),
 		}))
 	}, false)
@@ -215,7 +215,7 @@ func TestOpenRouterExtrasSerialize(t *testing.T) {
 	}{
 		{
 			name:    "reasoning",
-			opt:     WithOpenRouterReasoning(&openRouterReasoning{Effort: "high", Exclude: boolPtr(true)}),
+			opt:     WithOpenRouterReasoning(&OpenRouterReasoning{Effort: "high", Exclude: boolPtr(true)}),
 			key:     "reasoning",
 			wantRaw: json.RawMessage(`{"effort":"high","exclude":true}`),
 		},
@@ -227,7 +227,7 @@ func TestOpenRouterExtrasSerialize(t *testing.T) {
 		},
 		{
 			name:    "plugins",
-			opt:     WithOpenRouterPlugins(openRouterPlugin{ID: "web", MaxResults: 3, Engine: "exa"}),
+			opt:     WithOpenRouterPlugins(OpenRouterPlugin{ID: "web", MaxResults: 3, Engine: "exa"}),
 			key:     "plugins",
 			wantRaw: json.RawMessage(`[{"id":"web","max_results":3,"engine":"exa"}]`),
 		},

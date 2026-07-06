@@ -86,13 +86,18 @@ CREATE TABLE IF NOT EXISTS exp_meta (
 -- and default-empty — with no objective enqueued, every existing query above is
 -- byte-identical and the backlog source stays off (the default-off contract).
 -- Goal is operator-authored, inert data; the store never interprets it (I7).
--- min_period_ns stores time.Duration as nanoseconds; last_run is RFC3339Nano UTC
--- (or '' for the zero time, matching formatTS/parseTS); enabled is 0/1.
+-- min_period_ns / retry_period_ns store time.Duration as nanoseconds; last_run and
+-- last_success are RFC3339Nano UTC (or '' for the zero time, matching formatTS/parseTS);
+-- enabled is 0/1. retry_period_ns and last_success land on a fresh DB here; a DB created
+-- before they existed is ALTERed in Go (Store.migrateObjectiveCadence), guarded by
+-- pragma_table_info the same way as events.seq — additive and idempotent every Open.
 CREATE TABLE IF NOT EXISTS objectives (
-    id            TEXT PRIMARY KEY,
-    goal          TEXT    NOT NULL DEFAULT '',
-    priority      INTEGER NOT NULL DEFAULT 0,
-    enabled       INTEGER NOT NULL DEFAULT 1,   -- 1 enabled, 0 paused (inert, retained)
-    min_period_ns INTEGER NOT NULL DEFAULT 0,   -- minimum spacing between runs (time.Duration ns)
-    last_run      TEXT    NOT NULL DEFAULT ''    -- RFC3339Nano UTC, '' = never run
+    id              TEXT PRIMARY KEY,
+    goal            TEXT    NOT NULL DEFAULT '',
+    priority        INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 1,   -- 1 enabled, 0 paused (inert, retained)
+    min_period_ns   INTEGER NOT NULL DEFAULT 0,   -- minimum spacing between SUCCESSFUL runs (time.Duration ns)
+    retry_period_ns INTEGER NOT NULL DEFAULT 0,   -- shorter spacing after an unverified run; 0 = fall back to min_period_ns
+    last_run        TEXT    NOT NULL DEFAULT '',   -- RFC3339Nano UTC, '' = never run (debounce clock)
+    last_success    TEXT    NOT NULL DEFAULT ''    -- RFC3339Nano UTC, '' = never verified (success-cadence clock)
 );

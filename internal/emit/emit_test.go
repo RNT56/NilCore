@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// nilSafe asserts that every nil/no-op form of an Emitter is safe to call.
-func TestNilAndNopAreSafe(t *testing.T) {
+// TestNilIsSafe asserts that every nil/no-op form of an Emitter is safe to call.
+func TestNilIsSafe(t *testing.T) {
 	// A nil interface value gated by the caller is the documented default; the
 	// loop checks `if e != nil` before emitting, but a nil *WriterEmitter must
 	// itself be a safe no-op so a writer built from a nil io.Writer is harmless.
@@ -18,10 +18,6 @@ func TestNilAndNopAreSafe(t *testing.T) {
 	if got := NewWriter(nil); got != nil {
 		t.Fatalf("NewWriter(nil) = %v, want nil emitter", got)
 	}
-
-	// NopEmitter discards without touching anything.
-	var e Emitter = NopEmitter{}
-	e.Emit(Event{Kind: KindTool, Text: "noop", Step: 2})
 }
 
 // TestWriterRendersKindStepText asserts every kind renders Kind, Step, and Text

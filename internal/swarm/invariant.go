@@ -8,12 +8,17 @@ package swarm
 //   - ShipGate (I2): no shard ships on a vacuous verifier. A nil verifier or the
 //     always-true verify.Pass{} is refused at construction, so the sole authority
 //     on "done" can never be a stub.
-//   - ClassifyCeiling (budget): a budget.ErrCeiling caught at the shard boundary
-//     is classified as per-shard vs global by a tiny headroom probe, so the
-//     runner knows whether to fail one shard or stop the whole run.
+//   - ClassifyCeiling (budget): a budget.ErrCeiling caught at the SHARD boundary
+//     is classified as per-shard vs global by a tiny headroom probe, so the shard
+//     failure is annotated with which ceiling bound (the cmd shardFn calls it in
+//     classifyWorkerErr; the global RUN-stop rail remains the Controller's own
+//     non-recording globalBudgetExhausted probe — this classifies the shard's error,
+//     it does not re-decide whether the run stops).
 //   - ProjectTrusted (I7): the scoreboard/trace projection carries ONLY
 //     verifier-set, key-free fields — never the model-authored Value/Statement —
-//     so an injection phrase in a claim's Value can never reach a renderer.
+//     so an injection phrase in a claim's Value can never reach a renderer. The cmd
+//     shardFn feeds every verdict's artifact through it (then GoverningTrustedClaim
+//     picks the row's representative claim) before the Board records the outcome.
 
 import (
 	"context"
@@ -200,4 +205,24 @@ func ProjectTrusted(a *artifact.Artifact) []TrustedClaim {
 		})
 	}
 	return out
+}
+
+// GoverningTrustedClaim picks the ONE trusted claim that best represents a shard's
+// verdict for the single-row scoreboard/trace projection (the Board carries one
+// Verifier/Status/SourceURL per shard, not a per-claim list). It prefers the FIRST
+// non-pass claim — the claim that governs a red verdict, the one an operator most needs
+// to see — and falls back to the first claim when every claim passed. An empty slice
+// (nil artifact / no claims) yields ok=false and the caller leaves the row's provenance
+// unset. It operates on the ALREADY-I7-safe TrustedClaim set, so no model-authored Value
+// can leak through this selection.
+func GoverningTrustedClaim(claims []TrustedClaim) (TrustedClaim, bool) {
+	if len(claims) == 0 {
+		return TrustedClaim{}, false
+	}
+	for _, c := range claims {
+		if c.Status != artifact.StatusPass {
+			return c, true
+		}
+	}
+	return claims[0], true
 }

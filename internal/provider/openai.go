@@ -482,7 +482,7 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 			}
 		}
 		if hasWeb {
-			extras.Plugins = append(extras.Plugins, openRouterPlugin{ID: "web"})
+			extras.Plugins = append(extras.Plugins, OpenRouterPlugin{ID: "web"})
 		}
 		extras.applyDefaults()
 		reqBody.openRouterExtras = &extras

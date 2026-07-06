@@ -17,16 +17,17 @@ import (
 // closeFn() releases the graph (called when the loop returns, so the handle is
 // task-scoped — no leak). A graph-open failure degrades to nil funcs (the loop runs
 // without the `live` tool). Enabled opt-in via NILCORE_LIVE_INDEX.
-func liveSession(mem *memory.Memory, project string) func(string) (func(context.Context, string), func(context.Context, string) string, func()) {
-	return func(dir string) (func(context.Context, string), func(context.Context, string) string, func()) {
+func liveSession(mem *memory.Memory, project string) func(string) (func(context.Context, string), func(context.Context, string), func(context.Context, string) string, func()) {
+	return func(dir string) (func(context.Context, string), func(context.Context, string), func(context.Context, string) string, func()) {
 		g, err := graph.Open(":memory:")
 		if err != nil {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		ix := &live.Index{Graph: g, Memory: mem, Project: project}
 		_ = ix.IndexDir(context.Background(), dir) // best-effort initial index
 
 		update := func(ctx context.Context, path string) { _ = ix.Update(ctx, path) }
+		remove := func(ctx context.Context, path string) { _ = ix.Remove(ctx, path) }
 		query := func(ctx context.Context, symbol string) string {
 			facts, err := ix.Query(ctx, symbol)
 			if err != nil {
@@ -35,7 +36,7 @@ func liveSession(mem *memory.Memory, project string) func(string) (func(context.
 			return renderLiveFacts(symbol, facts)
 		}
 		closeFn := func() { _ = g.Close() }
-		return update, query, closeFn
+		return update, remove, query, closeFn
 	}
 }
 

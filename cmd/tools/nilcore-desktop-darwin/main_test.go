@@ -58,6 +58,46 @@ func TestCliclickBuilders(t *testing.T) {
 	}
 }
 
+// TestCliclickClickVariants proves the button/count contract: right and double clicks
+// map to distinct cliclick verbs, and an unsupported variant (middle click, triple, or a
+// repeated right click) fails closed rather than silently left-clicking.
+func TestCliclickClickVariants(t *testing.T) {
+	if got, err := cliclickClickN(1, 2, desktopwire.ButtonLeft, 1); err != nil || !reflect.DeepEqual(got, []string{"c:1,2"}) {
+		t.Fatalf("left click = %v (err %v)", got, err)
+	}
+	if got, err := cliclickClickN(1, 2, desktopwire.ButtonLeft, 2); err != nil || !reflect.DeepEqual(got, []string{"dc:1,2"}) {
+		t.Fatalf("double click = %v (err %v)", got, err)
+	}
+	if got, err := cliclickClickN(1, 2, desktopwire.ButtonRight, 1); err != nil || !reflect.DeepEqual(got, []string{"rc:1,2"}) {
+		t.Fatalf("right click = %v (err %v)", got, err)
+	}
+	if _, err := cliclickClickN(1, 2, desktopwire.ButtonMiddle, 1); err == nil {
+		t.Fatal("middle click must fail closed (no cliclick verb), never a silent left click")
+	}
+	if _, err := cliclickClickN(1, 2, desktopwire.ButtonLeft, 3); err == nil {
+		t.Fatal("triple click must fail closed on the MVP")
+	}
+	if _, err := cliclickClickN(1, 2, desktopwire.ButtonRight, 2); err == nil {
+		t.Fatal("repeated right click must fail closed on the MVP")
+	}
+}
+
+// TestCliclickDrag proves a drag maps to press(dd)→release(du); a non-left drag fails closed.
+func TestCliclickDrag(t *testing.T) {
+	if got, err := cliclickDrag(1, 2, 3, 4, desktopwire.ButtonLeft); err != nil || !reflect.DeepEqual(got, []string{"dd:1,2", "du:3,4"}) {
+		t.Fatalf("drag = %v (err %v)", got, err)
+	}
+	if got, err := cliclickMouseDown(5, 6, desktopwire.ButtonLeft); err != nil || !reflect.DeepEqual(got, []string{"dd:5,6"}) {
+		t.Fatalf("mouse-down = %v (err %v)", got, err)
+	}
+	if got, err := cliclickMouseUp(5, 6, ""); err != nil || !reflect.DeepEqual(got, []string{"du:5,6"}) {
+		t.Fatalf("mouse-up = %v (err %v)", got, err)
+	}
+	if _, err := cliclickDrag(1, 2, 3, 4, desktopwire.ButtonRight); err == nil {
+		t.Fatal("non-left drag must fail closed on the MVP")
+	}
+}
+
 func TestCoords(t *testing.T) {
 	// resized (50,25) at resize-scale 2 and backing 2 → pixel (100,50) → point (50,25).
 	x, y := resizedToPoint(50, 25, 2, 2, 2, 0, 0)

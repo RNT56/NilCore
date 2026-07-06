@@ -2,8 +2,9 @@
 // (P3-T04): one backend by default; on a hard or failed task, race best-of-N
 // backends in parallel worktrees and let the verifier pick the winner; and run a
 // cross-model review before the irreversible gate. Every race outcome is logged —
-// the data that later earns strength-routing. It implements the agent.Router seam
-// structurally (no import of agent), so wiring is additive.
+// the data that later earns strength-routing. The default single-backend router
+// lives in the orchestrator (agent.SingleRouter); this package owns only the
+// race/review policy, so it never imports agent.
 package route
 
 import (
@@ -17,14 +18,6 @@ import (
 	"nilcore/internal/model"
 	"nilcore/internal/verify"
 )
-
-// SingleRouter is the default: always the one configured backend.
-type SingleRouter struct{}
-
-// Route returns the default backend unchanged.
-func (SingleRouter) Route(_ context.Context, _ backend.Task, def backend.CodingBackend) backend.CodingBackend {
-	return def
-}
 
 // Candidate is one racer: a backend and the verifier for its own isolated
 // worktree (the orchestrator builds these in parallel worktrees; route runs and

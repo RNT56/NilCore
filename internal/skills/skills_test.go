@@ -2,7 +2,6 @@ package skills_test
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,20 +10,6 @@ import (
 	"nilcore/internal/skills"
 	"nilcore/internal/tools"
 )
-
-// examplePlugin is the native-plugin example: it contributes a structured tool.
-type examplePlugin struct{}
-
-func (examplePlugin) Tool() tools.Tool { return echoTool{} }
-
-type echoTool struct{}
-
-func (echoTool) Name() string            { return "echo" }
-func (echoTool) Description() string     { return "echo the input" }
-func (echoTool) Schema() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
-func (echoTool) Run(_ context.Context, _ string, in json.RawMessage) (string, error) {
-	return string(in), nil
-}
 
 func TestLoadSkillMarkdown(t *testing.T) {
 	dir := t.TempDir()
@@ -49,14 +34,13 @@ func TestLoadSkillMarkdown(t *testing.T) {
 	}
 }
 
-func TestAsToolsExposesBothFormats(t *testing.T) {
+func TestAsToolsExposesSkills(t *testing.T) {
 	reg := skills.New(
 		[]skills.Skill{{Name: "greet", Description: "greet", Instructions: "be warm"}},
-		examplePlugin{},
 	)
 	ts := reg.AsTools()
-	if len(ts) != 2 {
-		t.Fatalf("AsTools = %d, want 2", len(ts))
+	if len(ts) != 1 {
+		t.Fatalf("AsTools = %d, want 1", len(ts))
 	}
 
 	byName := map[string]tools.Tool{}
@@ -72,15 +56,11 @@ func TestAsToolsExposesBothFormats(t *testing.T) {
 	if out != "be warm" {
 		t.Errorf("skill tool returned %q, want its instructions", out)
 	}
-	// The native plugin surfaces as its tool.
-	if _, ok := byName["echo"]; !ok {
-		t.Error("native plugin tool not exposed")
-	}
 
-	// They register into the loop's registry exactly like built-in tools.
+	// It registers into the loop's registry exactly like a built-in tool.
 	loopReg := tools.NewRegistry(ts...)
-	if !loopReg.Has("skill_greet") || !loopReg.Has("echo") {
-		t.Error("skills/plugins should register into the native loop registry")
+	if !loopReg.Has("skill_greet") {
+		t.Error("skill should register into the native loop registry")
 	}
 }
 

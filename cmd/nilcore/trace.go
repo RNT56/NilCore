@@ -45,6 +45,7 @@ func traceMain(args []string) {
 	fs := flag.NewFlagSet("trace", flag.ExitOnError)
 	logPath := fs.String("log", defaultLogPath, "append-only event log path")
 	format := fs.String("format", "text", "render format: text | json")
+	interactive := fs.Bool("tui", false, "explore the trace interactively (needs the `make tui` build; a single task id required)")
 	_ = fs.Parse(rest)
 
 	// A positional that appeared AFTER the flags (e.g. `trace --log X t-1`) lands in
@@ -54,6 +55,23 @@ func traceMain(args []string) {
 		if tail := fs.Args(); len(tail) > 0 {
 			task = tail[0]
 		}
+	}
+
+	// Interactive TUI explorer: takes over the terminal (bubbletea) instead of printing,
+	// so it is handled here rather than through runTrace's text/JSON return. It needs a
+	// single named task and the tui build (a clear stub errors on the default binary).
+	if *interactive {
+		if task == "" || task == "*" {
+			fatal(fmt.Errorf("trace --tui needs a single task id, e.g. `nilcore trace --tui <task>`"))
+		}
+		tr, err := trace.Build(*logPath, task)
+		if err != nil {
+			fatal(fmt.Errorf("trace: %w", err))
+		}
+		if err := runTraceExplorer(tr); err != nil {
+			fatal(err)
+		}
+		return
 	}
 
 	out, exit, err := runTrace(*logPath, task, *format, termui.New(os.Stdout).Style())

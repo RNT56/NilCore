@@ -186,12 +186,6 @@ func connect(ctx context.Context, spec ServerSpec) (*Client, func(), error) {
 	return client, stop, nil
 }
 
-// Spawn launches a server and wraps it as a Client (stdio subprocess or HTTP). Kept
-// as the public entry; it delegates to connect.
-func Spawn(ctx context.Context, spec ServerSpec) (*Client, func(), error) {
-	return connect(ctx, spec)
-}
-
 // Call is a one-shot: connect to spec, handshake, invoke tool with args, return the
 // textual result, and tear down. This is what `nilcore mcp-call` runs (host-side).
 func Call(ctx context.Context, spec ServerSpec, tool string, args json.RawMessage) (string, error) {

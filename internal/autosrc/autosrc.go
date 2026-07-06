@@ -73,13 +73,6 @@ type Source interface {
 	Next(ctx context.Context) (sig QueuedSignal, ok bool, err error)
 }
 
-// SourceFunc adapts a plain function to the Source interface, for the common case of
-// a closure over an existing channel or poller.
-type SourceFunc func(ctx context.Context) (QueuedSignal, bool, error)
-
-// Next calls the underlying function.
-func (f SourceFunc) Next(ctx context.Context) (QueuedSignal, bool, error) { return f(ctx) }
-
 // Handler routes one admitted signal onward — in production, the verified/gated
 // drivegate path. It is an INJECTED dependency precisely so this leaf never imports
 // the orchestrator (I6 dependency direction). It receives the plain trigger.Signal
@@ -87,22 +80,6 @@ func (f SourceFunc) Next(ctx context.Context) (QueuedSignal, bool, error) { retu
 // handler — not the daemon — owns gating: the daemon can never bypass a gate because
 // it does no work itself, it only forwards the goal.
 type Handler func(ctx context.Context, sig trigger.Signal) error
-
-// Enqueue is the registration entry a Source's pump uses (and tests may call
-// directly): it admits sig into the bounded priority queue. Exposed as a method on
-// QueuedSignal-shaped input so a caller assembles {Signal, Priority} and the queue
-// owns the sequence. Returns ErrQueueFull at capacity or ErrQueueClosed after
-// shutdown.
-//
-// (The pump goroutines call this internally; it is exported so a push-style caller —
-// e.g. a webhook handler that already has a signal in hand — can feed the same queue
-// without becoming a pull Source.)
-func (d *Daemon) Enqueue(sig QueuedSignal) error {
-	if d == nil || d.q == nil {
-		return ErrQueueClosed
-	}
-	return d.q.enqueue(sig)
-}
 
 // audit appends one metadata-only event when a log is wired (I5). nil-safe.
 func (d *Daemon) audit(kind string, detail map[string]any) {

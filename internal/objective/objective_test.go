@@ -202,7 +202,7 @@ func TestNextIdleEmpty(t *testing.T) {
 	}
 }
 
-func TestMarkRunAdvancesLastRun(t *testing.T) {
+func TestMarkAttemptAdvancesLastRun(t *testing.T) {
 	st := newFakeStore(
 		Objective{ID: "ci", Goal: "keep CI green", Priority: 5, Enabled: true, MinPeriod: time.Hour},
 	)
@@ -214,8 +214,8 @@ func TestMarkRunAdvancesLastRun(t *testing.T) {
 		t.Fatal("never-run objective should be due")
 	}
 
-	if err := b.MarkRun(ctx, "ci", base); err != nil {
-		t.Fatalf("MarkRun: %v", err)
+	if err := b.MarkAttempt(ctx, "ci", base); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
 	}
 
 	got, err := b.Get(ctx, "ci")
@@ -227,12 +227,13 @@ func TestMarkRunAdvancesLastRun(t *testing.T) {
 	}
 	// Other fields preserved through the read-modify-write.
 	if got.Goal != "keep CI green" || got.Priority != 5 || !got.Enabled {
-		t.Fatalf("MarkRun clobbered other fields: %+v", got)
+		t.Fatalf("MarkAttempt clobbered other fields: %+v", got)
 	}
 
-	// Now within the period ⇒ no longer due.
+	// Now within the period ⇒ no longer due. (No RetryPeriod set, so an unverified
+	// attempt still debounces a full MinPeriod.)
 	if _, ok, _ := b.NextIdle(ctx, base.Add(10*time.Minute)); ok {
-		t.Fatal("objective should be debounced within MinPeriod after MarkRun")
+		t.Fatal("objective should be debounced within MinPeriod after MarkAttempt")
 	}
 	// Past the period ⇒ due again.
 	if _, ok, _ := b.NextIdle(ctx, base.Add(2*time.Hour)); !ok {
@@ -330,23 +331,23 @@ func TestMarkSuccessNotFound(t *testing.T) {
 	}
 }
 
-func TestMarkRunNotFound(t *testing.T) {
+func TestMarkAttemptNotFound(t *testing.T) {
 	b := New(newFakeStore())
-	err := b.MarkRun(context.Background(), "ghost", base)
+	err := b.MarkAttempt(context.Background(), "ghost", base)
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
-func TestMarkRunNormalizesToUTC(t *testing.T) {
+func TestMarkAttemptNormalizesToUTC(t *testing.T) {
 	st := newFakeStore(Objective{ID: "x", Enabled: true})
 	b := New(st)
 	ctx := context.Background()
 	// A non-UTC instant must be stored as UTC for deterministic comparisons.
 	loc := time.FixedZone("X+5", 5*3600)
 	when := time.Date(2026, 6, 26, 17, 0, 0, 0, loc)
-	if err := b.MarkRun(ctx, "x", when); err != nil {
-		t.Fatalf("MarkRun: %v", err)
+	if err := b.MarkAttempt(ctx, "x", when); err != nil {
+		t.Fatalf("MarkAttempt: %v", err)
 	}
 	got, _ := b.Get(ctx, "x")
 	if got.LastRun.Location() != time.UTC {
@@ -436,8 +437,8 @@ func TestErrorsPropagate(t *testing.T) {
 	if _, err := b.List(ctx); !errors.Is(err, boom) {
 		t.Fatalf("List should propagate store error, got %v", err)
 	}
-	if err := b.MarkRun(ctx, "x", base); !errors.Is(err, boom) {
-		t.Fatalf("MarkRun should propagate store error, got %v", err)
+	if err := b.MarkAttempt(ctx, "x", base); !errors.Is(err, boom) {
+		t.Fatalf("MarkAttempt should propagate store error, got %v", err)
 	}
 }
 
@@ -458,9 +459,6 @@ func TestNilStoreIsInert(t *testing.T) {
 	}
 	if err := b.Disable(ctx, "x"); err != nil {
 		t.Fatalf("nil-store Disable should be nil, got %v", err)
-	}
-	if err := b.MarkRun(ctx, "x", base); err != nil {
-		t.Fatalf("nil-store MarkRun should be nil, got %v", err)
 	}
 	if err := b.MarkAttempt(ctx, "x", base); err != nil {
 		t.Fatalf("nil-store MarkAttempt should be nil, got %v", err)

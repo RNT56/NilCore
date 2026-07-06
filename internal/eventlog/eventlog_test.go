@@ -122,7 +122,11 @@ func TestOnAppendHook(t *testing.T) {
 	log.OnAppend(func(e Event) { got = append(got, e) })
 	log.Append(Event{Kind: "a"})
 	log.Append(Event{Kind: "b"})
-	log.Flush() // the hook runs on the async drainer; barrier-sync before asserting
+	// The hook runs on the async drainer; Close drains everything still enqueued before
+	// returning, so it is the barrier-sync point for asserting the folded events.
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 2 || got[0].Kind != "a" || got[1].Kind != "b" {
 		t.Fatalf("hook must fire once per append, in order: %+v", got)
 	}
@@ -130,9 +134,6 @@ func TestOnAppendHook(t *testing.T) {
 	// so a projector can fold it as it lands.
 	if got[0].Seq != 0 || got[1].Seq != 1 || got[1].Prev != got[0].Hash || got[1].Hash == "" {
 		t.Fatalf("hook must receive the chained event: %+v", got)
-	}
-	if err := log.Close(); err != nil {
-		t.Fatal(err)
 	}
 	// The hook must not disturb the authoritative chain.
 	if err := Verify(path); err != nil {

@@ -45,8 +45,28 @@ func TestParseA11y(t *testing.T) {
 }
 
 func TestXdotoolBuilders(t *testing.T) {
-	if got := xdotoolClick(12, 34); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "12", "34", "click", "1"}) {
+	if got := xdotoolClick(12, 34, desktopwire.ButtonLeft, 1); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "12", "34", "click", "1"}) {
 		t.Fatalf("click args = %v", got)
+	}
+	// A double click repeats the same button; a right click selects button 3.
+	if got := xdotoolClick(1, 2, desktopwire.ButtonLeft, 2); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "1", "2", "click", "--repeat", "2", "1"}) {
+		t.Fatalf("double-click args = %v", got)
+	}
+	if got := xdotoolClick(1, 2, desktopwire.ButtonRight, 1); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "1", "2", "click", "3"}) {
+		t.Fatalf("right-click args = %v", got)
+	}
+	if got := xdotoolClick(1, 2, desktopwire.ButtonMiddle, 1); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "1", "2", "click", "2"}) {
+		t.Fatalf("middle-click args = %v", got)
+	}
+	// A drag presses at the origin, moves, and releases.
+	if got := xdotoolDrag(1, 2, 3, 4, desktopwire.ButtonLeft); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "1", "2", "mousedown", "1", "mousemove", "--sync", "3", "4", "mouseup", "1"}) {
+		t.Fatalf("drag args = %v", got)
+	}
+	if got := xdotoolMouseDown(5, 6, desktopwire.ButtonLeft); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "5", "6", "mousedown", "1"}) {
+		t.Fatalf("mousedown args = %v", got)
+	}
+	if got := xdotoolMouseUp(5, 6, desktopwire.ButtonLeft); !reflect.DeepEqual(got, []string{"mousemove", "--sync", "5", "6", "mouseup", "1"}) {
+		t.Fatalf("mouseup args = %v", got)
 	}
 	if got := xdotoolType("a-b"); !reflect.DeepEqual(got, []string{"type", "--clearmodifiers", "--", "a-b"}) {
 		t.Fatalf("type args = %v", got)
@@ -185,12 +205,53 @@ func TestPerformClickRef(t *testing.T) {
 	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Ref: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(120, 110)) {
+	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(120, 110, desktopwire.ButtonLeft, 1)) {
 		t.Fatalf("click recorded = %v, want click at (120,110)", rec)
 	}
 	// A ref not in the snapshot fails closed.
 	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Ref: 9}); err == nil {
 		t.Fatal("click on an unknown ref must fail closed")
+	}
+}
+
+// TestPerformClickVariants proves the driver honors the Button/Count contract: a right
+// click and a double click on a coordinate produce distinct xdotool commands, not a
+// single left click (the mis-click bug).
+func TestPerformClickVariants(t *testing.T) {
+	var rec [][]string
+	restore := withSeams(t, `[]`, nil, "", &rec)
+	defer restore()
+	d := newDriver()
+	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Coordinate: []int{10, 20}, Button: desktopwire.ButtonRight, Count: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(10, 20, desktopwire.ButtonRight, 1)) {
+		t.Fatalf("right click = %v, want a button-3 click", rec)
+	}
+	rec = nil
+	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Coordinate: []int{10, 20}, Button: desktopwire.ButtonLeft, Count: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(10, 20, desktopwire.ButtonLeft, 2)) {
+		t.Fatalf("double click = %v, want a --repeat 2 click", rec)
+	}
+}
+
+// TestPerformDrag proves a left_click_drag maps to a press-move-release, and that a drag
+// with no destination fails closed (never a silent drag to (0,0)).
+func TestPerformDrag(t *testing.T) {
+	var rec [][]string
+	restore := withSeams(t, `[]`, nil, "", &rec)
+	defer restore()
+	d := newDriver()
+	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpDrag, Coordinate: []int{1, 2}, To: []int{3, 4}, Button: desktopwire.ButtonLeft}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolDrag(1, 2, 3, 4, desktopwire.ButtonLeft)) {
+		t.Fatalf("drag = %v, want press-move-release", rec)
+	}
+	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpDrag, Coordinate: []int{1, 2}}); err == nil {
+		t.Fatal("a drag with no destination must fail closed")
 	}
 }
 
@@ -203,7 +264,7 @@ func TestPerformCoordinateRescale(t *testing.T) {
 	if err := d.perform(context.Background(), desktopwire.Act{Op: desktopwire.OpClick, Coordinate: []int{50, 25}}); err != nil {
 		t.Fatal(err)
 	}
-	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(100, 50)) {
+	if len(rec) != 1 || !reflect.DeepEqual(rec[0], xdotoolClick(100, 50, desktopwire.ButtonLeft, 1)) {
 		t.Fatalf("coordinate click = %v, want true (100,50)", rec)
 	}
 }

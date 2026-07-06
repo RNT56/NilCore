@@ -54,6 +54,16 @@ func NewExplorer(tr *Trace) tea.Model {
 	return m
 }
 
+// RunExplorer launches the interactive explorer for tr and blocks until the operator
+// quits (q / esc / ctrl+c). It is the tui-tagged entrypoint the `nilcore trace --tui`
+// command reaches: the default (non-tui) binary never links this file, so the plain
+// text renderer (Render) is the only path there (I6). The explorer is a pure read-only
+// VIEW over the already-built Trace — it never re-reads the log or mutates anything.
+func RunExplorer(tr *Trace) error {
+	_, err := tea.NewProgram(NewExplorer(tr), tea.WithAltScreen()).Run()
+	return err
+}
+
 func (m explorerModel) Init() tea.Cmd { return nil }
 
 // reflow rebuilds the flat row list from the tree, honouring the collapsed set:

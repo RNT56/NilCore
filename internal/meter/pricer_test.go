@@ -59,6 +59,11 @@ func TestPrice(t *testing.T) {
 		{"openrouter fusion 1k+1k", "openrouter/fusion", 1000, 1000, 0.020 + 0.150},
 		{"openrouter provider/model", "openrouter/anthropic/claude-x", 1000, 1000, 0.015 + 0.120},
 
+		// A vendor-namespaced SERVED id (the form OpenRouter echoes in response.model)
+		// resolves to its real tier via the post-'/' segment — NOT the conservative floor
+		// ($0.020/$0.150). This is exactly the served-model-pricing case in meter.go.
+		{"served vendor/model opus", "anthropic/claude-opus-4-8", 1000, 1000, 0.005 + 0.025},
+
 		// Longest-prefix wins: opus is more specific than the generic claude tier.
 		{"opus beats generic claude", "claude-opus-4-8-fast", 1000, 0, 0.005},
 		// gpt-5.5-pro is more specific than gpt-5.5, which is more specific than gpt.

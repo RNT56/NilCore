@@ -10,7 +10,13 @@ import (
 
 // ClaudeCode delegates the task to Claude Code in headless mode:
 //
-//	claude -p "<goal>" --output-format stream-json --permission-mode acceptEdits
+//	claude -p "<goal>" --output-format stream-json --verbose --permission-mode acceptEdits
+//
+// --verbose is REQUIRED: current Claude Code CLIs reject --output-format=stream-json
+// under --print/-p unless --verbose is also passed, so without it the delegated
+// backend exits non-zero on every run. --verbose only adds init/system framing lines
+// to the stream, which the stream-json parser (lastEventText/digText) already skips
+// because they carry no text payload.
 //
 // Like the Codex adapter it runs *inside* the sandbox container with
 // ANTHROPIC_API_KEY injected per run (P2-T03) — never persisted, logged, or
@@ -66,7 +72,10 @@ func (c *ClaudeCode) Run(ctx context.Context, t Task) (Result, error) {
 // returns exactly the original command. Effort is intentionally NOT here — it
 // travels via env (see the struct doc). Every value is shellQuote'd.
 func claudeArgs(goal, model string, extra []string) string {
-	cmd := "claude -p " + shellQuote(goal) + " --output-format stream-json --permission-mode acceptEdits"
+	// --verbose is mandatory alongside stream-json under -p (the CLI rejects the
+	// combination otherwise); the extra init/system lines carry no text payload so
+	// the stream-json parser ignores them.
+	cmd := "claude -p " + shellQuote(goal) + " --output-format stream-json --verbose --permission-mode acceptEdits"
 	if model != "" {
 		cmd += " --model " + shellQuote(model)
 	}

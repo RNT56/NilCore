@@ -37,10 +37,12 @@ import (
 // fail-closed: construction returns an error over a broken hash chain, so a
 // successfully-built reader is always over a verified (or empty) log.
 type Reader interface {
-	// BackendStanding returns the verifier-judged per-backend scoreboard. The
-	// taskClass argument is reserved for the per-class cell dimension that
-	// Pillar 2 (RTE) adds; today the standing is global and taskClass is echoed
-	// for forward-compatibility, not yet used to filter.
+	// BackendStanding returns the verifier-judged per-backend scoreboard for
+	// taskClass. An empty taskClass ("") reads the GLOBAL, class-agnostic
+	// scoreboard; a non-empty class reads only that class's races (an unknown
+	// class yields no standings, never the global fallback). Both the log-replay
+	// (OverLog) and store-backed (OverStore) readers key by this real class, so
+	// `-class` filtering agrees across paths.
 	BackendStanding(ctx context.Context, taskClass string) ([]trust.Stat, error)
 	// ConfigStanding returns the per-config eval rollup (pass-rate / cost / cases).
 	// Eval reports are a separate input folded by the store-backed reader; the

@@ -17,8 +17,8 @@ func TestLiveSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	update, query, closeFn := liveSession(nil, "proj")(dir) // nil memory: graph-only
-	if update == nil || query == nil || closeFn == nil {
+	update, remove, query, closeFn := liveSession(nil, "proj")(dir) // nil memory: graph-only
+	if update == nil || remove == nil || query == nil || closeFn == nil {
 		t.Fatal("live session did not open")
 	}
 	defer closeFn()
@@ -38,6 +38,12 @@ func TestLiveSession(t *testing.T) {
 	update(ctx, p2)
 	if out := query(ctx, "Run"); !strings.Contains(out, "helper") {
 		t.Errorf("after the edit, live query for Run should surface its new caller helper:\n%s", out)
+	}
+
+	// Removing q.go retracts helper's edge — the next query no longer surfaces it.
+	remove(ctx, p2)
+	if out := query(ctx, "Run"); strings.Contains(out, "helper") {
+		t.Errorf("after removing q.go, live query for Run should drop caller helper:\n%s", out)
 	}
 
 	// An unknown symbol renders the empty form, not a crash.

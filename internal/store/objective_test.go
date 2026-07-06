@@ -13,8 +13,9 @@ import (
 )
 
 // TestObjectiveRoundTrip proves a standing objective round-trips through the typed
-// *Store methods with every field preserved (enabled flag, MinPeriod as a Duration,
-// LastRun as a UTC instant), and that PutObjective is an upsert by ID.
+// *Store methods with every field preserved (enabled flag, MinPeriod/RetryPeriod as
+// Durations, LastRun/LastSuccess as UTC instants), and that PutObjective is an upsert
+// by ID.
 func TestObjectiveRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s, err := store.Open(filepath.Join(t.TempDir(), "obj.db"))
@@ -24,13 +25,16 @@ func TestObjectiveRoundTrip(t *testing.T) {
 	t.Cleanup(func() { s.Close() })
 
 	last := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	success := time.Date(2026, 6, 26, 8, 30, 0, 0, time.UTC)
 	want := objective.Objective{
-		ID:        "keep-ci-green",
-		Goal:      "keep CI green",
-		Priority:  10,
-		Enabled:   true,
-		MinPeriod: 6 * time.Hour,
-		LastRun:   last,
+		ID:          "keep-ci-green",
+		Goal:        "keep CI green",
+		Priority:    10,
+		Enabled:     true,
+		MinPeriod:   6 * time.Hour,
+		RetryPeriod: 30 * time.Minute,
+		LastRun:     last,
+		LastSuccess: success,
 	}
 	if err := s.PutObjective(ctx, want); err != nil {
 		t.Fatalf("put: %v", err)
@@ -40,7 +44,9 @@ func TestObjectiveRoundTrip(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	if got.ID != want.ID || got.Goal != want.Goal || got.Priority != want.Priority ||
-		got.Enabled != want.Enabled || got.MinPeriod != want.MinPeriod || !got.LastRun.Equal(last) {
+		got.Enabled != want.Enabled || got.MinPeriod != want.MinPeriod ||
+		got.RetryPeriod != want.RetryPeriod || !got.LastRun.Equal(last) ||
+		!got.LastSuccess.Equal(success) {
 		t.Errorf("round-trip mismatch:\n got %+v\nwant %+v", got, want)
 	}
 
@@ -197,21 +203,21 @@ func TestObjectiveStoreSatisfiesLeafSeam(t *testing.T) {
 		t.Errorf("NextIdle selected %q, want high", sel.ID)
 	}
 
-	// MarkRun advances LastRun through the store; with a MinPeriod it debounces.
+	// MarkAttempt advances LastRun through the store; with a MinPeriod it debounces.
 	if err := backlog.Put(ctx, objective.Objective{ID: "high", Goal: "g", Priority: 9, Enabled: true, MinPeriod: time.Hour}); err != nil {
 		t.Fatalf("put high w/ period: %v", err)
 	}
-	if err := backlog.MarkRun(ctx, "high", now); err != nil {
-		t.Fatalf("mark run: %v", err)
+	if err := backlog.MarkAttempt(ctx, "high", now); err != nil {
+		t.Fatalf("mark attempt: %v", err)
 	}
 	got, _ := s.GetObjective(ctx, "high")
 	if !got.LastRun.Equal(now) {
-		t.Errorf("MarkRun did not persist LastRun: %v", got.LastRun)
+		t.Errorf("MarkAttempt did not persist LastRun: %v", got.LastRun)
 	}
 	// Now "high" is debounced; "low" (no period) becomes the selection.
 	sel, ok, _ = backlog.NextIdle(ctx, now)
 	if !ok || sel.ID != "low" {
-		t.Errorf("after MarkRun, NextIdle = %q ok=%v, want low", sel.ID, ok)
+		t.Errorf("after MarkAttempt, NextIdle = %q ok=%v, want low", sel.ID, ok)
 	}
 }
 

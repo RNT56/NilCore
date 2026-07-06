@@ -12,7 +12,7 @@ package main
 // Usage:
 //
 //	nilcore objective list
-//	nilcore objective add -id keep-ci-green -goal "keep CI green" [-priority 10] [-period 24h]
+//	nilcore objective add -id keep-ci-green -goal "keep CI green" [-priority 10] [-period 24h] [-retry-period 1h]
 //	nilcore objective disable <id>
 //	nilcore objective enable <id>
 
@@ -60,7 +60,7 @@ func objectiveMain(args []string) {
 
 func objectiveUsage() {
 	fmt.Fprintln(os.Stderr, "usage: nilcore objective <list | add | disable <id> | enable <id>>\n"+
-		"  add: nilcore objective add -id <id> -goal \"<text>\" [-priority N] [-period 24h]")
+		"  add: nilcore objective add -id <id> -goal \"<text>\" [-priority N] [-period 24h] [-retry-period 1h]")
 }
 
 // openObjectiveStore opens the same durable store the rest of the persistence backbone
@@ -92,8 +92,12 @@ func runObjectiveList(ctx context.Context, s *store.Store) {
 		if !o.LastRun.IsZero() {
 			last = o.LastRun.UTC().Format("2006-01-02T15:04:05Z")
 		}
-		fmt.Fprintf(os.Stdout, "  %-24s [%s] priority=%d period=%s last_run=%s\n    goal: %s\n",
-			o.ID, state, o.Priority, o.MinPeriod, last, o.Goal)
+		success := "never"
+		if !o.LastSuccess.IsZero() {
+			success = o.LastSuccess.UTC().Format("2006-01-02T15:04:05Z")
+		}
+		fmt.Fprintf(os.Stdout, "  %-24s [%s] priority=%d period=%s retry=%s last_run=%s last_success=%s\n    goal: %s\n",
+			o.ID, state, o.Priority, o.MinPeriod, o.RetryPeriod, last, success, o.Goal)
 	}
 }
 
@@ -103,18 +107,21 @@ func runObjectiveAdd(ctx context.Context, s *store.Store, args []string) {
 	id := fs.String("id", "", "stable objective id (required)")
 	goal := fs.String("goal", "", "operator-authored goal text (required)")
 	priority := fs.Int("priority", 0, "higher runs first among due objectives")
-	period := fs.Duration("period", 0, "minimum spacing between runs (e.g. 24h; 0 = always due once enabled)")
+	period := fs.Duration("period", 0, "minimum spacing between SUCCESSFUL runs (e.g. 24h; 0 = always due once enabled)")
+	retryPeriod := fs.Duration("retry-period", 0, "shorter spacing after an unverified run (e.g. 1h; 0 = fall back to -period)")
 	_ = fs.Parse(args)
 	if *id == "" || *goal == "" {
 		fmt.Fprintln(os.Stderr, "objective add: -id and -goal are required")
 		os.Exit(2)
 	}
 	if err := s.PutObjective(ctx, objective.Objective{
-		ID: *id, Goal: *goal, Priority: *priority, Enabled: true, MinPeriod: *period,
+		ID: *id, Goal: *goal, Priority: *priority, Enabled: true,
+		MinPeriod: *period, RetryPeriod: *retryPeriod,
 	}); err != nil {
 		fatal(err)
 	}
-	fmt.Fprintf(os.Stdout, "added objective %q (priority %d, period %s, enabled)\n", *id, *priority, *period)
+	fmt.Fprintf(os.Stdout, "added objective %q (priority %d, period %s, retry-period %s, enabled)\n",
+		*id, *priority, *period, *retryPeriod)
 }
 
 // runObjectiveSetEnabled disables (pauses) or re-enables an objective by id. A disabled

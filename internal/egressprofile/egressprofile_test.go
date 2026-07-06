@@ -3,6 +3,7 @@ package egressprofile
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -259,6 +260,38 @@ func TestLoadFile(t *testing.T) {
 		}
 		if errors.Is(err, ErrFileNotFound) {
 			t.Fatalf("malformed JSON should not be ErrFileNotFound: %v", err)
+		}
+	})
+
+	t.Run("unsupported schema_version fails closed", func(t *testing.T) {
+		p := filepath.Join(dir, "future.json")
+		// A version the current build cannot read (fileSchemaVersion+1). It must be
+		// refused loudly, never misread as a valid allowlist.
+		body := fmt.Sprintf(`{"schema_version":%d,"allow":["evil.example.com"]}`, fileSchemaVersion+1)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		eg, err := LoadFile(p)
+		if !errors.Is(err, ErrUnsupportedSchema) {
+			t.Fatalf("LoadFile of unsupported schema = %v, want ErrUnsupportedSchema", err)
+		}
+		if len(eg.Allowed) != 0 {
+			t.Fatalf("fail-closed: unsupported schema must yield no hosts, got %v", eg.Allowed)
+		}
+	})
+
+	t.Run("absent schema_version accepted as current (back-compat)", func(t *testing.T) {
+		p := filepath.Join(dir, "noversion.json")
+		// A pre-versioning file carried no schema_version; it must still load.
+		if err := os.WriteFile(p, []byte(`{"allow":["a.com"]}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		eg, err := LoadFile(p)
+		if err != nil {
+			t.Fatalf("LoadFile of version-less file: %v", err)
+		}
+		if !reflect.DeepEqual(eg.Allowed, []string{"a.com"}) {
+			t.Fatalf("Allowed = %v, want [a.com]", eg.Allowed)
 		}
 	})
 }

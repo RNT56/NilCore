@@ -237,12 +237,17 @@ func desktopMain(args []string) {
 	// Path B (default) advertises our generic `computer` tool; Path A (-native /
 	// NILCORE_COMPUTER_NATIVE) advertises Anthropic's native `computer` beta tool,
 	// translating its actions to the SAME driver. Both share the governed body.
+	// The console approver (also the Rule-of-Two / host-control session gate above) is the
+	// per-action irreversible gate: the computer tool routes a delete/pay/accept-terms
+	// click, or an Enter-to-submit on such a dialog, through it (deny-default headless),
+	// symmetric with the browse tier. Without it, an irreversible desktop action would
+	// only be checked by the prompt + the one-time session gate.
 	var computer tools.Tool
 	if native {
-		computer = &desktopagent.NativeComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log)}
+		computer = &desktopagent.NativeComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver}
 		fmt.Fprintln(os.Stderr, "nilcore desktop: Path A (native Anthropic computer tool) enabled — pixel-mode, vendor-locked to Anthropic for this run.")
 	} else {
-		computer = &desktopagent.ComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log)}
+		computer = &desktopagent.ComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver}
 	}
 	reg := computerToolRegistry(computer, *df.readRepo)
 

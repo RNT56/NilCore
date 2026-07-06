@@ -21,7 +21,7 @@ package main
 //
 // It mirrors the inspect/health dispatch: a new subcommand off main's switch, no
 // new event kinds (purely a reader — I5), default subcommands byte-identical. The
-// command logic lives in runReport so the exit-code/banner behavior is unit-
+// command logic lives in runSwarmReport so the exit-code/banner behavior is unit-
 // testable without capturing os.Exit; reportMain only wires stdout + the exit.
 
 import (
@@ -80,14 +80,6 @@ func reportMain(args []string) {
 	if exit != 0 {
 		os.Exit(exit)
 	}
-}
-
-// runReport is the ORIGINAL single-run command core (P11-T33), preserved with its
-// exact pre-Phase-12 signature so existing callers and the existing report tests
-// compile and behave byte-identically. It is the no-swarm-dir case of runSwarmReport
-// (dir=""), which for text/md/html takes the legacy ReplayReport path verbatim.
-func runReport(logPath, root, format, runOverride, reportOut string, st termui.Style) (string, int, error) {
-	return runSwarmReport(logPath, root, "", format, runOverride, reportOut, st)
 }
 
 // runSwarmReport is the pure command core (SW-T16, extending P11-T33), separated from

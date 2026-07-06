@@ -37,7 +37,7 @@ func TestHelperMCPServer(t *testing.T) {
 	}
 }
 
-// TestCallEndToEnd drives a real Call through Spawn → Initialize → CallTool over a
+// TestCallEndToEnd drives a real Call through connect → Initialize → CallTool over a
 // subprocess's stdio, exercising the processRW bridge end to end.
 func TestCallEndToEnd(t *testing.T) {
 	t.Setenv("NILCORE_MCP_MOCK", "1") // the spawned child inherits this and acts as the server
@@ -80,11 +80,11 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
-func TestSpawnGracefulFailure(t *testing.T) {
-	if _, _, err := Spawn(context.Background(), ServerSpec{Name: "x"}); err == nil {
+func TestConnectGracefulFailure(t *testing.T) {
+	if _, _, err := connect(context.Background(), ServerSpec{Name: "x"}); err == nil {
 		t.Error("empty command must error")
 	}
-	if _, _, err := Spawn(context.Background(), ServerSpec{Name: "x", Command: []string{"nilcore-no-such-mcp-xyz"}}); err == nil {
+	if _, _, err := connect(context.Background(), ServerSpec{Name: "x", Command: []string{"nilcore-no-such-mcp-xyz"}}); err == nil {
 		t.Error("missing binary must error, not hang")
 	}
 }

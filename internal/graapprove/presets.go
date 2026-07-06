@@ -76,20 +76,24 @@ func Preset(name string) (Envelope, error) {
 		// prod* is always denied — both via Environments allowlisting staging only
 		// and the structural prod* deny in the graded scope check.
 		//
-		// The Deploy $/day CEILING is 5, aligned with the tightest+standard production
-		// blast presets (cmd/nilcore/blast.go: tight $1, standard $5) so it is an
-		// ATTAINABLE envelope, not dead weight above the runtime fence. MaxDollarsDay is a
-		// per-UTC-day CEILING on the ACTUAL auto-approved-dollar total for this class — NOT
-		// the cost charged per action. The graded gate charges each action its OWN cost
-		// (perActionCost — $0 today, since no GateAction field carries a per-action figure)
-		// against the per-day total, and when a blast budget is present routes the same
-		// charge through it, so the effective ceiling is min(this ceiling, the blast day
-		// budget). Trusted-preset Deploy is therefore reachable under a real
-		// `-blast-radius standard` run AND under the DEFAULT `-blast-radius off` (nil meter),
-		// where the clause's own MaxDollarsDay bounds the day total in-process. The prior bug
-		// charged the run ledger's CUMULATIVE spend (Evidence.SpentUSD) as this action's
-		// cost, which — under the default off path — denied every action once the run had
-		// spent any money; charging the action's own cost (0 today) fixes reachability.
+		// DORMANT until a deploy flow exists (docs/ROADMAP-DEPLOY.md). This deploy clause is
+		// tested scaffolding, NOT a currently-reachable path: no production code constructs a
+		// policy.GateAction{Type: Deploy}, so the graded gate's Deploy branch never fires in a
+		// real run today (a `-blast-radius standard` run does not create one — the only gated
+		// action the swarm/build paths emit is PromoteToBase). It is kept so the earned-trust +
+		// Environments-allowlist mechanism is ready the moment the roadmapped deploy flow lands
+		// and starts constructing Deploy GateActions; the graded.go Deploy branch carries the
+		// matching note.
+		//
+		// When that flow arrives, MaxDollarsDay is a per-UTC-day CEILING on the ACTUAL
+		// auto-approved-dollar total for this class — NOT the cost charged per action. The
+		// graded gate charges each action its OWN cost (perActionCost — $0 today, since no
+		// GateAction field carries a per-action figure) against the per-day total, and when a
+		// blast budget is present routes the same charge through it, so the effective ceiling is
+		// min(this ceiling, the blast day budget). The $/day CEILING of 5 is aligned with the
+		// standard production blast preset (cmd/nilcore/blast.go: tight $1, standard $5) so the
+		// envelope is ATTAINABLE — not dead weight above the runtime fence — once deploy actions
+		// flow through it.
 		return Envelope{Classes: []ClassClause{
 			{
 				Type:          "open-pr",
@@ -120,7 +124,7 @@ func Preset(name string) (Envelope, error) {
 				MinSample:     20,
 				RecencyDays:   7,
 				MaxPerDay:     2,
-				MaxDollarsDay: 5, // attainable within `-blast-radius standard` ($5/day); see comment above
+				MaxDollarsDay: 5, // dormant until ROADMAP-DEPLOY deploy flow; then attainable within `-blast-radius standard` ($5/day)
 			},
 			{
 				// Self-acceptance binding, trusted tier: a higher bar than `standard`.

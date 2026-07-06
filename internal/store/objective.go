@@ -28,21 +28,25 @@ import (
 )
 
 // PutObjective inserts or replaces a standing objective by ID. Enabled is stored as
-// 0/1, MinPeriod as nanoseconds, LastRun as RFC3339Nano UTC (” for the zero time so
-// a never-run objective round-trips to a zero Time). The whole record is carried
-// verbatim — this satisfies objective.Store.Put.
+// 0/1, MinPeriod/RetryPeriod as nanoseconds, LastRun/LastSuccess as RFC3339Nano UTC
+// (” for the zero time so a never-run objective round-trips to a zero Time). The whole
+// record is carried verbatim — this satisfies objective.Store.Put. The full success-
+// cadence state (RetryPeriod + LastSuccess) persists here so the daemon's MarkSuccess/
+// MarkAttempt survive a restart and gate the next pull exactly as they did in-process.
 func (s *Store) PutObjective(ctx context.Context, o objective.Objective) error {
 	enabled := 0
 	if o.Enabled {
 		enabled = 1
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO objectives (id, goal, priority, enabled, min_period_ns, last_run)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO objectives (id, goal, priority, enabled, min_period_ns, retry_period_ns, last_run, last_success)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		     goal=excluded.goal, priority=excluded.priority, enabled=excluded.enabled,
-		     min_period_ns=excluded.min_period_ns, last_run=excluded.last_run`,
-		o.ID, o.Goal, o.Priority, enabled, int64(o.MinPeriod), formatTS(o.LastRun))
+		     min_period_ns=excluded.min_period_ns, retry_period_ns=excluded.retry_period_ns,
+		     last_run=excluded.last_run, last_success=excluded.last_success`,
+		o.ID, o.Goal, o.Priority, enabled, int64(o.MinPeriod), int64(o.RetryPeriod),
+		formatTS(o.LastRun), formatTS(o.LastSuccess))
 	if err != nil {
 		return fmt.Errorf("put objective %q: %w", o.ID, err)
 	}
@@ -55,11 +59,12 @@ func (s *Store) PutObjective(ctx context.Context, o objective.Objective) error {
 func (s *Store) GetObjective(ctx context.Context, id string) (objective.Objective, error) {
 	var o objective.Objective
 	var enabled int
-	var minPeriodNS int64
-	var lastRun string
+	var minPeriodNS, retryPeriodNS int64
+	var lastRun, lastSuccess string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, goal, priority, enabled, min_period_ns, last_run FROM objectives WHERE id = ?`, id).
-		Scan(&o.ID, &o.Goal, &o.Priority, &enabled, &minPeriodNS, &lastRun)
+		`SELECT id, goal, priority, enabled, min_period_ns, retry_period_ns, last_run, last_success
+		 FROM objectives WHERE id = ?`, id).
+		Scan(&o.ID, &o.Goal, &o.Priority, &enabled, &minPeriodNS, &retryPeriodNS, &lastRun, &lastSuccess)
 	if err == sql.ErrNoRows {
 		return objective.Objective{}, fmt.Errorf("get objective %q: %w", id, objective.ErrNotFound)
 	}
@@ -68,7 +73,9 @@ func (s *Store) GetObjective(ctx context.Context, id string) (objective.Objectiv
 	}
 	o.Enabled = enabled != 0
 	o.MinPeriod = time.Duration(minPeriodNS)
+	o.RetryPeriod = time.Duration(retryPeriodNS)
 	o.LastRun = parseTS(lastRun)
+	o.LastSuccess = parseTS(lastSuccess)
 	return o, nil
 }
 
@@ -78,7 +85,7 @@ func (s *Store) GetObjective(ctx context.Context, id string) (objective.Objectiv
 // and no error. This satisfies objective.Store.List.
 func (s *Store) ListObjectives(ctx context.Context) ([]objective.Objective, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, goal, priority, enabled, min_period_ns, last_run
+		`SELECT id, goal, priority, enabled, min_period_ns, retry_period_ns, last_run, last_success
 		 FROM objectives ORDER BY priority DESC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list objectives: %w", err)
@@ -88,17 +95,43 @@ func (s *Store) ListObjectives(ctx context.Context) ([]objective.Objective, erro
 	for rows.Next() {
 		var o objective.Objective
 		var enabled int
-		var minPeriodNS int64
-		var lastRun string
-		if err := rows.Scan(&o.ID, &o.Goal, &o.Priority, &enabled, &minPeriodNS, &lastRun); err != nil {
+		var minPeriodNS, retryPeriodNS int64
+		var lastRun, lastSuccess string
+		if err := rows.Scan(&o.ID, &o.Goal, &o.Priority, &enabled, &minPeriodNS, &retryPeriodNS, &lastRun, &lastSuccess); err != nil {
 			return nil, fmt.Errorf("scan objective: %w", err)
 		}
 		o.Enabled = enabled != 0
 		o.MinPeriod = time.Duration(minPeriodNS)
+		o.RetryPeriod = time.Duration(retryPeriodNS)
 		o.LastRun = parseTS(lastRun)
+		o.LastSuccess = parseTS(lastSuccess)
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// migrateObjectiveCadence adds the retry_period_ns and last_success columns to a DB
+// created before the success-aware retry cadence existed. Additive and idempotent —
+// guarded by hasColumn because SQLite's ALTER TABLE ADD COLUMN has no IF NOT EXISTS
+// form — so Open is safe every start and safe on a legacy DB. A fresh DB already has
+// both columns (schema.sql), so this is a no-op there. Store.migrate must call this so
+// PutObjective/GetObjective/ListObjectives can always read/write the two columns.
+func (s *Store) migrateObjectiveCadence(ctx context.Context) error {
+	for col, ddl := range map[string]string{
+		"retry_period_ns": `ALTER TABLE objectives ADD COLUMN retry_period_ns INTEGER NOT NULL DEFAULT 0`,
+		"last_success":    `ALTER TABLE objectives ADD COLUMN last_success TEXT NOT NULL DEFAULT ''`,
+	} {
+		has, err := s.hasColumn(ctx, "objectives", col)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+				return fmt.Errorf("add objectives.%s: %w", col, err)
+			}
+		}
+	}
+	return nil
 }
 
 // DisableObjective marks the objective inert (paused, not deleted) by clearing its

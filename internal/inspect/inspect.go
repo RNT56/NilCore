@@ -10,8 +10,11 @@ package inspect
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"nilcore/internal/eventlog"
 )
@@ -46,26 +49,32 @@ func Replay(path string) (Summary, error) {
 	s := Summary{ByKind: map[string]int{}}
 	seen := map[string]bool{}
 
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for n := 1; sc.Scan(); n++ {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+	// Stream with a bufio.Reader (not bufio.Scanner) so there is NO fixed per-line
+	// cap: eventlog's own reader/Verify use os.ReadFile + strings.Split and impose no
+	// line-length limit, so a valid long event line the hash chain accepts must not be
+	// rejected here. ReadString grows its buffer to whatever a single line needs.
+	r := bufio.NewReader(f)
+	for n := 1; ; n++ {
+		line, rerr := r.ReadString('\n')
+		trimmed := strings.TrimRight(line, "\n")
+		if len(trimmed) > 0 {
+			var e event
+			if err := json.Unmarshal([]byte(trimmed), &e); err != nil {
+				return Summary{}, fmt.Errorf("event %d: parsing line: %w", n, err)
+			}
+			s.Total++
+			s.ByKind[e.Kind]++
+			if e.Task != "" && !seen[e.Task] {
+				seen[e.Task] = true
+				s.Tasks = append(s.Tasks, e.Task)
+			}
 		}
-		var e event
-		if err := json.Unmarshal(line, &e); err != nil {
-			return Summary{}, fmt.Errorf("event %d: parsing line: %w", n, err)
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			return Summary{}, fmt.Errorf("reading event log: %w", rerr)
 		}
-		s.Total++
-		s.ByKind[e.Kind]++
-		if e.Task != "" && !seen[e.Task] {
-			seen[e.Task] = true
-			s.Tasks = append(s.Tasks, e.Task)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return Summary{}, fmt.Errorf("reading event log: %w", err)
 	}
 
 	// Chain integrity is the eventlog package's call, not ours: a parseable log

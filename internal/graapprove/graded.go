@@ -181,6 +181,13 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		g.emitDeny("out_of_scope", typ, scope, nil)
 		return g.fallThrough(a)
 	}
+	// Deploy branch: DORMANT until a deploy flow constructs a policy.GateAction{Type:
+	// Deploy} (docs/ROADMAP-DEPLOY.md). No production code emits one today, so this arm is
+	// never reached in a real run — the only gated action the live paths produce is
+	// PromoteToBase. It is kept (with the matching trusted-preset deploy clause in
+	// presets.go) as tested scaffolding so the Environments allowlist is enforced the moment
+	// the roadmapped deploy flow lands: a Deploy is auto-approved only into an env the
+	// clause explicitly allowlists (staging), never a bare/absent Environments set.
 	if a.Type == policy.Deploy {
 		if len(clause.Environments) == 0 || !matchAny(scope, clause.Environments) {
 			g.emitDeny("out_of_scope", typ, scope, map[string]any{"environment": scope})

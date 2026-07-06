@@ -832,8 +832,7 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 			c.deps.log, defaultShardMaxSteps, nil, c.repo, c.deps.boot.cfg)
 		bres, rerr := be.Run(ctx, task)
 		if rerr != nil {
-			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
-				Err: fmt.Errorf("swarm shard: delegated backend: %w", rerr)})
+			return c.recordFail(s, c.classifyWorkerErr(ctx, s, fmt.Errorf("swarm shard: delegated backend: %w", rerr)))
 		}
 		workerSummary = bres.Summary
 	} else {
@@ -849,8 +848,7 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		worker := roster.NewWorker(prof, env.Box, gov, c.deps.log, c.pool.WorkerFor(s.ID), nil)
 		wres, rerr := worker.Run(ctx, task)
 		if rerr != nil {
-			return c.recordFail(s, spawn.Result{ID: s.ID, State: spawn.StateFailed,
-				Err: fmt.Errorf("swarm shard: worker: %w", rerr)})
+			return c.recordFail(s, c.classifyWorkerErr(ctx, s, fmt.Errorf("swarm shard: worker: %w", rerr)))
 		}
 		workerSummary = wres.Summary
 	}
@@ -875,7 +873,11 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		if verr != nil {
 			res.Err = fmt.Errorf("swarm shard: verify: %w", verr)
 		}
-		return c.recordFail(s, res)
+		// A verify-failed shard still wrote a verdict-overwritten artifact; record the
+		// governing RED claim's trusted provenance from it (recordFail's nil path is for
+		// early backend/setup fails that produced no artifact).
+		c.recordVerdict(s, false, readTrustedArtifact(wt.Path()))
+		return res
 	}
 
 	// Green: the artifact is already collated above. On a code preset, commit the
@@ -909,7 +911,9 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 	if as := readVerifiedArtifact(wt.Path()); as != nil {
 		res.Artifact = as
 	}
-	c.recordVerdict(s, true)
+	// recordVerdict needs the full artifact (verifier-set Verifier/SourceURL for the
+	// board's trusted provenance), which the flat res.Artifact summary drops — re-read it.
+	c.recordVerdict(s, true, readTrustedArtifact(wt.Path()))
 	return res
 }
 
@@ -936,16 +940,72 @@ func (c *shardContext) shardGoal(s swarm.Shard) string {
 		s.Goal, c.deliverable.kind, s.ID, s.ID)
 }
 
-// recordFail folds a failed shard verdict into the board and returns the Result.
-func (c *shardContext) recordFail(s swarm.Shard, res spawn.Result) spawn.Result {
-	c.recordVerdict(s, false)
+// classifyWorkerErr builds the failed Result for a worker/backend error, running the
+// error through swarm.ClassifyCeiling so a budget.ErrCeiling caught at the SHARD
+// boundary is attributed to the per-shard ceiling vs the global wall. This is the
+// single mechanism SWARM.md names for that decision: the global rail stays owned by the
+// Controller's non-recording globalBudgetExhausted probe (it stops the whole run at the
+// next pass top), so here we only ANNOTATE the shard's failure with the classified
+// scope — a per-shard exhaustion is the shard's own ceiling (fail this shard, the run
+// continues), a global exhaustion is the wall (this shard fails; the Controller stops
+// the run). A non-ceiling error classifies to ScopeNone and rides through unchanged.
+// The scope key is the pool's canonical per-shard ledger scope so the probe charges the
+// exact key SetShardCeiling armed.
+func (c *shardContext) classifyWorkerErr(ctx context.Context, s swarm.Shard, err error) spawn.Result {
+	res := spawn.Result{ID: s.ID, State: spawn.StateFailed, Err: err}
+	switch swarm.ClassifyCeiling(ctx, c.ledger, c.pool.Scope(s.ID), err) {
+	case swarm.ScopeShard:
+		res.Err = fmt.Errorf("per-shard budget exhausted: %w", err)
+	case swarm.ScopeGlobal:
+		res.Err = fmt.Errorf("global budget ceiling exhausted (run will stop): %w", err)
+	}
 	return res
 }
 
+// recordFail folds a failed shard verdict into the board and returns the Result. An
+// early fail (backend/setup error) has no verdict-overwritten artifact to project, so it
+// records the fail with a nil trusted projection; the artifact-bearing red path
+// (verify failure) reads the full artifact from the worktree and calls recordVerdict
+// directly (see the shard closure) so the governing red claim's provenance surfaces.
+func (c *shardContext) recordFail(s swarm.Shard, res spawn.Result) spawn.Result {
+	c.recordVerdict(s, false, nil)
+	return res
+}
+
+// readTrustedArtifact re-reads the single verdict-overwritten artifact from a shard's
+// worktree as a full *artifact.Artifact, for the I7-safe swarm.ProjectTrusted projection
+// (which needs the verifier-set Verifier/SourceURL that the flat spawn.ArtifactSummary
+// deliberately drops). Fail-closed: no / unparseable artifact yields nil, and recordVerdict
+// then leaves the board row's provenance unset. The read goes through artifact.Read
+// (worktreefs O_NOFOLLOW), so a symlink at the target is refused rather than followed (I4).
+func readTrustedArtifact(root string) *artifact.Artifact {
+	paths := artifactFiles(root)
+	if len(paths) == 0 {
+		return nil
+	}
+	a, err := artifact.Read(root, artifactID(paths[0]))
+	if err != nil {
+		return nil
+	}
+	return a
+}
+
 // recordVerdict feeds the board the verifier verdict for one shard (the ONLY input
-// that moves the pass/fail tally — I2), keyed by the shard's pass (Attempt+1).
-func (c *shardContext) recordVerdict(s swarm.Shard, passed bool) {
-	c.board.Record(board.ShardOutcome{ID: s.ID, Pass: s.Attempt + 1, Passed: passed})
+// that moves the pass/fail tally — I2), keyed by the shard's pass (Attempt+1). When an
+// artifact is present it is run through swarm.ProjectTrusted — the I7 guard that carries
+// ONLY the verifier-set Status/Verifier and the key-free SourceURL, NEVER the
+// model-authored Value/Statement — and the governing claim's trusted provenance is
+// surfaced on the board's trace projection. Using ProjectTrusted (rather than reading
+// claim fields ad hoc here) is what makes the "no model Value reaches the scoreboard"
+// property structural: the projection has no field to hold a Value.
+func (c *shardContext) recordVerdict(s swarm.Shard, passed bool, a *artifact.Artifact) {
+	o := board.ShardOutcome{ID: s.ID, Pass: s.Attempt + 1, Passed: passed}
+	if gc, ok := swarm.GoverningTrustedClaim(swarm.ProjectTrusted(a)); ok {
+		o.Verifier = gc.Verifier
+		o.Status = string(gc.Status)
+		o.SourceURL = gc.SourceURL
+	}
+	c.board.Record(o)
 }
 
 // collateArtifact copies the verdict-overwritten artifact for shard `id` from its
