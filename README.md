@@ -5,13 +5,13 @@
 ### The tiny, trustworthy coding agent.
 
 **The harness is small. The model is the engine.**
-NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~75,000 lines of Go** (a ~8k single‑task core you can read in an afternoon; everything else is opt‑in layers over it): the single‑task loop, an opt‑in **multi‑agent supervisor** that builds whole projects, a **verified swarm** that fans hundreds of agents at a problem, and a recursive **decompose** that splits a goal and merges the verified pieces back — all collapsed onto **one orchestration kernel**, so you don't pick a machine: **you just talk, and `nilcore` routes the goal** to the cheapest one that fits. It treats code as one **verifiable artifact** among many — reports, comparison matrices, audits, benchmarks, research dossiers — each carrying claims a verifier re‑checks in the sandbox. It can **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read **19 languages** (Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · Kotlin · Swift · …), and start work from a webhook or a schedule. And it **closes the loop on its own evidence** — learning from its verified-or-failed trace which backend to trust, what to recheck, and (opt‑in, fenced, never on `main`) what it may auto‑approve. Hardened by three disciplines and seven invariants it never breaks.
+NilCore borrows intelligence instead of re‑encoding it — so the whole agent is **~87,000 lines of Go** (a ~8k single‑task core you can read in an afternoon; everything else is opt‑in layers over it): the single‑task loop, an opt‑in **multi‑agent supervisor** that builds whole projects, a **verified swarm** that fans hundreds of agents at a problem, and a recursive **decompose** that splits a goal and merges the verified pieces back — all collapsed onto **one orchestration kernel**, so you don't pick a machine: **you just talk, and `nilcore` routes the goal** to the cheapest one that fits. It treats code as one **verifiable artifact** among many — reports, comparison matrices, audits, benchmarks, research dossiers — each carrying claims a verifier re‑checks in the sandbox. It can **see the running app** through a sandboxed browser — even driving a flow (log in, submit a form) before it observes — search code semantically, read **19 languages** (Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · Kotlin · Swift · …), and start work from a webhook or a schedule. And it **closes the loop on its own evidence** — learning from its verified-or-failed trace which backend to trust, what to recheck, and (opt‑in, fenced, never on `main`) what it may auto‑approve. Hardened by three disciplines and seven invariants it never breaks.
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
-[![Agent size](https://img.shields.io/badge/agent-~75k%20LOC-1f6feb)](#the-receipts)
+[![Agent size](https://img.shields.io/badge/agent-~87k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
 
 </div>
@@ -36,7 +36,7 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"It said it was done. It wasn't."** | The **verifier is the only authority on done.** After *any* backend runs, your project's own build/test/lint re‑runs and that verdict ships the work — a self‑report never does. |
 | **"Tests pass, but does the app actually *work*?"** | NilCore can **see the running app.** A sandboxed headless browser (`browser_view` + a pure‑Go `nilcore-browser` driver baked into the image) navigates your app — and, given an `actions` script, first **drives a flow** (click / type / key / wait, e.g. log in or submit a form) over a pure‑Go CDP client — then hands the model a **screenshot as a multimodal image**; opt‑in via `NILCORE_BROWSER_VERIFY`, a composite verifier folds that behavioral check *into* the verdict, so the verifier stays the sole authority on done. *(The live browser run is CI‑only — no Chromium in hermetic unit tests — and the driver fails **closed** without a browser.)* |
 | **"It ran a destructive command / touched my host."** | **Every command the model emits runs in a container** (rootless, `cap-drop=ALL`, read‑only rootfs), destructive ones denylisted *before* execution. The model can't run an arbitrary program on your machine; its file edits are confined to a throwaway worktree. |
-| **"It leaked my API key."** | Secrets come from the **environment only**, are injected per‑run into the container, and are **never** written to disk, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
+| **"It leaked my API key."** | Secrets come from the **`SecretStore`** (env · OS keychain · encrypted‑file vault · external hook), are injected per‑run into the container, and are **never** written to disk in plaintext, put in a prompt, or logged — the audit log is hash‑chained *and* redacted. |
 | **"A fetched file/web page hijacked it."** | **Untrusted input is data, never instructions.** Tool output, files, and web content are fenced behind a boundary the model is told not to obey. |
 | **"It edited blindly without understanding my codebase."** | A real **code‑intelligence stack** — AST → call graph → PageRank repo‑map → semantic + LSP retrieval — hands the loop a minimal, structurally‑coherent context bundle *before* it touches a file. It reads **19 languages across 34 file extensions** — Go · Python · TS/JS · Rust · Java · C · C++ · C# · Ruby · PHP · Kotlin · Swift · Scala · Dart · Zig · Bash · Lua · Elixir · SQL (a pure‑Go parser seam — Go is precise via `go/parser`, the rest are broad, structural **heuristic line scanners**, no tree‑sitter; the `NILCORE_LSP_COMMAND` seam stays the precise lens where a server exists), and semantic search runs on a content‑hash‑cached, pure‑Go **HNSW** vector index — opt‑in via `NILCORE_EMBED_KEY`, with a lexical fallback that's byte‑identical when it's off. |
 | **"It can only fix one task, not *build the thing*."** | `nilcore build` is a **supervisor that spawns role‑specialized subagents** (research · understand · plan · implement · review), lets them **talk back and forth**, **integrates** their parallel worktrees into one **verifier‑green** tree, and **re‑plans to convergence** — greenfield included. It still writes code itself. |
@@ -45,9 +45,9 @@ Because most of them ask you to trust a black box. NilCore is built on the oppos
 | **"I want it to *react* — not just sit there waiting for me."** | **Event‑driven & scheduled autonomy.** `nilcore serve --webhook` turns an HMAC‑verified SCM/CI webhook into a trigger; `nilcore schedule` self‑starts on a cron/interval. Both route through the *same* reversible‑auto‑start / human‑gate machinery — headless means irreversible work deny‑defaults. |
 | **"Opening the PR is the part I don't trust it with."** | **Gated PR.** `nilcore watch --open-pr` / `schedule --open-pr` open a **draft** PR (via `internal/forge`) **only after the human gate** — the push runs inside the approved prepare step, the token comes from the SecretStore and is scrubbed from logs, and **the agent never merges.** The verified branch is preserved; default disposable cleanup is byte‑identical. |
 | **"I can't give it project‑specific marching orders."** | **Operator steering.** Drop a `NILCORE.md` / `AGENTS.md` and it loads as **trusted** instructions — the one deliberate, scoped exception to "untrusted input is data," bounded *below* the safety core: it can shape behavior but can't widen capability or bypass the gate or verifier. Wired into chat and run/build. |
-| **"I'm locked into one model vendor."** | One `Provider` seam, three adapters: **Anthropic, OpenAI, OpenRouter.** Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. And one `CodingBackend` seam, three backends: the **native loop, Codex, Claude Code** — and you don't have to pick: `-backend auto` lets the **system** choose the best *available* backend (the ones whose CLI + key are actually present on the host), seeded by your stated preference (`-prefer-backend` / `preferred_backend`) and re‑ordered as the verifier‑judged **Trust Ledger** learns which one wins on your codebase. Or `-backends auto` competes *all* available backends — racing them on a hard task and letting the verifier pick the winner (`nilcore trust` shows the scoreboard). No more hard‑defaulting to native as if it were best. |
+| **"I'm locked into one model vendor."** | One `Provider` seam: **Anthropic, OpenAI, OpenRouter, and any OpenAI‑compatible endpoint** (`openai-compatible` — vLLM · Ollama · Azure · Groq · self‑hosted). Model selection is `role → provider:model`. The cheap executor escalates to a strong advisor on demand. And one `CodingBackend` seam, three backends: the **native loop, Codex, Claude Code** — and you don't have to pick: `-backend auto` lets the **system** choose the best *available* backend (the ones whose CLI + key are actually present on the host), seeded by your stated preference (`-prefer-backend` / `preferred_backend`) and re‑ordered as the verifier‑judged **Trust Ledger** learns which one wins on your codebase. Or `-backends auto` competes *all* available backends — racing them on a hard task and letting the verifier pick the winner (`nilcore trust` shows the scoreboard). No more hard‑defaulting to native as if it were best. |
 | **"It forgets everything between tasks."** | **Cross‑project memory** (SQLite): conventions and decisions are retrieved into context at task start and written back after — deduped, never as instructions. |
-| **"The framework is too big to trust."** | The entire agent is **~75,000 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — built up from a **~8k single‑task core you can read in an afternoon**, with the multi‑agent layer, swarm, browser/desktop, code‑intel, closed‑loop autonomy, and the conversational front door as opt‑in layers over it (one orchestration kernel they all collapse onto). *Still exactly two:* the browser driver (incl. its pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, and forge are **all pure stdlib** — no module was added. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
+| **"The framework is too big to trust."** | The entire agent is **~87,000 lines of Go with two core dependencies** — pure‑Go SQLite, and `golang.org/x/sys` (Go's own extended stdlib) for the Linux namespace sandbox — built up from a **~8k single‑task core you can read in an afternoon**, with the multi‑agent layer, swarm, browser/desktop, code‑intel, closed‑loop autonomy, and the conversational front door as opt‑in layers over it (one orchestration kernel they all collapse onto). *Still exactly two:* the browser driver (incl. its pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, and forge are **all pure stdlib** — no module was added. If you can't read it end to end, it's too big. *(The optional full‑screen TUI — `make tui` — links the Charm stack under a build tag, so the default binary doesn't and `internal/` never imports it.)* |
 
 ---
 
@@ -243,7 +243,7 @@ All opt-in — the default binary stays dependency-light and the loop is **byte-
 | Plug-in | Turn it on with | What you get |
 |---|---|---|
 | **Skills** | A `SKILL.md` (frontmatter + instructions) in `~/.config/nilcore/skills/` (or `$NILCORE_SKILLS_DIR`) | Surfaces to the loop as a `skill_<name>` tool; unused skills cost **~zero context**. |
-| **MCP servers** | `{name, command}` (stdio) or `{name, url, headers}` (remote HTTP/SSE) entries in `mcp.json` | `nilcore` generates typed wrappers under `mcp/servers/`; the executor discovers them on demand and invokes the host-dispatched `mcp` tool — so MCP works on **every** sandbox tier, including the macOS container default. Resources + prompts are opt-in (`NILCORE_MCP_RESOURCES=1`). |
+| **MCP servers** | `{name, command}` (stdio) or `{name, url, headers}` (remote HTTP/SSE) entries in `mcp.json` — `headers` resolve `{{secret:NAME}}` / `{{env:NAME}}` placeholders host-side, so a bearer token stays out of `mcp.json` and never reaches the model | `nilcore` generates typed wrappers under a per-repo cache dir; the executor discovers them on demand and invokes the host-dispatched `mcp` tool — so MCP works on **every** sandbox tier, including the macOS container default. Resources + prompts are opt-in (`NILCORE_MCP_RESOURCES=1`). |
 | **LSP retrieval** | `NILCORE_LSP_COMMAND=gopls` (or any language server) | Compiler-grade **"precise"** retrieval. |
 | **Live index** | `NILCORE_LIVE_INDEX=1` | A worktree-aware, incrementally-updated `live` code-intelligence tool. |
 
@@ -252,7 +252,7 @@ All opt-in — the default binary stays dependency-light and the loop is **byte-
 Set `NILCORE_MODEL=provider:model` (default `claude-sonnet-4-6`):
 
 - **Bare name → Anthropic** — e.g. `claude-sonnet-4-6`.
-- **Other providers** — `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`.
+- **Other providers** — `openai:gpt-5.5`, `openrouter:meta-llama/llama-3.1-70b`, or `openai-compatible:<model>` for any OpenAI‑compatible endpoint (vLLM · Ollama · Azure · Groq · self‑hosted; base URL + auth from env).
 - **OpenRouter fusion** — `openrouter` or `openrouter:` with no model defaults to **`openrouter/fusion`**, a multi-model panel that fuses several frontier models into one answer (it bills the panel's *cumulative* cost).
 
 **Every step** is appended to a hash-chained `nilcore.events.jsonl` — read it to see exactly what the agent did and why. Plaintext secrets never hit disk, logs, or prompts; on a headless host they are sealed in an encrypted-file vault (AES-256-GCM, owner-only key).
@@ -284,7 +284,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 1. **One frozen backend contract** — `Run(ctx, Task) (Result, error)`. Native, Codex, Claude Code are interchangeable behind it.
 2. **The verifier is the only authority on "done."** A self‑report never governs.
-3. **No ambient authority.** Secrets via env only; never on disk, in logs, in prompts, or in code.
+3. **No ambient authority.** Secrets via the `SecretStore` (env · OS keychain · encrypted vault · external) — never in plaintext on disk, in logs, in prompts, or in code.
 4. **Model-emitted execution is sandboxed.** Shell commands and delegated CLIs run in the container; the structured file/git tools run host-side but stay confined to the worktree — the model can't run an arbitrary program on the host.
 5. **The audit log is append‑only** — hash‑chained, redacted, replayable. History is never mutated.
 6. **Zero‑dependency core** — standard library only; the sanctioned exceptions are pure‑Go SQLite, `golang.org/x/sys` (Go's own extended stdlib, for the Linux namespace sandbox), and the Charm TUI stack (behind `//go:build tui`, so the default binary links none). The MCP client is not a module — it's JSON‑RPC over the stdlib.
@@ -296,7 +296,7 @@ These hold in every commit. Break one and the change is rejected — no matter h
 
 ```mermaid
 flowchart TD
-    CLI[cmd/nilcore<br/>chat · do · run · build · swarm · decompose · serve · report · schedule · doctor] --> ROUTER[router<br/>do: goal → preset]
+    CLI[cmd/nilcore<br/>chat · do · build · swarm · decompose · serve · report · schedule · doctor] --> ROUTER[router<br/>do: goal → preset]
     ROUTER --> KERNEL[kernel<br/>one recursive Run · run/build/swarm/decompose presets]
     CLI --> KERNEL
     KERNEL --> AGENT[agent<br/>orchestrator + adaptive routing]
@@ -309,7 +309,7 @@ flowchart TD
     ARTIFACT --> VERIFY
     AGENT --> BK[backend<br/>native · codex · claude-code]
     AGENT --> WT[worktree<br/>disposable per task]
-    BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter · multimodal]
+    BK --> MODEL[model + provider<br/>Anthropic · OpenAI · OpenRouter · openai-compatible · multimodal]
     BK --> SANDBOX[sandbox<br/>hardened container + nilcore-browser]
     BK --> VERIFY[verify<br/>source of truth + browser behavioral check]
     AGENT --> POLICY[policy<br/>gate · egress · tool-call]
@@ -332,9 +332,9 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 
 | | |
 |--:|:--|
-| **~75,000** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent supervisor · conversational front door · verified swarm · recursive decompose · closed‑loop autonomy — all on one orchestration kernel) |
-| ~142,300 | lines including its tests (347 test files) |
-| **122** | small, single‑responsibility packages |
+| **~87,000** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent supervisor · conversational front door · verified swarm · recursive decompose · closed‑loop autonomy — all on one orchestration kernel) |
+| ~170,000 | lines including its tests (391 test files) |
+| **120** | small, single‑responsibility packages |
 | **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, forge, the provider pool, the swarm runner, and the orchestration kernel + router are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
 | **Phases 0–16** | shipped — incl. the **unified orchestration kernel** (`run`/`build`/`swarm`/`decompose` collapse onto one recursive engine; `nilcore do` routes the goal), **closed‑loop autonomy** (trust‑routing, learned lessons + verify‑cache, a verified self‑improvement flywheel, and graduated auto‑approval fenced by a blast‑budget — opt‑in, never on `main`), the **verifier‑backed artifact factory**, and **verified swarm mode**, atop behavioral browser verification, semantic (HNSW) + multi‑language (**19 languages** / 34 extensions) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |
@@ -346,10 +346,10 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 ## What's inside
 
 ```text
-cmd/nilcore/           chat · do · run · build · swarm · decompose · tui · init · serve · schedule · watch · browse · desktop · report · trust · trace · experience · capability · lessons · flywheel · objective · auto-approvals · inspect · registry · propose-edit · mcp-call · doctor · config · secret · version
-cmd/tools/nilcore-browser   pure-Go headless-browser driver baked into the sandbox image
+cmd/nilcore/           chat · do · build · swarm · decompose · tui · init · serve · schedule · watch · browse · desktop · report · trust · trace · experience · capability · lessons · flywheel · selfacc · objective · auto-approvals · inspect · registry · propose-edit · mcp-call · doctor · config · secret · version   (single-task run is the flag form: nilcore -goal …)
+cmd/tools/             nilcore-browser (pure-Go headless-browser driver) · nilcore-desktop[-darwin] (computer-use drivers) — baked into the sandbox/host images
 internal/
-  model, provider      canonical message format (+ multimodal image block) + Anthropic/OpenAI/OpenRouter
+  model, provider      canonical message format (+ multimodal image block) + Anthropic/OpenAI/OpenRouter/openai-compatible
   backend              CodingBackend contract + native / codex / claude-code
   sandbox              hardened container executor
   verify               the source of truth for "done" (+ auto-detection · opt-in browser behavioral check)
