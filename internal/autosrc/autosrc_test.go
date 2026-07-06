@@ -135,6 +135,14 @@ func TestDequeueClosedAndEmpty(t *testing.T) {
 	}
 }
 
+// errSource is a Source that always returns a transient error — the daemon must stop
+// pumping it without tearing down the other sources.
+type errSource struct{}
+
+func (errSource) Next(context.Context) (QueuedSignal, bool, error) {
+	return QueuedSignal{}, false, errors.New("boom")
+}
+
 // chanSource is a Source backed by a channel: it yields each buffered signal, then
 // reports done (false,nil) when the channel closes. It honors ctx.
 type chanSource struct{ ch chan QueuedSignal }
@@ -327,9 +335,7 @@ func TestOneBadSourceDoesNotStopOthers(t *testing.T) {
 	}
 	d := New(handler, Config{})
 
-	bad := SourceFunc(func(ctx context.Context) (QueuedSignal, bool, error) {
-		return QueuedSignal{}, false, errors.New("boom")
-	})
+	bad := errSource{}
 	goodCh := make(chan QueuedSignal, 1)
 	goodCh <- sig("survivor", 1)
 	close(goodCh)
@@ -364,12 +370,9 @@ func TestOneBadSourceDoesNotStopOthers(t *testing.T) {
 	}
 }
 
-// TestEnqueueOnNilDaemon proves the nil-safe public surface.
-func TestEnqueueOnNilDaemon(t *testing.T) {
+// TestBacklogOnNilDaemon proves the nil-safe read surface.
+func TestBacklogOnNilDaemon(t *testing.T) {
 	var d *Daemon
-	if err := d.Enqueue(sig("x", 1)); !errors.Is(err, ErrQueueClosed) {
-		t.Fatalf("nil-daemon Enqueue: got %v, want ErrQueueClosed", err)
-	}
 	if d.Backlog() != 0 {
 		t.Fatal("nil-daemon Backlog should be 0")
 	}

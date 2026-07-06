@@ -158,11 +158,33 @@ func (d *driver) perform(ctx context.Context, a desktopwire.Act) error {
 		if err != nil {
 			return err
 		}
-		return runXdotool(ctx, xdotoolClick(x, y))
+		return runXdotool(ctx, xdotoolClick(x, y, a.Button, a.Count))
+	case desktopwire.OpDrag:
+		x0, y0, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		x1, y1, err := d.resolveTo(a)
+		if err != nil {
+			return err
+		}
+		return runXdotool(ctx, xdotoolDrag(x0, y0, x1, y1, a.Button))
+	case desktopwire.OpMouseDown:
+		x, y, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		return runXdotool(ctx, xdotoolMouseDown(x, y, a.Button))
+	case desktopwire.OpMouseUp:
+		x, y, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		return runXdotool(ctx, xdotoolMouseUp(x, y, a.Button))
 	case desktopwire.OpType:
 		if a.Ref > 0 { // focus the field first
 			if x, y, err := d.resolvePoint(a); err == nil {
-				_ = runXdotool(ctx, xdotoolClick(x, y))
+				_ = runXdotool(ctx, xdotoolClick(x, y, desktopwire.ButtonLeft, 1))
 			}
 		}
 		return runXdotool(ctx, xdotoolType(a.Text))
@@ -187,6 +209,16 @@ func (d *driver) resolvePoint(a desktopwire.Act) (int, int, error) {
 		return x, y, nil
 	}
 	return 0, 0, errf("click needs a ref or a coordinate")
+}
+
+// resolveTo maps a drag DESTINATION (Act.To, in resized image space) to a true-screen
+// point. A drag without a destination fails closed rather than dragging to (0,0).
+func (d *driver) resolveTo(a desktopwire.Act) (int, int, error) {
+	if len(a.To) != 2 {
+		return 0, 0, errf("drag needs a destination (to:[x,y])")
+	}
+	x, y := rescaleCoord(a.To[0], a.To[1], d.scaleX, d.scaleY)
+	return x, y, nil
 }
 
 // observe runs the Set-of-Marks ladder and builds the observation. Rung 1 returns

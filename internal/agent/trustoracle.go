@@ -102,6 +102,26 @@ func PricerCost(p meter.Pricer, modelID func(backend string) string, nominalIn, 
 	}
 }
 
+// OrchestratorCost adapts a per-backend CostFunc into the shape Orchestrator.Cost
+// wants — func(taskClass, backendName string) float64 — so ONE cost source feeds
+// BOTH cost-aware seams: the oracle's routing ORDER (via CostFunc, above) and the
+// per-race cost METADATA the orchestrator records for trust.Replay to fold into the
+// learned per-(class, backend) cost cell (RTE-T06). The task class is ignored: the
+// nominal-token pricing PricerCost uses is class-independent (it prices a backend's
+// model, not the task), and the orchestrator already threads the class alongside the
+// recorded cost — so the cell is keyed by (class, backend) even though the cost value
+// itself only varies by backend. A nil CostFunc yields nil (Orchestrator.Cost stays
+// unset ⇒ no cost dimension recorded, byte-identical). Cost is metadata only (I7) and
+// never gates (I2).
+func OrchestratorCost(cost CostFunc) func(taskClass, backendName string) float64 {
+	if cost == nil {
+		return nil
+	}
+	return func(_, backendName string) float64 {
+		return cost(backendName)
+	}
+}
+
 // Plan orders and (never) prunes the candidate set for one task class using the
 // ledger's per-class evidence, made cost-aware via the optional CostFunc.
 //

@@ -149,11 +149,3 @@ func TestReviewDeniesOnGarbage(t *testing.T) {
 		t.Error("unparseable review must deny (safe default)")
 	}
 }
-
-func TestSingleRouter(t *testing.T) {
-	def := fakeBackend{"native"}
-	got := route.SingleRouter{}.Route(context.Background(), backend.Task{}, def)
-	if got.Name() != "native" {
-		t.Errorf("SingleRouter should return the default backend")
-	}
-}

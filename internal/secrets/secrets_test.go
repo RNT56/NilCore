@@ -196,6 +196,60 @@ func TestExternalStore(t *testing.T) {
 	}
 }
 
+// ExternalFromEnv builds a store only when NILCORE_SECRET_EXTERNAL_CMD is set, and
+// the configured command (with any leading args) is actually invoked and its stdout
+// used — proving the env-driven wiring path runs end to end.
+func TestExternalFromEnv(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell hook")
+	}
+
+	t.Run("unset yields no store", func(t *testing.T) {
+		t.Setenv(ExternalCmdEnv, "")
+		if _, ok := ExternalFromEnv(); ok {
+			t.Fatal("unset env must yield ok=false")
+		}
+	})
+
+	t.Run("whitespace-only yields no store", func(t *testing.T) {
+		t.Setenv(ExternalCmdEnv, "   ")
+		if _, ok := ExternalFromEnv(); ok {
+			t.Fatal("blank env must yield ok=false")
+		}
+	})
+
+	t.Run("configured command is invoked with leading args", func(t *testing.T) {
+		// The hook echoes its FIRST argv token so the test proves the leading arg from
+		// the env spec is prepended before op+name.
+		script := filepath.Join(t.TempDir(), "hook.sh")
+		body := "#!/bin/sh\ncase \"$2\" in get) echo \"$1:value-for-$3\";; *) cat >/dev/null;; esac\n"
+		if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// spec = "<script> LEAD": Command=script, Args=[LEAD]. A get then invokes
+		// `script LEAD get API`, so inside the hook $1=LEAD, $2=get, $3=API.
+		t.Setenv(ExternalCmdEnv, script+" LEAD")
+		e, ok := ExternalFromEnv()
+		if !ok {
+			t.Fatal("set env must yield ok=true")
+		}
+		if e.Command != script {
+			t.Fatalf("Command = %q, want %q", e.Command, script)
+		}
+		if len(e.Args) != 1 || e.Args[0] != "LEAD" {
+			t.Fatalf("Args = %v, want [LEAD]", e.Args)
+		}
+		// Invocation is: script LEAD get API ⇒ $1=LEAD $2=get $3=API.
+		got, err := e.Get("API")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got != "LEAD:value-for-API" {
+			t.Fatalf("Get = %q, want LEAD:value-for-API (leading arg not passed?)", got)
+		}
+	})
+}
+
 // A hook that exits 0 but prints nothing must NOT yield an empty secret — fail
 // closed (I3): an empty / whitespace-only payload resolves as ErrNotFound so the
 // resolver falls through to the next store instead of injecting a blank credential.

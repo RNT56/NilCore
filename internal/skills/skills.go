@@ -1,9 +1,9 @@
 // Package skills adds capabilities as plugins, not core changes (P5-T01): it
 // loads Agent Skills (SKILL.md — frontmatter name/description + a markdown body of
-// instructions) and native tool plugins, and exposes both through the SAME tool
-// registry the native loop already uses (so the frozen core never changes). A
-// skill is surfaced as a tool that, when invoked, returns its instructions —
-// on-demand guidance, like MCP-as-code keeps unused capability out of context.
+// instructions) and exposes them through the SAME tool registry the native loop
+// already uses (so the frozen core never changes). A skill is surfaced as a tool
+// that, when invoked, returns its instructions — on-demand guidance, like
+// MCP-as-code keeps unused capability out of context.
 package skills
 
 import (
@@ -30,34 +30,22 @@ type Skill struct {
 	Version      string
 }
 
-// Plugin is a native capability: it contributes a structured tool directly.
-type Plugin interface {
-	Tool() tools.Tool
-}
-
-// Registry holds loaded skills and native plugins.
+// Registry holds loaded skills.
 type Registry struct {
-	skills  []Skill
-	plugins []Plugin
+	skills []Skill
 }
 
-// New builds a registry from skills and plugins.
-func New(skills []Skill, plugins ...Plugin) *Registry {
-	return &Registry{skills: skills, plugins: plugins}
+// New builds a registry from skills.
+func New(skills []Skill) *Registry {
+	return &Registry{skills: skills}
 }
 
-// AddPlugin registers a native plugin.
-func (r *Registry) AddPlugin(p Plugin) { r.plugins = append(r.plugins, p) }
-
-// AsTools exposes every skill and plugin as a tools.Tool, so they register into
-// the native loop's registry exactly like built-in and MCP tools.
+// AsTools exposes every skill as a tools.Tool, so they register into the native
+// loop's registry exactly like built-in and MCP tools.
 func (r *Registry) AsTools() []tools.Tool {
-	out := make([]tools.Tool, 0, len(r.skills)+len(r.plugins))
+	out := make([]tools.Tool, 0, len(r.skills))
 	for _, s := range r.skills {
 		out = append(out, skillTool{s})
-	}
-	for _, p := range r.plugins {
-		out = append(out, p.Tool())
 	}
 	return out
 }

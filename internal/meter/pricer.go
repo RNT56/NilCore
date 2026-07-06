@@ -281,11 +281,23 @@ func rateFor(modelID string) rate {
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	best := fallbackRate
 	bestLen := -1 // -1 so even a zero-length-after-prefix match beats "no match"
-	for _, kr := range knownRates {
-		if strings.HasPrefix(id, kr.prefix) && len(kr.prefix) > bestLen {
-			best = kr.rate
-			bestLen = len(kr.prefix)
+	consider := func(s string) {
+		for _, kr := range knownRates {
+			if strings.HasPrefix(s, kr.prefix) && len(kr.prefix) > bestLen {
+				best = kr.rate
+				bestLen = len(kr.prefix)
+			}
 		}
+	}
+	consider(id)
+	// OpenRouter and openai-compatible endpoints echo a VENDOR-NAMESPACED served id
+	// ("anthropic/claude-opus-4-8", "openai/gpt-5.5", "meta-llama/llama-3.1-70b"), which
+	// served-model pricing bills. The known prefixes are bare tiers, so also match on the
+	// segment after the last '/' — otherwise a real served id silently falls to the
+	// conservative floor instead of its true tier, defeating served-model pricing on the
+	// exact models[]-fallback case it exists for. A bare id (no '/') is unaffected.
+	if i := strings.LastIndex(id, "/"); i >= 0 && i+1 < len(id) {
+		consider(id[i+1:])
 	}
 	return best
 }

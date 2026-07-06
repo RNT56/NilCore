@@ -113,6 +113,32 @@ func TestReplayMissingFile(t *testing.T) {
 	}
 }
 
+func TestReplayLongLineExceedingScannerCap(t *testing.T) {
+	// A single event whose JSON line exceeds 1MB. eventlog's own reader/Verify use
+	// os.ReadFile + strings.Split with no line-length cap, so this line is valid and
+	// its hash chain checks out. Replay must accept it too — the old 1MB bufio.Scanner
+	// cap would reject a line the chain verifies, a false "unhealthy" report.
+	big := strings.Repeat("x", 1500*1024) // ~1.5MB payload > the former 1MB cap
+	path := buildLog(t, []eventlog.Event{
+		{Task: "t1", Kind: "tool_exec", Detail: map[string]any{"blob": big}},
+		{Task: "t1", Kind: "verify"},
+	})
+
+	s, err := Replay(path)
+	if err != nil {
+		t.Fatalf("Replay on a valid >1MB line: %v", err)
+	}
+	if s.Total != 2 {
+		t.Errorf("Total = %d, want 2", s.Total)
+	}
+	if s.ByKind["tool_exec"] != 1 || s.ByKind["verify"] != 1 {
+		t.Errorf("ByKind = %v, want one tool_exec + one verify", s.ByKind)
+	}
+	if err := Health(path); err != nil {
+		t.Errorf("Health on a valid >1MB line: %v", err)
+	}
+}
+
 func TestReplayEmptyLog(t *testing.T) {
 	// An empty log is readable and trivially verifies: zero events, zero tasks.
 	path := buildLog(t, nil)

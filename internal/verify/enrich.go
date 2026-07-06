@@ -270,64 +270,6 @@ func ContentHashWorktree(ctx context.Context, root string, skipDirs ...string) (
 	return foldEntries(entries), nil
 }
 
-// ContentHashFiles returns a deterministic content hash over an explicit set of
-// files, each given as a path relative to root and confined to it. It is the
-// precise-read-set counterpart of ContentHashWorktree: when a caller knows exactly
-// which files a check reads, hashing just those is both cheaper and more stable
-// than hashing the whole tree.
-//
-// Determinism: the rels are de-duplicated and sorted, so input order does not
-// affect the result. A missing file is folded as a distinct "absent" entry (so the
-// hash still reflects its absence deterministically) rather than erroring — the
-// hash describes the read-set's content, including which members are present.
-// Confinement: every rel is resolved through worktreefs.SafeJoin and opened with
-// O_NOFOLLOW, so a rel that escapes root (lexically or via symlink) is rejected
-// before any byte is read (I4).
-func ContentHashFiles(ctx context.Context, root string, rels []string) (string, error) {
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("resolve root: %w", err)
-	}
-
-	// De-duplicate so a repeated rel cannot inflate or reorder the fold.
-	seen := make(map[string]bool, len(rels))
-	uniq := make([]string, 0, len(rels))
-	for _, rel := range rels {
-		if rel == "" || seen[rel] {
-			continue
-		}
-		seen[rel] = true
-		uniq = append(uniq, rel)
-	}
-
-	var entries []hashEntry
-	for _, rel := range uniq {
-		if cerr := ctx.Err(); cerr != nil {
-			return "", cerr
-		}
-		target, serr := worktreefs.SafeJoin(resolvedRoot, rel)
-		if serr != nil {
-			return "", fmt.Errorf("confine %q: %w", rel, serr)
-		}
-		clean := filepath.ToSlash(filepath.Clean(rel))
-		fi, lerr := os.Lstat(target)
-		if lerr != nil {
-			if os.IsNotExist(lerr) {
-				entries = append(entries, hashEntry{rel: clean, line: "absent\x00" + clean})
-				continue
-			}
-			return "", fmt.Errorf("stat %q: %w", rel, lerr)
-		}
-		d := fs.FileInfoToDirEntry(fi)
-		line, elerr := entryLine(clean, target, d)
-		if elerr != nil {
-			return "", elerr
-		}
-		entries = append(entries, hashEntry{rel: clean, line: line})
-	}
-	return foldEntries(entries), nil
-}
-
 // hashEntry is one folded entry, sorted by rel for a walk-order-independent fold.
 type hashEntry struct {
 	rel  string

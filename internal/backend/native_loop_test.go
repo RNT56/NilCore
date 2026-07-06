@@ -46,7 +46,6 @@ func openTestLog(t *testing.T) (*eventlog.Log, func() string) {
 	}
 	t.Cleanup(func() { log.Close() })
 	return log, func() string {
-		log.Flush()
 		b, _ := os.ReadFile(path)
 		return string(b)
 	}

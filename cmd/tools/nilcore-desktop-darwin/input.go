@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"nilcore/internal/desktopwire"
 )
 
 // This file is CU-MAC-T04: input via cliclick (the zero-custom-native MVP path —
@@ -16,6 +18,63 @@ import (
 // cliclickClick builds the cliclick command for a left click at point (x,y).
 func cliclickClick(x, y int) []string {
 	return []string{"c:" + strconv.Itoa(x) + "," + strconv.Itoa(y)}
+}
+
+// cliclickClickN builds the cliclick command for a click at point (x,y) with the given
+// button and repeat count. cliclick verbs: c=left, rc=right, dc=double-left. It has NO
+// middle-click verb, so a middle click FAILS CLOSED rather than silently left-clicking
+// (never a wrong actuation). count>=2 uses dc (double) for the left button; a triple or
+// repeated non-left click is unsupported on the MVP and fails closed. count<=1 ⇒ single.
+func cliclickClickN(x, y int, button string, count int) ([]string, error) {
+	pt := strconv.Itoa(x) + "," + strconv.Itoa(y)
+	switch button {
+	case desktopwire.ButtonRight:
+		if count > 1 {
+			return nil, fmt.Errorf("repeated right click (count %d) is unsupported on the cliclick MVP", count)
+		}
+		return []string{"rc:" + pt}, nil
+	case desktopwire.ButtonMiddle:
+		return nil, fmt.Errorf("middle click is unsupported on the cliclick MVP (no middle-button verb); the signed helper does a real CGEvent middle click")
+	default: // ButtonLeft / "" / unknown → left
+		switch {
+		case count <= 1:
+			return []string{"c:" + pt}, nil
+		case count == 2:
+			return []string{"dc:" + pt}, nil
+		default:
+			return nil, fmt.Errorf("triple+ click (count %d) is unsupported on the cliclick MVP", count)
+		}
+	}
+}
+
+// cliclickDrag builds the cliclick command for a left-button drag from (x0,y0) to
+// (x1,y1): dd = drag-down (press) at the origin, then du = drag-up (release) at the
+// destination. cliclick moves the cursor between the two, so this is a faithful drag.
+// A non-left drag is unsupported on the MVP and fails closed.
+func cliclickDrag(x0, y0, x1, y1 int, button string) ([]string, error) {
+	if button != "" && button != desktopwire.ButtonLeft {
+		return nil, fmt.Errorf("non-left drag (%q) is unsupported on the cliclick MVP", button)
+	}
+	return []string{
+		"dd:" + strconv.Itoa(x0) + "," + strconv.Itoa(y0),
+		"du:" + strconv.Itoa(x1) + "," + strconv.Itoa(y1),
+	}, nil
+}
+
+// cliclickMouseDown / cliclickMouseUp expose the press/release halves of a drag as
+// standalone acts (Anthropic's left_mouse_down / left_mouse_up). Non-left fails closed.
+func cliclickMouseDown(x, y int, button string) ([]string, error) {
+	if button != "" && button != desktopwire.ButtonLeft {
+		return nil, fmt.Errorf("non-left mouse-down (%q) is unsupported on the cliclick MVP", button)
+	}
+	return []string{"dd:" + strconv.Itoa(x) + "," + strconv.Itoa(y)}, nil
+}
+
+func cliclickMouseUp(x, y int, button string) ([]string, error) {
+	if button != "" && button != desktopwire.ButtonLeft {
+		return nil, fmt.Errorf("non-left mouse-up (%q) is unsupported on the cliclick MVP", button)
+	}
+	return []string{"du:" + strconv.Itoa(x) + "," + strconv.Itoa(y)}, nil
 }
 
 // cliclickType builds the command to type literal text at the current focus.

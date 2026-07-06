@@ -28,6 +28,7 @@ type NativeComputerTool struct {
 	MaxSteps    int
 	MaxStagnant int // consecutive no-op acts before the harness nudges (default defaultMaxStagnant)
 	EventSink   EventSink
+	Approver    Approver // human gate for irreversible actions; nil ⇒ fail closed on one (I2)
 
 	mu       sync.Mutex
 	steps    int
@@ -77,6 +78,17 @@ func (n *NativeComputerTool) RunWithImage(ctx context.Context, _ string, input j
 		return guard.Wrap("computer budget", fmt.Sprintf("step budget of %d reached — finish or report blocked.", max)), nil, nil
 	}
 	n.steps++
+
+	// Irreversible-action gate, symmetric with Path B (I2). In pixel mode a click is
+	// coordinate-based (no accessible target), so this mainly catches an Enter/Return
+	// submit on a window that names a consequential action; a nil Approver fails CLOSED.
+	// A blocked action consumes a step so a retrying model still terminates.
+	if sig := irreversibleTarget(act, n.Sess.Latest()); sig != "" {
+		if n.Approver == nil || !n.Approver.Approve("computer "+act.Op+" on irreversible target ("+sig+")") {
+			body := fmt.Sprintf("the %s on %q was BLOCKED by the irreversible-action gate (matched %q) — not performed. A human must approve it; report this and finish if you cannot proceed.", act.Op, sig, sig)
+			return guard.Wrap("computer gate", body), nil, nil
+		}
+	}
 
 	obs, actErr := n.Sess.Act(ctx, act)
 
@@ -148,11 +160,16 @@ func (n *NativeComputerTool) isStagnant(op, sig string, errored bool) bool {
 
 // translateNative maps an Anthropic native `computer` action input to a
 // desktopwire.Act. The native action vocabulary is the model's; we cover the common
-// set and degrade unknown/compound actions to a safe observe (never a wrong mutation).
+// set FAITHFULLY — each click variant carries its real button/count, and drag/press/
+// release map to their own ops — so a double/right/middle/drag action can no longer be
+// silently demoted to a single left click (the mis-click bug). Read-only/positional
+// actions (screenshot/cursor_position/mouse_move) degrade to a safe observe, and a
+// genuinely UNKNOWN future action also degrades to observe (never a wrong mutation).
 func translateNative(input json.RawMessage) (desktopwire.Act, error) {
 	var in struct {
 		Action          string `json:"action"`
 		Coordinate      []int  `json:"coordinate"`
+		StartCoordinate []int  `json:"start_coordinate"`
 		Text            string `json:"text"`
 		ScrollDirection string `json:"scroll_direction"`
 		ScrollAmount    int    `json:"scroll_amount"`
@@ -164,8 +181,25 @@ func translateNative(input json.RawMessage) (desktopwire.Act, error) {
 	switch in.Action {
 	case "screenshot", "cursor_position", "mouse_move", "":
 		return desktopwire.Act{Op: desktopwire.OpObserve}, nil
-	case "left_click", "double_click", "triple_click", "right_click", "middle_click", "left_click_drag", "left_mouse_down", "left_mouse_up":
-		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate}, nil
+	case "left_click":
+		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft, Count: 1}, nil
+	case "double_click":
+		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft, Count: 2}, nil
+	case "triple_click":
+		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft, Count: 3}, nil
+	case "right_click":
+		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate, Button: desktopwire.ButtonRight, Count: 1}, nil
+	case "middle_click":
+		return desktopwire.Act{Op: desktopwire.OpClick, Coordinate: in.Coordinate, Button: desktopwire.ButtonMiddle, Count: 1}, nil
+	case "left_click_drag":
+		// Anthropic's drag carries the origin in start_coordinate and the destination in
+		// coordinate. When start_coordinate is absent, the drag begins at the current
+		// pointer (Coordinate empty ⇒ driver drags from where the cursor is).
+		return desktopwire.Act{Op: desktopwire.OpDrag, Coordinate: in.StartCoordinate, To: in.Coordinate, Button: desktopwire.ButtonLeft}, nil
+	case "left_mouse_down":
+		return desktopwire.Act{Op: desktopwire.OpMouseDown, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft}, nil
+	case "left_mouse_up":
+		return desktopwire.Act{Op: desktopwire.OpMouseUp, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft}, nil
 	case "type":
 		return desktopwire.Act{Op: desktopwire.OpType, Text: in.Text}, nil
 	case "key", "hold_key":

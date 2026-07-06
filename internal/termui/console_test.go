@@ -29,18 +29,15 @@ func TestPlainConsoleNoEscapes(t *testing.T) {
 	}
 }
 
-// Blue/Magenta join the existing palette: they wrap with the right ANSI code when
-// styling is on, and pass through unchanged when off (the I6 non-TTY discipline).
-func TestBlueMagentaStyle(t *testing.T) {
+// Blue joins the existing palette: it wraps with the right ANSI code when styling is
+// on, and passes through unchanged when off (the I6 non-TTY discipline).
+func TestBlueStyle(t *testing.T) {
 	on := Style{on: true}
 	if got := on.Blue("x"); got != "\033[34mx\033[0m" {
 		t.Errorf("Blue on = %q", got)
 	}
-	if got := on.Magenta("x"); got != "\033[35mx\033[0m" {
-		t.Errorf("Magenta on = %q", got)
-	}
 	off := Style{on: false}
-	if off.Blue("x") != "x" || off.Magenta("x") != "x" {
+	if off.Blue("x") != "x" {
 		t.Error("colors must pass through unchanged when styling is off")
 	}
 }

@@ -17,10 +17,11 @@ import (
 // per Complete so a test can assert exactly what the decorator charges. An
 // optional err lets a test exercise the failure path.
 type fakeProvider struct {
-	id    string
-	usage model.Usage
-	err   error
-	calls int // observability: how many times Complete was forwarded
+	id     string
+	served string // Response.ServedModel to report; "" ⇒ no served id (byte-identical)
+	usage  model.Usage
+	err    error
+	calls  int // observability: how many times Complete was forwarded
 }
 
 func (f *fakeProvider) Complete(ctx context.Context, system string, msgs []model.Message, tools []model.Tool, maxTokens int) (model.Response, error) {
@@ -28,7 +29,7 @@ func (f *fakeProvider) Complete(ctx context.Context, system string, msgs []model
 	if f.err != nil {
 		return model.Response{}, f.err
 	}
-	return model.Response{Usage: f.usage}, nil
+	return model.Response{Usage: f.usage, ServedModel: f.served}, nil
 }
 
 func (f *fakeProvider) Model() string { return f.id }
@@ -41,6 +42,7 @@ func (f *fakeProvider) Model() string { return f.id }
 // a stream cut short whose produced tokens are still billable.
 type streamingProvider struct {
 	id           string
+	served       string // Response.ServedModel to report on the streamed reply
 	usage        model.Usage
 	deltas       []string
 	err          error
@@ -63,8 +65,9 @@ func (s *streamingProvider) Stream(ctx context.Context, system string, msgs []mo
 		}
 	}
 	resp := model.Response{
-		Content: []model.Block{{Type: "text", Text: b.String()}},
-		Usage:   s.usage,
+		Content:     []model.Block{{Type: "text", Text: b.String()}},
+		Usage:       s.usage,
+		ServedModel: s.served,
 	}
 	return resp, s.err
 }
@@ -604,3 +607,86 @@ func (t *textProvider) Complete(ctx context.Context, system string, msgs []model
 }
 
 func (t *textProvider) Model() string { return t.id }
+
+// recordingPricer captures the model id the decorator passes to PriceUsage so a
+// test can prove WHICH id (requested vs. served) was billed. It charges nothing
+// (zero dollars) — the id, not the dollar figure, is what these tests assert.
+type recordingPricer struct{ gotID string }
+
+func (r *recordingPricer) Price(modelID string, in, out int) float64 { return 0 }
+func (r *recordingPricer) PriceUsage(modelID string, u model.Usage) float64 {
+	r.gotID = modelID
+	return 0
+}
+
+// TestServedModelPricedWhenReported pins served-model pricing: when the provider
+// reports a ServedModel that differs from the requested id (an OpenRouter models[]
+// fallback routing to a differently-priced upstream), the decorator prices the
+// SERVED id — the one that actually incurred the cost — not the requested one. When
+// ServedModel is empty the decorator falls back to the requested id (byte-identical
+// to before this seam existed). Both Complete and Stream are covered.
+func TestServedModelPricedWhenReported(t *testing.T) {
+	const requested = "openrouter/auto"
+	const served = "anthropic/claude-opus-4-8"
+	usage := model.Usage{InputTokens: 100, OutputTokens: 100}
+
+	cases := []struct {
+		name   string
+		served string
+		wantID string
+	}{
+		{"served differs from requested", served, served},
+		{"served empty falls back to requested", "", requested},
+	}
+	for _, c := range cases {
+		t.Run("complete/"+c.name, func(t *testing.T) {
+			rp := &recordingPricer{}
+			inner := &fakeProvider{id: requested, served: c.served, usage: usage}
+			p := &Provider{Inner: inner, Ledger: budget.New(), Task: "t", Price: rp}
+			if _, err := p.Complete(context.Background(), "sys", nil, nil, 100); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			if rp.gotID != c.wantID {
+				t.Errorf("priced id = %q, want %q", rp.gotID, c.wantID)
+			}
+		})
+		t.Run("stream/"+c.name, func(t *testing.T) {
+			rp := &recordingPricer{}
+			inner := &streamingProvider{id: requested, served: c.served, usage: usage, deltas: []string{"x"}}
+			p := &Provider{Inner: inner, Ledger: budget.New(), Task: "t", Price: rp}
+			if _, err := p.Stream(context.Background(), "sys", nil, nil, 100, nil); err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			if rp.gotID != c.wantID {
+				t.Errorf("priced id = %q, want %q", rp.gotID, c.wantID)
+			}
+		})
+	}
+}
+
+// TestServedModelChargesServedRate proves the served id changes the DOLLAR charge
+// through the real Table: a request nominally to a cheap id that OpenRouter routed
+// to a pricier served id is billed at the served (opus) rate, not the requested one.
+func TestServedModelChargesServedRate(t *testing.T) {
+	// Requested a Llama-class id (~$0.0009/1k both ways); OpenRouter served Opus
+	// (~$0.005 in / $0.025 out per 1k). Pricing the served id must yield the opus charge,
+	// proving the served id — not the requested one — drove the bill. The served id is the
+	// REAL VENDOR-NAMESPACED form OpenRouter echoes ("anthropic/claude-opus-4-8"); rateFor
+	// resolves it to the opus tier via its post-'/' segment, so it must NOT fall to the
+	// conservative floor.
+	inner := &fakeProvider{
+		id:     "meta-llama/llama-3.1-70b",
+		served: "anthropic/claude-opus-4-8",
+		usage:  model.Usage{InputTokens: 1000, OutputTokens: 1000},
+	}
+	led := budget.New()
+	p := &Provider{Inner: inner, Ledger: led, Task: "t", Price: NewTable()}
+	if _, err := p.Complete(context.Background(), "sys", nil, nil, 100); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	_, dollars := led.Spent("t")
+	const wantOpus = 0.005 + 0.025 // 1k in + 1k out at the opus tier
+	if !almostEqualDollars(dollars, wantOpus) {
+		t.Errorf("charged $%v, want served-opus $%v (served-model pricing not applied)", dollars, wantOpus)
+	}
+}

@@ -76,8 +76,9 @@ type Tool struct {
 // can differ from the requested id when a models[] fallback chain routes to a
 // later entry). It is purely additive and omitempty: a provider that does not
 // report a served id leaves it empty, so the JSON is byte-identical to before and
-// every existing consumer is unchanged. A meter MAY price the served id rather than
-// the requested one when this is set.
+// every existing consumer is unchanged. The metering decorator (internal/meter)
+// prices the served id rather than the requested one when this is set and non-empty,
+// falling back to the requested id otherwise.
 type Response struct {
 	Content     []Block `json:"content"`
 	StopReason  string  `json:"stop_reason"`

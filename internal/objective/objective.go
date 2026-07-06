@@ -241,15 +241,6 @@ func (b *Backlog) MarkSuccess(ctx context.Context, id string, when time.Time) er
 	return b.mark(ctx, id, when, true)
 }
 
-// MarkRun is the legacy debounce-only mark, retained for callers that record a run
-// without a verified/failed outcome. It is identical to MarkAttempt.
-//
-// Deprecated: use MarkAttempt at selection and MarkSuccess on a verified outcome so the
-// success-aware retry cadence (RetryPeriod) can re-service a failed objective sooner.
-func (b *Backlog) MarkRun(ctx context.Context, id string, when time.Time) error {
-	return b.MarkAttempt(ctx, id, when)
-}
-
 // mark is the shared read-modify-write: it advances LastRun always, and LastSuccess only
 // when success is true, preserving every other field through the narrow Store seam.
 func (b *Backlog) mark(ctx context.Context, id string, when time.Time, success bool) error {

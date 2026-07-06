@@ -75,8 +75,10 @@ func (b *Box) Resolve(line string) bool {
 	}
 }
 
-// Pending reports whether a batch is currently collecting (the front door uses it to
-// render the question-as-prompt while parked).
+// Pending reports whether a batch is currently collecting. It is a race-free read of
+// the single-flight gate, used to observe the parked state (e.g. session tests
+// synchronize on it as the box-level mirror of the AwaitingInput phase). Front-door
+// surfaces render the question from the emitted AskPrompt event, not from this flag.
 func (b *Box) Pending() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()

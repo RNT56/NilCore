@@ -4,9 +4,17 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
+
+// ExternalCmdEnv is the environment variable that configures the external secret
+// hook. Its value is a command line: the first field is the program, the rest are
+// fixed leading arguments (e.g. "vault-hook --profile prod"). Set ⇒ the wiring
+// layer inserts an ExternalStore into the resolver chain; empty/unset ⇒ no
+// external backend (the default). It names a COMMAND, never a secret (I3).
+const ExternalCmdEnv = "NILCORE_SECRET_EXTERNAL_CMD"
 
 // ExternalStore delegates to a user-configured command — the "external hook" for
 // corporate secret managers (Vault, cloud KMS wrappers, etc.). The command is
@@ -16,6 +24,26 @@ import (
 type ExternalStore struct {
 	Command string
 	Args    []string
+}
+
+// ExternalFromEnv constructs an ExternalStore from ExternalCmdEnv, returning
+// ok=false when the variable is unset or blank (so the wiring layer inserts the
+// external backend only when the operator configured one — never by default). The
+// value is split on whitespace: the first field is the command, the remainder are
+// fixed leading arguments prepended before the op+name on every call. The value is
+// a command line, not a secret, so it is safe to read from the environment (I3).
+func ExternalFromEnv() (ExternalStore, bool) {
+	return externalFromValue(os.Getenv(ExternalCmdEnv))
+}
+
+// externalFromValue is ExternalFromEnv's pure core (env read factored out) so the
+// parse is testable without mutating process state.
+func externalFromValue(spec string) (ExternalStore, bool) {
+	fields := strings.Fields(spec)
+	if len(fields) == 0 {
+		return ExternalStore{}, false
+	}
+	return ExternalStore{Command: fields[0], Args: fields[1:]}, true
 }
 
 // Name identifies the backend.

@@ -68,12 +68,9 @@ type Log struct {
 	err error // first write failure, if any (a broken audit trail is loud)
 }
 
-// hookMsg carries either an event to fold or a flush barrier. A non-nil flush chan is a
-// barrier: the drainer closes it after processing everything enqueued before it (FIFO),
-// so Flush can synchronize with the async projection without exposing the channel.
+// hookMsg carries one event to fold on the async drainer.
 type hookMsg struct {
-	e     Event
-	flush chan struct{}
+	e Event
 }
 
 // hookBuffer bounds the drainer's queue. A burst up to this size is absorbed without
@@ -134,16 +131,13 @@ func (l *Log) OnAppend(fn func(e Event)) {
 }
 
 // drainHooks is the single background consumer of the OnAppend queue. It invokes fn for
-// each event in FIFO order (preserving the projector's watermark ordering) and closes a
-// flush barrier when it reaches one. A panic in a buggy projector is RECOVERED (and
-// surfaced) so it can never take down the drainer or affect the durable log.
+// each event in FIFO order (preserving the projector's watermark ordering). A panic in a
+// buggy projector is RECOVERED (and surfaced) so it can never take down the drainer or
+// affect the durable log. Close drains everything still enqueued before returning, so a
+// caller can synchronize with the projection by closing the log.
 func (l *Log) drainHooks(fn func(e Event), done <-chan struct{}) {
 	defer l.hookWG.Done()
 	fold := func(m hookMsg) {
-		if m.flush != nil {
-			close(m.flush)
-			return
-		}
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Fprintf(os.Stderr, "nilcore: experience fold hook panicked: %v\n", r)
@@ -168,25 +162,6 @@ func (l *Log) drainHooks(fn func(e Event), done <-chan struct{}) {
 			fold(m)
 		}
 	}
-}
-
-// Flush blocks until every event enqueued for the OnAppend hook so far has been folded.
-// Production never needs it (the derived projection is eventually-consistent); it lets a
-// test or an operator command synchronize with the async drainer. No-op when no hook is
-// wired.
-func (l *Log) Flush() {
-	if l == nil {
-		return
-	}
-	l.mu.Lock()
-	ch := l.hookCh
-	l.mu.Unlock()
-	if ch == nil {
-		return
-	}
-	done := make(chan struct{})
-	ch <- hookMsg{flush: done} // blocking send: the barrier must not be dropped
-	<-done
 }
 
 // Open opens (creating if needed) the log at path, continuing the hash chain and

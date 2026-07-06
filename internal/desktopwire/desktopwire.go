@@ -92,13 +92,24 @@ type Observation struct {
 // Act op names — the closed set of desktop actions the model may emit. An unknown
 // op fails loudly (fail-closed).
 const (
-	OpObserve = "observe" // re-snapshot only
-	OpClick   = "click"   // click Ref (DoAction/box-centre) OR Coordinate
-	OpType    = "type"    // type Text at current focus (or into Ref first)
-	OpKey     = "key"     // press a key chord (e.g. "ctrl+s", "Return")
-	OpScroll  = "scroll"  // scroll Dir × Amount at focus/Ref
-	OpWait    = "wait"    // bounded settle (MS)
-	OpClose   = "close"   // session protocol only: shut the daemon down
+	OpObserve   = "observe"    // re-snapshot only
+	OpClick     = "click"      // click Ref (DoAction/box-centre) OR Coordinate; Button/Count refine it
+	OpType      = "type"       // type Text at current focus (or into Ref first)
+	OpKey       = "key"        // press a key chord (e.g. "ctrl+s", "Return")
+	OpScroll    = "scroll"     // scroll Dir × Amount at focus/Ref
+	OpWait      = "wait"       // bounded settle (MS)
+	OpDrag      = "drag"       // press at the Ref/Coordinate origin, move to To, release (left button)
+	OpMouseDown = "mouse_down" // press (and hold) the Button at the Ref/Coordinate
+	OpMouseUp   = "mouse_up"   // release the Button
+	OpClose     = "close"      // session protocol only: shut the daemon down
+)
+
+// Mouse button names for OpClick/OpMouseDown/OpMouseUp. Empty ⇒ ButtonLeft (the common
+// case, so a legacy Act{Op:OpClick} with no Button is still a plain left click).
+const (
+	ButtonLeft   = "left"
+	ButtonRight  = "right"
+	ButtonMiddle = "middle"
 )
 
 // Act is one instruction the host hands the driver. Only the fields relevant to Op
@@ -110,6 +121,9 @@ type Act struct {
 	Op         string `json:"op"`
 	Ref        int    `json:"ref,omitempty"`        // element id from the latest snapshot (Rung 1/2)
 	Coordinate []int  `json:"coordinate,omitempty"` // [x,y] in resized image space (Rung 3)
+	To         []int  `json:"to,omitempty"`         // OpDrag destination [x,y] in resized image space
+	Button     string `json:"button,omitempty"`     // OpClick/OpMouseDown/OpMouseUp button (ButtonLeft default)
+	Count      int    `json:"count,omitempty"`      // OpClick repeat: 2 = double, 3 = triple (default 1)
 	Text       string `json:"text,omitempty"`
 	Key        string `json:"key,omitempty"`
 	Dir        string `json:"dir,omitempty"`    // scroll direction

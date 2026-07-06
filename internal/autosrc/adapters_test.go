@@ -9,21 +9,18 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"nilcore/internal/trigger"
 )
 
 // errUnexpectedItem flags a Source that returned ok=true when the test expected it to
 // unpark on cancellation with no item.
 var errUnexpectedItem = errors.New("unexpected item from blocked source")
 
-// TestPriorityBandsOrdered locks the structural ladder: webhook outranks wake outranks
-// cron outranks file. A refactor that reorders the bands (and so changes which funnel
-// drains first under contention) is caught here, not silently in production.
+// TestPriorityBandsOrdered locks the structural ladder: a self-scheduled wake outranks
+// an operator-dropped file signal. A refactor that reorders the bands (and so changes
+// which funnel drains first under contention) is caught here, not silently in production.
 func TestPriorityBandsOrdered(t *testing.T) {
-	if PriorityWebhook <= PriorityWake || PriorityWake <= PriorityCron || PriorityCron <= PriorityFile {
-		t.Fatalf("priority bands out of order: file=%d cron=%d wake=%d webhook=%d",
-			PriorityFile, PriorityCron, PriorityWake, PriorityWebhook)
+	if PriorityWake <= PriorityFile {
+		t.Fatalf("priority bands out of order: file=%d wake=%d", PriorityFile, PriorityWake)
 	}
 	if PriorityFile != 0 {
 		t.Fatalf("PriorityFile must be the zero/default band, got %d", PriorityFile)
@@ -129,31 +126,6 @@ func TestFileSourceFromTempDir(t *testing.T) {
 	}
 }
 
-// TestCronSourceMapsFire proves a fired cron job (a trigger.Signal the scheduler emits)
-// becomes a PriorityCron QueuedSignal, preserving the scheduler's Source label, and
-// that the source reports DONE on channel close.
-func TestCronSourceMapsFire(t *testing.T) {
-	ch := make(chan trigger.Signal, 1)
-	ch <- trigger.Signal{Source: "cron", Goal: "nightly dependency audit"}
-	close(ch)
-
-	src := CronSource{Fires: ch}
-	qs, ok, err := src.Next(context.Background())
-	if err != nil || !ok {
-		t.Fatalf("Next: ok=%v err=%v", ok, err)
-	}
-	if qs.Priority != PriorityCron {
-		t.Fatalf("priority = %d, want PriorityCron(%d)", qs.Priority, PriorityCron)
-	}
-	if qs.Signal.Source != "cron" || qs.Signal.Goal != "nightly dependency audit" {
-		t.Fatalf("signal = %+v, want {cron, nightly dependency audit}", qs.Signal)
-	}
-
-	if _, ok, err := src.Next(context.Background()); ok || err != nil {
-		t.Fatalf("exhausted CronSource: ok=%v err=%v, want false,nil", ok, err)
-	}
-}
-
 // TestWakeSourceMapsFire proves a fired durable wake becomes a PriorityWake
 // QueuedSignal whose Source ties to the thread and whose Goal is the self-note.
 func TestWakeSourceMapsFire(t *testing.T) {
@@ -178,62 +150,12 @@ func TestWakeSourceMapsFire(t *testing.T) {
 	}
 }
 
-// TestWebhookSignalQueued proves the push-path mapping: an in-hand scmhook signal maps
-// to a PriorityWebhook QueuedSignal preserving the handler's Source and framed Goal.
-func TestWebhookSignalQueued(t *testing.T) {
-	in := trigger.Signal{Source: "issue", Goal: `Address GitHub issue #42 ("flaky login"): read, reproduce, fix.`}
-	qs := WebhookSignal(in).Queued()
-	if qs.Priority != PriorityWebhook {
-		t.Fatalf("priority = %d, want PriorityWebhook(%d)", qs.Priority, PriorityWebhook)
-	}
-	if qs.Signal != in {
-		t.Fatalf("signal = %+v, want %+v (Goal passed through verbatim — I7 data)", qs.Signal, in)
-	}
-}
-
-// TestWebhookSignalEnqueue proves the in-hand webhook signal lands on the daemon's
-// queue via the sanctioned push entry, and that the band is preserved through the
-// queue (the webhook drains ahead of a lower-band file signal).
-func TestWebhookSignalEnqueue(t *testing.T) {
-	d := New(nil, Config{})
-
-	// Push a low-band file signal first, then a webhook: the webhook must drain first.
-	if err := d.Enqueue(QueuedSignal{Signal: trigger.Signal{Source: "file:x", Goal: "low"}, Priority: PriorityFile}); err != nil {
-		t.Fatalf("seed file enqueue: %v", err)
-	}
-	hook := WebhookSignal{Source: "ci", Goal: "CI failed: diagnose and fix."}
-	if err := hook.Enqueue(d); err != nil {
-		t.Fatalf("webhook Enqueue: %v", err)
-	}
-	if d.Backlog() != 2 {
-		t.Fatalf("backlog = %d, want 2", d.Backlog())
-	}
-
-	first, ok, err := d.q.dequeue(context.Background())
-	if err != nil || !ok {
-		t.Fatalf("dequeue: ok=%v err=%v", ok, err)
-	}
-	if first.Signal.Source != "ci" || first.Priority != PriorityWebhook {
-		t.Fatalf("first drained = %+v, want the PriorityWebhook ci signal", first)
-	}
-}
-
-// TestWebhookEnqueueNilDaemonSafe proves the push path is nil-safe exactly like the
-// underlying Daemon.Enqueue: a nil daemon returns ErrQueueClosed, never panics.
-func TestWebhookEnqueueNilDaemonSafe(t *testing.T) {
-	var d *Daemon
-	if err := (WebhookSignal{Source: "ci", Goal: "x"}).Enqueue(d); !errors.Is(err, ErrQueueClosed) {
-		t.Fatalf("nil-daemon webhook Enqueue: got %v, want ErrQueueClosed", err)
-	}
-}
-
 // TestSourcesHonorCancel proves every pull adapter unparks and returns the context
 // error when its (empty, never-closed) input blocks and ctx is cancelled — the
 // daemon's shutdown contract for a Source.
 func TestSourcesHonorCancel(t *testing.T) {
 	cases := map[string]Source{
 		"file": FileSource{Signals: make(chan FileSignal)},
-		"cron": CronSource{Fires: make(chan trigger.Signal)},
 		"wake": WakeSource{Fires: make(chan Wake)},
 	}
 	for name, src := range cases {

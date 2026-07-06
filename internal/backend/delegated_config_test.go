@@ -78,7 +78,9 @@ func TestCodexArgs(t *testing.T) {
 // TestClaudeArgs mirrors TestCodexArgs for the Claude Code builder. Effort is
 // deliberately absent here — it travels via env, not a flag.
 func TestClaudeArgs(t *testing.T) {
-	const base = "claude -p 'g' --output-format stream-json --permission-mode acceptEdits"
+	// --verbose is mandatory alongside stream-json under -p, so it is part of the
+	// baseline command every knob-combination builds on.
+	const base = "claude -p 'g' --output-format stream-json --verbose --permission-mode acceptEdits"
 	tests := []struct {
 		name  string
 		goal  string
@@ -87,7 +89,7 @@ func TestClaudeArgs(t *testing.T) {
 		want  string
 	}{
 		{
-			name: "all zero is byte-identical to the original",
+			name: "all zero is the default command (stream-json + verbose)",
 			goal: "g",
 			want: base,
 		},
@@ -160,14 +162,16 @@ func TestCodexRunByteIdenticalWhenAllFieldsZero(t *testing.T) {
 	}
 }
 
-// TestClaudeRunByteIdenticalWhenAllFieldsZero is the Claude Code counterpart.
-func TestClaudeRunByteIdenticalWhenAllFieldsZero(t *testing.T) {
+// TestClaudeRunDefaultCommandWhenAllFieldsZero is the Claude Code counterpart: with
+// every operator knob zero, Run emits the default command — stream-json plus the
+// mandatory --verbose (the CLI rejects stream-json under -p without it).
+func TestClaudeRunDefaultCommandWhenAllFieldsZero(t *testing.T) {
 	box := &fakeBox{stdout: `{"text":"ok"}`}
 	cc := &ClaudeCode{Box: box, Key: "sk-ant"}
 	if _, err := cc.Run(context.Background(), Task{ID: "t", Goal: "do it"}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if want := "claude -p 'do it' --output-format stream-json --permission-mode acceptEdits"; box.gotCmd != want {
+	if want := "claude -p 'do it' --output-format stream-json --verbose --permission-mode acceptEdits"; box.gotCmd != want {
 		t.Errorf("cmd =\n  %q\nwant\n  %q", box.gotCmd, want)
 	}
 	if len(box.gotEnv) != 1 || box.gotEnv["ANTHROPIC_API_KEY"] != "sk-ant" {

@@ -83,6 +83,46 @@ func TestClaudeCodeInjectsKeyPerRunAndNeverLogsIt(t *testing.T) {
 	}
 }
 
+func TestClaudeArgsIncludesVerboseWithStreamJSON(t *testing.T) {
+	// Current Claude Code CLIs reject --output-format stream-json under -p unless
+	// --verbose is also passed, so the emitted command MUST carry --verbose.
+	cmd := claudeArgs("fix the bug", "", nil)
+	for _, want := range []string{"--output-format stream-json", "--verbose", "claude -p"} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("claudeArgs missing %q: %q", want, cmd)
+		}
+	}
+}
+
+func TestClaudeCodeToleratesVerboseInitFraming(t *testing.T) {
+	// With --verbose the stream carries init/system framing lines that have no text
+	// payload; the parser must skip them and still surface the last real message.
+	logPath := filepath.Join(t.TempDir(), "ev.jsonl")
+	log, err := eventlog.Open(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	stream := strings.Join([]string{
+		`{"type":"system","subtype":"init","session_id":"abc","tools":["Edit"]}`,
+		`{"type":"assistant","message":{"text":"working on it"}}`,
+		`{"type":"result","subtype":"success","text":"all done"}`,
+	}, "\n")
+	box := &fakeBox{stdout: stream}
+	cc := &ClaudeCode{Box: box, Key: "k", Log: log}
+	res, err := cc.Run(context.Background(), Task{ID: "t3", Goal: "do it"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Summary != "all done" {
+		t.Errorf("summary = %q, want the last text payload past the init framing", res.Summary)
+	}
+	if !strings.Contains(box.gotCmd, "--verbose") {
+		t.Errorf("emitted command lacks --verbose: %q", box.gotCmd)
+	}
+}
+
 func TestDelegatedFailsFastWhenCLIMissing(t *testing.T) {
 	// fakeBox returns a non-zero exit for everything, so the `command -v` pre-flight
 	// reports the CLI is absent and the backend fails fast before running the task.

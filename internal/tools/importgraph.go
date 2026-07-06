@@ -217,10 +217,13 @@ func renderLayers(adj map[string]map[string]bool, layers []string) string {
 	if len(layers) == 0 {
 		return "import_graph layers: provide an ordered high→low 'layers' prefix list to check (e.g. [\"mod/cmd\",\"mod/internal/agent\",\"mod/internal/tools\"])."
 	}
+	// Match on a path-SEGMENT boundary so a prefix like "mod/internal/ap" cannot claim
+	// "mod/internal/apple/...": a package belongs to a layer only when it equals the
+	// prefix or sits under it (prefix + "/").
 	layerOf := func(pkg string) int {
 		best, bestLen := -1, -1
 		for i, pre := range layers {
-			if (pkg == pre || strings.HasPrefix(pkg, pre)) && len(pre) > bestLen {
+			if (pkg == pre || strings.HasPrefix(pkg, pre+"/")) && len(pre) > bestLen {
 				best, bestLen = i, len(pre)
 			}
 		}

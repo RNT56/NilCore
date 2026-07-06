@@ -70,19 +70,34 @@ func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *event
 		return
 	}
 
+	// Source 1: the operator standing-objectives backlog (idle-gated). Constructed
+	// before the handler so the handler can close over it and record a VERIFIED outcome
+	// (MarkSuccess) — advancing LastSuccess so the full MinPeriod cadence (not the
+	// shorter RetryPeriod) gates the next pull. The BacklogSource already advances the
+	// debounce clock (MarkAttempt) at selection; the handler completes the cadence loop
+	// on a green verdict, so a failed/gate-denied objective re-arms after RetryPeriod
+	// while a verified one waits a full MinPeriod.
+	backlog := objective.New(s.ObjectiveStore())
+
 	handler := func(ctx context.Context, sig trigger.Signal) error {
 		// Run the inert goal (objective / file signal / wake note) through the verified
 		// orchestrator: reversible by construction (a disposable worktree), with every
 		// irreversible step hitting the headless gate the caller wired onto orch.Approver.
-		_, err := runViaKernel(ctx, orch, backend.Task{
+		outcome, err := runViaKernel(ctx, orch, backend.Task{
 			ID:   fmt.Sprintf("auto-%d", time.Now().UnixNano()),
 			Goal: sig.Goal,
 		})
+		// A backlog objective that VERIFIED (I2: outcome.Verified is the verifier's
+		// verdict, never a self-report) advances LastSuccess so its success-aware cadence
+		// applies. Only backlog signals carry a standing objective; file/wake signals have
+		// no cadence to record. A MarkSuccess failure is non-fatal to the run — the work is
+		// done and verified; a missed timestamp only means the objective re-arms sooner.
+		if err == nil && outcome.Verified && sig.Source == "backlog" {
+			markObjectiveSuccess(ctx, backlog, sig.Goal)
+		}
 		return err
 	}
 
-	// Source 1: the operator standing-objectives backlog (idle-gated).
-	backlog := objective.New(s.ObjectiveStore())
 	sources := []autosrc.Source{autosrc.NewBacklogSource(backlog, autosrc.BacklogConfig{Idle: idle})}
 
 	// Source 2: dropped file signals (reactive). A feeder goroutine owns the directory
@@ -104,6 +119,37 @@ func runAutonomyDaemon(ctx context.Context, orch *agent.Orchestrator, log *event
 	d := autosrc.New(handler, autosrc.Config{Concurrency: 1, QueueCap: autonomyQueueCap, Log: log})
 	if err := d.Run(ctx, sources...); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "nilcore: autonomy daemon stopped: %v\n", err)
+	}
+}
+
+// markObjectiveSuccess records a VERIFIED backlog outcome against its standing objective,
+// advancing LastSuccess (and LastRun) so the full MinPeriod cadence — not the shorter
+// RetryPeriod — gates the next pull. The backlog signal carries only the operator-authored
+// Goal (trigger.Signal has no objective ID), so the objective is resolved by matching that
+// Goal against the enabled backlog: it is marked only when EXACTLY ONE enabled objective
+// has that goal, so an ambiguous (duplicate-goal) or vanished objective is left to re-arm
+// after RetryPeriod rather than crediting the wrong record. Best-effort: any store error is
+// swallowed with a stderr note — the verified work already shipped (I2); a missed success
+// timestamp only re-services the objective sooner, never wrongly marks it done.
+func markObjectiveSuccess(ctx context.Context, backlog *objective.Backlog, goal string) {
+	objs, err := backlog.List(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: autonomy MarkSuccess lookup failed: %v\n", err)
+		return
+	}
+	var match string
+	var n int
+	for _, o := range objs {
+		if o.Enabled && o.Goal == goal {
+			match = o.ID
+			n++
+		}
+	}
+	if n != 1 {
+		return // no unambiguous objective to credit; it re-arms after RetryPeriod
+	}
+	if err := backlog.MarkSuccess(ctx, match, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: autonomy MarkSuccess(%q) failed: %v\n", match, err)
 	}
 }
 

@@ -91,13 +91,6 @@ type Emitter interface {
 	Emit(Event)
 }
 
-// NopEmitter discards every event. It exists so a non-nil zero value is always
-// safe; the loop still prefers a nil check to skip the call entirely.
-type NopEmitter struct{}
-
-// Emit discards e.
-func (NopEmitter) Emit(Event) {}
-
 // WriterEmitter renders events as one human-readable line each to an io.Writer
 // (the terminal's stdout for `nilcore chat`). It serializes writes with a mutex
 // so concurrent emits never interleave on the underlying writer.

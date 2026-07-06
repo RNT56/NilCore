@@ -142,14 +142,18 @@ type Native struct {
 	Emitter Emitter
 
 	// LiveSession, if set, opens a per-run incremental code-intelligence session for
-	// the worktree (P3-T16): update(path) re-indexes one edited file; query(symbol)
-	// returns its current call-graph neighborhood — reflecting the agent's own
-	// uncommitted edits — fused with project memory, already rendered. The loop opens
-	// it at Run start and closes it at Run end, so the graph handle is task-scoped (no
-	// leak) and backend imports no codeintel machinery — the same func-seam discipline
-	// as MemoryContext above. nil ⇒ off: no `live` tool is advertised and no re-index
-	// hook fires, so the loop is byte-identical.
-	LiveSession func(dir string) (update func(context.Context, string), query func(context.Context, string) string, closeFn func())
+	// the worktree (P3-T16): update(path) re-indexes one edited file; remove(path)
+	// prunes a deleted/renamed-away file (its symbol nodes AND the dangling edges that
+	// pointed INTO them — the one thing update/BuildFile deliberately cannot do, since
+	// it re-indexes a file that still exists); query(symbol) returns its current
+	// call-graph neighborhood — reflecting the agent's own uncommitted edits — fused
+	// with project memory, already rendered. The loop opens it at Run start and closes
+	// it at Run end, so the graph handle is task-scoped (no leak) and backend imports no
+	// codeintel machinery — the same func-seam discipline as MemoryContext above. nil ⇒
+	// off: no `live` tool is advertised and no re-index/prune hook fires, so the loop is
+	// byte-identical. A wiring that has no prune source may leave `remove` nil; the loop
+	// nil-gates it independently of `update`.
+	LiveSession func(dir string) (update func(context.Context, string), remove func(context.Context, string), query func(context.Context, string) string, closeFn func())
 
 	// Wake, if set, lets the agent SUSPEND its drive on a self-chosen timer (the
 	// `sleep` tool): it durably arms a wake for `after` and the drive then ends
@@ -364,10 +368,11 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	// tool is advertised only when a session is wired, so the loop is byte-identical
 	// when off. liveUpdate/liveQuery stay nil otherwise; every use is nil-gated.
 	var liveUpdate func(context.Context, string)
+	var liveRemove func(context.Context, string)
 	var liveQuery func(context.Context, string) string
 	if n.LiveSession != nil {
-		u, q, closeFn := n.LiveSession(t.Dir)
-		liveUpdate, liveQuery = u, q
+		u, r, q, closeFn := n.LiveSession(t.Dir)
+		liveUpdate, liveRemove, liveQuery = u, r, q
 		if closeFn != nil {
 			defer closeFn()
 		}
@@ -1064,22 +1069,17 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					if img != nil {
 						pendingImages = append(pendingImages, model.ImageBlock(img.MediaType, img.Base64))
 					}
-					// Incremental re-index (P3-T16): a successful write/edit updates just
-					// that file in the live graph, so the next `live` query reflects the
-					// edit. nil-safe and best-effort — the index is an accelerator, never
-					// on the critical path, so an index miss never fails the step.
-					if liveUpdate != nil && (b.Name == "write" || b.Name == "edit") {
-						var pin struct {
-							Path string `json:"path"`
-						}
-						if json.Unmarshal(b.Input, &pin) == nil && pin.Path != "" {
-							p := pin.Path
-							if !filepath.IsAbs(p) {
-								p = filepath.Join(t.Dir, p)
-							}
-							liveUpdate(ctx, p)
-						}
-					}
+					// Incremental re-index (P3-T16): a successful structured file op keeps
+					// the live graph current, so the next `live` query reflects the edit.
+					// A write/edit re-indexes the touched file (liveUpdate → BuildFile). A
+					// `patch` op that REMOVES a file — a delete_file, or the source side of a
+					// move_to (rename) — must PRUNE it (liveRemove → RemoveFile), because
+					// BuildFile deliberately keeps a file's incoming edges (it re-indexes a
+					// file that still exists) and so cannot drop the dangling edges left when
+					// the file is gone. Both hooks are nil-safe and best-effort — the index is
+					// an accelerator, never on the critical path, so an index miss never fails
+					// the step.
+					liveReindex(ctx, b.Name, t.Dir, b.Input, liveUpdate, liveRemove)
 					continue
 				}
 				results = append(results, errorResult(b.ID, "unknown tool: "+b.Name))
@@ -1146,6 +1146,84 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 
 func errorResult(id, msg string) model.Block {
 	return model.Block{Type: "tool_result", ToolUseID: id, Content: msg, IsError: true}
+}
+
+// liveReindex keeps the P3-T16 live code graph current after a successful structured
+// file tool. It maps each removing/updating file op to the right graph hook:
+//
+//   - write / edit: the one named file is re-indexed (update → BuildFile).
+//   - patch: each op is dispatched by kind — delete_file PRUNES the removed path
+//     (remove → RemoveFile), a move_to PRUNES the source AND re-indexes the
+//     destination (remove old + update new), and add_file / update_file re-index the
+//     written path. This is the removal signal the graph's RemoveFile/Index.Remove
+//     pruning always had but nothing fired: a deleted or renamed-away file's symbol
+//     nodes and the edges pointing INTO them were left dangling because only
+//     write/edit ever signalled the index.
+//
+// Both hooks are independently nil-gated (a session may wire update but not remove),
+// and every call is best-effort: the index is an accelerator, never on the critical
+// path, so a parse/prune miss never fails the step. Paths are resolved to absolute
+// under the worktree dir (the same normalization write/edit used), matching the paths
+// BuildFile/RemoveFile index with.
+func liveReindex(ctx context.Context, tool, dir string, input json.RawMessage,
+	update, remove func(context.Context, string)) {
+	abs := func(p string) string {
+		if p == "" {
+			return ""
+		}
+		if !filepath.IsAbs(p) {
+			return filepath.Join(dir, p)
+		}
+		return p
+	}
+	doUpdate := func(p string) {
+		if update != nil && p != "" {
+			update(ctx, abs(p))
+		}
+	}
+	doRemove := func(p string) {
+		if remove != nil && p != "" {
+			remove(ctx, abs(p))
+		}
+	}
+	switch tool {
+	case "write", "edit":
+		var pin struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal(input, &pin) == nil {
+			doUpdate(pin.Path)
+		}
+	case "patch":
+		var pin struct {
+			Ops []struct {
+				Kind   string `json:"kind"`
+				Path   string `json:"path"`
+				MoveTo string `json:"move_to"`
+			} `json:"ops"`
+		}
+		if json.Unmarshal(input, &pin) != nil {
+			return
+		}
+		for _, op := range pin.Ops {
+			switch op.Kind {
+			case "delete_file":
+				doRemove(op.Path)
+			case "update_file":
+				// A move_to relocates the file (patch validates move_to only on
+				// update_file): prune the old path, index the new one. Without it the
+				// same path is re-indexed in place.
+				if op.MoveTo != "" {
+					doRemove(op.Path)
+					doUpdate(op.MoveTo)
+				} else {
+					doUpdate(op.Path)
+				}
+			case "add_file":
+				doUpdate(op.Path)
+			}
+		}
+	}
 }
 
 // clampSleep bounds a self-timer to [1 minute, 24 hours]: a floor so a model cannot

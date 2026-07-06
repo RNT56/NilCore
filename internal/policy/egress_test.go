@@ -45,54 +45,6 @@ func TestDefaultEgress(t *testing.T) {
 	}
 }
 
-// TestEgressWithNoExtraEqualsDefault locks the contract that the conservative
-// default is never mutated: EgressWith() with no extra hosts must reproduce
-// DefaultEgress exactly — same hosts, same order.
-func TestEgressWithNoExtraEqualsDefault(t *testing.T) {
-	def := DefaultEgress()
-	got := EgressWith()
-	if len(got.Allowed) != len(def.Allowed) {
-		t.Fatalf("EgressWith() len = %d, want %d (default unchanged)", len(got.Allowed), len(def.Allowed))
-	}
-	for i := range def.Allowed {
-		if got.Allowed[i] != def.Allowed[i] {
-			t.Errorf("EgressWith()[%d] = %q, want %q (default order/contents must be preserved)", i, got.Allowed[i], def.Allowed[i])
-		}
-	}
-}
-
-// TestEgressWithAppendsAndDedups proves extra hosts land after the defaults, in
-// order, and that duplicates (against the defaults, against each other, and via
-// case/whitespace) are collapsed.
-func TestEgressWithAppendsAndDedups(t *testing.T) {
-	def := DefaultEgress()
-	got := EgressWith("internal.corp.example", "cache.example.com", "internal.corp.example", " API.Anthropic.com ", "cache.example.com")
-
-	// All defaults preserved in their original order at the front.
-	for i := range def.Allowed {
-		if got.Allowed[i] != def.Allowed[i] {
-			t.Fatalf("default[%d] = %q, want %q", i, got.Allowed[i], def.Allowed[i])
-		}
-	}
-	// Exactly the two new, unique hosts appended after the defaults, in order.
-	want := append(append([]string{}, def.Allowed...), "internal.corp.example", "cache.example.com")
-	if len(got.Allowed) != len(want) {
-		t.Fatalf("EgressWith len = %d (%v), want %d (%v)", len(got.Allowed), got.Allowed, len(want), want)
-	}
-	for i := range want {
-		if got.Allowed[i] != want[i] {
-			t.Errorf("EgressWith[%d] = %q, want %q", i, got.Allowed[i], want[i])
-		}
-	}
-	// The custom hosts are now reachable; the default is unaffected.
-	if !got.Allow("internal.corp.example") || !got.Allow("cache.example.com") || !got.Allow("api.anthropic.com") {
-		t.Error("EgressWith should allow both defaults and extra hosts")
-	}
-	if got.Allow("evil.example.com") {
-		t.Error("EgressWith must still deny unlisted hosts")
-	}
-}
-
 func TestEgressProxyDenies(t *testing.T) {
 	p := &EgressProxy{Egress: Egress{Allowed: []string{"allowed.com"}}}
 

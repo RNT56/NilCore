@@ -68,6 +68,24 @@ func (p *Provider) reportUsage(u model.Usage) {
 	}
 }
 
+// pricingModel picks the id the Pricer should bill. When a provider reports the model
+// that ACTUALLY served the call in Response.ServedModel, that is the correct billing key
+// — e.g. an OpenRouter models[] fallback chain can route to a differently-priced upstream
+// than the one requested. Every OpenAI-family adapter (OpenAI, OpenRouter, and any
+// openai-compatible base) echoes response.model into ServedModel, so those calls price
+// the SERVED id; the served id may be VENDOR-NAMESPACED ("anthropic/claude-opus-4-8"),
+// which rateFor resolves to the right tier by matching the post-'/' segment. Only the
+// Anthropic adapter leaves ServedModel empty, so ONLY that path falls back to
+// p.Inner.Model() — byte-identical to before this seam existed. For a legitimate OpenAI
+// call the served snapshot ("gpt-4o-2024-08-06") prefix-resolves to the same tier as the
+// requested id, so the dollar figure is unchanged there too.
+func (p *Provider) pricingModel(resp model.Response) string {
+	if resp.ServedModel != "" {
+		return resp.ServedModel
+	}
+	return p.Inner.Model()
+}
+
 // Complete forwards to the inner provider and, on success, charges the ledger
 // for the call's token usage at the priced dollar cost. If the inner call fails
 // it returns that error and charges nothing (a failed call consumed no billable
@@ -81,9 +99,12 @@ func (p *Provider) reportUsage(u model.Usage) {
 // input+output+reasoning (for the ledger's token meter) — the same token set the
 // dollar pricer bills (PriceUsage charges reasoning at the output rate), so the
 // token report and the dollar wall agree for o-series/extended-thinking models. The
-// dollar figure comes from Price.PriceUsage over the inner provider's model id and
-// the full resp.Usage, so an authoritative vendor cost (Usage.CostUSD) and the
-// cached-input discount feed the dollar ceiling. The charge uses chargeCtx (a
+// dollar figure comes from Price.PriceUsage over the PRICING model id (the served id
+// from resp.ServedModel when the provider reports one — e.g. an OpenRouter models[]
+// fallback that routed to a differently-priced upstream — else the inner provider's
+// requested id) and the full resp.Usage, so an authoritative vendor cost
+// (Usage.CostUSD) and the cached-input discount feed the dollar ceiling. The charge
+// uses chargeCtx (a
 // cancellation-stripped ctx): the tokens were already produced, so a ctx that is
 // cancelled in the window between the call returning and the charge landing must
 // NOT drop the charge — under-metering a completed call would let spend escape the
@@ -98,7 +119,7 @@ func (p *Provider) Complete(ctx context.Context, system string, msgs []model.Mes
 
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens + resp.Usage.ReasoningTokens
-	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
+	dollars := p.Price.PriceUsage(p.pricingModel(resp), resp.Usage)
 	if cerr := p.Ledger.Charge(chargeCtx(ctx), p.Task, tokens, dollars); cerr != nil {
 		// The charge ran on a cancellation-stripped ctx, so cerr is a real ceiling
 		// breach (budget.ErrCeiling), never a stale ctx error. It propagates so the
@@ -162,7 +183,7 @@ func (p *Provider) Stream(ctx context.Context, system string, msgs []model.Messa
 	// ledger drop these already-produced tokens.
 	p.reportUsage(resp.Usage)
 	tokens := resp.Usage.InputTokens + resp.Usage.OutputTokens + resp.Usage.ReasoningTokens
-	dollars := p.Price.PriceUsage(p.Inner.Model(), resp.Usage)
+	dollars := p.Price.PriceUsage(p.pricingModel(resp), resp.Usage)
 	cerr := p.Ledger.Charge(chargeCtx(ctx), p.Task, tokens, dollars)
 
 	if callErr != nil {

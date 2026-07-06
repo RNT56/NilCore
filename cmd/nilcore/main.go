@@ -1857,7 +1857,7 @@ const modelCallTimeout = 10 * time.Minute
 // resolver treats as a byte-identical pass-through — so the default path is
 // unchanged. The API key is NEVER carried here (I3): only static routing strings.
 func tuningFromConfig(cfg onboard.Config) provider.Tuning {
-	return provider.Tuning{
+	t := provider.Tuning{
 		ReasoningEffort:   cfg.ReasoningEffort,
 		MaxTokensField:    cfg.MaxTokensField,
 		ServiceTier:       cfg.Routing.ServiceTier,
@@ -1866,6 +1866,55 @@ func tuningFromConfig(cfg onboard.Config) provider.Tuning {
 		OpenRouterReferer: cfg.OpenRouterReferer,
 		OpenRouterTitle:   cfg.OpenRouterTitle,
 	}
+	// Structured-output (response_format / tool_choice) + OpenRouter routing extras from
+	// env. All are request DATA (routing knobs / schemas), NEVER a secret (I3). Each field
+	// stays nil/empty — and therefore omitted, byte-identical — when its var is unset, so
+	// the default run is unchanged. Malformed JSON is ignored (the knob simply stays off).
+	t.OpenRouterModels = splitComma(os.Getenv("NILCORE_OPENROUTER_MODELS"))
+	t.OpenRouterTransforms = splitComma(os.Getenv("NILCORE_OPENROUTER_TRANSFORMS"))
+	if raw := strings.TrimSpace(os.Getenv("NILCORE_OPENROUTER_PROVIDER")); raw != "" {
+		var p provider.OpenRouterProvider
+		if json.Unmarshal([]byte(raw), &p) == nil {
+			t.OpenRouterProvider = &p
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("NILCORE_OPENROUTER_REASONING")); raw != "" {
+		var r provider.OpenRouterReasoning
+		if json.Unmarshal([]byte(raw), &r) == nil {
+			t.OpenRouterReasoning = &r
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("NILCORE_OPENROUTER_PLUGINS")); raw != "" {
+		var pl []provider.OpenRouterPlugin
+		if json.Unmarshal([]byte(raw), &pl) == nil {
+			t.OpenRouterPlugins = pl
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("NILCORE_RESPONSE_FORMAT")); raw != "" {
+		var rf provider.ResponseFormat
+		if json.Unmarshal([]byte(raw), &rf) == nil {
+			t.ResponseFormat = &rf
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("NILCORE_TOOL_CHOICE")); raw != "" && json.Valid([]byte(raw)) {
+		// Only a VALID JSON value is accepted — an omitempty json.RawMessage set to
+		// malformed bytes would make json.Marshal of EVERY request fail. A malformed knob
+		// simply stays off, matching the sibling env knobs above.
+		t.ToolChoice = json.RawMessage(raw)
+	}
+	return t
+}
+
+// splitComma splits a comma-separated env value into trimmed, non-empty parts; an empty
+// input yields nil, so an unset var leaves the corresponding Tuning field omitted.
+func splitComma(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // the backend name + required secret up front. The model spec is NILCORE_MODEL,
@@ -2176,7 +2225,26 @@ func wireMultiBackend(o *agent.Orchestrator, c commonFlags, b boot, log *eventlo
 	// is unset (o.Oracle stays nil). The verifier still judges every race (I2).
 	if os.Getenv("NILCORE_TRUST_DEFAULT") == "1" {
 		if led, err := trust.Replay(*c.logPath); err == nil {
-			o.Oracle = agent.NewTrustRouteOracle(led, nil)
+			// Cost-aware routing (RTE-T06): price each backend by the model it runs, so the
+			// oracle can size race/escalate by learned trust AND expected cost, and each race
+			// records the cost cell trust.Replay folds. The nominal token budget only needs to
+			// be consistent across candidates (the oracle compares, never charges). A backend
+			// whose model id is unset prices to zero (cost-neutral), never a panic. Cost is
+			// metadata only (I7) and never gates the verifier (I2).
+			modelID := func(backendName string) string {
+				switch backendName {
+				case "native":
+					return modelSpec(os.Getenv("NILCORE_MODEL"), b.cfg.Executor)
+				case "codex":
+					return os.Getenv("NILCORE_CODEX_MODEL")
+				case "claude-code":
+					return os.Getenv("NILCORE_CLAUDE_MODEL")
+				}
+				return ""
+			}
+			cost := agent.PricerCost(meter.NewTable(), modelID, 1000, 1000)
+			o.Oracle = agent.NewTrustRouteOracle(led, cost)
+			o.Cost = agent.OrchestratorCost(cost)
 		} else {
 			fmt.Fprintf(os.Stderr, "trust-route: ledger unavailable (%v); using static routing\n", err)
 		}
@@ -2542,6 +2610,13 @@ func assembleStore(dir string, forWrite bool, keychain secrets.SecretStore) secr
 				stores = append(stores, v)
 			}
 		}
+	}
+	// External SecretStore (the 4th sanctioned I3 backend): a Vault/KMS hook that shells
+	// to NILCORE_SECRET_EXTERNAL_CMD. Consulted before the ambient env fallback, only when
+	// configured; it never logs the secret and fails closed. Read path only — `secret set`
+	// still writes to the keychain/file vault.
+	if ext, ok := secrets.ExternalFromEnv(); ok {
+		stores = append(stores, ext)
 	}
 	stores = append(stores, secrets.EnvStore{})
 	if len(stores) == 1 {

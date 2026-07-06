@@ -120,7 +120,7 @@ func (d flowDoc) toAdapterFlow() agenticflows.Flow {
 			tool = n.ID
 		}
 		nodes = append(nodes, agenticflows.Node{
-			ID: n.ID, Type: n.Type, Title: n.Title, Description: n.Description, Agent: n.Agent, Tool: tool,
+			ID: n.ID, Type: n.Type, Title: n.Title, Description: n.Description, Tool: tool,
 		})
 	}
 	return agenticflows.Flow{

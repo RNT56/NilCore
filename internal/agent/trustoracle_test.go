@@ -217,6 +217,34 @@ func TestPricerCost_AdaptsPricer(t *testing.T) {
 	}
 }
 
+// TestOrchestratorCost_AdaptsCostFunc proves OrchestratorCost lifts a per-backend
+// CostFunc into the (taskClass, backendName) shape Orchestrator.Cost wants — ignoring
+// the class, reading the backend — and returns nil for a nil CostFunc so the seam
+// stays default-off (byte-identical: no cost dimension recorded).
+func TestOrchestratorCost_AdaptsCostFunc(t *testing.T) {
+	base := agent.CostFunc(func(backend string) float64 {
+		if backend == "native" {
+			return 2.0
+		}
+		return 0.5
+	})
+	oc := agent.OrchestratorCost(base)
+	if oc == nil {
+		t.Fatal("OrchestratorCost returned nil for a non-nil CostFunc")
+	}
+	// The class is ignored; the backend drives the cost.
+	if got := oc("refactor", "native"); got != 2.0 {
+		t.Errorf("OrchestratorCost(refactor, native) = %v, want 2.0", got)
+	}
+	if got := oc("feature", "codex"); got != 0.5 {
+		t.Errorf("OrchestratorCost(feature, codex) = %v, want 0.5", got)
+	}
+	// A nil CostFunc yields a nil adapter — Orchestrator.Cost stays unset.
+	if agent.OrchestratorCost(nil) != nil {
+		t.Error("OrchestratorCost(nil) should return nil so the seam stays default-off")
+	}
+}
+
 // stubPricer is a hermetic meter.Pricer: it returns a fixed per-id cost, ignoring
 // token counts (the oracle only compares costs relatively, so absolute arithmetic
 // is irrelevant to these tests).

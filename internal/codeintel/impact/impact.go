@@ -1,19 +1,10 @@
-// Package impact answers "what does this change touch, and where is the bug?"
-// (P3-T15). Two complementary views over the code graph:
+// Package impact answers "what does this change touch?" (P3-T15) — a view over the
+// code graph:
 //
 //   - ImpactSet/AffectedTests — forward-of-blame: the transitive *callers* of a
 //     changed symbol (reverse reachability). Editing a leaf ripples up to every
 //     caller, so that caller set is exactly what must be re-checked; the subset
 //     whose names start with "Test" is the test suite to re-run for the change.
-//   - Localize — spectrum-based fault localization (SBFL). Given test coverage
-//     (which symbols each failing/passing test executed), rank symbols by how
-//     selectively the failures touch them, using the Ochiai suspiciousness
-//     metric. This points a debugging agent at the likely culprit first.
-//     Localize is an AVAILABLE API, not yet wired: nothing in the loop collects
-//     per-test symbol coverage to feed it, so it ships dark. Wiring it means a
-//     post-failure step that gathers coverage (e.g. from a per-test run of the
-//     affected tests) and ranks suspects — until then ImpactSet/AffectedTests are
-//     the live half of this package.
 //
 // Reverse reachability is done in Go (BFS over g.Callers) rather than a CTE so
 // the package stays a thin, testable layer over the graph's stable query API.
@@ -22,7 +13,6 @@ package impact
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 
@@ -83,52 +73,4 @@ func AffectedTests(ctx context.Context, g *graph.Graph, changed string) ([]strin
 	}
 	sort.Strings(tests)
 	return tests, nil
-}
-
-// Suspect is a symbol and its computed suspiciousness score.
-type Suspect struct {
-	Symbol string
-	Score  float64
-}
-
-// Cover records how many failing and passing tests executed a symbol.
-type Cover struct {
-	Failed int
-	Passed int
-}
-
-// Localize ranks symbols by suspiciousness using the Ochiai SBFL metric:
-//
-//	score = failed / sqrt(totalFailed * (failed + passed))
-//
-// where totalFailed is the largest Failed value in the map — i.e. a symbol
-// executed by every failing test. Symbols never hit by a failing test, or any
-// case that would divide by zero, score 0. Results are sorted by score
-// descending, with the symbol name as a stable tie-breaker.
-func Localize(coverage map[string]Cover) []Suspect {
-	var totalFailed int
-	for _, c := range coverage {
-		if c.Failed > totalFailed {
-			totalFailed = c.Failed
-		}
-	}
-	out := make([]Suspect, 0, len(coverage))
-	for sym, c := range coverage {
-		out = append(out, Suspect{Symbol: sym, Score: ochiai(c.Failed, c.Passed, totalFailed)})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Score != out[j].Score {
-			return out[i].Score > out[j].Score
-		}
-		return out[i].Symbol < out[j].Symbol
-	})
-	return out
-}
-
-func ochiai(failed, passed, totalFailed int) float64 {
-	denom := float64(totalFailed) * float64(failed+passed)
-	if denom <= 0 {
-		return 0
-	}
-	return float64(failed) / math.Sqrt(denom)
 }

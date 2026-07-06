@@ -46,6 +46,58 @@ func TestSecretSubstitution(t *testing.T) {
 	}
 }
 
+// TestTypedSecretScrubbedFromObservation exercises the host-side secret-reflow backstop
+// (I3): a {{secret:NAME}} typed into a NON-password desktop field must not reflow back to
+// the model. After the type act resolves the secret, the driver's next observation echoes
+// the plaintext in Title/Text/FocusedWindow and a Ref's Name/Value (the a11y dump populates
+// Ref.Value raw); the session must scrub every occurrence to the sentinel before returning.
+func TestTypedSecretScrubbedFromObservation(t *testing.T) {
+	const secret = "s3cr3t-token-value"
+	ft := &fakeTransport{reply: func(seq int, a desktopwire.Act) desktopwire.SessionResponse {
+		return desktopwire.SessionResponse{Seq: seq, Observation: desktopwire.Observation{
+			Version:       2,
+			Title:         "token is " + secret,
+			Text:          "your api key: " + secret + " (saved)",
+			FocusedWindow: "field: " + secret,
+			Refs: []desktopwire.Ref{
+				{ID: 1, Role: "entry", Name: "API key", Value: secret, Version: 2},
+			},
+		}}
+	}}
+	s := newSession(ft, func(name string) (string, bool) {
+		if name == "api_key" {
+			return secret, true
+		}
+		return "", false
+	})
+	s.latest = desktopwire.Observation{Version: 1, Refs: []desktopwire.Ref{{ID: 1, Role: "entry", Version: 1}}}
+
+	obs, err := s.Act(context.Background(), desktopwire.Act{Op: desktopwire.OpType, Ref: 1, Text: "{{secret:api_key}}"})
+	if err != nil {
+		t.Fatalf("Act: %v", err)
+	}
+	// The real value was sent to the driver (substitution works)…
+	if ft.got[0].Text != secret {
+		t.Fatalf("secret not substituted before send: %q", ft.got[0].Text)
+	}
+	// …but must NOT appear anywhere in the observation returned to the model.
+	if strings.Contains(obs.Title, secret) || strings.Contains(obs.Text, secret) || strings.Contains(obs.FocusedWindow, secret) {
+		t.Fatalf("secret reflowed into observation title/text/window: %+v", obs)
+	}
+	for _, r := range obs.Refs {
+		if strings.Contains(r.Name, secret) || strings.Contains(r.Value, secret) {
+			t.Fatalf("secret reflowed into a ref name/value: %+v", r)
+		}
+	}
+	if !strings.Contains(obs.Text, secretSentinel) || !strings.Contains(obs.Refs[0].Value, secretSentinel) {
+		t.Fatalf("scrubbed value should be replaced by the sentinel: %+v", obs)
+	}
+	// Latest() must also be scrubbed (it is what the tool renders).
+	if strings.Contains(s.Latest().Text, secret) {
+		t.Fatalf("Latest() still carries the plaintext secret: %q", s.Latest().Text)
+	}
+}
+
 func TestSecretMissingFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, func(string) (string, bool) { return "", false })

@@ -20,17 +20,17 @@ package provider
 // `models`, `reasoning`, `transforms`, and `plugins`. Every field is omitempty,
 // so configuring one knob never drags the others onto the wire.
 type openRouterExtras struct {
-	Provider   *openRouterProvider  `json:"provider,omitempty"`
+	Provider   *OpenRouterProvider  `json:"provider,omitempty"`
 	Models     []string             `json:"models,omitempty"`     // model fallback chain
-	Reasoning  *openRouterReasoning `json:"reasoning,omitempty"`  // reasoning controls
+	Reasoning  *OpenRouterReasoning `json:"reasoning,omitempty"`  // reasoning controls
 	Transforms []string             `json:"transforms,omitempty"` // prompt transforms, e.g. "middle-out"
-	Plugins    []openRouterPlugin   `json:"plugins,omitempty"`    // plugin chain, e.g. web search
+	Plugins    []OpenRouterPlugin   `json:"plugins,omitempty"`    // plugin chain, e.g. web search
 }
 
-// openRouterProvider is OpenRouter's provider-routing object. Every field is
+// OpenRouterProvider is OpenRouter's provider-routing object. Every field is
 // optional and omitempty; an empty object never reaches the wire because the
-// whole *openRouterProvider stays nil until WithOpenRouterProvider runs.
-type openRouterProvider struct {
+// whole *OpenRouterProvider stays nil until WithOpenRouterProvider runs.
+type OpenRouterProvider struct {
 	Order             []string            `json:"order,omitempty"`              // preferred upstream order
 	AllowFallbacks    *bool               `json:"allow_fallbacks,omitempty"`    // pointer: false is meaningful
 	RequireParameters *bool               `json:"require_parameters,omitempty"` // defaults true when extras present
@@ -40,31 +40,31 @@ type openRouterProvider struct {
 	Only              []string            `json:"only,omitempty"`               // restrict to these upstreams
 	Ignore            []string            `json:"ignore,omitempty"`             // skip these upstreams
 	Quantizations     []string            `json:"quantizations,omitempty"`      // e.g. "fp8", "int4"
-	MaxPrice          *openRouterMaxPrice `json:"max_price,omitempty"`          // per-token price ceiling
+	MaxPrice          *OpenRouterMaxPrice `json:"max_price,omitempty"`          // per-token price ceiling
 }
 
-// openRouterMaxPrice caps the per-million-token price OpenRouter will pay when
+// OpenRouterMaxPrice caps the per-million-token price OpenRouter will pay when
 // routing. Both legs are pointers so a 0 ceiling ("free only") is distinct from
 // unset; an all-nil struct is never emitted because MaxPrice itself stays nil.
-type openRouterMaxPrice struct {
+type OpenRouterMaxPrice struct {
 	Prompt     *float64 `json:"prompt,omitempty"`
 	Completion *float64 `json:"completion,omitempty"`
 }
 
-// openRouterReasoning controls reasoning-model behavior on OpenRouter (a
+// OpenRouterReasoning controls reasoning-model behavior on OpenRouter (a
 // normalized shape across upstream vendors). Effort and MaxTokens are mutually
 // exclusive upstream; we just carry whatever the operator set. Exclude:true asks
 // OpenRouter to run reasoning but withhold the reasoning text from the reply.
-type openRouterReasoning struct {
+type OpenRouterReasoning struct {
 	Effort    string `json:"effort,omitempty"`     // "low" | "medium" | "high"
 	MaxTokens int    `json:"max_tokens,omitempty"` // explicit reasoning-token budget
 	Exclude   *bool  `json:"exclude,omitempty"`    // run reasoning but omit it from output
 	Enabled   *bool  `json:"enabled,omitempty"`    // pointer: false disables distinctly from unset
 }
 
-// openRouterPlugin is one entry in OpenRouter's plugin chain (e.g. the web-search
+// OpenRouterPlugin is one entry in OpenRouter's plugin chain (e.g. the web-search
 // plugin). ID is the only required field; MaxResults / Engine are optional knobs.
-type openRouterPlugin struct {
+type OpenRouterPlugin struct {
 	ID         string `json:"id"`
 	MaxResults int    `json:"max_results,omitempty"`
 	Engine     string `json:"engine,omitempty"`
@@ -84,7 +84,7 @@ func (o *OpenAI) ensureExtras() *openRouterExtras {
 // serialized. require_parameters defaults to true WHEN a provider object is
 // present (callers that pass an explicit RequireParameters override it). A nil
 // argument is a no-op so the call site can pass through an unset config safely.
-func WithOpenRouterProvider(p *openRouterProvider) Option {
+func WithOpenRouterProvider(p *OpenRouterProvider) Option {
 	return func(o *OpenAI) {
 		if p == nil {
 			return
@@ -106,7 +106,7 @@ func WithOpenRouterModels(models ...string) Option {
 
 // WithOpenRouterReasoning sets the reasoning controls object. A nil argument is a
 // no-op. Applied only on the OpenRouter base.
-func WithOpenRouterReasoning(r *openRouterReasoning) Option {
+func WithOpenRouterReasoning(r *OpenRouterReasoning) Option {
 	return func(o *OpenAI) {
 		if r == nil {
 			return
@@ -126,7 +126,7 @@ func WithOpenRouterTransforms(transforms ...string) Option {
 }
 
 // WithOpenRouterPlugins sets the plugin chain (e.g. the web-search plugin).
-func WithOpenRouterPlugins(plugins ...openRouterPlugin) Option {
+func WithOpenRouterPlugins(plugins ...OpenRouterPlugin) Option {
 	return func(o *OpenAI) {
 		if len(plugins) == 0 {
 			return

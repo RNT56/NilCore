@@ -17,9 +17,53 @@ import (
 // unit-tested; the actual exec (runXdotool) and screen capture (capture) are live
 // seams (CI-only). resizeNearest is pure stdlib (no module, I6).
 
-// xdotoolClick builds args for a left click at true-screen (x,y).
-func xdotoolClick(x, y int) []string {
-	return []string{"mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y), "click", "1"}
+// xdotoolButton maps a desktopwire button name to the X11 button number xdotool uses
+// (1=left, 2=middle, 3=right). An empty/unknown name defaults to the left button.
+func xdotoolButton(button string) string {
+	switch button {
+	case desktopwire.ButtonRight:
+		return "3"
+	case desktopwire.ButtonMiddle:
+		return "2"
+	default: // ButtonLeft / "" / unknown → left
+		return "1"
+	}
+}
+
+// xdotoolClick builds args for a click at true-screen (x,y) with the given button and
+// repeat count: xdotool's `--repeat N` on a single button click is the double/triple
+// click (N=2/3), and the button number selects left/middle/right. count<=0 ⇒ 1.
+func xdotoolClick(x, y int, button string, count int) []string {
+	if count < 1 {
+		count = 1
+	}
+	args := []string{"mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y), "click"}
+	if count > 1 {
+		args = append(args, "--repeat", strconv.Itoa(count))
+	}
+	return append(args, xdotoolButton(button))
+}
+
+// xdotoolDrag builds args for a button-held drag from (x0,y0) to (x1,y1): move to the
+// origin, press the button (mousedown), move to the destination, release (mouseup).
+func xdotoolDrag(x0, y0, x1, y1 int, button string) []string {
+	b := xdotoolButton(button)
+	return []string{
+		"mousemove", "--sync", strconv.Itoa(x0), strconv.Itoa(y0),
+		"mousedown", b,
+		"mousemove", "--sync", strconv.Itoa(x1), strconv.Itoa(y1),
+		"mouseup", b,
+	}
+}
+
+// xdotoolMouseDown builds args to move to (x,y) and press (hold) the button.
+func xdotoolMouseDown(x, y int, button string) []string {
+	return []string{"mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y), "mousedown", xdotoolButton(button)}
+}
+
+// xdotoolMouseUp builds args to move to (x,y) and release the button.
+func xdotoolMouseUp(x, y int, button string) []string {
+	return []string{"mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y), "mouseup", xdotoolButton(button)}
 }
 
 // xdotoolType builds args to type literal text at the current focus. `--` ends

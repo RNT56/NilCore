@@ -76,9 +76,9 @@ func TestReportSubcommand(t *testing.T) {
 	t.Run("clean log prints text report exit 0", func(t *testing.T) {
 		root := t.TempDir()
 		logPath := seedCleanLog(t, root)
-		out, exit, err := runReport(logPath, root, "text", "", "", st(t))
+		out, exit, err := runSwarmReport(logPath, root, "", "text", "", "", st(t))
 		if err != nil {
-			t.Fatalf("runReport: %v", err)
+			t.Fatalf("runSwarmReport: %v", err)
 		}
 		if exit != 0 {
 			t.Fatalf("exit = %d, want 0 (clean chain)", exit)
@@ -97,9 +97,9 @@ func TestReportSubcommand(t *testing.T) {
 		root := t.TempDir()
 		logPath := seedCleanLog(t, root)
 		breakChain(t, logPath)
-		out, exit, err := runReport(logPath, root, "text", "", "", st(t))
+		out, exit, err := runSwarmReport(logPath, root, "", "text", "", "", st(t))
 		if err != nil {
-			t.Fatalf("runReport: %v", err)
+			t.Fatalf("runSwarmReport: %v", err)
 		}
 		if exit == 0 {
 			t.Fatalf("exit = 0, want non-zero on a broken chain")
@@ -117,11 +117,11 @@ func TestReportSubcommand(t *testing.T) {
 	t.Run("report-out html byte-equal no script", func(t *testing.T) {
 		root := t.TempDir()
 		logPath := seedCleanLog(t, root)
-		out, _, err := runReport(logPath, root, "html", "myrun", "myrun", st(t))
+		out, _, err := runSwarmReport(logPath, root, "", "html", "myrun", "myrun", st(t))
 		if err != nil {
-			t.Fatalf("runReport: %v", err)
+			t.Fatalf("runSwarmReport: %v", err)
 		}
-		// The printed bytes ARE render.RenderHTML(model) for the model runReport built;
+		// The printed bytes ARE render.RenderHTML(model) for the model runSwarmReport built;
 		// the persisted file must be byte-equal to those same rendered bytes. (A fresh
 		// ReplayReport would differ only by its GeneratedAt wall clock, so we compare
 		// against the single render the command produced.)
@@ -144,9 +144,9 @@ func TestReportSubcommand(t *testing.T) {
 	t.Run("non-TTY buffer yields no ANSI escapes", func(t *testing.T) {
 		root := t.TempDir()
 		logPath := seedCleanLog(t, root)
-		out, _, err := runReport(logPath, root, "text", "", "", plainStyle(t))
+		out, _, err := runSwarmReport(logPath, root, "", "text", "", "", plainStyle(t))
 		if err != nil {
-			t.Fatalf("runReport: %v", err)
+			t.Fatalf("runSwarmReport: %v", err)
 		}
 		if strings.Contains(out, "\x1b[") {
 			t.Errorf("plain (non-TTY) text report must carry no ANSI escapes:\n%q", out)
@@ -161,8 +161,8 @@ func TestReportSubcommand(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := runReport(logPath, root, "md", "", "", st(t)); err != nil {
-			t.Fatalf("runReport: %v", err)
+		if _, _, err := runSwarmReport(logPath, root, "", "md", "", "", st(t)); err != nil {
+			t.Fatalf("runSwarmReport: %v", err)
 		}
 		after, err := os.ReadFile(logPath)
 		if err != nil {
@@ -177,7 +177,7 @@ func TestReportSubcommand(t *testing.T) {
 	t.Run("unknown format errors", func(t *testing.T) {
 		root := t.TempDir()
 		logPath := seedCleanLog(t, root)
-		if _, _, err := runReport(logPath, root, "pdf", "", "", st(t)); err == nil {
+		if _, _, err := runSwarmReport(logPath, root, "", "pdf", "", "", st(t)); err == nil {
 			t.Errorf("want error for unknown -format")
 		}
 	})

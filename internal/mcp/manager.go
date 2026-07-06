@@ -58,9 +58,6 @@ func NewManager(cfg Config) *Manager {
 	return &Manager{cfg: cfg, procCtx: ctx, cancel: cancel, conns: map[string]*conn{}}
 }
 
-// Servers returns the configured server specs (read-only; for discovery wiring).
-func (m *Manager) Servers() []ServerSpec { return m.cfg.Servers }
-
 // get returns a live, initialized client for server, opening + caching it on first use.
 // fresh reports whether it was opened on THIS call (so a caller knows a retry is
 // pointless after a fresh open). Connect + initialize run OUTSIDE the lock behind a

@@ -151,7 +151,45 @@ func (d *driver) perform(ctx context.Context, a desktopwire.Act) error {
 		if err != nil {
 			return err
 		}
-		return runCliclick(ctx, cliclickClick(x, y))
+		cmd, err := cliclickClickN(x, y, a.Button, a.Count)
+		if err != nil {
+			return err
+		}
+		return runCliclick(ctx, cmd)
+	case desktopwire.OpDrag:
+		x0, y0, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		x1, y1, err := d.resolveTo(a)
+		if err != nil {
+			return err
+		}
+		cmd, err := cliclickDrag(x0, y0, x1, y1, a.Button)
+		if err != nil {
+			return err
+		}
+		return runCliclick(ctx, cmd)
+	case desktopwire.OpMouseDown:
+		x, y, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		cmd, err := cliclickMouseDown(x, y, a.Button)
+		if err != nil {
+			return err
+		}
+		return runCliclick(ctx, cmd)
+	case desktopwire.OpMouseUp:
+		x, y, err := d.resolvePoint(a)
+		if err != nil {
+			return err
+		}
+		cmd, err := cliclickMouseUp(x, y, a.Button)
+		if err != nil {
+			return err
+		}
+		return runCliclick(ctx, cmd)
 	case desktopwire.OpType:
 		if a.Ref > 0 {
 			if x, y, err := d.resolvePoint(a); err == nil {
@@ -180,6 +218,16 @@ func (d *driver) resolvePoint(a desktopwire.Act) (int, int, error) {
 		return x, y, nil
 	}
 	return 0, 0, fmt.Errorf("click needs a ref or a coordinate")
+}
+
+// resolveTo maps a drag DESTINATION (Act.To, in resized image space) to a true macOS
+// POINT. A drag without a destination fails closed rather than dragging to (0,0).
+func (d *driver) resolveTo(a desktopwire.Act) (int, int, error) {
+	if len(a.To) != 2 {
+		return 0, 0, fmt.Errorf("drag needs a destination (to:[x,y])")
+	}
+	x, y := resizedToPoint(a.To[0], a.To[1], d.scaleX, d.scaleY, d.bscale, d.origX, d.origY)
+	return x, y, nil
 }
 
 // observe captures the real desktop and builds a Rung-2 (SoM-marked) or Rung-3 (raw)
