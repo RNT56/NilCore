@@ -13,6 +13,7 @@ NilCore borrows intelligence instead of re‑encoding it — so the whole agent 
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
 [![Agent size](https://img.shields.io/badge/agent-~87k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -387,6 +388,12 @@ internal/
   onboard, paths       `nilcore init` wizard + versioned config + per-OS dirs
 eval/                  measure-first eval harness
 ```
+
+---
+
+## License
+
+NilCore is licensed under the [Apache License 2.0](LICENSE). Copyright 2026 RNT56 and NilCore contributors; attribution notices are recorded in [NOTICE](NOTICE).
 
 ---
 
