@@ -160,11 +160,28 @@ func TestGitTool(t *testing.T) {
 // rev beginning with '-' (e.g. "--ext-diff") must be rejected BEFORE it reaches
 // `git show --stat <rev>`, so a model-supplied rev can never be read as a git option.
 // The rejection is pure-regex (it fires before exec), so this needs no git binary.
+//
+// The assertions below are deliberately DISCRIMINATING: it is not enough that the op
+// errors (an empty dir has no repo, so `git show` would fail regardless — the OLD,
+// vulnerable regex `^[A-Za-z0-9_./^~-]+$` matched a leading dash, let these revs THROUGH
+// the validator, and produced a downstream exec failure that a bare `err != nil` check
+// would still pass on). We therefore require the SPECIFIC validator message
+// "disallowed characters" for every dash-leading rev, and require its ABSENCE for a
+// legit rev. That combination reddens on the old regex (no validator message) and passes
+// only on the fixed anchor `^[A-Za-z0-9_./^~][A-Za-z0-9_./^~-]*$`.
 func TestGitShowRejectsLeadingDashRev(t *testing.T) {
 	dir := t.TempDir()
 	for _, rev := range []string{"--ext-diff", "-c", "--output=/tmp/x", "-HEAD"} {
-		if _, err := run(t, GitTool{}, dir, `{"op":"show","rev":"`+rev+`"}`); err == nil {
+		_, err := run(t, GitTool{}, dir, `{"op":"show","rev":"`+rev+`"}`)
+		if err == nil {
 			t.Errorf("show must reject leading-dash rev %q as an option injection", rev)
+			continue
+		}
+		// Must be rejected BY THE VALIDATOR, not by a downstream "not a git repo" exec
+		// failure — otherwise the old regex (which let the rev through) would look green.
+		if !strings.Contains(err.Error(), "disallowed characters") {
+			t.Errorf("leading-dash rev %q must be rejected by safeRev with a %q error, got: %v",
+				rev, "disallowed characters", err)
 		}
 	}
 	// A legit rev must still pass the character validator. It may fail later (no repo /
