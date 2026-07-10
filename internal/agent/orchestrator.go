@@ -333,7 +333,9 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 			// data loss. The predecessor row is left "suspended" for a later sweep.
 			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resume_fallback",
 				Detail: map[string]any{"branch": resumeBranch, "resumed_from": resumedFrom, "error": cerr.Error()}})
-			resumeBranch, resumedFrom = "", ""
+			// wt stays nil ⇒ the HEAD-fallback worktree.Create below runs. resumeBranch is
+			// not read again, so it is intentionally left as-is (no data lost: the ref remains
+			// for a later sweep).
 		} else {
 			wt = rwt
 			// Retire the predecessor so it is never reattached twice AND its anchor
