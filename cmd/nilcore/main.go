@@ -1119,6 +1119,15 @@ func serveMain(args []string) {
 	// worktrees whose directory is already gone are candidates (a live run's
 	// worktree directory is present), so this never collects an active worktree.
 	serveGC(context.Background(), absDir, log)
+	// Reclaim leaked suspend/ recovery anchors: a resumed drive deletes its own anchor,
+	// but a nap that was resolved/abandoned before it could be resumed leaves the ref
+	// behind, so bound the backlog on boot. Best-effort — a sweep error must NEVER block
+	// serve (it is pure housekeeping, not a correctness gate).
+	if ckpt != nil {
+		if err := ckpt.SweepSuspended(context.Background(), absDir, 0); err != nil {
+			log.Append(eventlog.Event{Kind: "maint_error", Detail: map[string]any{"op": "suspend_sweep", "error": err.Error()}})
+		}
+	}
 	validateConcreteBackendFlag("-prefer-backend", *c.preferBackend)
 	// Resolve `-backend auto` / config backend:auto to a concrete name before serve
 	// reads it. serve still requires native below; auto simply lets the system pick

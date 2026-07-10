@@ -10,6 +10,7 @@ import (
 
 	"nilcore/internal/backend"
 	"nilcore/internal/store"
+	"nilcore/internal/worktree"
 )
 
 // Checkpoint persists orchestrator task state to the store so an interrupted run
@@ -67,6 +68,146 @@ func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal, branch string) e
 // work is recoverable under this ref, never lost.
 type suspendDetail struct {
 	Branch string `json:"branch,omitempty"`
+}
+
+// sessionPrefix returns the stable conversation key of a session task id, whose shape
+// is `<conversationID>-<seq>` (internal/session/drivers.go): everything up to the LAST
+// '-'. A drive that self-suspended as `<conv>-3` and the wake-resumed `<conv>-4` that
+// follows it therefore share the same prefix, so a resume can correlate the two. It
+// returns "" when there is no '-' (not a session shape) or when the only '-' is at
+// index 0 (nothing before it to key on) — either way there is no predecessor to
+// correlate, so the caller drives fresh.
+func sessionPrefix(taskID string) string {
+	i := strings.LastIndex(taskID, "-")
+	if i <= 0 {
+		return ""
+	}
+	return taskID[:i]
+}
+
+// ResumeBranch finds the preserved-work ref of a self-suspended predecessor in the
+// SAME session as taskID, so a wake-resumed drive can REATTACH onto the committed work
+// its earlier self left behind instead of re-driving from a fresh HEAD worktree. It
+// correlates by the stable session prefix (sessionPrefix): the suspended `<conv>-3` is
+// the predecessor of the resuming `<conv>-4`. Among the suspended siblings that carry a
+// non-empty suspendDetail.Branch it returns the MOST RECENT.
+//
+// Ordering assumption: TasksByStatus returns rows ORDER BY id ascending, so the LAST
+// matching row is the most-recent suspend of that conversation for the `<conv>-<seq>`
+// shape (seq grows monotonically). That is the recency signal this — and SweepSuspended
+// — rely on.
+//
+// No correlatable predecessor (no session prefix, no suspended sibling, or none with a
+// recorded branch) ⇒ ("", "", nil): the caller then drives off HEAD exactly as before.
+// The suspending task's own row is skipped so a re-driven id never reattaches onto
+// itself. A nil receiver is a clean no-op so an orchestrator with no checkpoint is
+// unaffected.
+func (c *Checkpoint) ResumeBranch(ctx context.Context, taskID string) (branch, suspendedID string, err error) {
+	if c == nil {
+		return "", "", nil
+	}
+	prefix := sessionPrefix(taskID)
+	if prefix == "" {
+		return "", "", nil
+	}
+	rows, err := c.store.TasksByStatus(ctx, "suspended")
+	if err != nil {
+		return "", "", fmt.Errorf("resume branch: %w", err)
+	}
+	for _, row := range rows {
+		if row.ID == taskID || sessionPrefix(row.ID) != prefix || row.Detail == "" {
+			continue
+		}
+		var d suspendDetail
+		if json.Unmarshal([]byte(row.Detail), &d) != nil || d.Branch == "" {
+			continue
+		}
+		// Keep scanning: rows are id-ascending, so a later match is more recent —
+		// take the last one that qualifies.
+		branch, suspendedID = d.Branch, row.ID
+	}
+	return branch, suspendedID, nil
+}
+
+// suspendRefPrefix is the ref namespace a suspended drive pins its committed work
+// under (orchestrator: "suspend/"+taskID). It is deliberately outside the throwaway
+// task/ rebase/ integrate/ read/ prefixes the run-end sweep reclaims, so a nap's
+// recovery anchor survives — SweepSuspended is what eventually reclaims it.
+const suspendRefPrefix = "suspend/"
+
+// defaultSuspendKeep bounds how many still-suspended recovery anchors SweepSuspended
+// retains when the caller passes a non-positive keep — a sane backlog cap.
+const defaultSuspendKeep = 20
+
+// SweepSuspended reclaims leaked suspend/ recovery anchors in baseRepo. Each suspended
+// drive pins its committed HEAD under suspend/<taskID> as a durable recovery anchor;
+// once the drive is resumed (auto-reattach retires its row and deletes the ref) or its
+// row is otherwise no longer "suspended", the ref is dead weight that would otherwise
+// accumulate forever. This sweep deletes:
+//
+//   - every suspend/ ref whose task row is NOT currently "suspended" (resolved, or the
+//     row is gone) — these can never be resumed, so the anchor is pure leak, and
+//   - the OLDEST still-suspended anchors beyond the `keep` most-recent — a bounded
+//     backlog so a long-lived server cannot grow unboundedly many live anchors.
+//
+// A still-"suspended" ref WITHIN the keep window is preserved — its committed work may
+// yet be resumed, and dropping it would reopen the data-loss the anchor closes. keep<=0
+// applies defaultSuspendKeep. Idempotent and best-effort: DeleteBranch swallows a
+// per-ref failure so one bad ref never aborts the sweep, and this is called from serve
+// boot where a sweep error must never block startup. A nil receiver is a clean no-op.
+//
+// The live-anchor ordering (which are "oldest") reuses ResumeBranch's documented
+// assumption: TasksByStatus is id-ascending, so iterating those rows yields anchors
+// oldest-first and the tail is the most-recent to keep.
+func (c *Checkpoint) SweepSuspended(ctx context.Context, baseRepo string, keep int) error {
+	if c == nil {
+		return nil
+	}
+	if keep <= 0 {
+		keep = defaultSuspendKeep
+	}
+	branches, err := worktree.ListBranches(ctx, baseRepo, suspendRefPrefix)
+	if err != nil {
+		return fmt.Errorf("sweep suspended: list refs: %w", err)
+	}
+	if len(branches) == 0 {
+		return nil
+	}
+	present := make(map[string]bool, len(branches))
+	for _, b := range branches {
+		present[b] = true
+	}
+
+	// The still-"suspended" rows — the only anchors whose work may still be resumed.
+	rows, err := c.store.TasksByStatus(ctx, "suspended")
+	if err != nil {
+		return fmt.Errorf("sweep suspended: rows: %w", err)
+	}
+	suspended := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		suspended[suspendRefPrefix+r.ID] = true
+	}
+
+	// Dead anchors: a ref whose row is no longer suspended (resolved/gone) → reclaim now.
+	for _, b := range branches {
+		if !suspended[b] {
+			worktree.DeleteBranch(ctx, baseRepo, b)
+		}
+	}
+	// Live anchors, in TasksByStatus (id-ascending) order — the SAME recency assumption
+	// ResumeBranch documents (last = most-recent). Delete the oldest beyond keep.
+	var live []string
+	for _, r := range rows {
+		if ref := suspendRefPrefix + r.ID; present[ref] {
+			live = append(live, ref)
+		}
+	}
+	if len(live) > keep {
+		for _, ref := range live[:len(live)-keep] {
+			worktree.DeleteBranch(ctx, baseRepo, ref)
+		}
+	}
+	return nil
 }
 
 // Interrupt marks every running task "interrupted" — the clean SIGTERM checkpoint
