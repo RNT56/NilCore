@@ -154,17 +154,25 @@ func validateFileLine(raw string) (fileLine, error) {
 }
 
 // validateRelPath enforces that path is a single, worktree-confined relative path. It
-// rejects an empty path, an absolute path (leading "/"), any ".." segment (the classic
-// traversal), and any single quote / whitespace / control byte (which would break the
-// single-quoting that keeps the path DATA in the shell command). It is deliberately
-// strict: the verifier reads only inside the worktree, so anything that could point
-// elsewhere or smuggle a second command is refused.
+// rejects an empty path, an absolute path (leading "/"), a path that begins with '-' (which
+// sed/grep would parse as an OPTION, not a filename — an argument-injection), any ".."
+// segment (the classic traversal), and any single quote / whitespace / control byte (which
+// would break the single-quoting that keeps the path DATA in the shell command). It is
+// deliberately strict: the verifier reads only inside the worktree, so anything that could
+// point elsewhere or smuggle a second command is refused.
 func validateRelPath(path string) error {
 	if path == "" {
 		return fmt.Errorf("locator path is empty")
 	}
 	if strings.HasPrefix(path, "/") {
 		return fmt.Errorf("locator path %q must be relative (no leading '/')", path)
+	}
+	// A leading '-' is parsed by sed/grep as an OPTION even when single-quoted in the shell
+	// (the quotes only stop word-splitting; the tool still sees an argv element starting with
+	// '-'), so e.g. "-rfoo" becomes options, not a file. Refuse it (mirrors the leading-dash
+	// guard in packs/code/code.go validateSelector). A legitimate file never starts with '-'.
+	if strings.HasPrefix(path, "-") {
+		return fmt.Errorf("locator path %q may not begin with '-' (it could be read as a sed/grep option)", path)
 	}
 	for _, r := range path {
 		if r == '\'' {

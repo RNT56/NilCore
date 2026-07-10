@@ -69,7 +69,7 @@ func TestClaudeCodeInjectsKeyPerRunAndNeverLogsIt(t *testing.T) {
 	}
 	defer log.Close()
 
-	box := &fakeBox{stdout: `{"type":"text","text":"changed files"}`}
+	box := &fakeBox{stdout: `{"type":"result","subtype":"success","result":"changed files"}`}
 	cc := &ClaudeCode{Box: box, Key: secret, Log: log}
 	if _, err := cc.Run(context.Background(), Task{ID: "t2", Goal: "do it"}); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -104,10 +104,15 @@ func TestClaudeCodeToleratesVerboseInitFraming(t *testing.T) {
 	}
 	defer log.Close()
 
+	// REAL Claude Code stream-json shapes: an assistant event carries message.content
+	// as an ARRAY of {type:"text",text:...} blocks; the final result event carries the
+	// answer under the top-level "result" STRING key. (The prior fixtures used invented
+	// shapes — message.text / a result event with a "text" key — that the CLI never
+	// emits, so the parser only worked by accident.)
 	stream := strings.Join([]string{
 		`{"type":"system","subtype":"init","session_id":"abc","tools":["Edit"]}`,
-		`{"type":"assistant","message":{"text":"working on it"}}`,
-		`{"type":"result","subtype":"success","text":"all done"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}`,
+		`{"type":"result","subtype":"success","result":"all done"}`,
 	}, "\n")
 	box := &fakeBox{stdout: stream}
 	cc := &ClaudeCode{Box: box, Key: "k", Log: log}
@@ -116,11 +121,55 @@ func TestClaudeCodeToleratesVerboseInitFraming(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if res.Summary != "all done" {
-		t.Errorf("summary = %q, want the last text payload past the init framing", res.Summary)
+		t.Errorf("summary = %q, want the result event's answer past the init framing", res.Summary)
 	}
 	if !strings.Contains(box.gotCmd, "--verbose") {
 		t.Errorf("emitted command lacks --verbose: %q", box.gotCmd)
 	}
+}
+
+// TestLastEventTextRealCLIShapes covers FIX #3: lastEventText/digText must handle the
+// REAL stream-json shapes the delegated CLIs emit — Claude Code's result event (answer
+// under the top-level "result" key) and assistant events (message.content[] array of
+// text blocks) — while keeping Codex's item.completed → item.text path intact. Before
+// this, a real claude-code run's Summary degraded to a raw-JSONL tail.
+func TestLastEventTextRealCLIShapes(t *testing.T) {
+	t.Run("claude-code result + assistant content array", func(t *testing.T) {
+		stream := strings.Join([]string{
+			`{"type":"system","subtype":"init","session_id":"s"}`,
+			`{"type":"assistant","message":{"content":[{"type":"text","text":"editing files"}]}}`,
+			`{"type":"result","subtype":"success","result":"done: 2 files changed"}`,
+		}, "\n")
+		if got := lastEventText(stream); got != "done: 2 files changed" {
+			t.Errorf("lastEventText = %q, want the result-event answer", got)
+		}
+	})
+
+	t.Run("claude-code assistant content array alone", func(t *testing.T) {
+		// No result event: the last assistant message.content[] text is the summary.
+		stream := `{"type":"assistant","message":{"content":[{"type":"text","text":"hello world"},{"type":"tool_use","id":"x","name":"Edit","input":{}}]}}`
+		if got := lastEventText(stream); got != "hello world" {
+			t.Errorf("lastEventText = %q, want the text block (tool_use skipped)", got)
+		}
+	})
+
+	t.Run("codex item.completed path preserved", func(t *testing.T) {
+		stream := strings.Join([]string{
+			`{"type":"item.started","item":{"type":"reasoning"}}`,
+			`{"type":"item.completed","item":{"type":"agent_message","text":"codex summary"}}`,
+		}, "\n")
+		if got := lastEventText(stream); got != "codex summary" {
+			t.Errorf("lastEventText = %q, want Codex's item.text", got)
+		}
+	})
+
+	t.Run("unfamiliar shape falls back to tail", func(t *testing.T) {
+		// No recognizable text payload ⇒ the raw tail, not the empty string.
+		stream := `{"type":"mystery","blob":{"nested":123}}`
+		if got := lastEventText(stream); got != stream {
+			t.Errorf("lastEventText = %q, want the raw tail fallback", got)
+		}
+	})
 }
 
 func TestDelegatedFailsFastWhenCLIMissing(t *testing.T) {

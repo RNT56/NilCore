@@ -6,14 +6,13 @@ Everything you need to build, run, and contribute to NilCore. Source of truth fo
 
 | Tool | Version | Why |
 |---|---|---|
-| Go | 1.23+ (latest stable recommended) | the entire core |
+| Go | 1.25+ (matches the `go` directive in `go.mod`) | the entire core |
 | Container runtime | **Podman ≥ 4 (rootless, preferred)** or Docker | the sandbox |
 | git | ≥ 2.30 | worktree-per-task workflow |
 | make | any | `make verify` is the gate |
 | golangci-lint | latest | lint gate in CI and locally |
 | jq | any | inspecting the JSONL event log and CLI streams |
 | SQLite | 3.x | Phase 4 memory store |
-| sqlc | latest | Phase 4 typed queries (matches the chosen stack) |
 
 Install Go from <https://go.dev/dl/>. Install Podman from <https://podman.io/> (rootless is the default on modern Linux). On macOS use `podman machine` or Docker Desktop. Install golangci-lint per <https://golangci-lint.run/>.
 

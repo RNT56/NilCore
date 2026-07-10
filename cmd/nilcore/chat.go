@@ -55,7 +55,6 @@ import (
 	"nilcore/internal/policy"
 	"nilcore/internal/sandbox"
 	"nilcore/internal/session"
-	"nilcore/internal/steering"
 	"nilcore/internal/summarize"
 	"nilcore/internal/termui"
 	"nilcore/internal/tools"
@@ -172,7 +171,13 @@ func chatMain(args []string) {
 	emitEgressProfile(log, prof, egressBackendLabel(*cf.common.sandboxPref))
 	warnNamespaceEgress(prof, *cf.common.sandboxPref)
 	allow, searchBackend := resolveWeb(b.cfg, prof.Tree.Allowed, *cf.allowEgress, searchKey)
-	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console, proxyBindAddr(*cf.common.sandboxPref, *cf.common.runtime))
+	// ONE shared -blast-radius budget for the whole chat process: the SAME meter fences
+	// the egress-host axis at the proxy, the sandbox wall-time on every drive's box, and
+	// the auto-approval $/rate axes at the gate. Previously chat minted a throwaway budget
+	// for the gate alone and passed nil to the proxy, so two of the three axes it advertises
+	// were unfenced. nil ("off", the default) ⇒ unfenced, byte-identical.
+	blast := mintBlastBudget(*cf.common.blastRadius, log)
+	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console, proxyBindAddr(*cf.common.sandboxPref, *cf.common.runtime), blast)
 	defer stopProxy()
 
 	sess, err := buildChatSession(chatDeps{
@@ -183,6 +188,7 @@ func chatMain(args []string) {
 		baseRepo:        absDir,
 		mem:             mem,
 		emitter:         emitter,
+		blast:           blast,
 		egress:          egress,
 		egressProxyAddr: proxyAddr,
 		// egressTree is the Pillar-5 widen-tree (P11-T28); empty unless a profile was
@@ -231,7 +237,7 @@ func chatMain(args []string) {
 	del := &chatDelivery{
 		log: log,
 		wrap: func(h policy.Approver) policy.Approver {
-			return wrapAutoApprove(h, b.cfg, absDir, *cf.common.logPath, log, mintBlastBudget(*cf.common.blastRadius, log))
+			return wrapAutoApprove(h, b.cfg, absDir, *cf.common.logPath, log, blast)
 		},
 	}
 	if err := chatREPL(ctx, sess, os.Stdin, console, emitter, del); err != nil && err != io.EOF {
@@ -240,6 +246,14 @@ func chatMain(args []string) {
 	// Let any in-flight drive unwind on the cancelled ctx before we exit, so its
 	// worktree cleanup runs and no drive goroutine is abandoned mid-write.
 	sess.Wait()
+	// Then checkpoint the conversation so a follow-up CONTINUES rather than restarts.
+	// Session.Checkpoint detaches from the (possibly cancelled) ctx internally, so the
+	// write actually lands; a nil Store is a no-op. Best-effort: a durability fault must
+	// never fail the exit. Until now Checkpoint had no callers at all and the
+	// continue-across-restart feature was inert.
+	if err := sess.Checkpoint(ctx); err != nil {
+		log.Append(eventlog.Event{Task: sess.ID, Kind: "session_persist", Detail: map[string]any{"error": true}})
+	}
 }
 
 // chatBanner is the one-time greeting printed before the prompt. It states the two
@@ -279,6 +293,11 @@ type chatDeps struct {
 	mem      *memory.Memory  // cross-project memory; feeds the opt-in NILCORE_LIVE_INDEX live tool (nil ⇒ none)
 	emitter  emit.Emitter    // the reasoning sink (REPL: a termui.ConsoleEmitter; TUI: its own; nil ⇒ none)
 	approver policy.Approver // irreversible-action gate (nil ⇒ the console approver)
+
+	// blast is the chat process's SHARED blast-radius budget (one envelope for the
+	// sandbox wall-time, the egress-host axis, and the auto-approval $/rate axes),
+	// minted from -blast-radius. nil ("off", the default) ⇒ unfenced, byte-identical.
+	blast *blastbudget.Budget
 
 	// egress is the sandbox network allowlist (from -allow-egress). Empty ⇒ default-
 	// deny: no network, and the web_fetch tool is not advertised. egressProxyAddr is
@@ -407,8 +426,8 @@ func resolveWeb(cfg onboard.Config, profileHosts []string, flagAllow, searchKey 
 // listener to the chosen sandbox backend — loopback unless a bridged container needs
 // it across the bridge; either way it only ever forwards to the allowlisted hosts and
 // refuses private/loopback destinations (the SSRF guard), so it is never an open relay.
-func startEgress(ctx context.Context, hosts []string, con *termui.Console, bindAddr string) (policy.Egress, string, func()) {
-	egress, addr, stop, ok := startEgressProxy(ctx, hosts, nil, bindAddr)
+func startEgress(ctx context.Context, hosts []string, con *termui.Console, bindAddr string, blast *blastbudget.Budget) (policy.Egress, string, func()) {
+	egress, addr, stop, ok := startEgressProxy(ctx, hosts, blast, bindAddr)
 	switch {
 	case len(hosts) == 0:
 		// default-deny; nothing to announce.
@@ -588,9 +607,8 @@ func buildChatSession(d chatDeps) (*session.Session, error) {
 // reconciles its classifier proposal against (§3.4). It is a deliberately simple,
 // pure-function judgment over the goal text — long, multi-component goals warrant
 // the supervisor; a short localized ask stays the single native loop. The router
-// uses it ONLY as the no-model / unparseable-output fallback (and the optional,
-// default-off ClampDownToNative backstop) — the model classifier's proposal is
-// authoritative — so it must never panic and must be cheap.
+// uses it ONLY as the no-model / unparseable-output fallback — the model
+// classifier's proposal is authoritative — so it must never panic and must be cheap.
 func chatShouldSupervise(goal string) bool {
 	g := strings.ToLower(goal)
 	// A genuinely large surface (many words) or an explicit multi-component verb is
@@ -740,7 +758,9 @@ func chatNativeRun(d chatDeps, metered model.Provider) session.RunNativeFunc {
 		// verifier (a research turn ships nothing, so there is nothing to gate, I2);
 		// Execute/Auto get the full write-capable backend gated by the real verifier.
 		newEnv := func(dir string) agent.Env {
-			box := selectSandbox(*d.flags.common.sandboxPref, *d.flags.common.runtime, *d.flags.common.image, dir)
+			// attachBlast applies the -blast-radius sandbox wall-time fence the flag's help
+			// promises; chat's native drives previously built the box bare.
+			box := attachBlast(selectSandbox(*d.flags.common.sandboxPref, *d.flags.common.runtime, *d.flags.common.image, dir), d.blast)
 			// Route a container box through the allowlist proxy when web access is on
 			// (no-op otherwise; default-deny stays the norm).
 			applyContainerEgress(box, d.egress, d.egressProxyAddr, *d.flags.common.runtime)
@@ -1289,13 +1309,15 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
+	// Cross-project memory + distilled lessons: the conversational front door reads the
+	// same merged view the run path does. Previously only buildBackend wired this, so
+	// the door people actually use never saw the agent's own distilled scars.
+	attachMemoryContext(n, d.mem, d.baseRepo)
 	// Operator steering (P10-T01): an authoritative project steering file
 	// (NILCORE.md / AGENTS.md) committed at the repo root is loaded ONCE at launch
 	// from the operator's own repo — front-door origin, never tool/inbox text — and
 	// prepended as TRUSTED instructions (the I7 exception). nil/empty ⇒ byte-identical.
-	if steer, _ := steering.DiscoverAndLoad(d.baseRepo); steer != "" {
-		n.SteeringContext = func() string { return steer }
-	}
+	attachSteering(n, d.baseRepo)
 	return n
 }
 
@@ -1358,11 +1380,16 @@ func chatSuperviseRun(d chatDeps, ledger *budget.Ledger) session.RunSuperviseFun
 // with the prior context SUMMARY remains a deeper follow-on, so that param is not yet
 // consumed — the loop runs the whole-project goal fresh and folds its outcome back.)
 func chatProjectRun(d chatDeps, ledger *budget.Ledger) session.RunProjectFunc {
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, in session.InboxHandle, outEmitter emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(chatBuildDeps(d, ledger, goal, gate))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		// Steer/queue parity with the supervised drive: the project loop drives this same
+		// supervisor, so wiring the session inbox here lets a mid-project steer/queue reach
+		// the planner at a round boundary. Without it those messages strand in the inbox and
+		// get re-folded (duplicated) into the next drive.
+		stack.sup.Inbox = in
 		stack.sup.Out = outEmitter // stream the project planner's intent back to this conversation
 		defer stack.cleanup()      // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
@@ -1408,10 +1435,10 @@ func chatBuildDeps(d chatDeps, ledger *budget.Ledger, goal string, gate policy.A
 		strong:   strong,
 		log:      d.log,
 		logPath:  *d.flags.common.logPath,
-		blast:    mintBlastBudget(*d.flags.common.blastRadius, d.log), // -blast-radius fence for the chat supervise/project sandboxes (nil when off)
-		approver: gateApproverFor(d, gate),                            // AU-T05b: line-REPL drives use the session AwaitingGate approver, not a stdin-racing ConsoleApprover
-		ledger:   ledger,                                              // pin the conversation wall (§6)
-		egress:   d.egressTree,                                        // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
+		blast:    d.blast,                  // the ONE shared -blast-radius fence for this chat process (nil when off)
+		approver: gateApproverFor(d, gate), // AU-T05b: line-REPL drives use the session AwaitingGate approver, not a stdin-racing ConsoleApprover
+		ledger:   ledger,                   // pin the conversation wall (§6)
+		egress:   d.egressTree,             // Pillar-5 widen-tree; empty ⇒ build stays deny-all (P11-T28)
 	}
 }
 
@@ -1562,7 +1589,7 @@ func chatREPL(ctx context.Context, sess chatSession, in io.Reader, con *termui.C
 				con.Line(con.Style().Warn("  unknown command: " + firstToken(line) + " — try /help"))
 			} else if strings.TrimSpace(line) != "" {
 				// Ack the mode BEFORE Turn dispatches (it may launch a streaming drive).
-				ackChatMode(con, line, sess.PhaseNow() != session.Idle)
+				ackChatMode(con, line, sess.PhaseNow() != session.Idle, sess.ActiveRoute())
 				if err := sess.Turn(ctx, line); err != nil {
 					con.Line(con.Style().Dim("  (routing failed: " + err.Error() + ")"))
 				}
@@ -1708,7 +1735,7 @@ func applyModeVerb(ctx context.Context, sess chatSession, con *termui.Console, m
 	_, paint := modeGlyph(mode, st)
 	con.Line(paint("  mode → "+mode.String()) + st.Dim(modeBlurb(mode)+note))
 	if rest != "" {
-		ackChatMode(con, rest, working)
+		ackChatMode(con, rest, working, sess.ActiveRoute())
 		if err := sess.Turn(ctx, rest); err != nil {
 			con.Line(st.Dim("  (routing failed: " + err.Error() + ")"))
 		}
@@ -1735,7 +1762,7 @@ func applyAddVerb(ctx context.Context, sess chatSession, con *termui.Console, ar
 	}
 	if isURLArg(arg) {
 		con.Line(st.Info("  fetching URL as context: " + arg))
-		ackChatMode(con, arg, sess.PhaseNow() != session.Idle)
+		ackChatMode(con, arg, sess.PhaseNow() != session.Idle, sess.ActiveRoute())
 		// Ask the agent to fetch with the sandboxed web_fetch tool and treat the body
 		// as reference DATA, not instructions (the tool also fences it, I7).
 		prompt := "Fetch this URL with the web_fetch tool and use its contents as reference context " +
@@ -1905,8 +1932,17 @@ func runChatCommand(_ context.Context, sess chatSession, cmd string, con *termui
 // flight (inFlight = Phase != Idle, exactly when Turn folds the message in at the
 // next step); when Idle the message starts a fresh drive immediately, so claiming it
 // is "queued" would be a lie — print nothing.
-func ackChatMode(con *termui.Console, line string, inFlight bool) {
+//
+// route is the in-flight drive's route: a RouteChat drive is a single model call with
+// no steppable loop, so a mid-reply steer/queue can't be folded into it (the chat driver
+// discards it — see chatDriver.Drive). We say THAT honestly rather than promising an
+// interruption that never happens.
+func ackChatMode(con *termui.Console, line string, inFlight bool, route session.Route) {
 	st := con.Style()
+	if inFlight && route == session.RouteChat {
+		con.Line(st.Dim("  a chat reply can't be interrupted — noted for your next turn"))
+		return
+	}
 	if chatIsSteer(line) {
 		con.Line(st.Warn("  steering — interrupting the current step…"))
 		return

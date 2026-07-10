@@ -193,7 +193,10 @@ func loadPlan(workdir string) ([]PlanStep, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(p)
+	// O_NOFOLLOW read (readNoFollow): safePath checks the path, but a plain os.ReadFile
+	// would follow a final-component symlink swapped in after that check and leak an
+	// out-of-worktree file (I4 TOCTOU). ENOENT still classifies as os.IsNotExist below.
+	b, err := readNoFollow(p)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}

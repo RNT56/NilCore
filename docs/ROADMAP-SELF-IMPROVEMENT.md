@@ -33,6 +33,7 @@
 - **The eval set is never mutated.** The loop loads a defensive copy of the content-hashed frozen suite and re-uses it for the baseline and every candidate, so a candidate cannot drop the cases it fails.
 - **Bounded cadence.** `MaxIterations` caps cycles per run and `Interval` throttles them; the serve cadence runs one bounded cycle per (long, 6h) tick and honors ctx.
 - **Auto-merge is a SEPARATE double opt-in.** Enabling the flywheel (`NILCORE_FLYWHEEL` / `nilcore flywheel`) does NOT enable auto-merge; that needs `NILCORE_SELFIMPROVE_AUTOAPPROVE` (no transitive opt-in — XC-T02), is reversible (a prompt/skill commit), and is audited (`auto_approve_selfimprove`).
+  - _Features-review fix:_ the landing merge was previously a **no-op** — `Propose` logged `self_edit_merged` and returned `merged=true` while **nothing actually merged**. There is now a real `Flow.Merge` seam; `Run` returns the verified branch, `merged=true` means it truly landed, and new events record the failure modes (`self_edit_merge_unwired` / `self_edit_no_branch` / `self_edit_merge_failed`).
 
 ## How to run it
 

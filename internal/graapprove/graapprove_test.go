@@ -910,15 +910,20 @@ func TestMaybeWrapReturnsHumanUnchanged(t *testing.T) {
 }
 
 // TestCountAutoApprovalsToday: the per-day rate counter folds only `auto_approve` events
-// for the exact (action,scope) on today's day — never boundary_outcome / auto_deny, never
-// another scope, never another day. (M11: the gate's MaxPerDay rate window depends on
-// this counting only the right events.)
+// for (action, scope FAMILY) on today's day — never boundary_outcome / auto_deny, never
+// another action, never another family, never another day. (M11: the gate's MaxPerDay
+// rate window depends on this counting only the right events.)
+//
+// The window keys on the FAMILY (feat/x and feat/y are both feat/*), not the exact
+// branch. Every live scope is unique per run, so an exact-branch window would open fresh
+// on every decision and MaxPerDay would never bind at all.
 func TestCountAutoApprovalsToday(t *testing.T) {
 	dir := t.TempDir()
 	path := writeLog(t, dir, []logEntry{
 		{kind: "auto_approve", action: "open-pr", scope: "feat/x", passed: true},
 		{kind: "auto_approve", action: "open-pr", scope: "feat/x", passed: true},
-		{kind: "auto_approve", action: "open-pr", scope: "feat/y", passed: true},         // different scope
+		{kind: "auto_approve", action: "open-pr", scope: "feat/y", passed: true},         // SAME family (feat/*)
+		{kind: "auto_approve", action: "open-pr", scope: "task/z", passed: true},         // different family
 		{kind: "auto_approve", action: "promote-to-base", scope: "feat/x", passed: true}, // different action
 		{kind: "boundary_outcome", action: "open-pr", scope: "feat/x", passed: true},     // wrong kind
 		{kind: "auto_deny", action: "open-pr", scope: "feat/x"},                          // wrong kind
@@ -926,8 +931,12 @@ func TestCountAutoApprovalsToday(t *testing.T) {
 	today := dayKey(time.Now().UTC())
 
 	n, err := countAutoApprovalsToday(path, "open-pr", "feat/x", today)
-	if err != nil || n != 2 {
-		t.Fatalf("count = %d, %v; want 2 (only today's auto_approve for open-pr+feat/x)", n, err)
+	if err != nil || n != 3 {
+		t.Fatalf("count = %d, %v; want 3 (today's open-pr auto_approve over the feat/* family)", n, err)
+	}
+	// A different family keeps its own window — the cap is per (action, family).
+	if n, err := countAutoApprovalsToday(path, "open-pr", "task/z", today); err != nil || n != 1 {
+		t.Fatalf("count for task/* = %d, %v; want 1 (families do not share a window)", n, err)
 	}
 	if n, _ := countAutoApprovalsToday(path, "open-pr", "feat/x", "1999-01-01"); n != 0 {
 		t.Errorf("a non-today day must count 0, got %d", n)

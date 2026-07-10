@@ -108,14 +108,16 @@ type NativeRun struct {
 type RunSuperviseFunc func(ctx context.Context, goal string, seed []model.Message, in InboxHandle, out emit.Emitter, ask AskerHandle, gate policy.Approver) (DriveOutcome, error)
 
 // RunProjectFunc runs one whole-project drive: project.Loop.Run(ctx), seeding the
-// loop's initial ContextSummary from the carried WorkState so a follow-up
-// continues the project rather than restarting it. The project loop has no inbox
-// seam of its own (its agentic work happens inside the supervisor it drives, which
-// carries the Inbox); the Emitter surfaces the loop's progress. The wiring site
-// supplies it. gate is the session-backed approver for the project loop's single
-// human promote gate — in a line-REPL chat drive it parks AwaitingGate so the REPL
-// reader answers it (AU-T05b); nil ⇒ the closure keeps its own approver.
-type RunProjectFunc func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter, gate policy.Approver) (DriveOutcome, error)
+// loop's initial ContextSummary from the carried WorkState so a follow-up continues
+// the project rather than restarting it. in is the live user Inbox: the project loop
+// has no inbox seam of its OWN, but it drives a supervisor that DOES, so the wiring
+// closure MUST wire `in` onto that supervisor (stack.sup.Inbox) — without it a
+// steer/queue typed during a project drive is silently stranded in the inbox and then
+// re-folded (duplicated) into the next drive. The Emitter surfaces the loop's progress.
+// gate is the session-backed approver for the project loop's single human promote gate —
+// in a line-REPL chat drive it parks AwaitingGate so the REPL reader answers it
+// (AU-T05b); nil ⇒ the closure keeps its own approver.
+type RunProjectFunc func(ctx context.Context, goal string, seed summarize.ContextSummary, in InboxHandle, out emit.Emitter, gate policy.Approver) (DriveOutcome, error)
 
 // nativeDriver maps RouteNative onto the orchestrator's single-task path. It holds
 // only the run closure + the metered chat/summarize provider used to distil the
@@ -230,13 +232,15 @@ func NewProjectDriver(run RunProjectFunc, sum model.Provider) Driver {
 }
 
 // Drive runs one whole-project drive: invoke the wiring closure seeded with the
-// carried WorkState summary (so a follow-up continues the project) and the
-// Emitter, then fold the verifier-judged outcome.
+// carried WorkState summary (so a follow-up continues the project), the live user
+// Inbox (wired onto the supervisor the loop drives, so a mid-project steer/queue is
+// folded at a round boundary and never stranded/duplicated), and the Emitter, then
+// fold the verifier-judged outcome.
 func (d *projectDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, error) {
 	if d.run == nil {
 		return DriveResult{}, fmt.Errorf("session: project driver has no run closure")
 	}
-	out, err := d.run(ctx, in.Goal, in.State.Summary, in.Out, in.Gate)
+	out, err := d.run(ctx, in.Goal, in.State.Summary, in.Inbox, in.Out, in.Gate)
 	if err != nil {
 		return DriveResult{}, fmt.Errorf("project drive: %w", err)
 	}
@@ -273,6 +277,17 @@ func (d *chatDriver) Drive(ctx context.Context, in DriveInput) (DriveResult, err
 	if d.model == nil {
 		return DriveResult{}, fmt.Errorf("session: chat driver has no model")
 	}
+	// A chat reply is a single model call with no steppable loop, so a steer/queue the
+	// session pushed to the inbox mid-reply cannot be folded into it. DISCARD whatever
+	// accumulated so it is not silently re-folded (duplicated) into the NEXT drive — the
+	// user's line is still in History (Turn appended it), so it stays as ordinary context
+	// for the next turn rather than a stranded, doubled user turn. Deferred so it also runs
+	// on the error path. A nil inbox (headless/tests) is a no-op.
+	defer func() {
+		if in.Inbox != nil {
+			_ = in.Inbox.Drain()
+		}
+	}()
 	msgs := chatMessages(in.History, in.Goal)
 	resp, err := d.model.Complete(ctx, chatSys, msgs, nil, 1024)
 	if err != nil {

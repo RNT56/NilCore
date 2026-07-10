@@ -2,6 +2,7 @@ package termui
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -119,6 +120,51 @@ func TestRenderSpinShape(t *testing.T) {
 	}
 	if !strings.Contains(line, "3.1k tok") {
 		t.Errorf("token count not rendered: %q", line)
+	}
+}
+
+// Regression for a reproduced deadlock between stopSpinLocked and animate.
+// stopSpinLocked closes s.stop and then joins the animator (<-s.done) while
+// holding c.mu; animate's tick branch used to acquire c.mu with a blocking Lock.
+// Because select picks uniformly among ready cases, a tick that fired in the same
+// instant stop closed could win the race, block on Lock against the stopper's
+// held mutex, and never reach the point where it observes stop and exits — so the
+// stopper blocked on the join forever, permanently wedging the console mutex. A
+// standalone repro deadlocked at ~iteration 665.
+//
+// This drives every stop path (StopSpin, Token, Prompt, and Spin-over-Spin) many
+// times with a very fast tick to maximise the odds a tick is buffered exactly
+// when stop closes — the wedge window. Under the fix (TryLock in the tick branch)
+// the animator never blocks on the mutex, so every cycle completes; the watchdog
+// fails the test only if a cycle wedges. Run under -race.
+func TestSpinnerStopNeverDeadlocks(t *testing.T) {
+	const cycles = 3000
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// A styled console (so the animator actually runs) over a discard sink,
+		// ticking far faster than the wedge window is wide. spinEvery is set here
+		// at construction and never mutated, so the animator reads it race-free.
+		c := &Console{w: io.Discard, st: Style{on: true}, spinEvery: 20 * time.Microsecond}
+		for i := 0; i < cycles; i++ {
+			c.Spin("work", uint64(i), verb.Chat, nil)
+			switch i % 4 {
+			case 0:
+				c.StopSpin() // StopSpin → stopSpinLocked
+			case 1:
+				c.Token("x") // Token stops the spinner, then opens a stream
+			case 2:
+				c.Prompt("> ") // Prompt stops the spinner
+			case 3:
+				c.Spin("again", uint64(i), verb.Native, nil) // Spin over a live Spin
+				c.StopSpin()
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("spinner stop deadlocked: animator wedged on c.mu while stopSpinLocked joined it")
 	}
 }
 

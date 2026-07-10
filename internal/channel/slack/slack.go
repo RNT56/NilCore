@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,9 +153,11 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 	}
 }
 
-// Update posts a progress line to the thread (channel).
+// Update posts a progress line to the thread (channel). The message is model- and
+// tool-derived (a serve surface line, an echoed goal) so it is escaped: untrusted
+// content must never carry active Slack markup like <!channel> or <http://x|y> (I7).
 func (b *Bot) Update(ctx context.Context, threadID, message string) error {
-	return b.postMessage(ctx, map[string]any{"channel": threadID, "text": message})
+	return b.postMessage(ctx, map[string]any{"channel": threadID, "text": escapeSlack(message)})
 }
 
 // StreamDraft streams a drive's live reasoning into ONE message edited in place:
@@ -226,9 +229,41 @@ func (b *Bot) updateMessage(ctx context.Context, chanID, ts, text string) error 
 }
 
 // escapeSlack escapes the three characters Slack treats specially in message text
-// (& < >), so arbitrary model prose renders safely.
+// and mrkdwn (& < >), so arbitrary model/tool prose renders as inert DATA. This is a
+// security control, not cosmetics: a raw '<' opens Slack's special-sequence syntax, so
+// untrusted content like <!channel> / <!here> (mass pings), <@U123> (user mentions), or
+// <http://evil|innocent> (forged links) would otherwise be INTERPRETED by Slack when it
+// reaches a text/mrkdwn field. Escaping '<' (and '&', to keep entity text literal)
+// neutralizes all of them (I7). Button labels use plain_text and are not interpreted, so
+// they do not need this.
 func escapeSlack(s string) string {
 	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// slackSectionLimit is Slack's Block Kit section `text` character cap. Text beyond it
+// makes chat.postMessage reject the WHOLE message with invalid_blocks — so an
+// evidence-rich gate (the compact evidence appendix is sized for Telegram's 4096 cap)
+// would error, Ask would return that error, and the structured approver would then
+// default-DENY a gate the operator never saw. Clipping the section to this limit keeps
+// the gate renderable and shown; the full evidence still lives on the terminal/event log.
+const slackSectionLimit = 3000
+
+// clipRunes bounds s to at most max runes, cutting on a rune boundary (so the result is
+// always valid UTF-8) and marking truncation with an ellipsis. Used to fit a section
+// under slackSectionLimit; Slack mrkdwn is lenient, so a severed entity renders oddly at
+// worst — never a hard parse error like Telegram's MarkdownV2.
+func clipRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	return string(r[:max-1]) + "…"
 }
 
 // Ask posts a gate question with Yes/No buttons and blocks for the answer.
@@ -241,14 +276,20 @@ func (b *Bot) Ask(ctx context.Context, threadID, question string) (bool, error) 
 	defer b.unregisterGate(id)
 	b.startIntake(ctx)
 
+	// The question is model-derived and may fold untrusted repo/tool content, so it is
+	// escaped (I7); the "*GATE* —" prefix is harness-controlled bold and stays literal.
+	// The section is then clipped to Slack's 3000-char cap so an evidence-rich gate
+	// renders instead of erroring into a silent default-deny.
+	section := clipRunes("*GATE* — "+escapeSlack(question), slackSectionLimit)
+	fallback := clipRunes("GATE — "+escapeSlack(question), slackSectionLimit)
 	blocks := []map[string]any{
-		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*GATE* — " + question}},
+		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": section}},
 		{"type": "actions", "elements": []map[string]any{
 			{"type": "button", "text": map[string]any{"type": "plain_text", "text": "✅ Yes"}, "value": "yes:" + id, "action_id": "gate_yes", "style": "primary"},
 			{"type": "button", "text": map[string]any{"type": "plain_text", "text": "❌ No"}, "value": "no:" + id, "action_id": "gate_no", "style": "danger"},
 		}},
 	}
-	if err := b.postMessage(ctx, map[string]any{"channel": threadID, "text": "GATE — " + question, "blocks": blocks}); err != nil {
+	if err := b.postMessage(ctx, map[string]any{"channel": threadID, "text": fallback, "blocks": blocks}); err != nil {
 		return false, err
 	}
 	select {
@@ -277,7 +318,19 @@ func (b *Bot) startIntake(ctx context.Context) {
 
 // intake is the sole socket reader: it pulls each Socket Mode envelope and routes it —
 // a gate answer to the waiting Ask, an ask_user tap or a message to the task queue.
+//
+// On exit (its ctx cancelled) it clears intakeStarted so the NEXT startIntake spins a
+// fresh reader — the property (mirrored from telegram, pinned by a restart test) that
+// makes a per-drive starter unable to wedge intake: if a gate Ask were ever the first
+// startIntake caller and its per-drive ctx ended, the socket owner would die AND unlatch,
+// so a later Receive revives it. Without this clear the flag stayed true forever and
+// Receive would block on taskWake with no reader — a permanent wedge.
 func (b *Bot) intake(ctx context.Context) {
+	defer func() {
+		b.mu.Lock()
+		b.intakeStarted = false
+		b.mu.Unlock()
+	}()
 	for {
 		if err := b.ensureConn(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -479,28 +532,78 @@ func (b *Bot) apiPost(ctx context.Context, method, token string, body any, out a
 		}
 		payload = bs
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiBase+"/"+method, bytes.NewReader(payload))
-	if err != nil {
-		return err
+	// Bounded retry on HTTP 429: Slack's Web API rate-limits (chat.update streaming can
+	// exceed the Tier-3 budget), and a dropped gate/ask/final message must not be silently
+	// lost. Honor Retry-After, cap the wait, and give up after maxRateRetries — never loop
+	// unboundedly. The payload bytes are reusable, so each attempt rebuilds its own request.
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.apiBase+"/"+method, bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("content-type", "application/json; charset=utf-8")
+		req.Header.Set("authorization", "Bearer "+token)
+		resp, err := b.http.Do(req)
+		if err != nil {
+			return err
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRateRetries {
+			if err := sleepCtx(ctx, retryAfter(resp.Header.Get("Retry-After"))); err != nil {
+				return err
+			}
+			continue
+		}
+		if resp.StatusCode/100 != 2 {
+			return fmt.Errorf("slack %s: %s", method, resp.Status)
+		}
+		if out != nil {
+			return json.Unmarshal(raw, out)
+		}
+		return nil
 	}
-	req.Header.Set("content-type", "application/json; charset=utf-8")
-	req.Header.Set("authorization", "Bearer "+token)
-	resp, err := b.http.Do(req)
-	if err != nil {
-		return err
+}
+
+// Rate-limit backoff knobs. maxRateRetries bounds the retry count; the wait is derived
+// from Retry-After, floored at rateRetryDefault and capped at rateRetryMax so a hostile
+// or absurd value can never park a call for long. rateRetryDefault is a var only so tests
+// can shrink it.
+const (
+	maxRateRetries = 3
+	rateRetryMax   = 30 * time.Second
+)
+
+var rateRetryDefault = 1 * time.Second
+
+// retryAfter parses a Retry-After header (delta-seconds) into a bounded wait: a
+// missing/garbage value falls back to rateRetryDefault, and the result is capped at
+// rateRetryMax.
+func retryAfter(h string) time.Duration {
+	d := rateRetryDefault
+	if n, err := strconv.Atoi(strings.TrimSpace(h)); err == nil && n > 0 {
+		d = time.Duration(n) * time.Second
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return err
+	if d > rateRetryMax {
+		d = rateRetryMax
 	}
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("slack %s: %s", method, resp.Status)
+	return d
+}
+
+// sleepCtx sleeps for d, returning early (with its error) if ctx is cancelled — so a
+// backoff never outlives the request's context.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
-	}
-	return nil
 }
 
 // socketSource reads Socket Mode envelopes off a WebSocket.

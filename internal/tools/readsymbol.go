@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -100,7 +99,10 @@ func sliceSymbol(workdir string, m symRef) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(abs)
+	// O_NOFOLLOW read (readNoFollow): safePath resolved+confined m.Rel, but a plain
+	// os.ReadFile would still follow a final-component symlink swapped in after that
+	// check and leak an out-of-worktree file (I4 TOCTOU). readNoFollow refuses it.
+	b, err := readNoFollow(abs)
 	if err != nil {
 		return "", err
 	}

@@ -267,7 +267,7 @@ func (l *Loop) Run(ctx) (Outcome, error)
 
 **Hierarchical verifier-as-judge (`judge.go`)** — three exit-code tiers (I2): subtask `Acceptance` → integration `verify.Check` on the merged tree → project `VerifyCmd` + each `Criterion.Command`. `DeriveAcceptance` has the advisor *propose* criteria; **every proposed command is dry-run in the sandbox** and dropped if unrunnable — LLM text never gates done-ness. Refinement is **add-only** (the bar never silently lowers).
 
-**Termination (`progress.go`)** — multiple independent ceilings, each a distinct `Outcome.Reason`: `MaxIterations`, `MaxNoProgress`→stop-ask, global `budget.Ledger` `ErrCeiling`, wall-clock `Deadline`/`ctx`, done-detection. **Failure recovery (`reflect.go`)** is a ladder — narrow (re-scope to the failing criterion) → switch (advisor proposes a different approach) → stop-and-ask-the-human (the existing `policy.Gate`/`channel.Ask` path) — never an abort. Partial slices keep their already-merged verified work (the integrator guarantees the merged subset is green).
+**Termination (`progress.go`)** — multiple independent ceilings, each a distinct `Outcome.Reason`: `MaxIterations`, `MaxNoProgress`→stop-ask, global `budget.Ledger` `ErrCeiling`, wall-clock `Deadline`/`ctx`, done-detection. **Failure recovery (`reflect.go`)** is a ladder — narrow (re-scope to the failing criterion) → switch (advisor proposes a different approach) → stop-and-ask-the-human (the existing `policy.GateStructured`/`channel.Ask` path) — never an abort. Partial slices keep their already-merged verified work (the integrator guarantees the merged subset is green).
 
 ---
 

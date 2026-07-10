@@ -51,7 +51,15 @@ type PackPlan struct {
 	Hosts    []string
 }
 
-// Build assembles the verify-pack named by name into a PackPlan. It:
+// Build assembles the verify-pack named by name into a PackPlan, wiring NO event sink. It
+// is the backward-compatible entry point; it delegates to BuildWithSink(…, nil). To record
+// the append-only evidence events (schema_verify / claim_verify / artifact_verify), a caller
+// uses BuildWithSink and supplies the eventlog-backed sink.
+func Build(name string, box sandbox.Sandbox, relPath string, schemaReg *schema.Registry) (PackPlan, error) {
+	return BuildWithSink(name, box, relPath, schemaReg, nil)
+}
+
+// BuildWithSink assembles the verify-pack named by name into a PackPlan. It:
 //
 //  1. starts from evverify.Default() and registers EXACTLY the named pack into it via
 //     Select — so an unknown name aborts here (Select returns an error) BEFORE composing
@@ -67,7 +75,13 @@ type PackPlan struct {
 // verifiers read (the same path, so the two layers judge the SAME artifact). schemaReg is
 // the per-Kind shape catalog (normally DefaultSchemas()); a nil schemaReg makes the schema
 // verifier fail every Kind closed, which is the correct fail-closed behavior, not a panic.
-func Build(name string, box sandbox.Sandbox, relPath string, schemaReg *schema.Registry) (PackPlan, error) {
+//
+// sink is threaded into BOTH the schema (Named[0]) and evidence (Named[1]) verifiers, so a
+// caller can record the metadata-only schema_verify event and the per-claim/artifact
+// evidence events. The leaves never import eventlog — the orchestrator supplies the backed
+// sink (the cmd-side adapter that serializes each event's Detail is owned separately). A nil
+// sink ⇒ no events emit and the plan behaves byte-identically to a sink-less build.
+func BuildWithSink(name string, box sandbox.Sandbox, relPath string, schemaReg *schema.Registry, sink func(ev any)) (PackPlan, error) {
 	// Register exactly the named pack into a fresh default registry. Select is ATOMIC and
 	// fail-closed: an unknown name returns an error and registers nothing, so Build can
 	// never compose a verifier over a pack that does not exist. This is the inversion of
@@ -88,10 +102,10 @@ func Build(name string, box sandbox.Sandbox, relPath string, schemaReg *schema.R
 
 	// Named[0] schema (structural, no network, no box) and Named[1] evidence (the I2
 	// per-claim gate). Both read the SAME relPath, so a shape defect short-circuits the
-	// whole verdict before any claim check runs.
+	// whole verdict before any claim check runs. Both receive the sink (nil ⇒ no events).
 	named := []verify.NamedVerifier{
-		{Name: "schema", V: &schema.SchemaVerifier{Reg: schemaReg, RelPath: relPath}},
-		{Name: "evidence", V: &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: relPath, Root: root}},
+		{Name: "schema", V: &schema.SchemaVerifier{Reg: schemaReg, RelPath: relPath, EventSink: sink}},
+		{Name: "evidence", V: &evverify.ArtifactVerifier{Box: box, Reg: reg, RelPath: relPath, Root: root, EventSink: sink}},
 	}
 
 	// Named[2] optional raw child. Only code and ui add one; benchmark, audit, and the

@@ -4,9 +4,16 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"nilcore/internal/eventlog"
 )
+
+// defaultRetryBackoff is how long a pump waits before re-attempting an enqueue that hit a
+// full queue. A full queue is transient back-pressure, so the pump HOLDS the already-
+// consumed signal and retries rather than dropping it or dying; the wait keeps a saturated
+// daemon from hot-spinning. Small so a freed slot is claimed promptly; tests override it.
+const defaultRetryBackoff = 25 * time.Millisecond
 
 // Config configures a Daemon. The zero value is a usable, default-off daemon: no
 // sources (drains nothing), unbounded queue, single-flight handler dispatch, no
@@ -30,10 +37,11 @@ type Config struct {
 // NO authority — it forwards a goal to the handler, which owns verification and
 // gating (I2/I3). Construct with New; the zero value is not usable.
 type Daemon struct {
-	q       *boundedQueue
-	handler Handler
-	conc    int
-	log     *eventlog.Log
+	q            *boundedQueue
+	handler      Handler
+	conc         int
+	log          *eventlog.Log
+	retryBackoff time.Duration // pump wait between enqueue retries when the queue is full
 }
 
 // New builds a Daemon with the given handler and config. A nil handler is allowed
@@ -45,10 +53,11 @@ func New(handler Handler, cfg Config) *Daemon {
 		conc = 1
 	}
 	return &Daemon{
-		q:       newBoundedQueue(cfg.QueueCap),
-		handler: handler,
-		conc:    conc,
-		log:     cfg.Log,
+		q:            newBoundedQueue(cfg.QueueCap),
+		handler:      handler,
+		conc:         conc,
+		log:          cfg.Log,
+		retryBackoff: defaultRetryBackoff,
 	}
 }
 
@@ -105,8 +114,10 @@ func (d *Daemon) Run(ctx context.Context, sources ...Source) error {
 }
 
 // pump pulls signals from one source and enqueues them until the source is done,
-// errors, or the queue closes. One bad source stops only itself (its pump exits);
-// the daemon and the other pumps continue.
+// errors, the queue closes, or ctx is cancelled. A momentarily FULL queue does NOT
+// stop the pump — enqueueSignal holds the signal and retries (back-pressure, not
+// death), so a saturated daemon slows a source without killing it. One bad source
+// stops only itself (its pump exits); the daemon and the other pumps continue.
 func (d *Daemon) pump(ctx context.Context, idx int, s Source) {
 	for {
 		sig, ok, err := s.Next(ctx)
@@ -122,19 +133,66 @@ func (d *Daemon) pump(ctx context.Context, idx int, s Source) {
 			d.audit("autosrc_source_done", map[string]any{"source": idx})
 			return
 		}
-		if eqErr := d.q.enqueue(sig); eqErr != nil {
-			// Closed ⇒ shutting down, stop quietly. Full ⇒ back-pressure: record it
-			// and stop pumping this source so we do not hot-spin re-offering a signal
-			// a saturated daemon cannot take. (A production source may instead choose
-			// to retry with backoff; the leaf's contract is simply that a rejected
-			// enqueue is surfaced, never silently lost.)
-			if errors.Is(eqErr, ErrQueueClosed) {
-				return
-			}
-			d.audit("autosrc_enqueue_rejected", map[string]any{"source": idx, "reason": eqErr.Error()})
-			return
+		if !d.enqueueSignal(ctx, idx, sig) {
+			return // queue closed or ctx cancelled while (re)enqueuing — clean stop
 		}
-		d.audit("autosrc_enqueued", map[string]any{"source": idx, "priority": sig.Priority, "signal_source": sig.Signal.Source})
+	}
+}
+
+// enqueueSignal admits one already-consumed signal into the queue, absorbing transient
+// back-pressure so a full queue never KILLS the pump. This is the fix for the source-death
+// bug: previously the pump RETURNED on ErrQueueFull, which left the source's feeder blocked
+// forever on its channel send (the pull side was gone) and silently lost the signal already
+// pulled from the source. A full queue is pressure, not death: enqueueSignal records the
+// stall once, then backs off and retries the SAME signal until a slot frees — so no consumed
+// signal is dropped and the source resumes producing once the daemon catches up. It returns
+// true when the signal is enqueued (the pump continues) and false when the pump should stop:
+// the queue closed, or ctx was cancelled (shutdown — dropping a not-yet-queued signal is
+// correct there, since the graceful-drain promise covers only already-QUEUED work).
+func (d *Daemon) enqueueSignal(ctx context.Context, idx int, sig QueuedSignal) bool {
+	stalled := false
+	for {
+		switch err := d.q.enqueue(sig); {
+		case err == nil:
+			d.audit("autosrc_enqueued", map[string]any{"source": idx, "priority": sig.Priority, "signal_source": sig.Signal.Source})
+			return true
+		case errors.Is(err, ErrQueueClosed):
+			return false // shutting down — stop quietly
+		case errors.Is(err, ErrQueueFull):
+			// Back-pressure. Record it once per stall (not per retry, so a long stall
+			// does not flood the log), then wait and retry the SAME signal. The signal
+			// is held, never dropped; the pump stays alive.
+			if !stalled {
+				d.audit("autosrc_backpressure", map[string]any{"source": idx, "signal_source": sig.Signal.Source})
+				stalled = true
+			}
+			if !d.backoff(ctx) {
+				return false // ctx cancelled while backing off — stop (a shutdown drop)
+			}
+		default:
+			// enqueue only returns Full/Closed today; any other rejection stops this
+			// pump, surfaced for audit (defensive).
+			d.audit("autosrc_enqueue_rejected", map[string]any{"source": idx, "reason": err.Error()})
+			return false
+		}
+	}
+}
+
+// backoff waits one retry interval or until ctx is cancelled, returning true to retry and
+// false if ctx ended while waiting. A non-positive interval is normalized to the default so
+// a misconfigured daemon never hot-spins on a full queue.
+func (d *Daemon) backoff(ctx context.Context) bool {
+	wait := d.retryBackoff
+	if wait <= 0 {
+		wait = defaultRetryBackoff
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

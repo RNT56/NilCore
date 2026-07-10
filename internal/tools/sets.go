@@ -31,14 +31,21 @@ func ReadOnly() *Registry {
 // keeps the write-free structural guarantee intact. It is the right set for
 // Discuss/Plan, which must navigate an unfamiliar codebase to converse or plan.
 func ReadOnlyWithCodeintel() *Registry {
-	// The host-side navigation/analysis tools below are all READ-ONLY AND
-	// EXECUTION-FREE (pure go/ast + file reads + an in-memory graph; no writes, no
-	// subprocess), so adding them keeps both the write-free AND the no-execution
-	// guarantee of a Discuss/Plan drive intact while giving it the precise lenses to
-	// navigate an unfamiliar codebase: outline (file/dir shape), read_symbol (surgical
-	// reads), dead_code + import_graph (hygiene/architecture). NOTE: affected_tests is
-	// deliberately EXCLUDED — it shells out to `git status`, and a read-only drive must
-	// stay execution-free (DisableShell); it remains available on the full primary loop.
+	// The host-side navigation/analysis tools below carry NO write surface and run NO
+	// MODEL-EMITTED execution (I4 holds): matching is pure go/ast + worktree-confined
+	// file reads over an in-memory graph. That keeps the write-free guarantee of a
+	// Discuss/Plan drive intact while giving it the precise lenses to navigate an
+	// unfamiliar codebase: outline (file/dir shape), read_symbol (surgical reads),
+	// dead_code + import_graph (hygiene/architecture), codeintel (a structural bundle).
+	//
+	// ONE honest caveat, on codeintel specifically: when the OPERATOR opts in it may
+	// spawn the operator-configured language server (NILCORE_LSP_COMMAND) for a precise
+	// lens, and call the embedding API (NILCORE_EMBED_KEY) for the semantic lens. Both
+	// are off by default and neither is model-emitted — the LSP binary is operator-
+	// trusted, so I4 (no model-driven arbitrary execution) still holds; it is simply not
+	// the blanket "zero subprocess" the rest of this set is. affected_tests is EXCLUDED
+	// for a stronger reason — it ALWAYS shells out to `git status` — and a read-only
+	// drive stays execution-free (DisableShell); it remains on the full primary loop.
 	return NewRegistry(
 		ReadTool{}, SearchTool{}, CodeintelTool{},
 		OutlineTool{}, ReadSymbolTool{}, DeadCodeTool{}, ImportGraphTool{},

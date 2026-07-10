@@ -41,16 +41,17 @@ const (
 	ClassOther      = "other"      // default: matched no keyword above
 )
 
-// classRule pairs a class label with the lower-cased keyword substrings that
-// select it. A goal selects the rule if it contains ANY of the rule's keywords.
+// classRule pairs a class label with the lower-cased keyword words/phrases that
+// select it. A goal selects the rule if it contains ANY of the rule's keywords on a
+// WORD BOUNDARY (see containsWord) — never as a mere substring of a larger word.
 type classRule struct {
 	class    string
 	keywords []string
 }
 
 // classTable is the ORDERED keyword table; Classify returns the class of the
-// FIRST rule whose keyword the (normalized) goal contains. Order matters and is
-// chosen for determinism + intent:
+// FIRST rule one of whose keywords the (normalized) goal contains on a word boundary.
+// Order matters and is chosen for determinism + intent:
 //
 //   - refactor / bugfix / test / docs first: these are the most specific,
 //     "act on existing code" intents and read as the dominant verb of a goal
@@ -92,12 +93,48 @@ func Classify(goal string) string {
 	}
 	for _, rule := range classTable {
 		for _, kw := range rule.keywords {
-			if strings.Contains(g, kw) {
+			if containsWord(g, kw) {
 				return rule.class
 			}
 		}
 	}
 	return ClassOther
+}
+
+// containsWord reports whether needle occurs in haystack on WORD BOUNDARIES, so a
+// keyword like "fix"/"comment"/"build a" matches the whole word/phrase but NOT a
+// larger word that merely contains it ("prefix"/"suffix", "uncomment", "rebuild all").
+// A boundary is only required at an end whose needle char is itself a word char, so
+// multi-word/punctuated keywords ("bug fix", "add a ", "clean up") still match as
+// phrases. Both inputs are already lower-cased + whitespace-collapsed by the caller
+// (normalize / the lower-cased classTable). This mirrors internal/policy.containsWord;
+// substring matching mis-bucketed classes ("fix "⊂"prefix ", "patch the"⊂"dispatch
+// the", "comment"⊂"uncomment", "build a"⊂"rebuild all"), which — though class only
+// biases attempt order, never a verdict (I2) — polluted per-class evidence.
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		leftOK := i == 0 || !isWordByte(needle[0]) || !isWordByte(haystack[i-1])
+		rightOK := end == len(haystack) || !isWordByte(needle[len(needle)-1]) || !isWordByte(haystack[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+// isWordByte reports whether b is an ASCII word character (letter, digit, underscore).
+// The goal and keywords are already lower-cased, so only lowercase letters appear.
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // normalize lower-cases the goal and collapses every run of whitespace to a

@@ -112,6 +112,47 @@ func TestVerifyRecoversAfterTornFinalLine(t *testing.T) {
 	}
 }
 
+// TestHealTornTailPreservesCommittedLines is the append-only guard for the torn-tail
+// heal (I5): it must trim ONLY a never-terminated partial tail and never shorten a
+// complete, newline-terminated (committed) line. It exercises healTornTail directly on
+// crafted byte layouts so the boundary behavior is deterministic.
+func TestHealTornTailPreservesCommittedLines(t *testing.T) {
+	committed := "{\"seq\":0}\n{\"seq\":1}\n" // two fully-terminated (committed) records
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// A file that already ends in '\n' is fully committed — the heal must leave it
+		// byte-identical (never truncate committed history).
+		{"clean terminated file untouched", committed, committed},
+		// A committed prefix plus a torn partial tail: only the partial is trimmed; every
+		// committed line survives byte-for-byte.
+		{"trims only the torn tail", committed + "{\"seq\":2,\"pa", committed},
+		// A single torn line (no '\n' at all) is entirely a never-committed partial ⇒ gone.
+		{"single torn line to empty", "{\"seq\":0,\"par", ""},
+		// An empty file is left empty.
+		{"empty stays empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "heal.jsonl")
+			if err := os.WriteFile(path, []byte(tc.in), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			healTornTail(path)
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("healTornTail mangled committed bytes:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOnAppendHook(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hook.jsonl")
 	log, err := Open(path)

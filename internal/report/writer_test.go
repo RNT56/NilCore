@@ -125,3 +125,18 @@ func TestWriteReportAllowlistShape(t *testing.T) {
 		}
 	}
 }
+
+// TestValidExtErrorListsAll proves the rejection message enumerates EVERY accepted
+// extension — including json, which the allowlist accepts but the message used to omit
+// (it said only "html, md, txt"). Deriving the list from allowedExts keeps them in sync.
+func TestValidExtErrorListsAll(t *testing.T) {
+	err := validExt("exe")
+	if err == nil {
+		t.Fatal("validExt(\"exe\") must be rejected")
+	}
+	for ext := range allowedExts {
+		if !strings.Contains(err.Error(), ext) {
+			t.Errorf("validExt error %q omits accepted ext %q", err.Error(), ext)
+		}
+	}
+}

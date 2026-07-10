@@ -155,6 +155,15 @@ func flowsMain(args []string) {
 		os.Exit(2)
 	}
 	verb := args[0]
+	// A help request AS the verb (`nilcore flows -h|--help|help`) prints clean usage to
+	// stdout and exits 0 — it is NOT an error. Without this, "-h" is taken as the verb
+	// and the run falls through to the "-flow is required" error branch (exit 2), so a
+	// help ask is mislabeled as a usage error. Mirrors the top-level `nilcore -h`.
+	switch verb {
+	case "-h", "--help", "help":
+		fmt.Fprint(os.Stdout, flowsUsageText)
+		return
+	}
 	fs := flag.NewFlagSet("flows "+verb, flag.ExitOnError)
 	flowPath := fs.String("flow", "", "path to the flow JSON (required)")
 	dir := fs.String("dir", ".", "repo directory to run the flow against (run only)")
@@ -337,8 +346,7 @@ func truncFlow(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func flowsUsage() {
-	fmt.Fprint(os.Stderr, `nilcore flows — consume a portable agentic-flows workflow (github.com/RNT56/agentic-flows)
+const flowsUsageText = `nilcore flows — consume a portable agentic-flows workflow (github.com/RNT56/agentic-flows)
 
 NilCore is the sandboxed-worker consumer of the agentic-flows contract: it runs a flow's
 agent_task nodes through its verified machinery. Flows are consumed as JSON (stdlib-only;
@@ -349,5 +357,10 @@ Usage:
   nilcore flows run      -flow <file.json> [-dir .]    run the agent_task DAG via the swarm code preset
 
 Exit codes (validate): 0 = consumable, 1 = not consumable / decode error.
-`)
+`
+
+// flowsUsage prints usage to stderr — the ERROR path (bad/missing args). A help
+// REQUEST prints the same text to stdout and exits 0 (see flowsMain).
+func flowsUsage() {
+	fmt.Fprint(os.Stderr, flowsUsageText)
 }

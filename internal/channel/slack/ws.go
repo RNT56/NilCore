@@ -15,6 +15,11 @@ import (
 	"strings"
 )
 
+// maxFramePayload caps a single inbound WebSocket frame (16 MiB). Socket Mode
+// envelopes are small; the cap exists purely to reject a hostile/oversized length
+// header before it can crash (negative make) or OOM the intake goroutine.
+const maxFramePayload = 16 << 20
+
 // wsConn is a minimal RFC-6455 WebSocket client — just what Slack Socket Mode
 // needs (read text frames, reply to pings, send masked text acks). Implemented
 // on stdlib so the zero-dependency invariant (I6) holds; Socket Mode is the only
@@ -109,7 +114,14 @@ func (w *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 		if _, err = io.ReadFull(w.r, ext); err != nil {
 			return 0, nil, err
 		}
-		length = int(binary.BigEndian.Uint64(ext))
+		// The 64-bit length is attacker-influenced (I7): a value > MaxInt64 goes NEGATIVE
+		// when cast to int and panics make() (crashing the intake goroutine), and a merely
+		// huge value OOMs the process. Reject anything past a sane cap BEFORE the make.
+		n := binary.BigEndian.Uint64(ext)
+		if n > maxFramePayload {
+			return 0, nil, fmt.Errorf("ws frame too large: %d bytes", n)
+		}
+		length = int(n)
 	}
 	var mask []byte
 	if masked {

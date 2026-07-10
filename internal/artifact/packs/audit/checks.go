@@ -184,6 +184,14 @@ func checkFindingReproduces(ctx context.Context, box sandbox.Sandbox, c artifact
 		// refuse rather than risk it (the locator path was already validated).
 		return artifact.StatusUnverifiable, "asserted pattern contains a quote or newline (cannot verify safely)"
 	}
+	if strings.HasPrefix(pattern, "-") {
+		// A leading '-' is parsed by grep as an OPTION (e.g. "-rfoo" ⇒ -r -f oo) even when
+		// single-quoted in the shell, not as the fixed-string pattern — an argument-injection.
+		// Refuse it (mirrors validateRelPath and packs/code/code.go's leading-dash guard). The
+		// pattern is already trimmed by value(); checkPatternMatches, which matches host-side
+		// and never shells the pattern, has no such risk and imposes no such limit.
+		return artifact.StatusUnverifiable, "asserted pattern may not begin with '-' (it could be read as a grep option)"
+	}
 	// grep -n -F '<pattern>' '<path>': fixed-string, line-numbered. The verb is a pack
 	// constant; the pattern and path are single-quoted DATA.
 	cmd := fmt.Sprintf("%s %s %s", verbGrep, quote(pattern), quote(loc.path))

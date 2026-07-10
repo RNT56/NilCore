@@ -90,6 +90,9 @@ func GenerateWrappers(base, server string, tools []Tool) error {
 func pruneStaleWrappers(dir string, want map[string]bool) error {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing was generated yet — nothing to prune
+		}
 		return fmt.Errorf("mcp prune list %s: %w", dir, err)
 	}
 	for _, e := range ents {
@@ -109,15 +112,19 @@ func pruneStaleWrappers(dir string, want map[string]bool) error {
 
 // GenerateResourceWrappers writes one descriptor per resource under
 // base/mcp/servers/<server>/resources/. Opt-in (NILCORE_MCP_RESOURCES); a resource is
-// read via the `mcp` tool's resource arg.
+// read via the `mcp` tool's resource arg. Like GenerateWrappers this is a full reconcile:
+// after writing the current set it PRUNES any stale descriptor for a resource the server has
+// since removed or renamed, so a dropped resource can't linger and stay discoverable. An
+// empty set prunes everything (a server that dropped all its resources leaves none behind).
 func GenerateResourceWrappers(base, server string, resources []Resource) error {
-	if len(resources) == 0 {
-		return nil
-	}
 	dir := filepath.Join(wrapperDir(base, server), "resources")
+	if len(resources) == 0 {
+		return pruneStaleWrappers(dir, nil) // no resources: drop any left from a prior generation
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mcp resource dir: %w", err)
 	}
+	want := make(map[string]bool, len(resources))
 	taken := newSlugSet()
 	for _, r := range resources {
 		desc := map[string]any{
@@ -134,20 +141,25 @@ func GenerateResourceWrappers(base, server string, resources []Resource) error {
 		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}
+		want[fname] = true
 	}
-	return nil
+	return pruneStaleWrappers(dir, want)
 }
 
 // GeneratePromptWrappers writes one descriptor per prompt under
-// base/mcp/servers/<server>/prompts/. Opt-in; rendered via the `mcp` tool's prompt arg.
+// base/mcp/servers/<server>/prompts/. Opt-in; rendered via the `mcp` tool's prompt arg. Like
+// GenerateWrappers this is a full reconcile: after writing the current set it PRUNES any stale
+// descriptor for a prompt the server has since removed or renamed, so a dropped prompt can't
+// linger and stay discoverable. An empty set prunes everything.
 func GeneratePromptWrappers(base, server string, prompts []Prompt) error {
-	if len(prompts) == 0 {
-		return nil
-	}
 	dir := filepath.Join(wrapperDir(base, server), "prompts")
+	if len(prompts) == 0 {
+		return pruneStaleWrappers(dir, nil) // no prompts: drop any left from a prior generation
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mcp prompt dir: %w", err)
 	}
+	want := make(map[string]bool, len(prompts))
 	taken := newSlugSet()
 	for _, p := range prompts {
 		desc := map[string]any{
@@ -160,8 +172,9 @@ func GeneratePromptWrappers(base, server string, prompts []Prompt) error {
 		if err := writeDescriptor(filepath.Join(dir, fname), desc); err != nil {
 			return err
 		}
+		want[fname] = true
 	}
-	return nil
+	return pruneStaleWrappers(dir, want)
 }
 
 func writeDescriptor(path string, desc map[string]any) error {

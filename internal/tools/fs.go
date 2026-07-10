@@ -331,7 +331,15 @@ func (t SearchTool) Run(_ context.Context, workdir string, input json.RawMessage
 func searchRoot(b *strings.Builder, root string, relative bool, glob string, re *regexp.Regexp, count *int) error {
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// An unreadable directory (e.g. perms 0000) must NOT abort the entire
+			// search across the worktree and every read root — skip just this subtree
+			// and keep going, exactly as an unreadable FILE is skipped below. Returning
+			// the error here would fail the whole query on one bad dir. (d is nil only
+			// when the root itself is unstattable; skipping it is the same graceful no-op.)
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if d.Name() == ".git" {

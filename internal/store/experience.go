@@ -162,6 +162,35 @@ func (s *Store) SetExpMeta(ctx context.Context, m ExpMeta) error {
 	return nil
 }
 
+// ClearExpStandings deletes every row from both projection standing tables
+// (exp_backend_standing and exp_config_standing) in ONE transaction, resetting the
+// derived read model to empty WITHOUT touching the append-only event log (I5 — the
+// projection is a droppable, rebuildable derivation, never a source of truth). It is
+// the "truncate" half of an authoritative truncate-then-rebuild: the experience
+// Projector calls it so a full Rebuild (or a rotation-triggered re-derive) reflects
+// ONLY the current log, dropping standings for (class, backend) or config keys that no
+// longer appear in it — which an upsert-only rebuild could never remove. The exp_meta
+// watermark is owned separately by SetExpMeta and is intentionally left untouched here.
+func (s *Store) ClearExpStandings(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("clear exp standings: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{
+		`DELETE FROM exp_backend_standing`,
+		`DELETE FROM exp_config_standing`,
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("clear exp standings: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("clear exp standings: commit: %w", err)
+	}
+	return nil
+}
+
 // formatTS renders a time as RFC3339Nano UTC, or "" for the zero time (matching
 // the column defaults so a zero Time round-trips through the empty string).
 func formatTS(t time.Time) string {

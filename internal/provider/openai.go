@@ -481,8 +481,15 @@ func (o *OpenAI) newRequest(ctx context.Context, system string, msgs []model.Mes
 				extras.Provider = &p
 			}
 		}
-		if hasWeb {
-			extras.Plugins = append(extras.Plugins, OpenRouterPlugin{ID: "web"})
+		if hasWeb && !hasPluginID(extras.Plugins, "web") {
+			// `extras` is a SHALLOW copy of the operator's config, so extras.Plugins
+			// aliases their backing array — an in-place append with spare capacity would
+			// corrupt their config for later requests. Copy into a fresh slice first.
+			// And skip entirely when a "web" plugin is already configured, so we never
+			// send a duplicated web plugin (WithOpenRouterPlugins + native web search).
+			plugins := make([]OpenRouterPlugin, len(extras.Plugins), len(extras.Plugins)+1)
+			copy(plugins, extras.Plugins)
+			extras.Plugins = append(plugins, OpenRouterPlugin{ID: "web"})
 		}
 		extras.applyDefaults()
 		reqBody.openRouterExtras = &extras
@@ -589,7 +596,15 @@ func toOpenAIMessages(system string, msgs []model.Message) []oaiMessage {
 		for _, b := range m.Content {
 			switch b.Type {
 			case "tool_result":
-				out = append(out, oaiMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: b.Content})
+				// OpenAI's role:"tool" message has no is_error field (unlike Anthropic's
+				// tool_result), so a FAILED tool would look identical to a successful one
+				// and the model would miss the failure signal. Carry it as an explicit
+				// content prefix so an OpenAI-family model sees the tool errored.
+				content := b.Content
+				if b.IsError {
+					content = "[tool error] " + content
+				}
+				out = append(out, oaiMessage{Role: "tool", ToolCallID: b.ToolUseID, Content: content})
 			case "text":
 				text += b.Text
 			case "image":

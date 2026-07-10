@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -194,6 +195,84 @@ func TestSchemaVerifier_EventEmitted(t *testing.T) {
 		if strings.Contains(d.Field, inj) {
 			t.Fatalf("event DefectMeta echoed a model field (I7): %+v", d)
 		}
+	}
+}
+
+// TestSchemaVerifier_EventWireShape pins the on-wire contract (fix: the event was dead —
+// no json tags, no claim_id/reason). A schema DEFECT must serialize to the shape the report
+// decoder reads: a top-level {"id", "defects":[…]} whose defect entries carry lowercase
+// {"code","field","claim_id","reason"}. We marshal the emitted event and decode it exactly
+// as report.schemaDefectsFromEvent does, proving round-trip compatibility WITHOUT importing
+// the report leaf. It also re-asserts I7: no model-authored field appears in the bytes.
+func TestSchemaVerifier_EventWireShape(t *testing.T) {
+	const inj = "WIRE-INJECT-PAYLOAD-98765"
+	// A strict schema so the single claim yields defects that carry a ClaimID + Reason.
+	reg := NewRegistry()
+	reg.Register(&Schema{Kind: artifact.KindReport, RequiredFields: []string{"field"}, CitationRequired: true, VerifierRequired: true, MinClaims: 1})
+	c := artifact.Claim{
+		ID:        "claim-7",
+		Field:     "", // ⇒ MissingField(claim-7)
+		Statement: inj,
+		Evidence:  artifact.Evidence{Value: inj, SourceURL: "", Verifier: ""}, // ⇒ MissingCitation + MissingVerifier
+	}
+	a := &artifact.Artifact{ID: "art-9", Kind: artifact.KindReport, Title: "T", Claims: []artifact.Claim{c}}
+
+	var got []any
+	v := &SchemaVerifier{Reg: reg, RelPath: writeArtifactFile(t, a), EventSink: func(ev any) { got = append(got, ev) }}
+	if _, err := v.Check(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one event, got %d", len(got))
+	}
+
+	// Serialize the event as the eventlog Detail would be, then decode it the way the report
+	// projection does: keying off "id" and "defects" with {code,field,claim_id,reason}.
+	data, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	if strings.Contains(string(data), inj) {
+		t.Fatalf("serialized event echoed a model-authored field (I7 violation):\n%s", data)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(data, &detail); err != nil {
+		t.Fatalf("unmarshal event Detail: %v", err)
+	}
+	if detail["id"] != "art-9" {
+		t.Fatalf("Detail[\"id\"] = %v, want \"art-9\" (the report decoder keys off this)", detail["id"])
+	}
+	raw, ok := detail["defects"].([]any)
+	if !ok || len(raw) == 0 {
+		t.Fatalf("Detail[\"defects\"] = %v, want a non-empty array (a dead pipeline yields none)", detail["defects"])
+	}
+	sawClaim, sawReason := false, false
+	for _, item := range raw {
+		d, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("defect entry is not an object: %T", item)
+		}
+		// Every key the decoder reads must be present (lowercase) and string-typed.
+		for _, k := range []string{"code", "field", "claim_id", "reason"} {
+			if _, present := d[k]; !present {
+				t.Fatalf("defect entry missing %q key: %v", k, d)
+			}
+			if _, isStr := d[k].(string); !isStr {
+				t.Fatalf("defect entry %q is not a string: %T", k, d[k])
+			}
+		}
+		if d["claim_id"] == "claim-7" {
+			sawClaim = true
+		}
+		if s, _ := d["reason"].(string); s != "" {
+			sawReason = true
+		}
+	}
+	if !sawClaim {
+		t.Fatalf("no defect carried the trusted claim_id \"claim-7\": %v", raw)
+	}
+	if !sawReason {
+		t.Fatalf("no defect carried a harness-authored reason: %v", raw)
 	}
 }
 

@@ -252,12 +252,20 @@ func (a *Anthropic) newRequest(ctx context.Context, system string, msgs []model.
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("x-api-key", a.key)
 	// Path A (CU-T12): a built-in tool (Anthropic's `computer` beta) requires its beta
-	// header. Set it when present; absent in every default path ⇒ byte-identical.
+	// header. Collect the beta value of EVERY beta-carrying tool (deduped) and send
+	// them as the comma-separated list the anthropic-beta header accepts — a turn that
+	// mixes two beta tools (e.g. computer + another) would otherwise silently enable
+	// only the first. Absent in every default path ⇒ header unset ⇒ byte-identical.
+	var betas []string
+	seenBeta := map[string]bool{}
 	for _, t := range tools {
-		if h := t.BetaHeader(); h != "" {
-			req.Header.Set("anthropic-beta", h)
-			break
+		if h := t.BetaHeader(); h != "" && !seenBeta[h] {
+			seenBeta[h] = true
+			betas = append(betas, h)
 		}
+	}
+	if len(betas) > 0 {
+		req.Header.Set("anthropic-beta", strings.Join(betas, ","))
 	}
 	return req, nil
 }
@@ -319,6 +327,7 @@ func (ar anthropicResponse) toModel() model.Response {
 		StopReason: ar.StopReason,
 		Usage:      ar.Usage.toModelUsage(),
 	}
+	sawServerTool := false
 	for _, b := range ar.Content {
 		switch b.Type {
 		case "text":
@@ -330,9 +339,35 @@ func (ar anthropicResponse) toModel() model.Response {
 				Name:  b.Name,
 				Input: json.RawMessage(orEmptyObj(string(b.Input))),
 			})
+		case "server_tool_use", "web_search_tool_result":
+			// Dropped from the loop's content (no handler for server-side tool blocks),
+			// but remembered: see the marker rule below.
+			sawServerTool = true
 		}
 	}
+	out.Content = preserveServerToolTurn(out.Content, sawServerTool)
 	return out
+}
+
+// serverToolMarker is the fixed, non-executable placeholder that stands in for a
+// server-side-tool turn (native web search) that carried NO assistant text — e.g. a
+// pause_turn emitted mid-search. It carries NONE of the untrusted search result body
+// (I7): a web result legitimately folds into the model's OWN text answer, and here
+// there was none. It exists only so the turn is never EMPTY content — an empty
+// assistant turn marshals to "content":null and 400s the NEXT request (see native.go).
+const serverToolMarker = "[a server-side tool ran but returned no assistant text this turn]"
+
+// preserveServerToolTurn guarantees a decoded turn is never empty when the model ran a
+// server-side tool (server_tool_use / web_search_tool_result) whose blocks we drop. If
+// content already has text or a tool_use, it is returned unchanged (byte-identical to
+// the normal path — the marker is NOT added when real content survives). Only a
+// server-tool-ONLY turn (no text) gets the marker, so pause_turn and web-search-only
+// replies stay non-empty and marshalable.
+func preserveServerToolTurn(content []model.Block, sawServerTool bool) []model.Block {
+	if len(content) == 0 && sawServerTool {
+		return []model.Block{{Type: "text", Text: serverToolMarker}}
+	}
+	return content
 }
 
 // streamEvent is one Messages-API server-sent event frame. Only the fields the
@@ -443,12 +478,15 @@ func (a *Anthropic) Stream(ctx context.Context, system string, msgs []model.Mess
 // split out from Stream so it is unit-testable against any io.Reader.
 func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(model.Chunk)) (model.Response, error) {
 	var (
-		out    model.Response
-		blocks = map[int]*streamBlock{}
-		order  []int // block indices in first-seen order, for stable assembly
+		out        model.Response
+		blocks     = map[int]*streamBlock{}
+		order      []int // block indices in first-seen order, for stable assembly
+		gotContent bool  // saw any block-open / delta / message_delta frame (see the EOF check)
 	)
 
 	finish := func() model.Response {
+		out.Content = nil // finish may be reached once; rebuild deterministically
+		sawServerTool := false
 		for _, idx := range order {
 			b := blocks[idx]
 			switch b.typ {
@@ -461,8 +499,13 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 					Name:  b.name,
 					Input: json.RawMessage(orEmptyObj(string(b.jsonBuf))),
 				})
+			case "server_tool_use", "web_search_tool_result":
+				// Dropped like the non-stream path (no loop handler); remembered so a
+				// server-tool-ONLY turn is not left empty (preserveServerToolTurn).
+				sawServerTool = true
 			}
 		}
+		out.Content = preserveServerToolTurn(out.Content, sawServerTool)
 		return out
 	}
 
@@ -504,6 +547,7 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 			out.Usage = ev.Message.Usage.toModelUsage()
 
 		case "content_block_start":
+			gotContent = true // a real content block opened — the turn produced output
 			if _, seen := blocks[ev.Index]; !seen {
 				order = append(order, ev.Index)
 			}
@@ -514,6 +558,7 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 			}
 
 		case "content_block_delta":
+			gotContent = true
 			b := blocks[ev.Index]
 			if b == nil {
 				continue
@@ -532,6 +577,7 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 			// Block fully received; nothing to flush — assembled lazily at finish.
 
 		case "message_delta":
+			gotContent = true // the turn's terminal delta (stop_reason / cumulative usage)
 			if ev.Delta.StopReason != "" {
 				out.StopReason = ev.Delta.StopReason
 			}
@@ -579,7 +625,22 @@ func assembleAnthropicStream(ctx context.Context, body io.Reader, onChunk func(m
 		return finish(), fmt.Errorf("read stream: %w", err)
 	}
 
-	// Clean EOF without an explicit message_stop: return what we assembled.
+	// Clean EOF without an explicit message_stop. If at least one content/delta frame
+	// arrived, the stream is a (possibly truncated) real reply — return it as a clean
+	// success so the native loop's truncation salvage can act on a partial tool_use
+	// (mirrors the non-stream path and the OpenAI assembler). But an EOF with NOTHING
+	// received is a broken connection dressed up as a 200: returning it as success
+	// yields an EMPTY Response that the loop would append as a poisoned assistant turn
+	// (native.go fix), and it silently defeats retry/failover. Surface a retryable
+	// error instead so Resilient retries or fails over — matching openai.go.
+	if !gotContent {
+		return finish(), &model.APIError{
+			StatusCode: 502,
+			Retryable:  true,
+			Type:       "stream_truncated",
+			Message:    "anthropic stream closed with no content before message_stop",
+		}
+	}
 	return finish(), nil
 }
 

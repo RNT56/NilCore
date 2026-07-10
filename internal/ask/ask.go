@@ -62,9 +62,14 @@ func New(em emit.Emitter) *Box {
 // consumer (Ask), cap-1 channel — a Resolve racing the batch's end is simply false.
 func (b *Box) Resolve(line string) bool {
 	b.mu.Lock()
-	pending := b.pending
-	b.mu.Unlock()
-	if !pending {
+	defer b.mu.Unlock()
+	// Re-check pending AND send under the lock so the check-and-send is atomic with Ask's
+	// teardown (its defer flips pending=false and drains the reply channel under the SAME
+	// lock). The old shape read pending, UNLOCKED, then sent: a line arriving once the batch
+	// had ended could slip into the just-drained cap-1 buffer and return true, so Session.Turn
+	// logged an answer and DROPPED the line instead of falling through to the follow-up path.
+	// The send is non-blocking on a cap-1 channel, so holding the lock across it never blocks.
+	if !b.pending {
 		return false
 	}
 	select {

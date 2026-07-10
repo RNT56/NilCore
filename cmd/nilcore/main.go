@@ -73,6 +73,14 @@ func main() {
 	// every normal invocation and on every non-Linux host.
 	sandbox.MaybeRunInit()
 
+	// Fail loudly at boot on a misconfigured verify surface, rather than reddening
+	// mysteriously at verify time (packs) or silently dropping a tightening the
+	// operator asked for (max-age). Pure env validation; a no-op when unset.
+	if err := validateVerifyEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "nilcore: %v\n", err)
+		os.Exit(2)
+	}
+
 	args := os.Args[1:]
 	if len(args) == 0 {
 		// The conversational front door is the natural default: bare `nilcore`
@@ -1184,7 +1192,11 @@ func serveMain(args []string) {
 		// The flywheel ticks in a background goroutine — it must never gate against
 		// os.Stdin (no human attends it). Headless approver + envelope-gated self-accept.
 		makeHeadlessBackground(fwOrch, b.cfg, *c.logPath, log, fwBlast)
-		fwLoop := newFlywheelLoop(fwOrch, log, *c.logPath, 1, time.Minute)
+		// The self-edit merge gate is headless too: deny-default, never os.Stdin. A
+		// background ticker that prompted on stdin would print into the serve console
+		// and block the cycle forever. SelfImproveGate still applies the separate
+		// NILCORE_SELFIMPROVE_AUTOAPPROVE double opt-in on top of this base.
+		fwLoop := newFlywheelLoop(fwOrch, log, *c.logPath, 1, time.Minute, denyAllApprover{}.Approve)
 		go runFlywheelTicker(ctx, fwLoop)
 	}
 
@@ -1286,7 +1298,7 @@ func serveMain(args []string) {
 	// SCM/CI webhook intake (P9-T04), opt-in via --webhook: a signed GitHub webhook
 	// becomes a trigger.Signal on the same gated machinery, bounded by the serve ctx.
 	if *webhookAddr != "" {
-		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"))
+		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"), mem, ckpt, serveBlast)
 	}
 
 	srv := &server.Server{Channel: rawCh, Auth: auth, NewSession: factory, Log: log, ResolveRoot: resolveReadRoot, Wake: wakeReg, SuppressWaker: autonomyOwnsWakes}
@@ -1436,7 +1448,8 @@ func resumeInflight(ctx context.Context, d serveDeps, notifyCh channel.Channel) 
 	adv := resolveAdvisor(*c.backendName, d.boot, c)
 	run := func(ctx context.Context, t backend.Task) (bool, error) {
 		newEnv := func(dir string) agent.Env {
-			box := selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir)
+			// Same -blast-radius fence the live serve drive gets (see serveNativeRun).
+			box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), d.blast)
 			v := orchestratorVerifier(box, *c.checkCmd, d.log, *c.logPath)
 			be := buildBackend("native", d.provider, d.boot.cred, adv, box, v, d.log, *c.maxSteps, d.mem, d.baseRepo, d.boot.cfg)
 			return agent.Env{Backend: be, Verifier: v}
@@ -1627,7 +1640,10 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 	}
 	return func(ctx context.Context, in session.NativeRun) (session.DriveOutcome, error) {
 		newEnv := func(dir string) agent.Env {
-			box := selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir)
+			// attachBlast applies the -blast-radius sandbox wall-time fence. Serve threaded
+			// its shared budget everywhere EXCEPT here, so a native serve drive ran its
+			// sandbox commands unfenced while the flag's help promised it bounded them.
+			box := attachBlast(selectSandbox(*d.flags.sandboxPref, *d.flags.runtime, *d.flags.image, dir), d.blast)
 			// Route a container box through the allowlist proxy when web access is on
 			// (no-op otherwise; default-deny stays the norm), and bind-mount /add'd
 			// roots read-only. Mirrors chat.
@@ -1653,12 +1669,25 @@ func serveNativeRun(d serveDeps, metered model.Provider, approver policy.Approve
 			Approver:   approver,       // gates route back to this thread (Channel.Ask)
 			RaceN:      *d.flags.raceN, // escalate a verify failure to a best-of-N race
 			Checkpoint: d.checkpoint,   // records running/done so a restart can resume a leftover drive
+			// KEEP a verified execute drive's branch (the D4 seam) so serve /diff can preview
+			// it and serve /apply's "the verified branch is kept" refusal is HONEST — without
+			// this the branch was deleted and /diff always said "nothing to preview" while the
+			// refusal claimed a kept branch. Read-only modes ship nothing, so they keep the
+			// disposable default. Parity with chatNativeRun.
+			KeepBranch: !in.Mode.ReadOnly(),
 		}
 		out, err := runViaKernel(ctx, orch, backend.Task{ID: in.TaskID, Goal: modePreamble(in.Mode) + in.Goal})
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
-		return session.DriveOutcome{Summary: out.Summary, Verified: out.Verified}, nil
+		// Re-home the kept branch under the sweep-proof nilcore/kept/ prefix and bound the
+		// family, then surface it so it flows into the persisted WorkState.Branch that serve
+		// /diff reads (KeptBranch()). Mirrors chatNativeRun.
+		branch := pinKeptBranch(ctx, d.baseRepo, out.Branch, d.log)
+		if branch != "" {
+			capKeptBranches(ctx, d.baseRepo, branch, d.log)
+		}
+		return session.DriveOutcome{Summary: out.Summary, Verified: out.Verified, Branch: branch}, nil
 	}
 }
 
@@ -1740,6 +1769,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
+	// Cross-project memory + distilled lessons, and the operator's steering file —
+	// both reach serve drives now, exactly as they reach run/watch and chat.
+	attachMemoryContext(n, d.mem, d.baseRepo)
+	attachSteering(n, d.baseRepo)
 	// Self-timer (serve-only): the `sleep` tool arms a durable wake for this thread.
 	// nil ⇒ no `sleep` tool advertised (byte-identical) — e.g. no checkpointer wired.
 	n.Wake = wakeArm
@@ -1782,17 +1815,28 @@ func serveSuperviseRun(d serveDeps, ledger *budget.Ledger, approver policy.Appro
 		// conclusion; a SIGTERM-interrupted drive (ctx cancelled) is left "supervise" so
 		// the next boot's resumeSupervise replays it from the last checkpointed tip.
 		finalizeSupervise(ctx, d, taskID, goal, o.Done)
-		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
+		// Pin a converged tip under nilcore/kept/ BEFORE the deferred stack.cleanup() sweeps
+		// the integrate/ prefix — otherwise DriveOutcome.Branch would name a branch this same
+		// function just deleted, and serve /diff (which reads WorkState.Branch via KeptBranch)
+		// would fail. Only a Done drive surfaces a branch: a non-converged drive's raw
+		// integrate/<sha> tip is swept, and folding that dead name into State.Branch would
+		// overwrite a still-existing prior kept deliverable. Mirrors chatSuperviseRun.
+		var branch string
+		if o.Done {
+			branch = pinKeptBranch(ctx, d.baseRepo, o.Branch, d.log)
+		}
+		return session.DriveOutcome{Summary: o.Summary, Branch: branch, Verified: o.Done}, nil
 	}
 }
 
 func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approver, threadID string) session.RunProjectFunc {
 	taskID := superviseTaskID(threadID)
-	return func(ctx context.Context, goal string, _ summarize.ContextSummary, outEmitter emit.Emitter, _ policy.Approver) (session.DriveOutcome, error) {
+	return func(ctx context.Context, goal string, _ summarize.ContextSummary, in session.InboxHandle, outEmitter emit.Emitter, _ policy.Approver) (session.DriveOutcome, error) {
 		stack, err := buildStack(serveBuildDeps(d, ledger, approver, goal, taskID))
 		if err != nil {
 			return session.DriveOutcome{}, err
 		}
+		stack.sup.Inbox = in       // steer/queue reaches the project's supervisor at round boundaries (else it strands + duplicates)
 		stack.sup.Out = outEmitter // stream the project planner's intent back over the channel
 		defer stack.cleanup()      // tear down the supervisor's live read worktree per drive
 		o, err := buildViaKernel(ctx, stack.loop)
@@ -1800,7 +1844,13 @@ func serveProjectRun(d serveDeps, ledger *budget.Ledger, approver policy.Approve
 			return session.DriveOutcome{}, err
 		}
 		finalizeSupervise(ctx, d, taskID, goal, o.Done)
-		return session.DriveOutcome{Summary: o.Summary, Branch: o.Branch, Verified: o.Done}, nil
+		// Pin the converged tip before the deferred cleanup sweeps integrate/ — same delivery
+		// discipline as serveSuperviseRun above, so serve /diff can preview the verified work.
+		var branch string
+		if o.Done {
+			branch = pinKeptBranch(ctx, d.baseRepo, o.Branch, d.log)
+		}
+		return session.DriveOutcome{Summary: o.Summary, Branch: branch, Verified: o.Done}, nil
 	}
 }
 
@@ -2167,9 +2217,7 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 		// the worktree checkout; load it once and prepend as trusted instructions on
 		// the native backend. nil/empty ⇒ byte-identical; only the native loop reads it.
 		if n, ok := be.(*backend.Native); ok {
-			if steer, _ := steering.DiscoverAndLoad(dir); steer != "" {
-				n.SteeringContext = func() string { return steer }
-			}
+			attachSteering(n, dir)
 		}
 		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
@@ -2201,9 +2249,7 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
 		// once for the native backend (nil/empty ⇒ byte-identical; only native reads it).
 		if n, ok := be.(*backend.Native); ok {
-			if steer, _ := steering.DiscoverAndLoad(dir); steer != "" {
-				n.SteeringContext = func() string { return steer }
-			}
+			attachSteering(n, dir)
 		}
 		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
@@ -2284,6 +2330,34 @@ func resolveDelegated(envPrefix string, dc onboard.DelegatedConfig) onboard.Dele
 	return dc
 }
 
+// attachMemoryContext wires the merged task-context view (LRN last mile) onto a native
+// loop: the lessons distiller writes to GLOBAL scope, so a project-only query would
+// hide the agent's own distilled lessons. TaskContext folds both scopes under one
+// record budget, newest-first, with the I7 "NOT instructions" labels intact.
+//
+// It is a helper because it must be applied on EVERY front door. It used to be inline
+// in buildBackend alone, so cross-project memory and distilled lessons reached run and
+// watch but never chat, the TUI, or serve — the agent could not see its own scars on
+// the doors people actually use. nil mem ⇒ no-op (byte-identical).
+func attachMemoryContext(n *backend.Native, mem *memory.Memory, project string) {
+	if mem == nil {
+		return
+	}
+	n.MemoryContext = func(ctx context.Context, _ string) string {
+		blk, _ := mem.TaskContext(ctx, project, 10)
+		return blk
+	}
+}
+
+// attachSteering loads the operator's committed steering file (NILCORE.md / AGENTS.md)
+// from repoDir and prepends it as TRUSTED instructions (the deliberate I7 exception:
+// front-door origin, never tool or inbox text). Absent/empty ⇒ byte-identical.
+func attachSteering(n *backend.Native, repoDir string) {
+	if steer, _ := steering.DiscoverAndLoad(repoDir); steer != "" {
+		n.SteeringContext = func() string { return steer }
+	}
+}
+
 func buildBackend(name string, prov model.Provider, cred func(string) string, adv advisorCfg, box sandbox.Sandbox, v verify.Verifier, log *eventlog.Log, maxSteps int, mem *memory.Memory, project string, cfg onboard.Config) backend.CodingBackend {
 	switch name {
 	case "codex":
@@ -2311,16 +2385,7 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			n.Advisor = advisor.New(adv.prov, adv.maxCalls)
 			n.EscalateAfter = adv.escalateAfter
 		}
-		if mem != nil {
-			// Merged task-context view (LRN last mile): the lessons distiller writes
-			// to GLOBAL scope, so a project-only query would hide the agent's own
-			// distilled lessons. TaskContext folds both scopes under the same total
-			// record budget as before, newest-first, with the I7 labels intact.
-			n.MemoryContext = func(ctx context.Context, _ string) string {
-				blk, _ := mem.TaskContext(ctx, project, 10)
-				return blk
-			}
-		}
+		attachMemoryContext(n, mem, project)
 		// Repo orientation + window awareness (upgrade program): the map spares the
 		// first steps of every drive from ls/cat structure discovery, and the window
 		// resolver lets the loop compact BEFORE a context overflow instead of dying

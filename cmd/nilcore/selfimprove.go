@@ -64,13 +64,28 @@ func proposeEditMain(args []string) {
 	var runBranch string // the verified branch the last Run left behind (for the diff)
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
-		Run: func(ctx context.Context, g string) (bool, error) {
+		Run: func(ctx context.Context, g string) (bool, string, error) {
 			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("self-%d", time.Now().Unix()), Goal: g})
 			if err != nil {
-				return false, err
+				return false, "", err
 			}
 			runBranch = out.Branch
-			return out.Verified, nil
+			return out.Verified, out.Branch, nil
+		},
+		// Merge lands the approved, verified branch into the repo's checked-out branch
+		// with the same hardened, conflict-aborting git chat's /apply uses (I4). A
+		// conflict is an error: the flow reports the edit did NOT ship rather than
+		// leaving a half-merged tree and claiming success.
+		Merge: func(ctx context.Context, branch string) error {
+			tip, conflict, err := mergeKeptBranch(ctx, absDir, branch)
+			if err != nil {
+				return err
+			}
+			if conflict {
+				return fmt.Errorf("merge %s conflicted; the tree was restored and nothing landed", branch)
+			}
+			fmt.Printf("self-edit merged: %s -> %s\n", branch, shortSHA(tip))
+			return nil
 		},
 		// Changed reports what the verified run actually modified, by diffing the kept
 		// branch against the base repo's HEAD. Propose fail-closes on ANY path outside the

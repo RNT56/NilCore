@@ -184,7 +184,7 @@ func TestSuperviseDriverWiresInboxAndOut(t *testing.T) {
 
 func TestProjectDriverSeedsSummary(t *testing.T) {
 	var gotSeed summarize.ContextSummary
-	run := func(_ context.Context, _ string, seed summarize.ContextSummary, out emit.Emitter, _ policy.Approver) (DriveOutcome, error) {
+	run := func(_ context.Context, _ string, seed summarize.ContextSummary, _ InboxHandle, out emit.Emitter, _ policy.Approver) (DriveOutcome, error) {
 		gotSeed = seed
 		if out == nil {
 			t.Error("project Out not wired")
@@ -209,6 +209,37 @@ func TestProjectDriverSeedsSummary(t *testing.T) {
 	}
 	if !res.Verified || res.Branch != "main-tip" {
 		t.Fatalf("fold = (%v,%q)", res.Verified, res.Branch)
+	}
+}
+
+// TestProjectDriverWiresInbox locks the fix: the project loop drives a supervisor that
+// folds steer/queue at round boundaries, so the driver MUST pass the live Inbox to its run
+// closure (which wires it onto that supervisor, stack.sup.Inbox). Without it a mid-project
+// message strands in the inbox and is re-folded — DUPLICATED, on top of the same text
+// already in History — by the NEXT drive. The closure here drains the inbox (standing in
+// for the supervisor) to prove the queued turn actually reaches it.
+func TestProjectDriverWiresInbox(t *testing.T) {
+	var gotInbox InboxHandle
+	drained := 0
+	run := func(_ context.Context, _ string, _ summarize.ContextSummary, in InboxHandle, _ emit.Emitter, _ policy.Approver) (DriveOutcome, error) {
+		gotInbox = in
+		if in != nil {
+			drained = len(in.Drain()) // the supervisor drains at a round boundary
+		}
+		return DriveOutcome{Summary: "scaffolded", Verified: true}, nil
+	}
+	box := inbox.New(nil, "chat-local")
+	box.Push(userTurn("also add CI"), inbox.Queue) // a turn typed mid-project
+	if _, err := NewProjectDriver(run, nil).Drive(context.Background(), DriveInput{
+		Route: RouteProject, Goal: "build a service", Inbox: box,
+	}); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	if gotInbox == nil {
+		t.Fatal("project run closure got a nil Inbox — a mid-project steer/queue would strand and duplicate")
+	}
+	if drained != 1 {
+		t.Fatalf("supervisor drained %d queued turns, want 1 (the inbox reaches the project's supervisor)", drained)
 	}
 }
 
@@ -248,6 +279,27 @@ func TestChatDriverRunsNoLoop(t *testing.T) {
 	}
 	if res.Summary.Goal != "fix the typo" {
 		t.Fatalf("chat dropped the carried goal: %q", res.Summary.Goal)
+	}
+}
+
+// TestChatDriverDrainsInbox locks the fix: a chat reply is one model call with no
+// steppable loop, so a message the session queued mid-reply cannot be folded into it — and
+// must NOT linger in the inbox to be re-folded (DUPLICATED, atop the same text already in
+// History) by the NEXT drive. The chat driver drains-and-discards, so after the drive the
+// inbox is empty and a later drive re-folds nothing.
+func TestChatDriverDrainsInbox(t *testing.T) {
+	d := NewChatDriver(&scriptModel{reply: "we're refactoring auth"})
+	box := inbox.New(nil, "chat-local")
+	box.Push(userTurn("also add a test"), inbox.Queue) // queued during the chat reply
+	if _, err := d.Drive(context.Background(), DriveInput{
+		Route: RouteChat, Goal: "what are you working on?", Inbox: box,
+	}); err != nil {
+		t.Fatalf("Drive: %v", err)
+	}
+	// The queued turn was drained by the chat drive itself, so a subsequent drive that
+	// drains the inbox gets nothing — the line (already in History via Turn) is never doubled.
+	if leftover := box.Drain(); len(leftover) != 0 {
+		t.Fatalf("chat drive left %d message(s) in the inbox; the next drive would re-fold them (duplicate): %v", len(leftover), leftover)
 	}
 }
 
@@ -514,7 +566,7 @@ func TestSuperviseProjectDriversReceiveGate(t *testing.T) {
 
 	t.Run("project", func(t *testing.T) {
 		var got policy.Approver
-		run := func(_ context.Context, _ string, _ summarize.ContextSummary, _ emit.Emitter, gate policy.Approver) (DriveOutcome, error) {
+		run := func(_ context.Context, _ string, _ summarize.ContextSummary, _ InboxHandle, _ emit.Emitter, gate policy.Approver) (DriveOutcome, error) {
 			got = gate
 			return DriveOutcome{Summary: "ok", Verified: true}, nil
 		}

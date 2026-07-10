@@ -67,10 +67,10 @@ Before an edit, the agent asks the graph for the **transitive set** of call site
 
 This wires codebase understanding directly into verification and safety. It is the most distinctive idea here.
 
-### Verification-targeted retrieval + SBFL
-The graph maps **symbols → the tests that exercise them**. After a failure, **spectrum-based fault localization** uses *which tests fail* (and which pass) to rank the most-likely-faulty symbols, closing the loop between "what broke" and "where to look." Retrieval becomes failure-aware.
+### Verification-targeted retrieval
+The graph maps **symbols → the tests that exercise them**, so the verifier can run the affected tests first (the `affected_tests` tool). A **spectrum-based fault-localization** (SBFL) ranker was prototyped to score the most-likely-faulty symbols from *which tests fail* (and which pass), but it was never wired and has since been removed as dead code (#98).
 
-> **Status:** `impact.AffectedTests`/`ImpactSet` (the impact set) are wired (the `affected_tests` tool). `impact.Localize` (the Ochiai SBFL ranker) is an **available API, not yet wired** — nothing in the loop yet collects the per-test symbol coverage it needs, so it ships dark. Wiring it means a post-failure step that gathers coverage and ranks suspects.
+> **Status:** `impact.AffectedTests`/`ImpactSet` (the impact set) are wired (the `affected_tests` tool). `impact.Localize` (the Ochiai SBFL ranker) was **removed as unused dead code** (#98) — it was never wired (nothing in the loop collected the per-test symbol coverage it needed). Re-adding SBFL would mean a post-failure step that gathers coverage and ranks suspects.
 
 ### Living map
 **Incremental** re-parse of only changed files (file-watching), never a full re-index. Within a task's **worktree**, the map and graph reflect the agent's *own in-progress edits* — it understands the code as it is *becoming*, not just the starting state.
@@ -111,5 +111,5 @@ Built as sibling sub-packages under `internal/codeintel/` so the tasks paralleli
 | P3-T12 | `lsp/` | LSP client for precise facts, graceful fallback (SCIP-aligned) |
 | P3-T13 | `semantic/` | symbol embeddings + structure-aware hybrid retrieval; content-hash-cached pure-Go HNSW index (`hnsw.go`), opt-in via `NILCORE_EMBED_KEY` (else lexical) |
 | P3-T14 | `retrieve/` | the fusion pipeline + Context Bundle assembly |
-| P3-T15 | `impact/` | Impact Set (blast radius) + test-impact mapping + SBFL |
+| P3-T15 | `impact/` | Impact Set (blast radius) + test-impact mapping (SBFL ranker `Localize` pruned as dead code, #98) |
 | P3-T16 | `live/` | incremental/worktree-aware updates + memory fusion |

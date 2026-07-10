@@ -65,28 +65,59 @@ func (t skillTool) Run(context.Context, string, json.RawMessage) (string, error)
 }
 
 // LoadDir discovers Agent Skills: any SKILL.md under dir (recursively).
+//
+// Loading is ADDITIVE and best-effort: a single unreadable or malformed SKILL.md is
+// SKIPPED with a warning, never fatal. One bad file must not zero out every valid
+// skill — the cmd loader treats a LoadDir error as "no skills at all", so aborting the
+// whole walk on the first bad file (the old behavior) silently discarded every good
+// skill too, contradicting the "a bad skill is a warning, not a failure" contract.
+// Only a failure to access the skills ROOT itself is returned as an error.
+//
+// Name collisions are warned, not silent: two skills whose frontmatter names sanitize
+// to the SAME skill_<name> tool name would otherwise shadow each other in the registry
+// (one silently wins). On a collision the first skill (in WalkDir's lexical order) is
+// kept and the later one is skipped with a warning.
 func LoadDir(dir string) ([]Skill, error) {
 	var out []Skill
+	// seen maps a sanitized skill name to the SKILL.md path that first claimed it, so a
+	// later skill colliding on the same skill_<name> tool name is warned + skipped
+	// rather than silently shadowing the first.
+	seen := map[string]string{}
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// A failure to access the skills ROOT is fatal (the feature cannot load at
+			// all). A mid-walk access error on some sub-path is skipped with a warning
+			// so one bad path never zeroes out the rest.
+			if path == dir {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "nilcore: skills: skipping %s: %v\n", path, err)
+			return nil
 		}
 		if d.IsDir() || d.Name() != "SKILL.md" {
 			return nil
 		}
 		b, rerr := os.ReadFile(path)
 		if rerr != nil {
-			return rerr
+			fmt.Fprintf(os.Stderr, "nilcore: skills: skipping unreadable %s: %v\n", path, rerr)
+			return nil
 		}
 		s, perr := parseSkill(string(b))
 		if perr != nil {
-			return fmt.Errorf("%s: %w", path, perr)
+			fmt.Fprintf(os.Stderr, "nilcore: skills: skipping malformed %s: %v\n", path, perr)
+			return nil
 		}
+		if first, dup := seen[s.Name]; dup {
+			fmt.Fprintf(os.Stderr, "nilcore: skills: %s resolves to tool name %q already claimed by %s; keeping the first\n",
+				path, skillNamePrefix+s.Name, first)
+			return nil
+		}
+		seen[s.Name] = path
 		out = append(out, s)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("skills: load %s: %w", dir, err)
 	}
 	return out, nil
 }

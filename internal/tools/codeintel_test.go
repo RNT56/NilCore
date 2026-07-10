@@ -47,6 +47,59 @@ func writeFile(t *testing.T, dir, rel, content string) {
 	}
 }
 
+// TestSourceFilesUnderSkipsSymlinksAndVendor covers the I4 + cap-hygiene walk
+// discipline the AST/graph tools share: a symlink planted in-tree is NEVER followed
+// (its out-of-worktree target would otherwise be parsed host-side and leak via
+// codeintel/outline/dead_code/structural_replace), and dependency/build/hidden trees
+// are pruned so the maxIndexedFiles cap is spent on the project's own source rather
+// than a vendored node_modules that sorts ahead of it.
+func TestSourceFilesUnderSkipsSymlinksAndVendor(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+
+	writeFile(t, dir, "real.go", "package p\nfunc Real() {}\n")
+	writeFile(t, dir, "node_modules/dep/dep.go", "package dep\nfunc Dep() {}\n")
+	writeFile(t, dir, "vendor/v/v.go", "package v\nfunc V() {}\n")
+	writeFile(t, dir, "dist/out.go", "package d\nfunc Dist() {}\n")
+	writeFile(t, dir, ".hidden/h.go", "package h\nfunc H() {}\n")
+
+	// A symlink pointing at an out-of-worktree Go file must NOT be followed/indexed.
+	secret := filepath.Join(outside, "secret.go")
+	if err := os.WriteFile(secret, []byte("package s\nfunc Secret() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOK := true
+	if err := os.Symlink(secret, filepath.Join(dir, "evil.go")); err != nil {
+		symlinkOK = false
+		t.Logf("symlink unsupported: %v", err)
+	}
+
+	files, err := sourceFilesUnder(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		rel, rerr := filepath.Rel(dir, f)
+		if rerr != nil {
+			t.Fatal(rerr)
+		}
+		got[filepath.ToSlash(rel)] = true
+	}
+	if !got["real.go"] {
+		t.Errorf("real.go (real in-tree source) should be indexed; got %v", files)
+	}
+	skipped := []string{"node_modules/dep/dep.go", "vendor/v/v.go", "dist/out.go", ".hidden/h.go"}
+	if symlinkOK {
+		skipped = append(skipped, "evil.go")
+	}
+	for _, bad := range skipped {
+		if got[bad] {
+			t.Errorf("%s should be skipped (symlink/vendor/hidden dir), but was indexed", bad)
+		}
+	}
+}
+
 // A query against a temp repo returns a structurally-coherent bundle: the lead
 // symbol AND its call-graph neighborhood, each annotated with a provenance and a
 // rationale (the bundle shape the understander reads to orient).

@@ -15,7 +15,9 @@ import (
 // internal/flywheel/loop; here we only assert the cmd-side wiring shape.
 func TestNewFlywheelLoopWiringHonorsCancel(t *testing.T) {
 	orch := &agent.Orchestrator{BaseRepo: t.TempDir()} // Execute is never reached
-	fw := newFlywheelLoop(orch, nil, filepath.Join(t.TempDir(), "e.jsonl"), 1, time.Minute)
+	// Deny-default gate: a shape assertion must never depend on a console/stdin.
+	fw := newFlywheelLoop(orch, nil, filepath.Join(t.TempDir(), "e.jsonl"), 1, time.Minute,
+		denyAllApprover{}.Approve)
 	if fw == nil {
 		t.Fatal("newFlywheelLoop must return a non-nil, runnable loop")
 	}

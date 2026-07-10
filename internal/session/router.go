@@ -45,18 +45,11 @@ import (
 // unparseable classifier output (or when no classifier is wired), never an
 // overrule of a parseable proposal. Log is the append-only audit (nil-safe); a nil
 // Log simply records nothing.
-//
-// ClampDownToNative is an OPTIONAL, default-OFF operator backstop: when true it
-// one-directionally clamps a parseable supervise/project proposal down to
-// RouteNative whenever the heuristic judges the goal simple. It is INERT by default
-// (the zero value) so the documented behavior is "classifier proposal wins"; it
-// exists only as a conservative operator lever and never UPGRADES a proposal.
 type SupervisorFirstRouter struct {
-	Classifier        model.Provider         // the METERED provider (same conversation ledger)
-	ShouldSupervise   func(goal string) bool // reused agent heuristic; now ONLY the parse-failure fallback
-	Log               *eventlog.Log          // metadata-only session_route audit; nil-safe
-	ID                string                 // conversation id for the audit Task field (optional)
-	ClampDownToNative bool                   // OPTIONAL default-OFF backstop: clamp supervise/project→native when the heuristic says simple (one-directional, never upgrades)
+	Classifier      model.Provider         // the METERED provider (same conversation ledger)
+	ShouldSupervise func(goal string) bool // reused agent heuristic; now ONLY the parse-failure fallback
+	Log             *eventlog.Log          // metadata-only session_route audit; nil-safe
+	ID              string                 // conversation id for the audit Task field (optional)
 }
 
 // classifierSys is the system prompt for the one cheap routing call. It asks for a
@@ -121,24 +114,12 @@ func (r *SupervisorFirstRouter) Route(ctx context.Context, text string, st WorkS
 // is the single source of truth for which bounded machine runs (CLAUDE.md §1). The
 // former upgrade/downgrade arms that let the string heuristic OVERRULE the model
 // are gone: the heuristic now lives only in fallback() (the unparseable-output / no-
-// classifier path). RouteChat/native/supervise/project are returned unchanged.
-//
-// The one exception is the OPTIONAL, default-OFF ClampDownToNative backstop: when an
-// operator enables it, a supervise/project proposal is clamped DOWN to RouteNative
-// whenever the heuristic judges the goal simple. It is one-directional (it only ever
-// makes a route cheaper, never larger) and INERT by default, so the documented
-// behavior remains "classifier proposal wins". An unknown route value from
-// parseRoute (shouldn't happen) is sized by the heuristic, never blindly trusted.
+// classifier path). RouteChat/native/supervise/project are returned unchanged; an
+// unknown route value from parseRoute (shouldn't happen) is sized by the heuristic,
+// never blindly trusted.
 func (r *SupervisorFirstRouter) reconcile(proposed Route, goal string) Route {
 	switch proposed {
-	case RouteChat, RouteNative:
-		return proposed
-	case RouteSupervise, RouteProject:
-		// Default-off operator backstop only: clamp a large proposal down to native
-		// when explicitly enabled AND the cheap heuristic says the goal is simple.
-		if r.ClampDownToNative && !r.supervise(goal) {
-			return RouteNative
-		}
+	case RouteChat, RouteNative, RouteSupervise, RouteProject:
 		return proposed
 	default:
 		return r.fallback(goal)
@@ -224,9 +205,12 @@ func referencesGoal(text, goal string) bool {
 	}
 	lower := strings.ToLower(text)
 
-	// Explicit continuation verbs always continue the active work.
+	// Explicit continuation verbs always continue the active work. Matched on WORD
+	// boundaries: a bare substring test re-enters the active driver on "discontinue"
+	// (⊃ "continue") or "logo online" (⊃ "go on"), and a mis-continue routes the
+	// follow-up into the wrong driver.
 	for _, v := range []string{"continue", "keep going", "carry on", "go on", "finish it", "resume"} {
-		if strings.Contains(lower, v) {
+		if containsWord(lower, v) {
 			return true
 		}
 	}
@@ -289,4 +273,37 @@ func firstTextBlock(blocks []model.Block) string {
 		}
 	}
 	return ""
+}
+
+// containsWord reports whether needle occurs in haystack on word boundaries, so
+// "continue" does not match inside "discontinue". Mirrors policy.containsWord,
+// kept package-local for the same reason firstTextBlock is (no cross-package
+// dependency on an unexported helper).
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for start := 0; start <= len(haystack)-len(needle); {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		leftOK := i == 0 || !isWordByte(needle[0]) || !isWordByte(haystack[i-1])
+		rightOK := end == len(haystack) || !isWordByte(needle[len(needle)-1]) || !isWordByte(haystack[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
+// isWordByte reports whether b is part of a word (letter, digit, underscore).
+func isWordByte(b byte) bool {
+	return b == '_' ||
+		(b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z')
 }

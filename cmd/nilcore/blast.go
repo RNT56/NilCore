@@ -117,6 +117,22 @@ func rebuildBlastDay(b *blastbudget.Budget, logPath string) {
 			sum += autoApprovalActualUSD(d)
 		}
 	}
+	// A scan fault (an over-long line, a read error) means we did NOT see the whole log,
+	// so today's rebuilt total may be an UNDER-count — the fail-OPEN direction on a safety
+	// ceiling (it would let the day's auto-approval $ run past its cap). Fail CLOSED: pin
+	// today's auto-approval $ AT the ceiling so every further dollar-bearing auto-approval
+	// is refused for the rest of the day (the human gate takes over), until a clean restart
+	// re-establishes the real figure. Charge exactly the remaining headroom — a larger
+	// amount would itself be refused (>ceiling) and record nothing, i.e. fail open — and
+	// warn so the operator notices.
+	if err := sc.Err(); err != nil {
+		u := b.Used(today)
+		if remaining := u.DayCeiling - u.Dollars; remaining > 0 {
+			_ = b.ChargeAutoApprovalDollars(context.Background(), today, remaining)
+		}
+		fmt.Fprintf(os.Stderr, "nilcore: blast-radius day rebuild scan failed (%v); pinning today's auto-approval $ at the ceiling (fail-closed)\n", err)
+		return
+	}
 	if sum > 0 {
 		_ = b.ChargeAutoApprovalDollars(context.Background(), today, sum)
 	}

@@ -180,8 +180,8 @@ internal/
   blastbudget/         ← Phase 16 the hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads
   flywheel/            ← Phase 16 self-improvement flywheel (selfeval · distiller · measure · loop) — verified, human-gated, never edits the verifier of record
   autosrc·objective/   ← Phase 16 autonomy daemon (bounded source queue) + operator-only standing-objectives backlog
-  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; default-on via NILCORE_KERNEL [escape hatch =0], equivalence-proven)
-  router/              ← Phase 16 Pillar 8 (UOK V2): the preset ROUTER that completes the kernel — Classify(goal)→run|build|swarm + an Oracle seam; backs `nilcore do` so the agent picks how to work (pure leaf; only orders the machine choice — never overrides a verdict/gate; docs/ROADMAP-KERNEL-V2.md)
+  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm/decompose are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; default-on via NILCORE_KERNEL [escape hatch =0], equivalence-proven)
+  router/              ← Phase 16 Pillar 8 (UOK V2): the preset ROUTER that completes the kernel — Classify(goal)→run|build|swarm|decompose + an Oracle seam; backs `nilcore do` so the agent picks how to work (pure leaf; only orders the machine choice — never overrides a verdict/gate; docs/ROADMAP-KERNEL-V2.md)
 ```
 
 New packages introduced by later phases are listed as **extension points** in `docs/ARCHITECTURE.md` and owned by specific tasks in `docs/TASKS.md`.

@@ -282,6 +282,15 @@ type swarmAssembly struct {
 	gate  func(policy.GateAction) bool
 	style termui.Style
 
+	// sc is the shard closure's context. run() stamps its proxyAddr before dispatching,
+	// so every shard box is pointed at the allowlist proxy for this run.
+	sc *shardContext
+
+	// resumeUnresolved > 0 means this resumed run inherited planned shards it did not
+	// re-admit (red, retry budget spent). The run may still make progress on the rest,
+	// but it can never be "clean" — that work is unfinished (I2).
+	resumeUnresolved int
+
 	cleanup func()
 }
 
@@ -509,6 +518,23 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 		}
 	}
 
+	// --- the shard egress allowlist, and the proxy that ENFORCES it. ---
+	//
+	// Deriving the allowlist was not enough: roster.NewWorker never reads Profile.Egress
+	// (its own doc says the CALLER must apply Container.AllowEgressVia before handing the
+	// box over), and swarm never did — so every shard ran --network none. The research
+	// preset, whose workers must web_fetch and whose web/finance packs re-check claims
+	// over the network, could therefore never verify green, and --egress-allow was inert.
+	//
+	// A preset has ONE Profile, so every shard of this run shares one role and one
+	// allowlist: we stand up a single proxy enforcing exactly the role-intersected set.
+	// Enforcing the un-intersected union here would over-permit a narrow role.
+	// The proxy itself is stood up in run(), bound to the RUN ctx — buildSwarm must not
+	// bind a listener, since it can still fail afterwards and it is called directly by
+	// tests. Here we only DERIVE the allowlist.
+	egressTree := shardEgress(pre, splitCSV(*sf.egressAllow))
+	shardEg := roster.EgressFor(pre.Profile, egressTree)
+
 	// --- the shardFn I2 closure (the heart): write+verify each shard's typed artifact
 	// and set Passed/Branch ONLY on a green verifier report. ---
 	sc := &shardContext{
@@ -516,7 +542,9 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 		preset:      pre,
 		packName:    shardPack,
 		deliverable: deliverables,
-		egress:      shardEgress(pre, splitCSV(*sf.egressAllow)),
+		egress:      egressTree,
+		shardEgress: shardEg,
+		runtime:     *sf.common.runtime,
 		pool:        pl,
 		ledger:      ledger,
 		board:       bd,
@@ -553,6 +581,10 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	// persisted SwarmState (pass counter / retry ledger / tip) forward, so the resumed
 	// run continues rather than re-deriving from scratch. ---
 	var initial []swarm.Shard
+	// resumeUnresolved counts planned shards a --resume deliberately does not re-admit
+	// (red with no retry budget left). They never merged, so a run carrying any of them
+	// must never report a clean converge.
+	var resumeUnresolved int
 	// Ledger.MaxAttempts arms the focused-requeue + conflict-rebuild budget: with
 	// the historical zero, requeue was disabled entirely and "until-clean" was
 	// effectively single-pass for red shards (a gap the DAG-completion work
@@ -584,11 +616,29 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 		// the Controller re-runs and re-folds them (Release kept the branch; the Fn re-greens
 		// and integrateGreen lands it). A passed shard already in st.Merged is skipped — it
 		// is on the tip. resetForResume clears its terminal state so it dispatches afresh.
-		unfolded, uerr := resumeUnfoldedPassed(context.Background(), queue, resumed)
+		//
+		// resumeIncomplete generalizes that re-seed to EVERY shard the interrupted process
+		// left unfinished. queue.Failed only reads StatusFailed, but a DAG dependent whose
+		// dep failed is durably Marked ShardSkipped→StatusQueued, and a conflict-retry shard
+		// re-queued for the next pass persists the same way. Neither source returned them, so
+		// the resumed run rebuilt `planned` from a seed set that omitted them and could
+		// converge Done=true / exit 0 with planned nodes never executed — the skipped-dependent
+		// false green (I2), which the in-process termAccounting catches but resume never saw.
+		incomplete, uerr := resumeIncomplete(context.Background(), queue, resumed)
 		if uerr != nil {
 			return swarmAssembly{}, fmt.Errorf("swarm: resume: %w", uerr)
 		}
-		initial = append(initial, unfolded...)
+		initial = dedupeShards(append(initial, incomplete...))
+
+		// Shards that ran red and spent their whole retry budget are deliberately NOT
+		// re-admitted (resetForResume would hand them a fresh budget they did not earn).
+		// But they ARE planned work that never merged, so the resumed run must not report a
+		// clean converge over them. Count them and refuse the clean verdict below.
+		allFailed, aerr := queue.Failed(context.Background(), nil) // nil ledger ⇒ every failed shard
+		if aerr != nil {
+			return swarmAssembly{}, fmt.Errorf("swarm: resume: %w", aerr)
+		}
+		resumeUnresolved = len(allFailed) - len(failed)
 	} else {
 		shards, serr := buildInitialShards(context.Background(), d, sf, pre, deliverables, shardPack, pl, runID)
 		if serr != nil {
@@ -611,23 +661,71 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	gate := buildGateFuncEv(swarmApprover(), d.log, gateEvidenceFunc(swarmDiffer, nil, ledger))
 
 	return swarmAssembly{
-		controller:   controller,
-		initial:      initial,
-		state:        state,
-		flags:        sf,
-		ledger:       ledger,
-		pool:         pl,
-		board:        bd,
-		preset:       pre,
-		deliverables: deliverables,
-		repo:         repo,
-		collateRoot:  collateRoot,
-		runID:        runID,
-		logPath:      *sf.common.logPath,
-		gate:         gate,
-		style:        termui.New(os.Stdout).Style(),
-		cleanup:      cleanup,
+		controller:       controller,
+		initial:          initial,
+		state:            state,
+		flags:            sf,
+		ledger:           ledger,
+		pool:             pl,
+		board:            bd,
+		preset:           pre,
+		deliverables:     deliverables,
+		repo:             repo,
+		collateRoot:      collateRoot,
+		runID:            runID,
+		logPath:          *sf.common.logPath,
+		gate:             gate,
+		style:            termui.New(os.Stdout).Style(),
+		sc:               sc,
+		resumeUnresolved: resumeUnresolved,
+		cleanup:          cleanup,
 	}, nil
+}
+
+// startShardEgress stands up the allowlist proxy that ENFORCES the run's shard egress,
+// bound to the run ctx, and stamps its address onto the shard closure so every shard box
+// is routed through it (applyContainerEgress).
+//
+// Deriving the allowlist was never enough: roster.NewWorker does not read Profile.Egress
+// (its own doc says the CALLER must apply Container.AllowEgressVia before handing the box
+// over) and swarm never did — so every shard ran --network none. The research preset,
+// whose workers web_fetch and whose packs re-check claims over the network, could
+// therefore never verify green, and --egress-allow was inert.
+//
+// A preset has ONE Profile, so all shards of a run share one role and one allowlist: a
+// single proxy enforces exactly the role-INTERSECTED set. Enforcing the un-intersected
+// operator tree here would over-permit a narrower role.
+//
+// Returns a stop func. An empty allowlist (or a proxy that cannot bind) leaves proxyAddr
+// empty, which keeps every box on --network none — the fail-closed default (I4).
+func (a swarmAssembly) startShardEgress(ctx context.Context) func() {
+	eg := a.sc.shardEgress
+	if eg.Empty() {
+		fmt.Fprintln(os.Stderr, "swarm: shard network off (default-deny)")
+		return func() {}
+	}
+	_, addr, stop, ok := startEgressProxy(ctx, eg.Allowed, nil,
+		proxyBindAddr(*a.flags.common.sandboxPref, *a.flags.common.runtime))
+	if !ok {
+		// Fail CLOSED: no proxyAddr ⇒ boxes keep --network none. The run reddens on any
+		// networked claim rather than reaching an unfiltered network.
+		fmt.Fprintln(os.Stderr, "swarm: egress proxy failed to start; shards run with no network (deny-all)")
+		return func() {}
+	}
+	// Stamped before any shard is dispatched, so the write happens-before every read.
+	a.sc.proxyAddr = addr
+
+	// Announce and AUDIT the allowlist. Shards used to run --network none because the
+	// derived egress was never applied; the preset's declared hosts are now actually
+	// reachable (through the SSRF-guarded proxy). That is a visible change to what a
+	// shard may touch, so it is stated and recorded (I5) — never silent.
+	fmt.Fprintf(os.Stderr, "swarm: shard egress allowlist (%s preset): %s\n",
+		a.preset.Name, strings.Join(eg.Allowed, ", "))
+	a.log().Append(eventlog.Event{Kind: "swarm_egress", Detail: map[string]any{
+		"preset": a.preset.Name,
+		"hosts":  eg.Allowed,
+	}})
+	return stop
 }
 
 // run drives the multi-pass Controller, then emits the swarm_pass_clean signal on a
@@ -635,6 +733,10 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 // final clean tip as a single gated PromoteToBase candidate. It NEVER auto-lands: the
 // gate's nil approver default-denies, so a converged run stops at the promote gate.
 func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
+	// The shard egress proxy lives exactly as long as the run.
+	stopEgress := a.startShardEgress(ctx)
+	defer stopEgress()
+
 	out, err := swarmViaKernel(ctx, a.controller, a.state, a.initial)
 	// Always force the terminal scoreboard snapshot to the log (even on error/cap),
 	// so a replayed report reflects the same final scoreboard the live render prints
@@ -648,8 +750,16 @@ func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
 	// converge over a verified chain (I2/I5) — the report's FinalCleanPass requires
 	// both an empty worklist AND a verified chain.
 	chainOK := eventlogVerified(a.logPath)
-	clean := out.Done && out.Remaining == 0 && chainOK
-	a.board.MarkClean(out.Done && out.Remaining == 0, chainOK)
+	// A resumed run that inherited red, budget-exhausted shards carries unfinished
+	// planned work the Controller never saw (they are not in `initial`, so they are not
+	// in `planned`, so termAccounting cannot count them). Fold that knowledge in here,
+	// or the resume converges clean over work that never passed (I2).
+	worklistDone := out.Done && out.Remaining == 0 && a.resumeUnresolved == 0
+	if a.resumeUnresolved > 0 {
+		fmt.Fprintf(os.Stderr, "swarm: %d shard(s) remain red with no retry budget; not a clean converge (re-run with --resume --retries N to re-admit them)\n", a.resumeUnresolved)
+	}
+	clean := worklistDone && chainOK
+	a.board.MarkClean(worklistDone, chainOK)
 	if clean {
 		a.log().Append(eventlog.Event{Kind: board.SwarmPassCleanKind, Detail: map[string]any{
 			"run": a.runID, "passes": out.Passes,
@@ -678,25 +788,30 @@ func (a swarmAssembly) renderReport() (string, int) {
 	var sb strings.Builder
 	exit := 0
 
-	if a.deliverables.report {
-		rendered, code, err := runSwarmReport(a.logPath, a.collateRoot, a.collateRoot, *a.flags.reportFmt, a.runID, *a.flags.out, st)
-		if err == nil {
-			sb.WriteString(rendered)
-			if code != 0 {
-				exit = code
-			}
+	// A report BUILD error is not a cosmetic miss: the chain-verify leg of the exit
+	// contract ("exit 0 iff the event-log chain verifies") rides entirely on this
+	// path returning code 1. Swallowing the error into exit 0 would green a run whose
+	// log could not even be read. Fail closed on any error.
+	render := func(format, out string) {
+		rendered, code, err := runSwarmReport(a.logPath, a.collateRoot, a.collateRoot, format, a.runID, out, st)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "swarm: %s report failed: %v\n", format, err)
+			exit = 1
+			return
 		}
+		sb.WriteString(rendered)
+		if code != 0 {
+			exit = code
+		}
+	}
+
+	if a.deliverables.report {
+		render(*a.flags.reportFmt, *a.flags.out)
 	}
 	// A matrix deliverable always renders the cross-shard pivot, regardless of the
 	// per-shard Kind or the --report format (the headline `report+matrix` contract).
 	if a.deliverables.matrix {
-		rendered, code, err := runSwarmReport(a.logPath, a.collateRoot, a.collateRoot, "matrix", a.runID, "", st)
-		if err == nil {
-			sb.WriteString(rendered)
-			if code != 0 {
-				exit = code
-			}
-		}
+		render("matrix", "")
 	}
 	return sb.String(), exit
 }
@@ -713,7 +828,10 @@ type shardContext struct {
 	preset      preset.Preset
 	packName    string
 	deliverable deliverableSet
-	egress      policy.Egress
+	egress      policy.Egress // the run's egress TREE (preset hosts ∪ --egress-allow)
+	shardEgress policy.Egress // the tree INTERSECTED with the role's allowlist — what a shard box gets
+	proxyAddr   string        // allowlist proxy enforcing shardEgress; "" ⇒ boxes stay --network none
+	runtime     string        // container runtime, for the host alias applyContainerEgress needs
 	pool        *pool.Pool
 	ledger      *budget.Ledger
 	board       *board.Board
@@ -787,6 +905,13 @@ func (c *shardContext) run(ctx context.Context, s swarm.Shard) spawn.Result {
 		return c.recordFail(s, spawn.Result{ID: s.ID, Branch: br, Passed: false, State: spawn.StateFailed,
 			Err: fmt.Errorf("swarm shard: no sandbox (fail-closed, I4)")})
 	}
+
+	// Point this shard's box at the allowlist proxy for the role's egress. Must happen
+	// BEFORE the worker or the delegated backend runs — both execute inside env.Box, and
+	// both the worker's web_fetch and the pack's networked claim re-checks depend on it.
+	// A deny-all role (empty shardEgress) or an unavailable proxy leaves the box on
+	// --network none, which is the fail-closed default (I4).
+	applyContainerEgress(env.Box, c.shardEgress, c.proxyAddr, c.runtime)
 
 	// The per-shard governing verifier: packs.Build composes schema + the per-claim
 	// in-box ArtifactVerifier (+ a raw build/browser child for code/ui) over the
@@ -1214,7 +1339,24 @@ func loadResumeState(ctx context.Context, st *store.Store, log *eventlog.Log) (*
 // is reset to a queued, first-attempt shard so the Controller re-runs and re-folds it
 // (Release kept the branch; the Fn re-greens and integrateGreen lands it). A nil/absent
 // resumed state means a fresh run — nothing to re-seed.
-func resumeUnfoldedPassed(ctx context.Context, q *swarm.Queue, resumed *swarm.SwarmState) ([]swarm.Shard, error) {
+// resumeIncomplete returns every shard the interrupted process left UNFINISHED, so a
+// resumed run re-seeds the whole of its planned work rather than a slice of it.
+//
+// The Controller derives `planned` from the seed set (passes.go), and termination
+// honesty refuses to converge while a planned shard is unresolved. A shard missing
+// from the seed set is therefore invisible to that backstop — the resumed run simply
+// never knows it was owed. Three durable states were missing:
+//
+//   - ShardPassed && !merged — verified, branch kept, never folded onto the tip
+//     (a crash between Mark and integrateGreen). Re-run and re-fold.
+//   - ShardSkipped — a DAG dependent whose dep failed. Marked StatusQueued, so
+//     queue.Failed (StatusFailed only) never returned it. This is the
+//     skipped-dependent false green.
+//   - ShardQueued / ShardRunning — never dispatched, or interrupted mid-flight.
+//
+// ShardFailed is deliberately excluded: queue.Failed seeds those under the retry-budget
+// gate, so a red shard with no budget left is not silently handed a fresh one here.
+func resumeIncomplete(ctx context.Context, q *swarm.Queue, resumed *swarm.SwarmState) ([]swarm.Shard, error) {
 	if resumed == nil {
 		return nil, nil
 	}
@@ -1228,12 +1370,34 @@ func resumeUnfoldedPassed(ctx context.Context, q *swarm.Queue, resumed *swarm.Sw
 	}
 	var out []swarm.Shard
 	for _, s := range all {
-		if s.State != swarm.ShardPassed || merged[s.ID] {
-			continue // not passed, or already folded onto the tip — nothing to re-fold
+		switch s.State {
+		case swarm.ShardPassed:
+			if !merged[s.ID] {
+				out = append(out, resetForResume(s))
+			}
+		case swarm.ShardQueued, swarm.ShardSkipped, swarm.ShardRunning:
+			out = append(out, resetForResume(s))
+		case swarm.ShardFailed, swarm.ShardExhausted:
+			// Seeded (or withheld) by queue.Failed under the Ledger's budget gate.
 		}
-		out = append(out, resetForResume(s))
 	}
 	return out, nil
+}
+
+// dedupeShards keeps the FIRST occurrence of each shard id. The resume seed is a union
+// of two independent queries; a shard must be dispatched at most once per pass, and a
+// duplicate would also double-count board totals.
+func dedupeShards(in []swarm.Shard) []swarm.Shard {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, s := range in {
+		if seen[s.ID] {
+			continue
+		}
+		seen[s.ID] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // resetForResume re-arms a durably-passed-but-unfolded shard as a fresh queued,

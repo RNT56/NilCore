@@ -131,20 +131,80 @@ func TestParseSkillNameSanitized(t *testing.T) {
 	}
 }
 
-// TestParseSkillAllInvalidNameRejected proves a name with no valid characters is
-// rejected — never emitted as an empty or poison tool name.
-func TestParseSkillAllInvalidNameRejected(t *testing.T) {
-	dir := t.TempDir()
-	sd := filepath.Join(dir, "s")
+// writeSkillFile writes a SKILL.md with the given body under dir/<sub>/SKILL.md.
+func writeSkillFile(t *testing.T, dir, sub, md string) {
+	t.Helper()
+	sd := filepath.Join(dir, sub)
 	if err := os.MkdirAll(sd, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Frontmatter name with only non-ASCII/space runes: nothing survives slugify.
-	md := "---\nname: 日本 语\ndescription: d\n---\nbody\n"
 	if err := os.WriteFile(filepath.Join(sd, "SKILL.md"), []byte(md), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := skills.LoadDir(dir); err == nil {
-		t.Fatal("expected an error for a skill name with no valid characters")
+}
+
+// TestParseSkillAllInvalidNameSkipped proves a name with no valid characters is
+// SKIPPED (never emitted as an empty or poison tool name) AND does not zero out a
+// sibling valid skill — loading is additive, a bad skill is a warning, not a failure.
+func TestParseSkillAllInvalidNameSkipped(t *testing.T) {
+	dir := t.TempDir()
+	// Frontmatter name with only non-ASCII/space runes: nothing survives slugify, so
+	// this skill must be dropped rather than poisoning the tool name.
+	writeSkillFile(t, dir, "bad", "---\nname: 日本 语\ndescription: d\n---\nbody\n")
+	writeSkillFile(t, dir, "good", "---\nname: greet\ndescription: d\n---\nbody\n")
+
+	loaded, err := skills.LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir must skip the bad skill, not error: %v", err)
+	}
+	if len(loaded) != 1 || loaded[0].Name != "greet" {
+		t.Fatalf("want only the valid skill loaded, got %+v", loaded)
+	}
+}
+
+// TestLoadDirSkipsMalformedContinuesRest is the headline for fix 1: a directory with
+// one malformed SKILL.md and two valid ones must load the TWO valid skills — one bad
+// file can never zero out the rest (which the cmd loader would otherwise discard
+// wholesale on a LoadDir error).
+func TestLoadDirSkipsMalformedContinuesRest(t *testing.T) {
+	dir := t.TempDir()
+	writeSkillFile(t, dir, "alpha", "---\nname: alpha\ndescription: a\n---\nbody a\n")
+	writeSkillFile(t, dir, "broken", "no frontmatter at all — this file is malformed\n")
+	writeSkillFile(t, dir, "beta", "---\nname: beta\ndescription: b\n---\nbody b\n")
+
+	loaded, err := skills.LoadDir(dir)
+	if err != nil {
+		t.Fatalf("one malformed skill must not fail the whole load: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("want 2 valid skills loaded (malformed skipped), got %d: %+v", len(loaded), loaded)
+	}
+	got := map[string]bool{}
+	for _, s := range loaded {
+		got[s.Name] = true
+	}
+	if !got["alpha"] || !got["beta"] {
+		t.Fatalf("expected both valid skills (alpha, beta), got %+v", loaded)
+	}
+}
+
+// TestLoadDirWarnsOnNameCollision proves two skills whose frontmatter names sanitize
+// to the SAME tool name do not both load (which would silently shadow in the
+// registry): the first wins and the collision is dropped, not fatal.
+func TestLoadDirWarnsOnNameCollision(t *testing.T) {
+	dir := t.TempDir()
+	// "my greet" and "my/greet" both sanitize to "my-greet".
+	writeSkillFile(t, dir, "a-first", "---\nname: my greet\ndescription: a\n---\nbody a\n")
+	writeSkillFile(t, dir, "b-second", "---\nname: my/greet\ndescription: b\n---\nbody b\n")
+
+	loaded, err := skills.LoadDir(dir)
+	if err != nil {
+		t.Fatalf("a name collision must not fail the load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("colliding tool names must not both load, got %d: %+v", len(loaded), loaded)
+	}
+	if loaded[0].Name != "my-greet" {
+		t.Fatalf("collision survivor name = %q, want %q", loaded[0].Name, "my-greet")
 	}
 }

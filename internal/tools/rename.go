@@ -194,7 +194,10 @@ func applyRenameAtomic(workdir string, changes []renameChange) error {
 		if perr != nil {
 			return perr
 		}
-		prior, rerr := os.ReadFile(p)
+		// O_NOFOLLOW read (readNoFollow): snapshot the prior bytes without following a
+		// final-component symlink swapped in after safePath's check (I4 TOCTOU) — the
+		// same discipline the write-back (writeNoFollow) already uses.
+		prior, rerr := readNoFollow(p)
 		if rerr != nil {
 			return fmt.Errorf("rename_symbol: snapshot %s: %w", c.rel, rerr)
 		}

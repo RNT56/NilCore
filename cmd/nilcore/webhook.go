@@ -9,8 +9,11 @@ import (
 	"sync"
 	"time"
 
+	"nilcore/internal/agent"
 	"nilcore/internal/backend"
+	"nilcore/internal/blastbudget"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/memory"
 	"nilcore/internal/scmhook"
 	"nilcore/internal/trigger"
 )
@@ -26,14 +29,19 @@ import (
 // `nilcore -goal`. The listener is bound to ctx and shut down on serve exit. A
 // missing secret disables the intake (fail-closed) rather than accepting unsigned
 // requests.
-func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boot, log *eventlog.Log, dir, secret string) {
+func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boot, log *eventlog.Log, dir, secret string, mem *memory.Memory, ckpt *agent.Checkpoint, blast *blastbudget.Budget) {
 	if secret == "" {
 		fmt.Fprintln(os.Stderr, "nilcore serve: --webhook set but NILCORE_WEBHOOK_SECRET is empty; webhook intake disabled (fail-closed)")
 		return
 	}
-	// Share the run's blast-radius budget across its sandbox/egress (BR-T02/T03); the
-	// gate stays a hardcoded headless deny (I3). nil when off ⇒ unfenced, byte-identical.
-	orch := buildRunOrchestrator(c, b, log, dir, mintBlastBudget(*c.blastRadius, log))
+	// Reuse the SERVE process's store, memory, checkpointer and blast budget.
+	// buildRunOrchestrator calls setupPersistence, which opens a second MaxOpenConns(1)
+	// *sql.DB on the nilcore.db serve already owns — its own contract forbids serve from
+	// calling it. That second handle re-pointed log.UseStore and the experience/lessons
+	// hooks at a different connection, was never Closed, and exposed SQLITE_BUSY under a
+	// concurrent serve-thread + webhook-run write. buildRunOrchestratorWith takes the
+	// handles serve already holds. The gate stays a hardcoded headless deny (I3).
+	orch := buildRunOrchestratorWith(c, b, log, dir, blast, mem, ckpt)
 	var mu sync.Mutex // serialize self-started runs on the single orchestrator
 	trig := &trigger.Trigger{
 		Enabled: true,

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -593,6 +594,129 @@ func TestTipAlwaysVerifiedAcrossInterleavedReds(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(wt.Path(), green)); err != nil {
 			t.Errorf("green branch file %s missing from the tip: %v", green, err)
 		}
+	}
+}
+
+// TestNonConflictMergeErrorNotLabeledConflict proves a merge that fails for a
+// NON-conflict reason (here an unresolvable branch ref — git refuses it with "not
+// something we can merge" and never enters a merge state) is surfaced as an error to
+// escalate on, NOT mislabeled as a Conflict, and that integration CONTINUES onto the
+// next branch because the tree was never dirtied.
+func TestNonConflictMergeErrorNotLabeledConflict(t *testing.T) {
+	repo := baseRepo(t)
+	branchFrom(t, repo, "task/a", map[string]string{"a.txt": "1\n"})
+	branchFrom(t, repo, "task/c", map[string]string{"c.txt": "3\n"})
+
+	log, readEvents := testLog(t)
+	it := &Integrator{
+		BaseRepo: repo,
+		NewEnv:   newEnvFor("README", func(string) bool { return true }),
+		Log:      log,
+	}
+	wt, results, err := it.Integrate(context.Background(), []MergeItem{
+		{ID: "a", Branch: "task/a"},
+		{ID: "bad", Branch: "task/does-not-exist"}, // unresolvable ref → non-conflict failure
+		{ID: "c", Branch: "task/c"},
+	})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	if len(results) != 3 {
+		t.Fatalf("integration must continue past a non-conflict error; want 3 results, got %d: %+v", len(results), results)
+	}
+	if !results[0].Verified {
+		t.Fatalf("branch a should merge green first: %+v", results[0])
+	}
+	bad := results[1]
+	if bad.Conflict {
+		t.Errorf("a non-conflict merge failure must NOT be labeled Conflict: %+v", bad)
+	}
+	if bad.Err == nil {
+		t.Errorf("a non-conflict merge failure must carry an Err: %+v", bad)
+	}
+	if !bad.Escalate {
+		t.Errorf("a non-conflict merge failure must Escalate: %+v", bad)
+	}
+	if bad.TreeDirty {
+		t.Errorf("a non-conflict failure leaves the tree clean, not dirty: %+v", bad)
+	}
+	// The loop continued: branch c merged green after the bad ref.
+	if !results[2].Merged || !results[2].Verified {
+		t.Errorf("branch c should merge green after a non-conflict error (loop continued): %+v", results[2])
+	}
+	// The non-conflict failure must NOT be recorded as an integration_conflict.
+	if hasKind(readEvents(), "integration_conflict") {
+		t.Errorf("a non-conflict merge failure must not emit an integration_conflict event")
+	}
+}
+
+// TestAbortFailureStopsIntegration proves that when a real conflict's `git merge
+// --abort` itself FAILS (leaving the tree mid-merge), the Integrator marks the result
+// TreeDirty and STOPS — it must not keep folding subsequent branches onto the dirty
+// tree (which would cascade spurious conflicts). The git runner is substituted to force
+// the abort to fail; every other git op runs for real.
+func TestAbortFailureStopsIntegration(t *testing.T) {
+	repo := baseRepo(t)
+	// a and b add the SAME path with different content → a real add/add conflict on b.
+	branchFrom(t, repo, "task/a", map[string]string{"shared.txt": "from-a\n"})
+	branchFrom(t, repo, "task/b", map[string]string{"shared.txt": "from-b\n"})
+	branchFrom(t, repo, "task/c", map[string]string{"c.txt": "c\n"})
+
+	// Force `git merge --abort` to fail; delegate every other git op to the real runner.
+	real := git
+	git = func(ctx context.Context, dir string, args ...string) (string, error) {
+		if len(args) >= 2 && args[0] == "merge" && args[1] == "--abort" {
+			return "simulated abort failure", fmt.Errorf("forced abort failure")
+		}
+		return real(ctx, dir, args...)
+	}
+	defer func() { git = real }()
+
+	log, readEvents := testLog(t)
+	it := &Integrator{
+		BaseRepo: repo,
+		NewEnv:   newEnvFor("README", func(string) bool { return true }),
+		Log:      log,
+	}
+	wt, results, err := it.Integrate(context.Background(), []MergeItem{
+		{ID: "a", Branch: "task/a"},
+		{ID: "b", Branch: "task/b"},
+		{ID: "c", Branch: "task/c"},
+	})
+	if err != nil {
+		t.Fatalf("Integrate: %v", err)
+	}
+	defer func() { _ = wt.Cleanup() }()
+
+	// Only a (green) and b (conflict → abort failed) were attempted; c must be SKIPPED
+	// because integration stopped on the dirty tree.
+	if len(results) != 2 {
+		t.Fatalf("integration must STOP after an abort failure; want 2 results (c skipped), got %d: %+v", len(results), results)
+	}
+	if !results[0].Verified {
+		t.Fatalf("branch a should merge green first: %+v", results[0])
+	}
+	b := results[1]
+	if !b.Conflict || !b.TreeDirty || !b.Escalate {
+		t.Errorf("branch b: want Conflict+TreeDirty+Escalate after an abort failure, got %+v", b)
+	}
+	if b.Err == nil {
+		t.Errorf("branch b: an abort failure must surface an Err for the audit trail")
+	}
+	// The audit trail records the conflict with abort_failed=true.
+	sawAbortFailed := false
+	events := readEvents()
+	for _, e := range events {
+		if e.Kind == "integration_conflict" {
+			if v, _ := e.Detail["abort_failed"].(bool); v {
+				sawAbortFailed = true
+			}
+		}
+	}
+	if !sawAbortFailed {
+		t.Errorf("missing integration_conflict{abort_failed:true}; kinds=%v", kinds(events))
 	}
 }
 

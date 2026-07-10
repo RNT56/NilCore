@@ -109,20 +109,25 @@ func TestDetectIsReusedForGoModule(t *testing.T) {
 	}
 }
 
-// TestDetectFallbackUnknownLayout shows an undetectable worktree falls through to
-// verify.Detect's safe no-op "true" rather than a spurious red — the pack inherits the
-// ladder's conservatism.
-func TestDetectFallbackUnknownLayout(t *testing.T) {
-	dir := t.TempDir() // no markers
-	box := &fakeBox{workdir: dir, exec: exit(0, "")}
-	if _, err := checkBuildPasses(context.Background(), box, claim(IDBuildPasses, "", "")); false {
-		_ = err
-	}
+// TestUndetectableBuildIsUnverifiable pins the fix: an unrecognized worktree layout (where
+// verify.Detect yields the no-op "true") must NOT green a typed build claim. Running "true"
+// always exits 0 — a Pass with ZERO checking (I2). The pack inverts Detect's permissiveness:
+// an undetectable build is Unverifiable, reached BEFORE any box call (no no-op is run).
+func TestUndetectableBuildIsUnverifiable(t *testing.T) {
+	dir := t.TempDir() // no markers ⇒ verify.Detect == "true"
 	if got := verify.Detect(dir); got != "true" {
-		t.Fatalf("verify.Detect over an empty dir = %q, want \"true\"", got)
+		t.Fatalf("verify.Detect over an empty dir = %q, want \"true\" (test setup invalid)", got)
 	}
-	if len(box.calls) != 1 || box.calls[0] != "true" {
-		t.Fatalf("expected the no-op 'true' to run, got %v", box.calls)
+	box := &fakeBox{workdir: dir, exec: exit(0, "")}
+	status, msg := checkBuildPasses(context.Background(), box, claim(IDBuildPasses, "", ""))
+	if status != artifact.StatusUnverifiable {
+		t.Fatalf("status = %q, want Unverifiable for an undetectable build layout (never a no-op green)", status)
+	}
+	if len(box.calls) != 0 {
+		t.Fatalf("an undetectable build must not run the no-op 'true' in the box; calls = %v", box.calls)
+	}
+	if !strings.Contains(msg, "no build system") {
+		t.Fatalf("detail = %q, want a 'no build system detected' reason", msg)
 	}
 }
 
@@ -207,7 +212,7 @@ func TestCheckTestPassesVerdicts(t *testing.T) {
 		{
 			name: "go-selector-pass", extract: "go", value: "./internal/foo",
 			box: &fakeBox{exec: exit(0, "")}, want: artifact.StatusPass,
-			wantCmd: "go test -- './internal/foo'",
+			wantCmd: "go test './internal/foo'",
 		},
 		{
 			// EMPTY selector ⇒ the WHOLE suite. For go this MUST recurse ("./..."):
@@ -311,35 +316,47 @@ func TestDetailBounded(t *testing.T) {
 
 // --- single-quoting (I7) ------------------------------------------------------
 
-// TestTestCommandIsSingleQuoted asserts a benign selector is single-quoted into the
-// fixed shape behind a literal "--" separator, so it stays DATA (the command-injection
-// boundary) and can never be read as a flag.
+// TestTestCommandIsSingleQuoted asserts a benign selector is single-quoted into each
+// runner's fixed shape so it stays DATA (the command-injection boundary). For go the
+// selector is a BARE positional package path (no "--", which would skip the package); for
+// npm/pytest it sits after a literal "--" so it can never be read as a runner flag.
 func TestTestCommandIsSingleQuoted(t *testing.T) {
-	cmd, err := buildTestCommand(claim(IDTestPasses, "go", "TestFoo"))
+	// go: bare single-quoted package path, NO "--" (a "--" would forge a green — I2).
+	goCmd, err := buildTestCommand(claim(IDTestPasses, "go", "./internal/foo"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cmd != "go test -- 'TestFoo'" {
-		t.Fatalf("cmd = %q, want the selector single-quoted behind '--' in the go shape", cmd)
+	if goCmd != "go test './internal/foo'" {
+		t.Fatalf("cmd = %q, want the go selector single-quoted as a bare package path", goCmd)
 	}
-	if !strings.Contains(cmd, " -- ") {
-		t.Fatalf("cmd = %q, want a literal '--' separator before the selector", cmd)
+	if strings.Contains(goCmd, " -- ") {
+		t.Fatalf("cmd = %q, the go runner must NOT insert a '--' (post-'--' args skip the selected package — I2)", goCmd)
+	}
+	// npm/pytest: single-quoted selector behind a literal "--".
+	npmCmd, err := buildTestCommand(claim(IDTestPasses, "npm", "unit"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if npmCmd != "npm test -- 'unit'" {
+		t.Fatalf("cmd = %q, want the npm selector single-quoted behind '--'", npmCmd)
 	}
 }
 
-// TestGoRunnerSelectorIsPackagePath documents (and pins) the corrected contract for
-// the go runner: the selector is emitted as a positional argument after `--`, so for
-// `go test` it can only ever be a PACKAGE PATH or file, never a `-run` test-name filter.
-// A package-path selector produces the expected `go test -- '<pkg>'` shape; a value that
-// happens to look like a test name is STILL emitted positionally (it would be read by
-// `go test` as a package import path), confirming a Go test-name selector is not honored.
+// TestGoRunnerSelectorIsPackagePath documents (and pins) the corrected contract for the go
+// runner: the selector is emitted as a BARE positional argument (never after "--"), so for
+// `go test` it selects a PACKAGE PATH, never a `-run` test-name filter. `go test -- <x>`
+// would hand <x> to the current-dir test binary and skip the selected package — the false
+// green this fix removes.
 func TestGoRunnerSelectorIsPackagePath(t *testing.T) {
 	pkgCmd, err := buildTestCommand(claim(IDTestPasses, "go", "./internal/foo"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if pkgCmd != "go test -- './internal/foo'" {
-		t.Fatalf("cmd = %q, want a package path positionally after '--'", pkgCmd)
+	if pkgCmd != "go test './internal/foo'" {
+		t.Fatalf("cmd = %q, want a bare positional package path (no '--')", pkgCmd)
+	}
+	if strings.Contains(pkgCmd, "--") {
+		t.Fatalf("cmd = %q, the go runner must never emit a '--' (post-'--' args skip the selected package — I2)", pkgCmd)
 	}
 	// A test-name-looking value is emitted positionally too — it can NEVER become
 	// `go test -run '...'` (the leading-dash rule forbids ever producing a flag form).
@@ -349,6 +366,49 @@ func TestGoRunnerSelectorIsPackagePath(t *testing.T) {
 	}
 	if strings.Contains(nameCmd, "-run") {
 		t.Fatalf("cmd = %q, the go runner must never emit a -run flag for a selector", nameCmd)
+	}
+}
+
+// TestFailingSelectedSubpackageIsFailNotPass is the discriminating end-to-end proof of the
+// `--` fix. The stub models a red test in the SELECTED sub-package: the fixed command
+// `go test './sub'` exits 1 (Fail), while the PRE-FIX buggy `go test -- './sub'` (which runs
+// only the current-dir package) would have exited 0 and forged a green (I2). Because the
+// fixed pack emits the bare package-path form, the claim REDDENS.
+func TestFailingSelectedSubpackageIsFailNotPass(t *testing.T) {
+	box := &fakeBox{exec: func(cmd string) (sandbox.Result, error) {
+		if cmd == "go test './sub'" {
+			return sandbox.Result{ExitCode: 1, Stderr: "--- FAIL: TestSub"}, nil
+		}
+		// The pre-fix post-'--' form ran only the current dir (which passes) — a spurious green.
+		return sandbox.Result{ExitCode: 0, Stderr: "ok (current dir only)"}, nil
+	}}
+	status, _ := checkTestPasses(context.Background(), box, claim(IDTestPasses, "go", "./sub"))
+	if status != artifact.StatusFail {
+		t.Fatalf("status = %q, want Fail — a failing SELECTED sub-package must redden the claim (I2)", status)
+	}
+	if len(box.calls) != 1 || box.calls[0] != "go test './sub'" {
+		t.Fatalf("ran %v, want exactly the bare package-path form (no '--' prefix)", box.calls)
+	}
+}
+
+// TestGoNoPackagesIsUnverifiableNotFail pins the secondary false-RED fix: `go test ./...` in
+// a worktree with no Go packages exits 1 with "matched no packages" — nothing was tested, so
+// the verdict must be Unverifiable (no decisive result), never a false Fail. The marker never
+// appears in a genuine `--- FAIL:` failure, so this can only downgrade, never mask a red.
+func TestGoNoPackagesIsUnverifiableNotFail(t *testing.T) {
+	box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+		return sandbox.Result{ExitCode: 1, Stderr: "go: warning: \"./...\" matched no packages\nno packages to test"}, nil
+	}}
+	status, _ := checkTestPasses(context.Background(), box, claim(IDTestPasses, "go", ""))
+	if status != artifact.StatusUnverifiable {
+		t.Fatalf("status = %q, want Unverifiable (no packages to test is not a decisive fail)", status)
+	}
+	// And a REAL failure with no such marker still reds (guard against over-broad downgrading).
+	box2 := &fakeBox{exec: func(string) (sandbox.Result, error) {
+		return sandbox.Result{ExitCode: 1, Stderr: "--- FAIL: TestReal"}, nil
+	}}
+	if status2, _ := checkTestPasses(context.Background(), box2, claim(IDTestPasses, "go", "")); status2 != artifact.StatusFail {
+		t.Fatalf("status = %q, want Fail for a genuine test failure (downgrade must not mask a real red)", status2)
 	}
 }
 

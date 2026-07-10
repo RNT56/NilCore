@@ -308,3 +308,35 @@ func TestIrreversibleTargetMatching(t *testing.T) {
 		})
 	}
 }
+
+// TestIrreversibleSignalWordBoundary proves the word-boundary fix: a benign UI label that
+// merely CONTAINS a signal as a substring must NOT gate, while a genuine irreversible label
+// still does. A raw strings.Contains false-positived the benign cases, and because the gate
+// is deny-default headless (nil Approver blocks, and Enter probes the whole page) that
+// permanently blocked benign clicks/Enter on any such screen.
+func TestIrreversibleSignalWordBoundary(t *testing.T) {
+	// Benign — each contains a signal as a substring but not as a whole word ⇒ no gate.
+	for _, benign := range []string{
+		"Payment history",    // ⊃ "pay"
+		"Deleted items",      // ⊃ "delete"
+		"Manage subscribers", // ⊃ "subscribe"
+		"Repayment schedule", // ⊃ "pay"
+		"Undelete message",   // ⊃ "delete"
+	} {
+		if sig := irreversibleSignal(benign); sig != "" {
+			t.Errorf("benign %q must not signal, but matched %q", benign, sig)
+		}
+	}
+	// Genuine irreversible labels — a whole-word or whole-phrase match ⇒ gate.
+	for _, danger := range []string{
+		"Delete account",     // "delete"
+		"Confirm payment",    // "confirm payment" (whole phrase; a bare "payment" is not a signal)
+		"Pay now",            // "pay" / "pay now"
+		"Accept all cookies", // "accept all"
+		"#transfer-funds",    // a punctuation-folded CSS selector still matches "transfer"
+	} {
+		if sig := irreversibleSignal(danger); sig == "" {
+			t.Errorf("irreversible %q must signal, but matched nothing", danger)
+		}
+	}
+}

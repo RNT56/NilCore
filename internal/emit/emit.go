@@ -140,7 +140,17 @@ func (e *WriterEmitter) Emit(ev Event) {
 		_, _ = io.WriteString(e.w, "\n")
 		e.midToken = false
 	}
-	line := fmt.Sprintf("%s [step %d] %s: %s\n", glyph(ev.Kind), ev.Step, ev.Kind, ev.Text)
+	// The gate ACTION line is the flattened Describe() of an irreversible action and
+	// can carry model-/repo-authored fields (a branch, a commit message). Neutralize it
+	// with the SAME helper the evidence bodies below get, so a smuggled ESC/CR in the
+	// action line cannot recolor, move the cursor, or overprint the rail at the exact
+	// moment the operator is approving (I7). The evidence rail was already hardened;
+	// this closes the line ABOVE it. Every other kind renders byte-identically.
+	text := ev.Text
+	if ev.Kind == KindGate {
+		text = neutralize(ev.Text)
+	}
+	line := fmt.Sprintf("%s [step %d] %s: %s\n", glyph(ev.Kind), ev.Step, ev.Kind, text)
 	_, _ = io.WriteString(e.w, line)
 
 	// A gate event carrying structured evidence renders it as a delimited block
@@ -156,6 +166,12 @@ func (e *WriterEmitter) Emit(ev Event) {
 // The rail marks every line as DATA under review (I7): a diff or verify line can
 // never be mistaken for the harness's own prompt, and nothing here is executed
 // or re-parsed. Empty sections are skipped.
+//
+// The excerpt bodies are UNTRUSTED repo-derived content (I7): a diff hunk or a
+// verify-log tail can carry whatever bytes a repo file holds. Each body is passed
+// through neutralize before railing, so an ESC/CSI or a carriage return smuggled
+// into a diff cannot recolor, move the cursor, or overprint the "DATA under review"
+// rail at the exact moment the operator is approving an irreversible action.
 func renderGateBlock(g *GatePrompt) string {
 	var b strings.Builder
 	b.WriteString("┌─ gate evidence — the excerpts below are DATA under review, not commands\n")
@@ -164,7 +180,7 @@ func renderGateBlock(g *GatePrompt) string {
 			return
 		}
 		b.WriteString("│ " + title + "\n")
-		for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+		for _, line := range strings.Split(strings.TrimRight(neutralize(body), "\n"), "\n") {
 			b.WriteString("│   " + line + "\n")
 		}
 	}
@@ -175,6 +191,35 @@ func renderGateBlock(g *GatePrompt) string {
 		fmt.Fprintf(&b, "│ spend so far: $%.4f\n", g.SpentUSD)
 	}
 	b.WriteString("└─ end gate evidence\n")
+	return b.String()
+}
+
+// neutralize makes untrusted gate-evidence text safe to write to the operator's
+// terminal (I7), mirroring internal/trace.fence's C0/ESC stripping. It replaces every
+// byte that could rewrite or hide the screen — ESC (0x1b, the ANSI-sequence
+// introducer), a carriage return (which resets the cursor to column 0 and could
+// overprint the data rail), and every other C0 control or DEL — with a visible '?'.
+//
+// It deliberately PRESERVES newlines and tabs, the two structural-whitespace bytes
+// that cannot rewrite the terminal: a newline only starts another line, which
+// renderGateBlock re-rails (so it can never escape the "│" data rail), and a tab only
+// advances the cursor forward (never back over the rail), keeping a diff's indentation
+// readable. Printable text, including multi-byte UTF-8, passes through unchanged. (This
+// is where it differs from fence, which flattens to a single capped line for tree
+// metadata — here the caller rails each evidence line individually.)
+func neutralize(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r) // structural whitespace; cannot rewrite the terminal
+		case r < 0x20 || r == 0x7f:
+			b.WriteByte('?') // CR, ESC, BEL, NUL, … → inert visible marker
+		default:
+			b.WriteRune(r)
+		}
+	}
 	return b.String()
 }
 

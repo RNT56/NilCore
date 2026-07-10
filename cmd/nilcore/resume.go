@@ -191,7 +191,13 @@ func superviseOwnerThread(taskID string) string {
 // further-advanced tip. cleanup is deferred (it sweeps task/integrate/read — never the
 // resume/ pin), so an interrupted resume still preserves the tip.
 func runResumedSupervise(ctx context.Context, d serveDeps, goal, taskID, baseRef string, seed *super.ResumeState, approver policy.Approver) (bool, error) {
-	bd := serveBuildDeps(d, budget.New(), approver, goal, taskID)
+	// The dollar wall must apply here too. buildStack only mints a ceiling when it is
+	// handed a NIL ledger, so passing a bare budget.New() (global ceiling 0 = unlimited)
+	// left a serve-restart-resumed multi-agent run with no spend cap at all — unbounded
+	// headless spend, unlike every other path. Set the same wall the live serve drive uses.
+	ledger := budget.New()
+	ledger.SetGlobalCeiling(d.budget)
+	bd := serveBuildDeps(d, ledger, approver, goal, taskID)
 	bd.baseRef = baseRef
 	bd.resume = seed
 	stack, err := buildStack(bd)

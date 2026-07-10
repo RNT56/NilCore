@@ -136,6 +136,39 @@ func TestClassifyFirstMatchWins(t *testing.T) {
 	}
 }
 
+// TestClassifyWordBoundary proves keyword matching is on WORD BOUNDARIES, not raw
+// substrings. Each goal embeds a class keyword inside a LARGER word — "prefix"/"suffix"
+// ⊃ "fix ", "dispatch the" ⊃ "patch the", "uncomment" ⊃ "comment", "rebuild all" ⊃
+// "build a" — which the old strings.Contains match mis-bucketed (a class only biases
+// attempt order, never a verdict (I2), but the false bucket polluted per-class
+// evidence). The embedded keyword must NOT select its class; a control row proves the
+// same keyword as a whole word still does.
+func TestClassifyWordBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		goal string
+		want string
+	}{
+		// The false positives from the report: the embedded keyword must not fire.
+		{"prefix is not fix", "prefix every request identifier", ClassOther},
+		{"suffix is not fix", "strip the suffix from output names", ClassOther},
+		{"dispatch is not patch-the", "dispatch the request to the pool", ClassOther},
+		{"uncomment is not comment", "uncomment the debug block in the loop", ClassOther},
+		{"rebuild is not build-a", "rebuild all the modules", ClassOther},
+		// Controls: the very same keyword as a WHOLE word still classifies.
+		{"real fix", "fix the login redirect", ClassBugfix},
+		{"real comment", "add a comment to the parser", ClassDocs},
+		{"real build a", "build a metrics endpoint", ClassFeature},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Classify(tt.goal); got != tt.want {
+				t.Errorf("Classify(%q) = %q, want %q", tt.goal, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestClassifyLabelSetClosed proves every value Classify can return is one of the
 // documented, closed label set — a tripwire if a future table edit introduces a
 // stray label that the per-class routing cell would not recognize.

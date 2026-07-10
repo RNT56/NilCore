@@ -105,10 +105,13 @@ func (l *Log) UseStore(s *store.Store) {
 // OnAppend registers an optional hook called with each event AFTER it is durably
 // appended and mirrored to the store. It is the seam the Phase-16 experience
 // projector uses to fold a verifier-judged race_outcome into its derived projection
-// as it lands (EXP-T03). The hook runs under the log lock (appends stay serialized)
-// and its result is IGNORED: a derived projection failing must never break or stall
-// the authoritative append-only log (I5). nil (the default) installs nothing, so an
-// unwired log is byte-identical. Set it once, before traffic.
+// as it lands (EXP-T03). The hook runs on a SINGLE background drainer goroutine, in
+// append (FIFO) order, OFF the append critical section — so a slow or contended fold
+// never stalls the authoritative writer. Its result is IGNORED and a panic is
+// recovered: a derived projection failing must never break or stall the append-only
+// log (I5); if the drainer falls behind, folds are dropped (the projection is
+// rebuildable). nil (the default) installs nothing, so an unwired log is
+// byte-identical. Set it once, before traffic.
 func (l *Log) OnAppend(fn func(e Event)) {
 	if l == nil {
 		return
@@ -164,33 +167,20 @@ func (l *Log) drainHooks(fn func(e Event), done <-chan struct{}) {
 	}
 }
 
-// Open opens (creating if needed) the log at path, continuing the hash chain and
-// the sequence counter from any existing content.
+// Open opens (creating if needed) the log at path, continuing the hash chain and the
+// sequence counter from any existing content.
+//
+// SINGLE WRITER PER PATH. A given log file must have at most ONE Log appending to it at
+// a time (the orchestrator owns a run's log). Within a process the append path is
+// goroutine-safe (l.mu) and the hash chain detects cross-process interleaving after the
+// fact, but Open's torn-tail heal (healTornTail) is only safe under this assumption: it
+// inspects the tail and trims a never-terminated partial write. Two processes opening
+// and healing the same live log concurrently is unsupported.
 func Open(path string) (*Log, error) {
-	// Heal a torn final line before opening for append. If the file is non-empty and
-	// does not end in '\n', a prior process crashed mid-write (or a short write
-	// occurred), leaving a partial record with no terminator. TRUNCATE the partial
-	// bytes back to the end of the last complete line, so the NEXT record starts on a
-	// clean boundary rather than being concatenated into the partial one (which would
-	// corrupt the next event too) AND so Verify is not permanently broken by an
-	// unparseable trailing line (a single torn tail otherwise fails json.Unmarshal in
-	// the Verify loop forever, with no recovery path).
-	//
-	// This stays append-only in spirit (I5): the partial bytes NEVER durably became a
-	// committed event — Append advances l.prev/l.seq only AFTER a full line write lands,
-	// so no completed record is dropped here. We remove only the never-finished tail of
-	// an interrupted write, exactly the bytes that were never a record. (A fully written
-	// line always ends in '\n', so a missing terminator unambiguously marks an
-	// interrupted write — there is no valid record without it.)
-	if data, rerr := os.ReadFile(path); rerr == nil && len(data) > 0 && data[len(data)-1] != '\n' {
-		// Keep everything up to and including the last newline; drop the partial tail.
-		// If there is no newline at all, the whole file is one torn line ⇒ truncate to 0.
-		keep := strings.LastIndexByte(string(data), '\n') + 1
-		if tf, terr := os.OpenFile(path, os.O_WRONLY, 0o644); terr == nil {
-			_ = tf.Truncate(int64(keep))
-			_ = tf.Close()
-		}
-	}
+	// Heal a torn final line before opening for append (see healTornTail). This stays
+	// append-only (I5): only the never-newline-terminated tail of an interrupted write is
+	// ever trimmed — bytes that never durably became a committed event.
+	healTornTail(path)
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -202,6 +192,59 @@ func Open(path string) (*Log, error) {
 		l.seq = last.Seq + 1
 	}
 	return l, nil
+}
+
+// healTornTail trims a torn final line so the next append starts on a clean boundary and
+// Verify is not permanently broken by an unparseable trailing record. If the file is
+// non-empty and does not end in '\n', a prior writer crashed mid-write (or a short write
+// occurred), leaving a partial record with no terminator. Without the heal the next
+// record would be concatenated onto the partial one (corrupting it too), and Verify
+// would fail json.Unmarshal on that line forever with no recovery path.
+//
+// Append-only safety (I5). A fully written line ALWAYS ends in '\n' — Append writes the
+// record and its terminator in one Write and only advances l.prev/l.seq after that Write
+// lands — so a missing terminator unambiguously marks an interrupted write whose trailing
+// bytes were NEVER a committed event. We therefore only ever remove that trailing PARTIAL
+// line, never a complete committed line, and the trim boundary is always a line
+// terminator (the offset just past the last '\n') or 0 (no '\n' at all ⇒ the whole file
+// is one torn line).
+//
+// Torn-READ defense. The trim offset is computed from an unlocked snapshot (os.ReadFile).
+// Under the single-writer rule that snapshot is authoritative, but to be defensive
+// against torn-READing a concurrent writer's in-flight append, we re-stat the file under
+// the write handle and DECLINE to heal if its size changed since the snapshot: a size
+// change means another writer appended — possibly committing the very line we were about
+// to trim — so truncating to the stale offset could drop a durably committed record. A
+// still-torn tail is then caught loudly by Verify (the honest signal) rather than risking
+// silent history loss. This never weakens append-only: the trim can only ever shrink a
+// never-committed partial tail, and only when no concurrent write is detected.
+func healTornTail(path string) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil || len(data) == 0 || data[len(data)-1] == '\n' {
+		return // unreadable, empty, or already cleanly terminated — nothing to heal
+	}
+	// keep is the offset just past the last newline; everything at [keep:] is the
+	// never-terminated partial tail. No '\n' at all ⇒ keep == 0 (the whole file is torn).
+	keep := int64(strings.LastIndexByte(string(data), '\n') + 1)
+	// Boundary guard: the byte before keep MUST be the terminator (or keep is 0), so a
+	// complete committed line can never be cut short. True by construction; asserted so a
+	// future change cannot silently break it.
+	if keep > 0 && data[keep-1] != '\n' {
+		return
+	}
+	tf, terr := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if terr != nil {
+		return
+	}
+	defer tf.Close()
+	// Re-stat under the handle: if the on-disk size differs from the snapshot, another
+	// writer appended between the read and now (the single-writer rule was violated).
+	// Truncating to the stale offset could drop a line that writer durably committed
+	// (I5), so decline to heal — Verify surfaces any residual tear.
+	if st, serr := tf.Stat(); serr != nil || st.Size() != int64(len(data)) {
+		return
+	}
+	_ = tf.Truncate(keep)
 }
 
 // Append records e: it redacts secrets, links e to the previous event, hashes it,

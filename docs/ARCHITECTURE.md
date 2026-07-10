@@ -152,7 +152,7 @@ Tool output, file contents, and fetched web content are data, never controlling 
 
 Phase 16 closes the loop on the agent's own verifier-judged evidence so it depends on the operator less while staying inside all seven invariants (full plan: `docs/ROADMAP-CLOSED-LOOP.md`). Every pillar is **opt-in and default-off** — an operator who turns nothing on sees a byte-identical binary. The verifier (I2), the sandbox (I4), no-ambient-authority (I3), and the append-only log (I5) are never weakened; the program moves the human *from per-action approval to policy + envelope + earned trust*, and makes self-verification carry more weight.
 
-**§0 recorded relaxation — graduated auto-approval (the SECOND human-gate relaxation, parallel to the `--mac-host` I4 relaxation).** `internal/graapprove.GradedApprover` *wraps* the human approver and auto-approves a structured `policy.GateAction` ONLY when the action-class+scope has EARNED trust (verifier-green ≥ N times, recent, over an unbroken chain — folded from a dedicated `boundary_outcome` event, never a self-report) AND the action sits within the operator-authored envelope AND the shared blast-radius budget still admits it; anything else falls through to the human. A free-text `Approve(string)` gate is **never** auto-approved. This relaxes the *default that every irreversible action needs a human* — it grants **no ambient authority** (the envelope is operator-authored host-side data, fail-closed, and never reaches the model — I3) and never lets unverified work ship (I2). It is reached only behind its own opt-in (`onboard.Config.AutoApprove` / a `nilcore init` preset / `NILCORE_AUTOAPPROVE_PRESET`), is bounded by the shared `internal/blastbudget` fence, and is revocable by an instant kill-switch (`.nilcore/AUTOAPPROVE_OFF` / `NILCORE_AUTOAPPROVE_OFF=1`).
+**§0 recorded relaxation — graduated auto-approval (the SECOND human-gate relaxation, parallel to the `--mac-host` I4 relaxation).** `internal/graapprove.GradedApprover` *wraps* the human approver and auto-approves a structured `policy.GateAction` ONLY when the action-class+scope has EARNED trust (verifier-green ≥ N times, recent, over an unbroken chain — folded from a dedicated `boundary_outcome` event, never a self-report) AND the action sits within the operator-authored envelope AND the shared blast-radius budget still admits it; anything else falls through to the human. A free-text `Approve(string)` gate is **never** auto-approved. This relaxes the *default that every irreversible action needs a human* — it grants **no ambient authority** (the envelope is operator-authored host-side data, fail-closed, and never reaches the model — I3) and never lets unverified work ship (I2). It is reached only behind its own opt-in (`onboard.Config.AutoApprove` / a `nilcore init` preset / `NILCORE_AUTOAPPROVE_PRESET`), is bounded by the shared `internal/blastbudget` fence, and is revocable by an instant kill-switch (`.nilcore/AUTOAPPROVE_OFF` / `NILCORE_AUTOAPPROVE_OFF=1`). **Scope granularity (as shipped):** trust and the per-day rate window key on a stable scope *family* (`task/trig-123`→`task/*`, a bare sha→`#commit`) so earned trust generalizes across per-run-unique branch names, while the protected-base floor (main/master/release/trunk/stable/prod\*) and `DenyBranches` are always evaluated on the **concrete** branch; an `AllowBranches:["*"]` clause matches any non-empty scope, but an empty scope never auto-approves. *(Before the features-review pass this whole path was structurally unreachable — `*` failed `path.Match` on slash-y branches and trust/rate keyed on per-run-unique scopes — so no action ever actually auto-approved; that is now fixed.)*
 
 The three operator-approved presets, and **the rule that NO preset ever admits `main`/`master`/`release`/`prod`** (deny always wins; `prod*` is denied structurally for Deploy):
 
@@ -237,7 +237,7 @@ additive and nil-gated (nil = byte-identical), exactly like `Advisor`/`Peer`:
 
 | Package | Responsibility | May import |
 |---|---|---|
-| `internal/emit` | live reasoning/intent sink (`Emitter`, `Event`, `WriterEmitter`, `NopEmitter`) | stdlib only |
+| `internal/emit` | live reasoning/intent sink (`Emitter`, `Event`, `WriterEmitter`; the no-op is a nil `Emitter`) | stdlib only |
 | `internal/inbox` | the user→agent message seam (`Box`: `Push`/`Drain`/`Steer`, `Queue`/`Steer` modes) | `model`, `eventlog` |
 | `internal/session` | state container + auto-router + drivers (`Session`, `Turn`, `WorkState`, `Phase`, `SupervisorFirstRouter`, `Driver`s) | composes `agent`, `backend`, `super`, `project`, `summarize`, `model`, `eventlog`, `policy`, `inbox`, `emit`, `store` |
 
@@ -479,7 +479,7 @@ instruction") **first**, the findings `guard.Wrap`'d as data **second**, never
 concatenated. Steer is just more user text: it **cannot** set `finished=true` or
 shortcut verify (I2 — the verifier stays the sole authority on "done"; there is no
 "user says done → ship" path), and a steered irreversible action still reaches
-`policy.Gate` → `Approver` with one explicit prompt (the gate is unchanged).
+`policy.GateStructured` → `Approver` with one explicit prompt (the gate is unchanged).
 
 ### Budget & termination keying
 
@@ -607,7 +607,7 @@ task (CLI or channel)
          ├─ pick backend  (Phase 3: routing — single | race best-of-N | review)
          ├─ backend.Run    (native loop  /  codex exec  /  claude -p)   in a worktree+sandbox
          ├─ verify.Check    ← SOURCE OF TRUTH
-         ├─ policy.Gate     (irreversible actions: merge/deploy → human gate)
+         ├─ policy.GateStructured (irreversible actions: merge/deploy → human gate)
          └─ eventlog.Append (every step)  ─▶  (Phase 4) SQLite store + memory
 ```
 

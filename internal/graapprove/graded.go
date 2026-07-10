@@ -203,6 +203,9 @@ func (g *GradedApprover) ApproveStructured(a policy.GateAction) bool {
 		g.emitDeny("chain_broken", typ, scope, map[string]any{"chain_ok": view.ChainOK})
 		return g.fallThrough(a)
 	}
+	// Trust accrues over the scope FAMILY (see trustScope): every live scope is unique
+	// per run, so an exact-scope tally could never reach MinSuccesses. Tally normalizes
+	// the concrete scope to the family BuildTrust bucketed it under.
 	t := view.Tally(ScopeKey{Type: typ, Scope: scope})
 	now := g.now().UTC()
 	recentOK := !t.LastGreen.IsZero() &&
@@ -340,7 +343,11 @@ func (g *GradedApprover) chargeDay(ctx context.Context, a policy.GateAction, tod
 	g.rateMu.Lock()
 	defer g.rateMu.Unlock()
 
-	key := rateKey(a.Type.String(), scopeFor(a), today)
+	// Key the per-day $ window on the scope FAMILY, exactly as the rate window does.
+	// Every live scope is unique per run, so an exact-branch key would open a fresh $
+	// window on every decision and MaxDollarsDay would never bind — the same
+	// ephemeral-scope defect, on the money axis.
+	key := rateKey(a.Type.String(), trustScope(scopeFor(a)), today)
 	dayTotal, seeded := g.dollarsDay[key]
 	if !seeded {
 		// First access of this window this process — seed the day's auto-approved $ from
@@ -415,7 +422,10 @@ func sumAutoApprovalDollarsToday(logPath, action, scope, today string) (float64,
 		}
 		a, _ := e.Detail["action"].(string)
 		s, _ := e.Detail["scope"].(string)
-		if a != action || s != scope {
+		// The event records the CONCRETE scope; the day's $ window sums the family, to
+		// match chargeDay's key. Comparing exact scopes would seed every fresh branch's
+		// window at zero and the ceiling would never bind.
+		if a != action || trustScope(s) != trustScope(scope) {
 			continue
 		}
 		if dayKey(e.Time) != today {
@@ -482,7 +492,10 @@ func (g *GradedApprover) reserveRate(typ, scope, today string, maxPerDay int) (b
 	g.rateMu.Lock()
 	defer g.rateMu.Unlock()
 
-	key := rateKey(typ, scope, today)
+	// Key the in-process window on the scope FAMILY, matching the durable seed below.
+	// A per-run-unique branch would otherwise mint a fresh window on every decision and
+	// MaxPerDay would never bind.
+	key := rateKey(typ, trustScope(scope), today)
 	cur, seeded := g.rateCount[key]
 	if !seeded {
 		// First access of this window this process — seed from the durable log so a
@@ -510,7 +523,7 @@ func (g *GradedApprover) reserveRate(typ, scope, today string, maxPerDay int) (b
 func (g *GradedApprover) releaseRate(typ, scope, today string) {
 	g.rateMu.Lock()
 	defer g.rateMu.Unlock()
-	key := rateKey(typ, scope, today)
+	key := rateKey(typ, trustScope(scope), today) // same family key reserveRate took
 	if n := g.rateCount[key]; n > 0 {
 		g.rateCount[key] = n - 1
 	}

@@ -123,8 +123,18 @@ func runSwarmReport(logPath, root, dir, format, runOverride, reportOut string, s
 	// run/ext is surfaced as a fatal error rather than a silent skip. It writes under
 	// the SAME root as the fold (--dir when given) so the report lands beside the
 	// artifacts it describes.
+	//
+	// The ARCHIVED file must be DETERMINISTIC: its bytes must not depend on whether
+	// stdout happened to be a TTY. text and matrix are the only style-aware renders, so
+	// persist them with a PLAIN (zero-value) Style — never the ANSI-styled `out` that
+	// went to a terminal stdout; html/md/json ignore style, so `out` is already clean and
+	// is reused as-is.
 	if reportOut != "" {
-		if err := report.WriteReport(reportRoot(root, dir), m.Run, extFor(format), []byte(out)); err != nil {
+		persisted := out
+		if format == "text" || format == "matrix" {
+			persisted = renderModel(sr, m, format, termui.Style{})
+		}
+		if err := report.WriteReport(reportRoot(root, dir), m.Run, extFor(format), []byte(persisted)); err != nil {
 			return "", 0, err
 		}
 	}

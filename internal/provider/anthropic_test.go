@@ -554,14 +554,23 @@ type cacheReqProbe struct {
 // messages never carry a marker. Absent sections (empty system, zero tools,
 // uncacheable final block) skip their marker and the request stays valid.
 func TestAnthropicCacheBreakpoints(t *testing.T) {
-	// captureBody runs one adapter call against a canned server and returns the
-	// raw request body it sent. The canned JSON reply satisfies Complete; Stream
-	// tolerates it too (no data: frames ⇒ clean EOF ⇒ empty response, no error).
+	// captureBody runs one adapter call against a canned server and returns the raw
+	// request body it sent. Complete gets the JSON reply; the STREAM request (stream:
+	// true) gets a minimal valid SSE exchange — a zero-frame clean EOF is now a
+	// retryable stream_truncated error, so the JSON reply would fail the Stream path.
 	captureBody := func(t *testing.T, call func(a *Anthropic)) []byte {
 		t.Helper()
 		var body []byte
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ = io.ReadAll(r.Body)
+			if strings.Contains(string(body), `"stream":true`) {
+				w.Header().Set("content-type", "text/event-stream")
+				_, _ = io.WriteString(w, "event: message_start\n"+
+					`data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":1}}}`+"\n\n"+
+					"event: message_stop\n"+
+					`data: {"type":"message_stop"}`+"\n\n")
+				return
+			}
 			w.Header().Set("content-type", "application/json")
 			_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
 		}))

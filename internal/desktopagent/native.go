@@ -202,8 +202,23 @@ func translateNative(input json.RawMessage) (desktopwire.Act, error) {
 		return desktopwire.Act{Op: desktopwire.OpMouseUp, Coordinate: in.Coordinate, Button: desktopwire.ButtonLeft}, nil
 	case "type":
 		return desktopwire.Act{Op: desktopwire.OpType, Text: in.Text}, nil
-	case "key", "hold_key":
+	case "key":
 		return desktopwire.Act{Op: desktopwire.OpKey, Key: in.Text}, nil
+	case "hold_key":
+		// hold_key presses Text and HOLDS it for `duration` SECONDS (unlike the discrete
+		// `key` tap). desktopwire.OpKey has no dedicated hold field, so carry the hold
+		// length in MS — the same ms convention OpWait uses — instead of DROPPING duration
+		// and silently degrading the hold to a tap. A zero/absent duration falls back to a
+		// 1s default, mirroring the wait case. NOTE: the in-sandbox driver's current OpKey
+		// handler issues a discrete keypress and does not yet consume MS
+		// (cmd/tools/nilcore-desktop/serve.go), so honoring the hold end-to-end still needs
+		// a driver change — but the duration is no longer lost at this translation boundary,
+		// so that change needs no re-plumbing here.
+		ms := in.Duration * 1000
+		if ms <= 0 {
+			ms = 1000
+		}
+		return desktopwire.Act{Op: desktopwire.OpKey, Key: in.Text, MS: ms}, nil
 	case "scroll":
 		return desktopwire.Act{Op: desktopwire.OpScroll, Dir: in.ScrollDirection, Amount: in.ScrollAmount}, nil
 	case "wait":

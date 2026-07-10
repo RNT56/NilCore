@@ -66,7 +66,9 @@ func flywheelMain(args []string) {
 		maxIter = 1
 	}
 	orch := buildRunOrchestrator(c, b, log, absDir, mintBlastBudget(*c.blastRadius, log))
-	fw := newFlywheelLoop(orch, log, *c.logPath, maxIter, *interval)
+	// Attended command: a human is at the terminal, so the merge gate is the console.
+	fw := newFlywheelLoop(orch, log, *c.logPath, maxIter, *interval,
+		policy.NewConsoleApprover(os.Stdin, os.Stdout).Approve)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Hour)
 	defer cancel()
@@ -100,7 +102,14 @@ func rotatedLogGenerations(logPath string) []string {
 	return []string{rotated}
 }
 
-func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string, maxIter int, interval time.Duration) *loop.Loop {
+// gateApprove is the base human approver for the self-edit merge gate. It is a
+// PARAMETER because the loop runs in two very different contexts: the attended
+// `nilcore flywheel` command (a console approver on os.Stdin) and the serve-embedded
+// background ticker (deny-default — no human attends it). Hardcoding the console
+// approver here made a terminal-launched `serve` print a GATE prompt into its own
+// console from a background goroutine and block that flywheel cycle on stdin forever,
+// contradicting makeHeadlessBackground's own contract.
+func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string, maxIter int, interval time.Duration, gateApprove func(action string) bool) *loop.Loop {
 	runSuite := func(ctx context.Context, cases []eval.Case) (eval.Report, error) {
 		report := eval.Run(ctx, cases, "flywheel", func(ctx context.Context, cse eval.Case) (bool, float64) {
 			out, err := runViaKernel(ctx, orch, backend.Task{ID: fmt.Sprintf("flywheel-eval-%d", time.Now().UnixNano()), Goal: cse.Goal})
@@ -130,7 +139,7 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 	var runBranch string
 	flow := &selfimprove.Flow{
 		Scope: selfimprove.DefaultScope(),
-		Run: func(ctx context.Context, g string) (bool, error) {
+		Run: func(ctx context.Context, g string) (bool, string, error) {
 			// Preserve the run's verified branch (KeepBranch) so Changed can diff it. We flip
 			// KeepBranch on a per-edit COPY of orch — NOT the shared orch — so the eval-scoring
 			// runs (runSuite) keep their default disposable worktrees (no leaked branches).
@@ -138,10 +147,10 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 			editOrch.KeepBranch = true
 			out, err := runViaKernel(ctx, &editOrch, backend.Task{ID: fmt.Sprintf("flywheel-edit-%d", time.Now().UnixNano()), Goal: g})
 			if err != nil {
-				return false, err
+				return false, "", err
 			}
 			runBranch = out.Branch
-			return out.Verified, nil
+			return out.Verified, out.Branch, nil
 		},
 		// Changed reports what the verified self-edit actually modified, by diffing the kept
 		// branch against the base repo HEAD. Propose fail-closes on ANY path outside the
@@ -151,7 +160,21 @@ func newFlywheelLoop(orch *agent.Orchestrator, log *eventlog.Log, logPath string
 		Changed: func(ctx context.Context) ([]string, error) {
 			return selfEditChangedPaths(ctx, orch.BaseRepo, runBranch)
 		},
-		Gate: graapprove.SelfImproveGate(policy.NewConsoleApprover(os.Stdin, os.Stdout).Approve, autoApproveSink{log}),
+		// Merge lands the approved, verified self-edit with the same hardened,
+		// conflict-aborting git chat's /apply uses (I4). Without this the flywheel
+		// reported ships that never happened: verified branches piled up unmerged while
+		// Summary.Merged counted them as landed.
+		Merge: func(ctx context.Context, branch string) error {
+			_, conflict, err := mergeKeptBranch(ctx, orch.BaseRepo, branch)
+			if err != nil {
+				return err
+			}
+			if conflict {
+				return fmt.Errorf("merge %s conflicted; the tree was restored and nothing landed", branch)
+			}
+			return nil
+		},
+		Gate: graapprove.SelfImproveGate(gateApprove, autoApproveSink{log}),
 		Log:  log,
 	}
 	return loop.New(loop.Config{

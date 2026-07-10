@@ -14,10 +14,10 @@ package schema
 // is refused, never waved through.
 //
 // Trust boundary (I7): Output and the emitted event carry ONLY harness-trusted fields
-// — the Code, the field/claim NAME, and the bounded harness-authored Reason. They
-// NEVER echo a model-authored Value/SourceURL/Statement, so an injection phrase
-// smuggled into a claim value cannot ride out in the report or the event stream. Only
-// the verifier-set verdict is trusted (I2).
+// — the Code, the field NAME, the ClaimID (the artifact's own stable claim key), and the
+// bounded harness-authored Reason. They NEVER echo a model-authored Value/SourceURL/
+// Statement, so an injection phrase smuggled into a claim value cannot ride out in the
+// report or the event stream. Only the verifier-set verdict is trusted (I2).
 
 import (
 	"context"
@@ -37,24 +37,32 @@ import (
 // SchemaVerifyEvent from the log; the leaf itself never imports eventlog.
 const EventKind = "schema_verify"
 
-// DefectMeta is the redacted, harness-trusted projection of a Defect carried in the
-// event: the Code and the field NAME only. It deliberately omits Reason and ClaimID —
-// the event is metadata about WHAT shape rule fired, not a place to replay any
-// (potentially model-influenced) string — keeping the event stream strictly metadata.
+// DefectMeta is the harness-trusted projection of a Defect carried in the event. Every
+// field is harness-authored or a trusted identifier — the Code (closed enum), the field
+// NAME, the ClaimID (the artifact's own stable claim key, already emitted by the per-claim
+// ClaimVerifyEvent), and the bounded harness-written Reason (<=256B, built only from
+// constants and identifiers). It NEVER carries a model-authored Value/SourceURL/Statement
+// (I7). The json tags are the ON-WIRE contract the report decoder (SW-T06) reads:
+// {"code","field","claim_id","reason"} — lowercase — so a serialized event round-trips into
+// SchemaDefectRow rows.
 type DefectMeta struct {
-	Code  Code
-	Field string
+	Code    Code   `json:"code"`
+	Field   string `json:"field"`
+	ClaimID string `json:"claim_id"`
+	Reason  string `json:"reason"`
 }
 
 // SchemaVerifyEvent is the per-artifact, metadata-only event the SchemaVerifier emits
 // through EventSink. It records the artifact identity, its Kind, the trusted defect
-// metadata, and the pass/fail verdict — never a model field. SW-T06 imports this
-// package to decode it.
+// metadata, and the pass/fail verdict — never a model field. The json tags define the
+// event Detail's on-wire shape the report decoder reads: {"id","kind","defects":[…],
+// "passed"} with the defect list carrying {code,field,claim_id,reason}. SW-T06 decodes the
+// Detail (it keys off "id" and "defects"); it does not import this struct.
 type SchemaVerifyEvent struct {
-	ArtifactID string
-	Kind       artifact.Kind
-	Defects    []DefectMeta
-	Passed     bool
+	ArtifactID string        `json:"id"`
+	Kind       artifact.Kind `json:"kind"`
+	Defects    []DefectMeta  `json:"defects"`
+	Passed     bool          `json:"passed"`
 }
 
 // SchemaVerifier adapts the Schema walk to verify.Verifier. Reg is the catalog the
@@ -152,15 +160,22 @@ func (v *SchemaVerifier) render(a *artifact.Artifact, defects []Defect, passed b
 }
 
 // emit sends the one metadata-only SchemaVerifyEvent when an EventSink is wired. The
-// payload carries only the artifact identity, Kind, the redacted DefectMeta list, and
-// the verdict — never a model-authored field (I7).
+// payload carries only the artifact identity, Kind, the harness-trusted DefectMeta list
+// (Code, field NAME, ClaimID, and the bounded harness Reason), and the verdict — never a
+// model-authored Value/SourceURL/Statement (I7). A clean check still emits (with an empty
+// defect list); the report decoder yields zero rows for it.
 func (v *SchemaVerifier) emit(a *artifact.Artifact, defects []Defect, passed bool) {
 	if v.EventSink == nil {
 		return
 	}
 	metas := make([]DefectMeta, 0, len(defects))
 	for _, d := range defects {
-		metas = append(metas, DefectMeta{Code: d.Code, Field: d.Field})
+		metas = append(metas, DefectMeta{
+			Code:    d.Code,
+			Field:   d.Field,
+			ClaimID: d.ClaimID,
+			Reason:  d.Reason,
+		})
 	}
 	v.EventSink(SchemaVerifyEvent{
 		ArtifactID: a.ID,

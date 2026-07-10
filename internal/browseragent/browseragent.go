@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
 
 	"nilcore/internal/browsersession"
 	"nilcore/internal/browserwire"
@@ -75,7 +76,6 @@ type BrowseTool struct {
 	steps    int
 	stagnant int
 	lastSig  string
-	lastOp   string
 }
 
 const (
@@ -200,7 +200,7 @@ func (b *BrowseTool) RunWithImage(ctx context.Context, _ string, input json.RawM
 			body += fmt.Sprintf("\n\n[harness] the last %d actions changed nothing — try a FUNDAMENTALLY different approach (a different element, keyboard navigation, or finish if blocked).", b.stagnant)
 		}
 	}
-	b.lastSig, b.lastOp = sig, in.Op
+	b.lastSig = sig
 
 	// Emit a metadata-only trajectory step (Pillar 7) — no untrusted body, just the
 	// op, the page URL, and counts, so a run is legible in `nilcore trace`/report.
@@ -242,15 +242,15 @@ func observationSignature(o browserwire.Observation) string {
 }
 
 // irreversibleSignals are the browser action-semantic phrases that route a
-// click/select through the human gate (ROADMAP §6.6). They are intentionally
-// conservative — when a target's accessible name/value matches any of these, the
-// action is treated as consequential and must be approved. Matched on a normalized
-// (lowercased, whitespace-collapsed) substring of the target text: these are UI
-// labels ("Pay now", "Accept all cookies"), not shell commands, so a substring match
-// is the right granularity (unlike policy.Classify's word-boundary command matching).
+// click/select (or an Enter-to-submit) through the human gate (ROADMAP §6.6). They are
+// intentionally conservative — when a target's accessible name/value matches any of these
+// on a WORD boundary, the action is treated as consequential and must be approved. These
+// are UI labels ("Pay now", "Accept all cookies", "Confirm payment"). "confirm payment" is
+// gated as a whole phrase so a genuine payment confirmation is caught WITHOUT a bare
+// "payment" signal firing inside the benign "Payment history".
 var irreversibleSignals = []string{
 	"purchase", "buy now", "place order", "checkout", "confirm order",
-	"pay", "pay now", "transfer", "send money", "delete", "remove",
+	"confirm payment", "pay", "pay now", "transfer", "send money", "delete", "remove",
 	"refund", "consent", "accept terms", "accept all", "accept cookies",
 	"i agree", "subscribe", "unsubscribe",
 }
@@ -321,18 +321,48 @@ func isSubmitKey(key string) bool {
 }
 
 // irreversibleSignal returns the first irreversibleSignals phrase found in text, matched
-// on a normalized (lowercased, whitespace-collapsed) substring, or "" when none match.
+// on WORD boundaries (not a raw substring), or "" when none match. Both the haystack and
+// each signal are space-padded over a normalized token stream, so a single- or multi-word
+// signal matches only as a complete token sequence.
+//
+// WORD boundaries, not strings.Contains (the fix): a bare substring test fires "pay" inside
+// the ubiquitous "Payment history", "delete" inside "Deleted items", and "subscribe" inside
+// "Manage subscribers". Because the gate is deny-default headless (a nil Approver BLOCKS,
+// and for an Enter key the WHOLE page is the probe), those false positives would
+// permanently block benign clicks/Enter on any such page. Mirrors
+// desktopagent.irreversibleSignal; it additionally folds punctuation (see normalizeSignal)
+// because the browser tier also classifies model-supplied CSS selectors like
+// "#transfer-funds".
 func irreversibleSignal(text string) string {
-	hay := strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	hay := normalizeSignal(text)
 	if hay == "" {
 		return ""
 	}
+	padded := " " + hay + " "
 	for _, sig := range irreversibleSignals {
-		if strings.Contains(hay, sig) {
+		if strings.Contains(padded, " "+sig+" ") {
 			return sig
 		}
 	}
 	return ""
+}
+
+// normalizeSignal lowercases text, folds every non-alphanumeric rune to a space, and
+// collapses whitespace to single spaces — so a CSS selector or hyphenated label like
+// "#transfer-funds" tokenizes to "transfer funds" and word-boundary matching sees the
+// embedded action words. Folding punctuation is what lets the browser tier gate a
+// selector-targeted click, which desktopagent (no selectors) does not need.
+func normalizeSignal(text string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // renderObservation produces the compact, model-readable view: URL, title, the

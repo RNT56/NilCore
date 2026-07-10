@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"nilcore/internal/eventlog"
@@ -256,6 +257,115 @@ func TestProjectorFoldSeqZero(t *testing.T) {
 	if standingMap(st2)["native"] != [2]int{1, 1} {
 		t.Fatalf("seq-0 re-fold must be idempotent, got %v", standingMap(st2))
 	}
+}
+
+// TestProjectorFoldResumesAfterRotation guards the rotation-awareness of the live Fold
+// path. serve caps the append-only log at 64 MiB by moving it aside and starting a
+// FRESH genesis chain at seq 0 (maint.RotateLog), whose low seqs land far below the
+// high-water mark the rotated-away chain left in exp_meta. Fold must recognise that
+// backward seq jump as a NEW CHAIN and re-derive from it — folding the new events (not
+// silently dropping them as "already folded" until the new chain climbs past the old
+// watermark ~64 MiB later) AND clearing the rotated-away generation's stale standings,
+// so the warm projection equals a fresh fold of the current log (I5).
+func TestProjectorFoldResumesAfterRotation(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	p := experience.NewProjector(s)
+
+	// Generation 0: a race lands with a HIGH seq (the log had climbed well past genesis
+	// before rotation), advancing the watermark to 40.
+	if err := p.Fold(ctx, eventlog.Event{Seq: 40, Kind: "race_outcome", Backend: "native", Detail: map[string]any{"passed": true}}); err != nil {
+		t.Fatalf("fold gen0: %v", err)
+	}
+	if st, _ := experience.OverStore(s, nil).BackendStanding(ctx, ""); standingMap(st)["native"] != [2]int{1, 1} {
+		t.Fatalf("gen0 native = %v, want 1/1", standingMap(st))
+	}
+
+	// Generation 1 (post-rotation): the fresh chain restarts at seq 0 with a DIFFERENT
+	// backend. seq 0 is below the watermark (40); the OLD code dropped it as already-
+	// folded (0 <= 40). It must now fold, and the rotated-away native row must be cleared.
+	if err := p.Fold(ctx, eventlog.Event{Seq: 0, Kind: "race_outcome", Backend: "codex", Detail: map[string]any{"passed": true}}); err != nil {
+		t.Fatalf("fold gen1 genesis: %v", err)
+	}
+	gm := standingMap(mustStanding(ctx, t, s))
+	if _, stale := gm["native"]; stale {
+		t.Errorf("rotated-away native standing must be cleared, got %v", gm)
+	}
+	if gm["codex"] != [2]int{1, 1} {
+		t.Errorf("post-rotation codex = %v, want 1/1 (fold resumed)", gm)
+	}
+
+	// Folding then continues normally on the new chain (seq 1 > the new watermark 0).
+	if err := p.Fold(ctx, eventlog.Event{Seq: 1, Kind: "race_outcome", Backend: "codex", Detail: map[string]any{"passed": false}}); err != nil {
+		t.Fatalf("fold gen1 seq1: %v", err)
+	}
+	if got := standingMap(mustStanding(ctx, t, s))["codex"]; got != [2]int{2, 1} {
+		t.Errorf("post-rotation codex after 2 races = %v, want 2/1", got)
+	}
+}
+
+// TestProjectorRebuildDropsStaleKeysAcrossGenerations guards the authoritative
+// truncate-then-rebuild: after a rotation the live log is a fresh genesis chain, so a
+// Rebuild over it must re-derive the WHOLE projection from THAT log — dropping
+// (class, backend) keys earned only in a rotated-away generation. Otherwise the
+// upsert-only rebuild would leave OverStore carrying keys OverLog (a fresh fold of the
+// same log) does not, breaking their parity (I5).
+func TestProjectorRebuildDropsStaleKeysAcrossGenerations(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	// Generation A: two backends earn standings.
+	genA := writeLog(t, []map[string]any{
+		{"backend": "native", "passed": true},
+		{"backend": "codex", "passed": false},
+	})
+	if err := experience.NewProjector(s).Rebuild(ctx, genA); err != nil {
+		t.Fatalf("rebuild genA: %v", err)
+	}
+	if st := mustStanding(ctx, t, s); len(st) != 2 {
+		t.Fatalf("after genA, standings = %v, want 2 backends", standingMap(st))
+	}
+
+	// Generation B (post-rotation): a fresh genesis chain with a DIFFERENT backend only.
+	// Rebuild over it must reflect ONLY genB — native and codex are gone.
+	genB := writeLog(t, []map[string]any{
+		{"backend": "claude-code", "passed": true},
+	})
+	if err := experience.NewProjector(s).Rebuild(ctx, genB); err != nil {
+		t.Fatalf("rebuild genB: %v", err)
+	}
+
+	gm := standingMap(mustStanding(ctx, t, s))
+	if _, stale := gm["native"]; stale {
+		t.Errorf("native (rotated-away) must be dropped, got %v", gm)
+	}
+	if _, stale := gm["codex"]; stale {
+		t.Errorf("codex (rotated-away) must be dropped, got %v", gm)
+	}
+	if gm["claude-code"] != [2]int{1, 1} {
+		t.Errorf("claude-code = %v, want 1/1", gm)
+	}
+
+	// OverStore == OverLog over the CURRENT log — the I5 parity the fix restores.
+	logRd, err := experience.OverLog(genB)
+	if err != nil {
+		t.Fatalf("OverLog genB: %v", err)
+	}
+	logSt, _ := logRd.BackendStanding(ctx, "")
+	if lm := standingMap(logSt); !reflect.DeepEqual(lm, gm) {
+		t.Errorf("OverStore != OverLog across generations: store=%v log=%v", gm, lm)
+	}
+}
+
+// mustStanding reads the global ("") backend standings from the store-backed reader,
+// failing the test on a query error.
+func mustStanding(ctx context.Context, t *testing.T, s *store.Store) []trust.Stat {
+	t.Helper()
+	st, err := experience.OverStore(s, nil).BackendStanding(ctx, "")
+	if err != nil {
+		t.Fatalf("backend standing: %v", err)
+	}
+	return st
 }
 
 func TestProjectorFailsClosedOnBrokenChain(t *testing.T) {

@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -46,6 +48,146 @@ func TestStdioRoundTripHonorsCtxOnStalledRead(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("roundTrip did not honor ctx cancellation on a stalled read (hang)")
+	}
+}
+
+// TestStdioRoundTripHonorsCtxOnBlockedWrite: the WRITE side must be ctx-cancellable too. A
+// server that stops draining its stdin makes t.enc.Encode block forever while holding t.mu,
+// wedging every other caller. net.Pipe is synchronous — with no reader on the server side the
+// very first Encode blocks — so this reproduces the write-side deadlock. Regression for it.
+func TestStdioRoundTripHonorsCtxOnBlockedWrite(t *testing.T) {
+	cConn, sConn := net.Pipe()
+	defer sConn.Close() // server side NEVER reads: the client's Encode blocks with nothing draining
+	defer cConn.Close()
+	st := newStdioTransport(cConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.roundTrip(ctx, rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the goroutine reach the blocked Encode
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocked stdio write must return context.Canceled on cancel, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("roundTrip did not honor ctx cancellation on a blocked write (write-side deadlock)")
+	}
+}
+
+// TestStdioCancelReapsChildViaProcessRW proves the whole cancel→teardown→reap chain: a
+// ctx-cancelled round-trip closes the transport, which (through processRW.Close) reaps the
+// child, so a stdio subprocess is never left a zombie until the next call or Manager.Close.
+func TestStdioCancelReapsChildViaProcessRW(t *testing.T) {
+	cConn, sConn := net.Pipe()
+	defer sConn.Close()
+	var reaped atomic.Int32
+	// processRW over the synchronous pipe: the server never drains, so Encode blocks; on
+	// cancel the transport's Close calls processRW.Close, which must invoke reap.
+	prw := &processRW{w: cConn, r: cConn, reap: func() { reaped.Add(1) }}
+	st := newStdioTransport(prw)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = st.roundTrip(ctx, rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled round-trip hung instead of tearing down")
+	}
+	if reaped.Load() == 0 {
+		t.Fatal("a ctx-cancelled round-trip must reap the child (processRW.reap) — zombie leak")
+	}
+}
+
+// TestCapReaderTripsAtCap unit-tests the per-response byte cap: it must stop EXACTLY at the
+// cap with errResponseTooLarge (a hard error, never a silently-truncated "ok" read), and a
+// fresh arm() must grant the next message its own budget (long-lived stdio reuse).
+func TestCapReaderTripsAtCap(t *testing.T) {
+	cr := &capReader{r: bytes.NewReader(make([]byte, 1000)), cap: 100}
+	cr.arm()
+	buf := make([]byte, 64)
+	var total int
+	for {
+		n, err := cr.Read(buf)
+		total += n
+		if err != nil {
+			if !errors.Is(err, errResponseTooLarge) {
+				t.Fatalf("want errResponseTooLarge at the cap, got %v", err)
+			}
+			break
+		}
+	}
+	if total != 100 {
+		t.Fatalf("capReader let %d bytes through, want exactly the 100-byte cap", total)
+	}
+	cr.arm() // a new message gets a fresh budget
+	if n, err := cr.Read(buf); err != nil || n == 0 {
+		t.Fatalf("after re-arm the reader must yield the next message's bytes, got n=%d err=%v", n, err)
+	}
+}
+
+// oversizedJSONResult streams a valid JSON-RPC response whose text field alone exceeds the
+// response cap, so decoding it must trip errResponseTooLarge rather than buffer it all.
+func oversizedJSONResult(w io.Writer) {
+	_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"`)
+	chunk := strings.Repeat("A", 64*1024)
+	for written := 0; written < maxResponseBytes+len(chunk); written += len(chunk) {
+		_, _ = io.WriteString(w, chunk)
+	}
+	_, _ = io.WriteString(w, `"}]}}`+"\n")
+}
+
+// TestStdioResponseCapRejectsOversized: a hostile stdio server streaming an unbounded reply
+// must be rejected (errResponseTooLarge), not buffered into an OOM (I7).
+func TestStdioResponseCapRejectsOversized(t *testing.T) {
+	cConn, sConn := net.Pipe()
+	defer cConn.Close()
+	go func() {
+		defer sConn.Close()
+		var req map[string]any
+		_ = json.NewDecoder(sConn).Decode(&req) // drain the request so the client's Encode completes
+		oversizedJSONResult(sConn)
+	}()
+	st := newStdioTransport(cConn)
+	_, err := st.roundTrip(context.Background(), rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+	if !errors.Is(err, errResponseTooLarge) {
+		t.Fatalf("oversized stdio response must be rejected as errResponseTooLarge, got %v", err)
+	}
+}
+
+// TestHTTPResponseCapRejectsOversized: same guard on the HTTP body path.
+func TestHTTPResponseCapRejectsOversized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		oversizedJSONResult(w)
+	}))
+	defer srv.Close()
+	ht := newHTTPTransport(srv.URL, nil, srv.Client())
+	_, err := ht.roundTrip(context.Background(), rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+	if !errors.Is(err, errResponseTooLarge) {
+		t.Fatalf("oversized HTTP body must be rejected as errResponseTooLarge, got %v", err)
+	}
+}
+
+// TestSSEResponseCapRejectsOversized: the SSE data accumulator must cap total bytes across
+// many data: lines in one event (each line is under the scanner cap, but the sum is not).
+func TestSSEResponseCapRejectsOversized(t *testing.T) {
+	var sb strings.Builder
+	line := "data: " + strings.Repeat("x", 60*1024) + "\n"
+	for sb.Len() < maxResponseBytes+len(line) {
+		sb.WriteString(line)
+	}
+	_, err := readSSEResponse(strings.NewReader(sb.String()), 1, "tools/call")
+	if !errors.Is(err, errResponseTooLarge) {
+		t.Fatalf("oversized SSE data accumulation must be rejected as errResponseTooLarge, got %v", err)
 	}
 }
 
@@ -431,5 +573,66 @@ func TestGenerateResourceAndPromptWrappers(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(base, "mcp", "servers", "docs", "prompts", "greet.json")); err != nil {
 		t.Errorf("prompt descriptor not written: %v", err)
+	}
+}
+
+// TestGenerateResourceWrappersPrunesStale: like the tool path, regenerating the resource set
+// must prune a descriptor for a resource the server dropped (so it can't stay discoverable),
+// and an EMPTY regeneration must clear them all.
+func TestGenerateResourceWrappersPrunesStale(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "mcp", "servers", "docs", "resources")
+	if err := GenerateResourceWrappers(base, "docs", []Resource{
+		{URI: "file://a.txt", Name: "A"},
+		{URI: "file://b.txt", Name: "B"},
+	}); err != nil {
+		t.Fatalf("GenerateResourceWrappers: %v", err)
+	}
+	// Regen with B removed → B pruned, A kept.
+	if err := GenerateResourceWrappers(base, "docs", []Resource{{URI: "file://a.txt", Name: "A"}}); err != nil {
+		t.Fatalf("re-GenerateResourceWrappers: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "A.json")); err != nil {
+		t.Errorf("live resource A.json must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "B.json")); !os.IsNotExist(err) {
+		t.Errorf("stale resource B.json must be pruned (err=%v)", err)
+	}
+	// Empty regen → everything pruned.
+	if err := GenerateResourceWrappers(base, "docs", nil); err != nil {
+		t.Fatalf("empty GenerateResourceWrappers: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "A.json")); !os.IsNotExist(err) {
+		t.Errorf("empty regen must prune all resources (A.json err=%v)", err)
+	}
+}
+
+// TestGeneratePromptWrappersPrunesStale: same reconcile for prompts.
+func TestGeneratePromptWrappersPrunesStale(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "mcp", "servers", "docs", "prompts")
+	if err := GeneratePromptWrappers(base, "docs", []Prompt{{Name: "greet"}, {Name: "bye"}}); err != nil {
+		t.Fatalf("GeneratePromptWrappers: %v", err)
+	}
+	if err := GeneratePromptWrappers(base, "docs", []Prompt{{Name: "greet"}}); err != nil {
+		t.Fatalf("re-GeneratePromptWrappers: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "greet.json")); err != nil {
+		t.Errorf("live prompt greet.json must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bye.json")); !os.IsNotExist(err) {
+		t.Errorf("stale prompt bye.json must be pruned (err=%v)", err)
+	}
+}
+
+// TestGenerateWrappersEmptyOnMissingDirIsNoop: pruning an empty set when no descriptors were
+// ever generated must be a clean no-op, not a read-error on the missing dir.
+func TestGenerateWrappersEmptyOnMissingDirIsNoop(t *testing.T) {
+	base := t.TempDir()
+	if err := GenerateResourceWrappers(base, "docs", nil); err != nil {
+		t.Errorf("empty resources on a fresh base must be a no-op, got %v", err)
+	}
+	if err := GeneratePromptWrappers(base, "docs", nil); err != nil {
+		t.Errorf("empty prompts on a fresh base must be a no-op, got %v", err)
 	}
 }

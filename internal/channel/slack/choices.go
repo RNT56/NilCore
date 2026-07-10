@@ -73,8 +73,12 @@ func (e *askEntry) blocks(token string) []map[string]any {
 	if e.multi {
 		hint = "toggle choices then tap Done, or just type your answer"
 	}
+	// The question is model-authored and may fold untrusted repo/tool content, so it is
+	// escaped before it enters this mrkdwn field — otherwise <!channel> / <@U…> / a forged
+	// <url|label> would be INTERPRETED by Slack (I7). The button labels are plain_text (not
+	// interpreted) and the hint is harness-controlled, so neither needs escaping.
 	return []map[string]any{
-		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*❓ " + e.question + "*"}},
+		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": "*❓ " + escapeSlack(e.question) + "*"}},
 		{"type": "actions", "elements": elems},
 		{"type": "context", "elements": []map[string]any{{"type": "mrkdwn", "text": hint}}},
 	}
@@ -84,7 +88,7 @@ func (e *askEntry) blocks(token string) []map[string]any {
 func (b *Bot) PostChoices(ctx context.Context, threadID, question string, choices []channel.AskChoice, multiSelect bool) error {
 	token := "k" + strconv.FormatInt(b.askSeq.Add(1), 10)
 	ent := &askEntry{question: question, choices: choices, multi: multiSelect, picked: make([]bool, len(choices)), channel: threadID}
-	ts, err := b.postMessageTS(ctx, map[string]any{"channel": threadID, "text": "❓ " + question, "blocks": ent.blocks(token)})
+	ts, err := b.postMessageTS(ctx, map[string]any{"channel": threadID, "text": "❓ " + escapeSlack(question), "blocks": ent.blocks(token)})
 	if err != nil {
 		return err
 	}
@@ -192,6 +196,6 @@ func (b *Bot) claim(token string) (*askEntry, bool) {
 // the operator sees the ☑ checkmarks accumulate.
 func (b *Bot) updateBlocks(ctx context.Context, ent *askEntry, token string) {
 	_ = b.apiPost(ctx, "chat.update", b.botToken, map[string]any{
-		"channel": ent.channel, "ts": ent.ts, "text": "❓ " + ent.question, "blocks": ent.blocks(token),
+		"channel": ent.channel, "ts": ent.ts, "text": "❓ " + escapeSlack(ent.question), "blocks": ent.blocks(token),
 	}, nil)
 }

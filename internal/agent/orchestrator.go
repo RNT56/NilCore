@@ -496,7 +496,24 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 	if o.Oracle != nil || o.Cost != nil {
 		class = trust.Classify(t.Goal)
 	}
-	var cands []route.Candidate
+	var (
+		cands  []route.Candidate
+		rwts   []*worktree.Worktree // parallel to cands; runRace disposes them (the winner is preserved under KeepBranch)
+		passed []*bool              // parallel to cands ONLY when KeepBranch; each recording verifier flips its own flag
+	)
+	// verifierFor wraps a candidate's verifier to RECORD its pass verdict, but ONLY when
+	// KeepBranch needs to identify the WINNER — route.Race returns just the winning Result,
+	// not its index, yet KeepBranch must preserve the WINNER's worktree/branch (never a
+	// loser's). Unwrapped otherwise, so the non-KeepBranch race is byte-identical.
+	verifierFor := func(v verify.Verifier) verify.Verifier {
+		if !o.KeepBranch {
+			return v
+		}
+		flag := new(bool)
+		passed = append(passed, flag)
+		return &raceRecorder{inner: v, passed: flag}
+	}
+
 	if o.multiBackend() {
 		// Multi path: race the DISTINCT configured backends (one fresh worktree per
 		// ordered name) so route.Race competes DIFFERENT backends and the verifier
@@ -512,20 +529,17 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 			if err != nil {
 				continue
 			}
-			defer func() { _ = rwt.Cleanup() }()
+			rwts = append(rwts, rwt)
 			rt := t
 			rt.Dir = rwt.Path()
 			renv := o.NewEnvFor(rt.Dir, name)
-			rc := route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class}
+			rc := route.Candidate{Backend: renv.Backend, Verifier: verifierFor(renv.Verifier), Task: rt, Class: class}
 			if o.Cost != nil {
 				rc.Cost = o.Cost(class, name)
 			}
 			cands = append(cands, rc)
 		}
-		if len(cands) == 0 {
-			return Outcome{}, false
-		}
-		return o.runRace(ctx, t, cands)
+		return o.runRace(ctx, t, cands, rwts, passed)
 	}
 
 	// Single path — byte-identical when the oracle is unwired: raceN copies of the
@@ -538,16 +552,13 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 		if err != nil {
 			continue
 		}
-		defer func() { _ = rwt.Cleanup() }()
+		rwts = append(rwts, rwt)
 		rt := t
 		rt.Dir = rwt.Path()
 		renv := o.NewEnv(rt.Dir)
-		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class})
+		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: verifierFor(renv.Verifier), Task: rt, Class: class})
 	}
-	if len(cands) == 0 {
-		return Outcome{}, false
-	}
-	return o.runRace(ctx, t, cands)
+	return o.runRace(ctx, t, cands, rwts, passed)
 }
 
 // raceEscalateDetail enriches a race_escalate event's Detail with the RTE-T05
@@ -608,17 +619,60 @@ func withFailureEvidence(constraints []string, failClass, verifierOutput string)
 	return append(out, line)
 }
 
-// runRace is the shared tail of both raceEscalate paths: judge the candidates by
-// the verifier (route.Race — I2), and on a winner record the durable terminal
-// status and write back facts. Both the single (N-copies) and multi (distinct
-// backends) paths feed identical candidates here, so the single path stays
-// byte-identical — only the candidate SET differs between them.
-func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate) (Outcome, bool) {
+// runRace is the shared tail of both raceEscalate paths: judge the candidates by the
+// verifier (route.Race — I2), then dispose every race worktree — EXCEPT, when KeepBranch is
+// set, the WINNER's, whose branch carries the verified work for the delivery loop (/diff,
+// /apply, a gated PR). Without preserving it, a first-attempt-fail + race-win under
+// KeepBranch reported "verified" while deleting the diff and its branch (D4 was honored only
+// on the non-race single path, so chat/serve/TUI drives that set KeepBranch+RaceN kept
+// NOTHING). rwts is parallel to cands; passed is parallel too when KeepBranch is set and
+// picks the WINNER — the lowest-index passing candidate, exactly route.Race's own selection.
+func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate, rwts []*worktree.Worktree, passed []*bool) (Outcome, bool) {
+	// keepIdx is the one race worktree to PRESERVE (a KeepBranch win): its branch carries
+	// the verified work. -1 disposes every worktree — the default and every non-KeepBranch
+	// race, byte-identical to before.
+	keepIdx := -1
+	defer func() {
+		for i, w := range rwts {
+			if i == keepIdx {
+				if rerr := w.Release(); rerr != nil {
+					o.Log.Append(eventlog.Event{Task: t.ID, Kind: "worktree_release",
+						Detail: map[string]any{"error": rerr.Error()}})
+				}
+				continue
+			}
+			if cerr := w.Cleanup(); cerr != nil {
+				o.Log.Append(eventlog.Event{Task: t.ID, Kind: "worktree_cleanup",
+					Detail: map[string]any{"error": cerr.Error()}})
+			}
+		}
+	}()
+
 	rres, ok := route.Race(ctx, cands, o.Log)
 	if !ok {
 		return Outcome{}, false
 	}
 	out := Outcome{Backend: rres.Backend, Summary: rres.Summary, Verified: true}
+
+	// D4 parity with the single path: preserve the WINNING candidate's branch under
+	// KeepBranch. The winner is the lowest-index passing candidate (route.Race's own rule),
+	// found via the recording verifiers. Commit its working tree so the branch carries the
+	// work (exactly like the single path's KeepBranch commit), keep it (Release, not
+	// Cleanup, via keepIdx above), and surface it in Outcome.Branch; the losers are still
+	// disposed. A commit failure is logged but the branch is still kept — the PR flow
+	// re-checks the diff, mirroring the single path.
+	if o.KeepBranch {
+		if idx := lowestPassed(passed); idx >= 0 && idx < len(rwts) {
+			w := rwts[idx]
+			if _, _, cerr := w.Commit(ctx, "nilcore: "+t.Goal); cerr != nil {
+				o.Log.Append(eventlog.Event{Task: t.ID, Kind: "keep_branch_commit",
+					Detail: map[string]any{"error": cerr.Error()}})
+			}
+			keepIdx = idx
+			out.Branch = w.Branch()
+		}
+	}
+
 	if o.Checkpoint != nil {
 		_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, true)
 	}
@@ -626,4 +680,38 @@ func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []rout
 		o.OnSuccess(ctx, t, out)
 	}
 	return out, true
+}
+
+// raceRecorder wraps a race candidate's verifier so runRace can learn WHICH candidate the
+// race selected: route.Race returns only the winning Result, not its index, but KeepBranch
+// must preserve the WINNER's worktree/branch (never a loser's). It records this candidate's
+// pass verdict into passed and is otherwise transparent (it returns the inner report
+// verbatim), so route.Race behaves identically. Installed only when KeepBranch is set.
+// route.Race runs each Check in its own goroutine and joins them (wg.Wait) before returning,
+// so the *bool a candidate owns is written by exactly one goroutine and read only after
+// route.Race returns — no shared write, no data race.
+type raceRecorder struct {
+	inner  verify.Verifier
+	passed *bool
+}
+
+func (r *raceRecorder) Check(ctx context.Context) (verify.Report, error) {
+	rep, err := r.inner.Check(ctx)
+	if err == nil {
+		*r.passed = rep.Passed
+	}
+	return rep, err
+}
+
+// lowestPassed returns the index of the lowest-index candidate whose recording verifier
+// reported a pass — the SAME winner route.Race selects (it returns the first passing
+// candidate in candidate order) — or -1 when none was recorded (no KeepBranch wrapping, or
+// none passed).
+func lowestPassed(passed []*bool) int {
+	for i, p := range passed {
+		if p != nil && *p {
+			return i
+		}
+	}
+	return -1
 }

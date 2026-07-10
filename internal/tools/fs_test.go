@@ -221,6 +221,76 @@ func TestReadRefusesFinalComponentSymlinkSwap(t *testing.T) {
 	}
 }
 
+// TestSearchSkipsUnreadableDir is the Fix-3 regression: an unreadable subdirectory
+// (perms 0000) must not abort the ENTIRE search — the readable root match is still
+// returned. Previously the WalkDir error for the bad dir propagated and failed the
+// whole query (worktree + every read root), while unreadable FILES were skipped.
+func TestSearchSkipsUnreadableDir(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "top.go", "package p\n// NEEDLE at the top level\n")
+	sub := filepath.Join(dir, "locked")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, sub, "inner.go", "// NEEDLE inside the locked dir\n")
+	if err := os.Chmod(sub, 0o000); err != nil {
+		t.Skipf("chmod unsupported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o755) }) // let TempDir cleanup remove it
+	if _, rerr := os.ReadDir(sub); rerr == nil {
+		t.Skip("directory still readable after chmod 0000 (running as root?)")
+	}
+
+	out, err := run(t, SearchTool{}, dir, `{"pattern":"NEEDLE"}`)
+	if err != nil {
+		t.Fatalf("search must not abort the whole query on an unreadable subdir: %v", err)
+	}
+	if !strings.Contains(out, "top.go") {
+		t.Errorf("the readable root match should still be returned:\n%s", out)
+	}
+}
+
+// TestPlanRefusesSymlinkedPlanFile is a Fix-2 regression: loadPlan now reads via
+// O_NOFOLLOW (readNoFollow), so a .nilcore/plan.json swapped for a symlink is refused
+// (ELOOP) rather than followed. The symlink target is IN-worktree so safePath passes —
+// isolating the O_NOFOLLOW read as the layer that must refuse the final-component link.
+func TestPlanRefusesSymlinkedPlanFile(t *testing.T) {
+	dir := t.TempDir()
+	realTarget := filepath.Join(dir, "real-plan.json")
+	if err := os.WriteFile(realTarget, []byte(`[{"id":"x","title":"FROM_SYMLINK","status":"pending"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".nilcore"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realTarget, filepath.Join(dir, ".nilcore", "plan.json")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	out, err := run(t, PlanTool{}, dir, `{"op":"get"}`)
+	if err == nil {
+		t.Fatalf("plan get must refuse a symlinked plan.json via O_NOFOLLOW (I4); got %q", out)
+	}
+	if strings.Contains(out, "FROM_SYMLINK") {
+		t.Fatal("plan followed a final-component symlink instead of refusing it")
+	}
+}
+
+// TestReadSymbolRefusesSymlinkedFile is a Fix-2 regression: sliceSymbol now reads via
+// O_NOFOLLOW, so a file-scoped read whose file is a symlink is refused rather than the
+// body being sliced THROUGH the link. The target is in-worktree (safePath passes), so
+// the no-follow slice read is the layer under test.
+func TestReadSymbolRefusesSymlinkedFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "real.go", "package p\nfunc Secret() { _ = \"SYMLINK_BODY\" }\n")
+	if err := os.Symlink(filepath.Join(dir, "real.go"), filepath.Join(dir, "evil.go")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	out, err := run(t, ReadSymbolTool{}, dir, `{"name":"Secret","file":"evil.go"}`)
+	if err == nil && strings.Contains(out, "SYMLINK_BODY") {
+		t.Fatalf("read_symbol sliced a symbol body THROUGH a final-component symlink: %q", out)
+	}
+}
+
 // TestEditRefusesFinalComponentSymlinkSwap: EditTool likewise reads via O_NOFOLLOW,
 // so it cannot be tricked into reading (and then rewriting through) a symlink swapped
 // in at the final component after the confinement check.

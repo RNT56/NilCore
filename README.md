@@ -105,7 +105,7 @@ Code is one artifact type among many — reports, comparison matrices, audits, b
 <td width="50%" valign="top">
 
 ▸ **Code intelligence** (**19 languages** — Go · Python · TS/JS · Rust · Java · C/C++ · C# · Ruby · Kotlin · Swift · …; heuristic scanners, LSP = the precise lens)
-AST · call graph · PageRank repo‑map · LSP · pure‑Go **HNSW** semantic search · Impact Set + SBFL · live worktree‑aware updates.
+AST · call graph · PageRank repo‑map · LSP · pure‑Go **HNSW** semantic search · Impact Set + affected-tests · live worktree‑aware updates.
 
 ▸ **It can see the running app**
 A sandboxed headless browser (`browser_view`) can **drive a flow first** (click / type / key / wait — log in, submit a form) over a pure‑Go CDP client, then hands the model a screenshot as a multimodal image; opt‑in, a composite verifier folds the behavioral check into the verdict. *(Live run is CI‑only; fails closed without a browser.)*

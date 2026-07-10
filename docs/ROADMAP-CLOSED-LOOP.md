@@ -322,7 +322,7 @@ Format: `ID — goal · depends · owns · verify`. Acceptance criteria for the 
 
 ### Pillar 7 — autonomy daemon + objectives (`AUTO`)
 - **AUTO-T01** — `objective` store table + typed CRUD. · — · `internal/store`, schema · additive; old-DB clean.
-- **AUTO-T02** — `internal/objective` leaf + idle-selection. · T01 · `internal/objective/` · `NextIdle`/`MarkRun`; deps stdlib.
+- **AUTO-T02** — `internal/objective` leaf + idle-selection. · T01 · `internal/objective/` · `NextIdle`/`MarkAttempt`/`MarkSuccess` (shipped as `MarkAttempt`+`MarkSuccess`, not `MarkRun`); deps stdlib.
 - **AUTO-T03** — `autosrc` registry + bounded priority queue. · — · `internal/autosrc/` · `container/heap`; drivegate-bounded.
 - **AUTO-T04** — existing sources as `autosrc` adapters (signals/cron/webhook/wake). · T03 · `internal/autosrc/adapters` · parity with today's verbs.
 - **AUTO-T05** — backlog source (idle self-service). · T02,T03 · `internal/autosrc/backlog.go` · reversible auto, irreversible gated.

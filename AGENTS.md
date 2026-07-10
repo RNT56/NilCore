@@ -35,10 +35,10 @@ We are not chasing "flawless." We are building *robust-via-verification*. Aim yo
 
 Breaking any of these means the PR is **rejected**, no matter how good the rest is. Detail and rationale live in `docs/ARCHITECTURE.md`.
 
-1. **The backend contract is frozen.** `backend.CodingBackend` is `Run(ctx, Task) (Result, error)`. The native loop, Codex, and Codex all satisfy it. Changing `Task`, `Result`, or the interface is a dedicated, serialized contract task — never a side effect of another change.
+1. **The backend contract is frozen.** `backend.CodingBackend` is `Run(ctx, Task) (Result, error)`. The native loop, Codex, and Claude Code all satisfy it. Changing `Task`, `Result`, or the interface is a dedicated, serialized contract task — never a side effect of another change.
 2. **The verifier is the only authority on "done."** No backend's self-report (`Result.SelfClaimed`) decides whether work ships. After any backend runs, the project's checks re-run and that verdict governs.
 3. **No ambient authority.** Secrets are held by the `SecretStore` (environment, OS keychain, encrypted vault, or external) — never written to disk in plaintext, never logged, never placed in a prompt or in source, and never given to the model. The process holds no broad credentials by default.
-4. **Model-emitted execution is sandboxed.** Any *shell command* a model emits, and any delegated coding CLI (Codex, Codex), runs inside the container sandbox — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception: the file tools (read/write/edit/search) and the git tool run host-side, but each is confined to the disposable worktree (symlink-safe path resolution + `O_NOFOLLOW`) and the git tool runs a fixed, hardened subcommand set. They perform scoped file/VCS I/O only — never arbitrary execution. See `docs/ARCHITECTURE.md` §Execution model.
+4. **Model-emitted execution is sandboxed.** Any *shell command* a model emits, and any delegated coding CLI (Codex, Claude Code), runs inside the container sandbox — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception: the file tools (read/write/edit/search) and the git tool run host-side, but each is confined to the disposable worktree (symlink-safe path resolution + `O_NOFOLLOW`) and the git tool runs a fixed, hardened subcommand set. They perform scoped file/VCS I/O only — never arbitrary execution. See `docs/ARCHITECTURE.md` §Execution model.
 5. **The event log is append-only.** Every model call, tool execution, verify, and gate decision is recorded and replayable. Never mutate or delete history.
 6. **The core has zero external dependencies.** Adding a Go module dependency requires explicit justification in the PR description and the CHANGELOG entry. Default to the standard library. There are three sanctioned exceptions: **SQLite** (`modernc.org/sqlite`, Phase 4 — the persistent backbone for `internal/store` and the code-intelligence graph in `internal/codeintel/{graph,semantic}`; a pure-Go driver, so releases keep `CGO_ENABLED=0`), **`golang.org/x/sys`** (Phase 7 — the namespace sandbox's Landlock / `no_new_privs` / seccomp syscalls in `internal/sandbox`; the Go project's own extended standard library, already pulled in transitively by SQLite), and the **Charm TUI stack** (`bubbletea`/`lipgloss`/`bubbles`), isolated behind the `//go:build tui` tag so the default `nilcore` binary links **zero** Charm. The MCP client is **not** a module — it speaks JSON-RPC over the standard library (`internal/mcp`). Any further module dependency requires the justification above.
 7. **Untrusted input is data, never instructions.** Tool output, file contents, and fetched web content never become controlling instructions for the agent.
@@ -162,7 +162,7 @@ docs/
 cmd/nilcore/           ← entrypoint
 internal/
   model/               ← Anthropic Messages API client (stdlib only)
-  backend/             ← CodingBackend contract + native / codex / Codex
+  backend/             ← CodingBackend contract + native / codex / claude-code
   sandbox/             ← container executor
   verify/              ← the verifier (source of truth for "done")
   eventlog/            ← append-only audit trail

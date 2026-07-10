@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // errDeliveryFailed marks a round-trip that failed BEFORE the request could reach the
@@ -34,6 +35,20 @@ import (
 // side (decode/EOF/non-2xx/JSON-RPC error) is NOT wrapped — the server may already have
 // executed the call, so it must never be auto-retried.
 var errDeliveryFailed = errors.New("mcp: request not delivered")
+
+// errResponseTooLarge marks a reply the peer sent that exceeds maxResponseBytes. It is a
+// RESPONSE-side failure (the server received and answered the call), so it is deliberately
+// NOT wrapped in errDeliveryFailed — a size-capped reply must never be auto-retried, and it
+// is surfaced as a hard error rather than a silently-truncated "successful" decode.
+var errResponseTooLarge = errors.New("mcp: response exceeds size cap")
+
+// maxResponseBytes bounds a single MCP response read off the wire — the stdio JSON value,
+// the HTTP body, and the accumulated SSE data of one event. MCP servers are UNTRUSTED (I7):
+// without a cap a hostile or buggy server can stream an unbounded reply and exhaust host
+// memory (OOM). Tool results are clipped to ~48KB downstream, so a few MiB is far more than
+// any legitimate result needs while still fencing a memory-exhaustion attack. It matches the
+// per-line SSE scanner cap below so no single allowed line can already blow the total.
+const maxResponseBytes = 8 << 20 // 8 MiB
 
 // rpcRequest / rpcNotification / rpcResponse are the JSON-RPC 2.0 frames. A request
 // carries an id and expects a response; a notification has no id and no reply.
@@ -80,11 +95,22 @@ type stdioTransport struct {
 	mu     sync.Mutex
 	enc    *json.Encoder
 	dec    *json.Decoder
+	rd     *capReader // bounds bytes per decoded response (I7 OOM guard)
 	closer io.Closer
+	// closed is set the moment this connection is torn down (on a ctx-cancelled round-trip,
+	// or by the Manager). Once set, no further round-trip touches the shared enc/dec — that
+	// would race the goroutine still unwinding out of the blocking Encode/Decode we abandoned
+	// — so a subsequent call short-circuits to a retryable delivery failure and the Manager
+	// reconnects on a fresh transport. atomic because Close may be called concurrently (the
+	// Manager tearing down) with a round-trip reading the flag.
+	closed atomic.Bool
 }
 
 func newStdioTransport(rw io.ReadWriteCloser) *stdioTransport {
-	return &stdioTransport{enc: json.NewEncoder(rw), dec: json.NewDecoder(rw), closer: rw}
+	// The decoder reads through capReader so one hostile response can't grow json.Decoder's
+	// buffer without bound; the encoder writes straight to rw (writes are not the OOM vector).
+	rd := &capReader{r: rw, cap: maxResponseBytes}
+	return &stdioTransport{enc: json.NewEncoder(rw), dec: json.NewDecoder(rd), rd: rd, closer: rw}
 }
 
 func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResponse, error) {
@@ -93,19 +119,42 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.enc.Encode(req); err != nil {
-		// Send side: the request never reached the server ⇒ safe to retry (errDeliveryFailed).
-		return rpcResponse{}, fmt.Errorf("%w: send %s: %v", errDeliveryFailed, req.Method, err)
+	if t.closed.Load() {
+		// A prior round-trip already tore this connection down on cancel; the abandoned
+		// Encode/Decode goroutine may still be unwinding, so never touch enc/dec again.
+		// Report a retryable delivery failure so the Manager evicts + reconnects fresh.
+		return rpcResponse{}, fmt.Errorf("%w: send %s: transport closed", errDeliveryFailed, req.Method)
 	}
-	// A json.Decoder read over the subprocess pipe is a BLOCKING call with no ctx
-	// awareness, so each decode runs in a goroutine and we select on ctx.Done(). Without
-	// this, a server that accepts the request but never replies (or never answers
-	// `initialize`) would wedge this call — and, because roundTrip holds t.mu, EVERY other
-	// caller of this shared per-server connection — indefinitely (a boot / cross-session
-	// deadlock). On cancellation we CLOSE the connection: the read goroutine's Decode then
-	// returns over the torn-down pipe, and the next call's Encode fails errDeliveryFailed,
-	// so the Manager evicts + reconnects (self-heal). The ch is buffered so the goroutine
-	// never leaks even after we have already returned on ctx.Done().
+	// WRITE side. t.enc.Encode is a BLOCKING pipe write with no ctx awareness: a server that
+	// stops draining its stdin (e.g. it is itself blocked writing a flood of notifications to
+	// a stdout nothing reads between round-trips) makes Encode block forever while holding
+	// t.mu — wedging every other caller, with ctx unable to unblock it. So the send runs in a
+	// goroutine and we select on ctx.Done() exactly like the read side. On cancel we CLOSE the
+	// connection (which unblocks the stuck Encode and forces a reconnect) and return ctx.Err().
+	// A partially-written frame may already have reached the server, so a cancel is NOT
+	// errDeliveryFailed (never auto-retried); only a CLEAN Encode error — the write provably
+	// never left the pipe — stays retryable. The chan is buffered so the goroutine never leaks
+	// even after we return on ctx.Done().
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- t.enc.Encode(req) }()
+	select {
+	case <-ctx.Done():
+		_ = t.Close()
+		return rpcResponse{}, ctx.Err()
+	case err := <-sendErr:
+		if err != nil {
+			return rpcResponse{}, fmt.Errorf("%w: send %s: %v", errDeliveryFailed, req.Method, err)
+		}
+	}
+	// READ side. A json.Decoder read over the subprocess pipe is likewise a BLOCKING call with
+	// no ctx awareness, so each decode runs in a goroutine and we select on ctx.Done(). Without
+	// this, a server that accepts the request but never replies (or never answers `initialize`)
+	// would wedge this call — and, because roundTrip holds t.mu, EVERY other caller of this
+	// shared per-server connection — indefinitely (a boot / cross-session deadlock). On
+	// cancellation we CLOSE the connection: the read goroutine's Decode then returns over the
+	// torn-down pipe, and the next call short-circuits errDeliveryFailed, so the Manager evicts
+	// + reconnects (self-heal). The ch is buffered so the goroutine never leaks even after we
+	// have already returned on ctx.Done().
 	type frame struct {
 		resp rpcResponse
 		err  error
@@ -114,6 +163,7 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 		if err := ctx.Err(); err != nil {
 			return rpcResponse{}, err
 		}
+		t.rd.arm() // fresh per-response byte budget before each blocking decode (I7 OOM guard)
 		ch := make(chan frame, 1)
 		go func() {
 			var resp rpcResponse
@@ -136,17 +186,64 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 	}
 }
 
-func (t *stdioTransport) notify(_ context.Context, n rpcNotification) error {
+// notify fires a one-way JSON-RPC notification. Like roundTrip's write side, the Encode is a
+// blocking pipe write, so it honors ctx: on cancel the connection is closed (unblocking the
+// stuck write) and ctx.Err() is returned, rather than wedging forever under t.mu.
+func (t *stdioTransport) notify(ctx context.Context, n rpcNotification) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.enc.Encode(n)
+	if t.closed.Load() {
+		return fmt.Errorf("%w: notify %s: transport closed", errDeliveryFailed, n.Method)
+	}
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- t.enc.Encode(n) }()
+	select {
+	case <-ctx.Done():
+		_ = t.Close()
+		return ctx.Err()
+	case err := <-sendErr:
+		return err
+	}
 }
 
 func (t *stdioTransport) Close() error {
+	t.closed.Store(true) // poison further round-trips; the abandoned goroutine keeps enc/dec to itself
 	if t.closer != nil {
 		return t.closer.Close()
 	}
 	return nil
+}
+
+// capReader bounds how many bytes a SINGLE decoded response may pull from the wire, so an
+// untrusted MCP server cannot make json.Decoder grow its buffer without limit and exhaust
+// host memory (I7). arm() is called before each Decode to grant that response a fresh budget
+// of cap bytes measured from the current read offset — which correctly accounts for bytes the
+// decoder buffered ahead while completing the previous message. Read trims each request to the
+// remaining budget and returns errResponseTooLarge the moment the budget is spent, turning an
+// oversized reply into a hard error rather than a silent truncation. It is only ever touched
+// by the single decode goroutine active under t.mu, so it needs no locking of its own.
+type capReader struct {
+	r        io.Reader
+	cap      int64
+	n        int64 // total bytes read from r so far
+	deadline int64 // n may not exceed this for the current response
+}
+
+func (c *capReader) arm() { c.deadline = c.n + c.cap }
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.n >= c.deadline {
+		return 0, errResponseTooLarge
+	}
+	if room := c.deadline - c.n; int64(len(p)) > room {
+		p = p[:room] // never pull more than the remaining budget, so we trip exactly at the cap
+	}
+	m, err := c.r.Read(p)
+	c.n += int64(m)
+	return m, err
 }
 
 // --- Streamable HTTP transport ----------------------------------------------
@@ -228,9 +325,19 @@ func (t *httpTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcRespo
 	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
 		return readSSEResponse(resp.Body, req.ID, req.Method)
 	}
+	// Bound the body: an untrusted server must not be able to stream an unbounded JSON reply
+	// and OOM the host (I7). Read at most cap+1 bytes; if the decoder consumed all of them the
+	// body overflowed the cap, which is a hard error (never a truncated-but-"successful" decode).
+	lr := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
 	var out rpcResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(lr).Decode(&out); err != nil {
+		if lr.N <= 0 {
+			return rpcResponse{}, fmt.Errorf("mcp http %s: %w", req.Method, errResponseTooLarge)
+		}
 		return rpcResponse{}, fmt.Errorf("mcp http %s decode: %w", req.Method, err)
+	}
+	if lr.N <= 0 {
+		return rpcResponse{}, fmt.Errorf("mcp http %s: %w", req.Method, errResponseTooLarge)
 	}
 	return out, nil
 }
@@ -294,7 +401,13 @@ func readSSEResponse(body io.Reader, wantID int, method string) (rpcResponse, er
 			continue
 		}
 		if strings.HasPrefix(line, "data:") {
-			// Per the SSE spec, multiple data: lines in one event join with '\n'.
+			// Per the SSE spec, multiple data: lines in one event join with '\n'. The scanner
+			// caps ONE line at 8MiB, but data accumulates across lines with no bound of its
+			// own, so an untrusted server could OOM the host with an event of endless data:
+			// lines (I7). Cap the total accumulated payload; exceeding it is a hard error.
+			if data.Len() > maxResponseBytes {
+				return rpcResponse{}, fmt.Errorf("mcp sse %s: %w", method, errResponseTooLarge)
+			}
 			if data.Len() > 0 {
 				data.WriteByte('\n')
 			}

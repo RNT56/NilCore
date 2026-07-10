@@ -414,6 +414,14 @@ func (s *Server) drainShutdown() {
 	s.mu.Unlock()
 	for _, th := range live {
 		th.sess.Wait()
+		// Persist each conversation's bounded work-state now that its drive has unwound,
+		// so a restart CONTINUES the thread rather than restarting it. Session.Checkpoint
+		// detaches from this (already-cancelled) shutdown ctx internally, so the write
+		// actually lands; a nil Store is a no-op. Best-effort: durability is a backstop,
+		// not a rail — a persistence fault must never block shutdown.
+		if err := th.sess.Checkpoint(context.Background()); err != nil {
+			s.Log.Append(eventlog.Event{Kind: "session_persist", Detail: map[string]any{"error": true}})
+		}
 		th.emit.wait()
 	}
 }
@@ -787,6 +795,16 @@ func (e *channelEmitter) wait() {
 	e.wg.Wait()
 }
 
+// verifyFailed reports whether a KindVerify line reads as a failure, so the channel
+// renderer shows ✗ rather than a green check. Mirrors termui's isFailure — the one
+// emit.KindVerify carries both the pass and the fail line.
+func verifyFailed(s string) bool {
+	l := strings.ToLower(s)
+	return strings.Contains(l, "did not pass") ||
+		strings.Contains(l, "not verified") ||
+		strings.Contains(l, "failed")
+}
+
 // surfaceLine renders one emit.Event as a single progress line for the channel.
 // It surfaces the harness-authored intent text (already metadata-light), never a
 // raw model/tool dump, so laundered tool output cannot ride into the thread
@@ -802,6 +820,13 @@ func surfaceLine(e emit.Event) string {
 	case emit.KindTool:
 		return "→ " + e.Text
 	case emit.KindVerify:
+		// A verify event carries BOTH verdicts on this one kind, so the glyph must read
+		// the text. Without this a failed serve drive rendered over Telegram/Slack as
+		// "✓ not verified — …": a green check on a failure. termui and the TUI already
+		// branch on the same predicate.
+		if verifyFailed(e.Text) {
+			return "✗ " + e.Text
+		}
 		return "✓ " + e.Text
 	case emit.KindSteerAck:
 		return "! " + e.Text

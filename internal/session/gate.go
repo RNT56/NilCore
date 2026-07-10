@@ -115,9 +115,15 @@ func (s *Session) approveViaTurn(ctx context.Context, action string, gp *emit.Ga
 // returns false when no gate is outstanding (the caller falls back to the normal path).
 func (s *Session) resolveGate(line string) bool {
 	s.mu.Lock()
-	pending := s.gatePending
-	s.mu.Unlock()
-	if !pending {
+	defer s.mu.Unlock()
+	// Re-check gatePending AND send under s.mu so the check-and-send is atomic with the
+	// gate's teardown (approveViaTurn's defer flips gatePending=false and drains gateReply
+	// under the SAME lock). The old shape read the flag, UNLOCKED, then sent: a line arriving
+	// once the gate had resolved could slip into the just-drained cap-1 buffer and return
+	// true, so Session.Turn logged a gate reply and DROPPED the line instead of falling
+	// through. The send is non-blocking on a cap-1 channel, so holding s.mu across it never
+	// blocks.
+	if !s.gatePending {
 		return false
 	}
 	select {

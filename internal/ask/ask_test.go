@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,5 +225,61 @@ func TestReprompt(t *testing.T) {
 	a := <-done
 	if len(a) != 1 || len(a[0].Selected) != 0 || a[0].Custom != "" {
 		t.Fatalf("want one declined answer, got %+v", a)
+	}
+}
+
+// TestResolveAfterBatchEndFallsThrough locks the atomic check-and-send: once a batch has
+// fully collected and Ask returned (its defer flipped pending=false under the box lock), a
+// late Resolve must return false so Session.Turn falls through to the follow-up path instead
+// of stranding the line in the just-drained cap-1 reply buffer (and reporting a bogus true).
+func TestResolveAfterBatchEndFallsThrough(t *testing.T) {
+	em := &chanEmitter{ch: make(chan emit.Event, 4)}
+	b := New(em)
+	done := make(chan struct{})
+	go func() {
+		_, _ = b.Ask(context.Background(), []backend.AskQuestion{{Prompt: "q"}})
+		close(done)
+	}()
+	<-em.ch // the box is (about to be) waiting on the one question
+	if !b.Resolve("answer") {
+		t.Fatal("Resolve during an active batch must deliver the answer")
+	}
+	<-done // Ask fully returned ⇒ pending is false under the lock
+	if b.Pending() {
+		t.Fatal("Pending must be false after Ask returned")
+	}
+	if b.Resolve("a late extra line") {
+		t.Fatal("a Resolve after the batch ended must return false (fall through), never strand the line")
+	}
+}
+
+// TestResolveConcurrentWithBatchEnd stresses Resolve racing the batch teardown under the
+// race detector: many rounds, each answering a one-question batch while a SECOND goroutine
+// fires an extra Resolve around the batch's end. It asserts no deadlock/panic and that Ask's
+// answer is always exactly one of the two sent lines — never corrupted, never empty (which
+// would mean the delivered reply was stranded by the teardown). The atomic check-and-send
+// keeps the single-flight rendezvous coherent under the race.
+func TestResolveConcurrentWithBatchEnd(t *testing.T) {
+	for round := 0; round < 200; round++ {
+		em := &chanEmitter{ch: make(chan emit.Event, 4)}
+		b := New(em)
+		got := make(chan string, 1)
+		go func() {
+			a, _ := b.Ask(context.Background(), []backend.AskQuestion{{Prompt: "q"}})
+			if len(a) == 1 {
+				got <- a[0].Custom
+			} else {
+				got <- "<none>"
+			}
+		}()
+		<-em.ch // box about to wait; both Resolves now race the consume + teardown
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); b.Resolve("first") }()
+		go func() { defer wg.Done(); b.Resolve("second") }()
+		wg.Wait()
+		if ans := <-got; ans != "first" && ans != "second" {
+			t.Fatalf("round %d: answer %q is neither sent line — the rendezvous was corrupted", round, ans)
+		}
 	}
 }

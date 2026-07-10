@@ -66,13 +66,15 @@ type projEvent struct {
 	Detail  map[string]any `json:"detail"`
 }
 
-// Rebuild drops nothing it shouldn't and re-derives the whole projection from the
-// append-only log: it replays every race_outcome into per-(class, backend)
-// standings AND every selfeval_report into per-config standings, records the
-// watermark + chain status in exp_meta, and FAILS CLOSED on a broken chain (it
-// records chain_ok=0 and returns the verify error, so no reader ranks over a
-// tampered log — I5). The log being append-only, re-running Rebuild upserts the
-// same rows, so it is idempotent for a given log.
+// Rebuild AUTHORITATIVELY re-derives the whole projection from the append-only log:
+// it clears the derived standings first (so keys from a rotated-away generation that
+// are absent from the current log do not linger), then replays every race_outcome into
+// per-(class, backend) standings AND every selfeval_report into per-config standings,
+// records the watermark + chain status in exp_meta, and FAILS CLOSED on a broken chain
+// (it records chain_ok=0 and returns the verify error, so no reader ranks over a
+// tampered log — I5). Because it truncates-then-rebuilds, the result reflects EXACTLY
+// the current log (OverStore == OverLog), and re-running it over the same log yields
+// the same rows — so it is idempotent for a given log.
 func (p *Projector) Rebuild(ctx context.Context, logPath string) error {
 	stands := map[standKey]*acc{}
 	confs := map[string]*confAcc{}
@@ -111,6 +113,17 @@ func (p *Projector) Rebuild(ctx context.Context, logPath string) error {
 	f.Close()
 
 	verr := eventlog.Verify(logPath)
+	// Authoritative re-derive (I5): clear the derived standings so the rebuilt
+	// projection reflects ONLY the current log. serve rotates the log at 64 MiB by
+	// moving it aside and starting a FRESH genesis chain (maint.RotateLog), so a
+	// (class, backend) or config key that earned standings in a rotated-away generation
+	// but is ABSENT from the current log must not linger. Upsert-only could never drop
+	// such a key, leaving OverStore (the projection) carrying keys OverLog (a fresh fold
+	// of the very same log) does not — breaking their parity. A truncate-then-rebuild
+	// drops them. The clear is atomic and never touches the append-only log itself.
+	if err := p.s.ClearExpStandings(ctx); err != nil {
+		return fmt.Errorf("clearing projection: %w", err)
+	}
 	for k, a := range stands {
 		if err := p.s.UpsertBackendStanding(ctx, store.BackendStanding{
 			Class: k.class, Backend: k.backend, Races: a.races, Passes: a.passes,
@@ -136,8 +149,10 @@ func (p *Projector) Rebuild(ctx context.Context, logPath string) error {
 }
 
 // Fold incrementally folds ONE already-durable event into the projection. It is
-// idempotent via the exp_meta.source_seq watermark (folding an event at or below
-// the watermark is a no-op), so a replayed or duplicated event never double-counts.
+// idempotent via the exp_meta.source_seq watermark (re-folding the event AT the
+// watermark is a no-op), so a replayed or duplicated event never double-counts — while
+// an event BELOW the watermark is treated as a log rotation (a new genesis chain) and
+// re-derives from it, never a replay (see the rotation-awareness note below).
 // Only verifier-judged events change state (I2): race_outcome verdicts fold into
 // per-(class, backend) standings, and selfeval_report records (emitted by
 // selfeval.Fold only over a verified chain) fold into per-config standings. Every
@@ -150,13 +165,37 @@ func (p *Projector) Fold(ctx context.Context, e eventlog.Event) error {
 	if err != nil {
 		return err
 	}
-	// A fresh projection (no meta row yet) has folded NOTHING — not even seq 0. Only
-	// once a meta row exists is SourceSeq a real high-water mark, so an event at or
-	// below it is already folded (idempotent). Distinguishing the two lets an event
-	// that is the literal first log entry (seq 0) fold under live activation instead
-	// of being dropped by a spurious 0 <= 0 test.
-	if ok && int64(e.Seq) <= meta.SourceSeq {
+	// Rotation awareness (I5). serve caps the append-only log at 64 MiB by moving it
+	// aside and starting a FRESH genesis chain whose seq counter restarts at 0
+	// (maint.RotateLog + a fresh eventlog.Open). The live OnAppend hook then folds that
+	// new chain, so its low seqs land far BELOW the high-water mark the rotated-away
+	// chain left in exp_meta. The append hook delivers seqs strictly INCREASING within a
+	// generation, so the ONLY way a verifier-judged event arrives with a seq below the
+	// stored watermark is a new chain — a backward seq jump a single generation can
+	// never produce. So a below-watermark seq is a rotation, NOT a replay: detect it and
+	// re-derive from the fresh chain, rather than dropping every post-rotation event as
+	// "already folded" (which silently no-ops the projection until the new chain climbs
+	// past the old watermark — ~64 MiB of events later).
+	rotated := ok && int64(e.Seq) < meta.SourceSeq
+	// A fresh projection (no meta row yet) has folded NOTHING — not even seq 0 — so it
+	// must fold. Once a meta row exists, an event AT the watermark (seq == SourceSeq) is
+	// a re-delivered latest event and is a no-op (idempotent); an event BELOW it is a
+	// rotation (handled above), never a replay. Distinguishing "fresh" from "at
+	// watermark" lets the literal first log entry (seq 0) fold under live activation
+	// instead of being dropped by a spurious 0 <= 0 test.
+	if ok && int64(e.Seq) <= meta.SourceSeq && !rotated {
 		return nil // already folded (idempotent)
+	}
+	if rotated {
+		// The projection still holds the rotated-away chain's standings, but the current
+		// log no longer contains those events. Clear the derived standings so this fresh
+		// chain re-accumulates from its genesis — keeping the warm projection equal to a
+		// fresh fold of the CURRENT log (OverStore == OverLog), exactly as Rebuild does.
+		// Only the DROPPABLE derived projection is cleared; the append-only log is never
+		// touched (I5).
+		if err := p.s.ClearExpStandings(ctx); err != nil {
+			return err
+		}
 	}
 
 	pe := projEvent{Kind: e.Kind, Backend: e.Backend, Detail: e.Detail, Time: e.Time}

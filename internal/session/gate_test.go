@@ -98,6 +98,35 @@ func TestGateCancelDenies(t *testing.T) {
 	}
 }
 
+// TestResolveGateAfterAnswerFallsThrough locks the gate's atomic check-and-send: once the
+// gate has been answered and the drive completed (gatePending=false under s.mu), a late
+// resolveGate must return false so a trailing line falls through to the normal follow-up
+// path instead of stranding in the just-drained gateReply buffer (and reporting a bogus true
+// that Session.Turn would log as a gate reply and DROP).
+func TestResolveGateAfterAnswerFallsThrough(t *testing.T) {
+	drv := &gatingDriver{action: "push to main", started: make(chan struct{}), done: make(chan struct{})}
+	s := newGatingSession(t, drv)
+	if err := s.Turn(context.Background(), "go"); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	waitClosed(t, drv.started)
+	waitFor(t, func() bool { return s.PhaseNow() == AwaitingGate && s.gatePendingNow() })
+	// Delivering the answer while the gate is parked succeeds and lets the drive complete.
+	if !s.resolveGate("y") {
+		t.Fatal("resolveGate during an active gate must deliver the answer")
+	}
+	waitClosed(t, drv.done)
+	s.Wait()
+	waitPhase(t, s, Idle)
+	if s.gatePendingNow() {
+		t.Fatal("gatePending must be false after the gate resolved")
+	}
+	// A late line after the gate resolved must NOT resolve a (nonexistent) gate.
+	if s.resolveGate("y") {
+		t.Fatal("resolveGate after the gate resolved must return false (fall through), never strand the line")
+	}
+}
+
 // gatePendingNow exposes gatePending under the lock for tests.
 func (s *Session) gatePendingNow() bool {
 	s.mu.Lock()

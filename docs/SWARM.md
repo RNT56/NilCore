@@ -413,6 +413,8 @@ import `preset` — the sharder carries `Kind`/`Pack`/`Role` as plain fields).
 --jitter DUR (default 750ms)   --egress-allow host,…   --report text|md|html|json|matrix   --resume   --sandbox/--runtime/--image/--log/--config/--deadline
 ```
 
+> _Features-review fix:_ `--egress-allow` (and each preset's derived egress) now actually reaches the shards — a per-shard allowlist proxy is stood up and applied to every shard box. Previously every shard ran `--network none`, so `--egress-allow` was inert and a web-needing preset (e.g. `research`) could never verify green. Relatedly, `--resume` now re-seeds skipped/queued/running shards (planned-DAG dependents were being dropped) and red budget-exhausted shards block a clean converge.
+
 **`--artifact` consumer (SW-T17).** Parse the `+`-joined list into (a) the per-shard `artifact.Kind`
 the shardFn enforces (overrides the preset default when given) and (b) the run-level **deliverable
 set** the final renderer produces (text/md/html report **and/or** `RenderMatrix`). `matrix` always

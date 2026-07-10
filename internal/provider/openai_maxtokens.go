@@ -47,34 +47,50 @@ func (r oaiRequest) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// "model" is always present and always first (no omitempty), so the body
-	// begins with `{"model":<...>` and the next byte is either '}' (no other
-	// fields) or ','. Splice the single token key right after the model value,
-	// preserving the original field position.
-	insertAt := bytes.IndexByte(rest, ',')
 	tokenPart := append(keyVal, ':')
 	tokenPart = append(tokenPart, []byte(fmt.Sprintf("%d", r.MaxTokens))...)
 
-	var out []byte
-	if insertAt < 0 {
-		// Only "model" was emitted: `{"model":...}` -> insert before the '}'.
-		closeAt := bytes.LastIndexByte(rest, '}')
-		if closeAt < 0 {
-			return nil, fmt.Errorf("oaiRequest: malformed marshalled body %q", rest)
-		}
-		out = make([]byte, 0, len(rest)+len(tokenPart)+1)
-		out = append(out, rest[:closeAt]...)
-		out = append(out, ',')
-		out = append(out, tokenPart...)
-		out = append(out, rest[closeAt:]...)
-		return out, nil
+	// "model" is always present and always first (no omitempty), so the body begins
+	// with `{"model":<json-string>` and the model value is immediately followed by
+	// either '}' (no other fields) or ','. Insert the single token key right after
+	// that value, so it lands as the second field exactly where the original omitempty
+	// int placed it. We locate the value's END by scanning the JSON string (honoring
+	// escapes) — NOT by finding the first ',' byte, which was the bug: a model id
+	// containing a comma (e.g. an OpenRouter route list) puts a comma INSIDE the model
+	// string, and splicing there produces corrupt JSON.
+	const modelPrefix = `{"model":`
+	if !bytes.HasPrefix(rest, []byte(modelPrefix)) {
+		return nil, fmt.Errorf("oaiRequest: marshalled body does not begin with the model field: %q", tail(string(rest), 120))
 	}
-	// At least one more field follows "model": splice the token key + a comma
-	// in at the first comma boundary, keeping `max_tokens` as the second field.
-	out = make([]byte, 0, len(rest)+len(tokenPart)+1)
-	out = append(out, rest[:insertAt+1]...) // up to and including the first comma
-	out = append(out, tokenPart...)
+	valEnd := endOfJSONString(rest, len(modelPrefix))
+	if valEnd < 0 {
+		return nil, fmt.Errorf("oaiRequest: could not locate the model value boundary in %q", tail(string(rest), 120))
+	}
+	// rest[valEnd:] is either "}" or ",<more fields>}"; inserting ",<token>" before it
+	// yields `...<model>","max_tokens":N}` or `...<model>","max_tokens":N,<more>}`.
+	out := make([]byte, 0, len(rest)+len(tokenPart)+1)
+	out = append(out, rest[:valEnd]...)
 	out = append(out, ',')
-	out = append(out, rest[insertAt+1:]...)
+	out = append(out, tokenPart...)
+	out = append(out, rest[valEnd:]...)
 	return out, nil
+}
+
+// endOfJSONString returns the index in b just PAST the closing quote of the JSON
+// string that begins at b[start] (which must be the opening '"'), honoring backslash
+// escapes so a quote inside the string is not mistaken for the terminator. It returns
+// -1 if b[start] is not a quote or the string is unterminated.
+func endOfJSONString(b []byte, start int) int {
+	if start >= len(b) || b[start] != '"' {
+		return -1
+	}
+	for i := start + 1; i < len(b); i++ {
+		switch b[i] {
+		case '\\':
+			i++ // skip the escaped byte (e.g. \" or \\)
+		case '"':
+			return i + 1
+		}
+	}
+	return -1
 }
