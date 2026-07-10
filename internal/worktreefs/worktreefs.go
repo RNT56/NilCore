@@ -418,12 +418,19 @@ func resolveExistingPrefix(p string) (string, error) {
 }
 
 // hasGitComponent reports whether rel — an OS-separated path relative to the
-// worktree root — has a component exactly equal to ".git" (the entry itself or any
-// segment inside a ".git" directory). ".gitignore"/".gitattributes"/".github" are
-// NOT ".git", so legitimate tracked files are unaffected.
+// worktree root — has a component that a real filesystem would resolve to ".git"
+// (the entry itself or any segment inside a ".git" directory). It matches the way a
+// case-insensitive / name-normalizing filesystem resolves names: fold case (macOS
+// APFS/HFS+ and Windows are case-insensitive, so ".GIT"/".Git" open the real ".git")
+// and strip trailing dots and spaces (Windows strips them, so ".git." and ".git "
+// also open ".git"). Without this, `.GIT/config` slips past the guard on macOS and
+// lands in the REAL .git/config — reopening the repo-local-config RCE (a filter.*.clean
+// planted there runs on the next host-side `git add`). On a case-sensitive FS this is a
+// harmless over-restriction (a genuine ".GIT" directory is not a git dir).
+// ".gitignore"/".gitattributes"/".github" differ from ".git" and stay writable.
 func hasGitComponent(rel string) bool {
 	for _, comp := range strings.Split(rel, string(os.PathSeparator)) {
-		if comp == ".git" {
+		if strings.EqualFold(strings.TrimRight(comp, ". "), ".git") {
 			return true
 		}
 	}

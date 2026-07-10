@@ -381,8 +381,12 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 			// survive). So before the disposable task/<id> worktree is cleaned up we pin its
 			// committed HEAD under a distinct, collision-safe, sweep-safe ref
 			// (suspend/<id>, mirroring the resume/ durable-anchor convention): the commits
-			// stay reachable for the wake to resume, while uncommitted working-tree edits
-			// remain disposable exactly as the guidance states. Best-effort — a Head/pin
+			// stay reachable as a durable RECOVERY anchor so they are never lost, while
+			// uncommitted working-tree edits remain disposable exactly as the guidance
+			// states. (The current wake re-engages a fresh drive from the note; it does NOT
+			// yet auto-reattach onto this ref — auto-reattach + suspend/<id> GC is a
+			// documented follow-up. The ref means the committed work is RECOVERABLE, not
+			// destroyed — which is the data-loss finding this closes.) Best-effort — a Head/pin
 			// failure is logged and we still record what we can and unwind cleanly.
 			branch := "suspend/" + t.ID
 			if sha, herr := wt.Head(ctx); herr != nil {
@@ -395,8 +399,9 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 					Detail: map[string]any{"error": perr.Error()}})
 			}
 			if o.Checkpoint != nil {
-				// Record the preserved branch in the durable checkpoint so a resume can find
-				// and reattach to the committed work rather than starting from an empty tree.
+				// Record the preserved branch in the durable checkpoint so the committed work
+				// is discoverable under this ref (a recovery anchor). NOTE: no path reads this
+				// back yet — the wake re-drives fresh from the note; auto-reattach is a follow-up.
 				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal, branch)
 			}
 			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended",

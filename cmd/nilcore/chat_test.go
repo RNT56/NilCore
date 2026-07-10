@@ -585,6 +585,27 @@ func TestApplyContainerEgress(t *testing.T) {
 	if deny.Network != "none" {
 		t.Errorf("no allowlist must stay --network none, got %q", deny.Network)
 	}
+
+	// NILCORE_EGRESS_STRICT: refuse cooperative container egress even with a real
+	// allowlist + proxy. The box stays deny-all (--network none) and NO proxy env is
+	// set — pre-fix this returned bridge + HTTP(S)_PROXY, silently pretending the
+	// cooperative allowlist was a hard wall.
+	t.Run("strict mode refuses cooperative egress", func(t *testing.T) {
+		t.Setenv("NILCORE_EGRESS_STRICT", "1")
+		strict := sandbox.NewContainer("podman", "img", "/work")
+		applyContainerEgress(strict, egress, "0.0.0.0:54321", "podman")
+		if strict.Network != "none" {
+			t.Errorf("strict egress: Network = %q, want none (never bridge)", strict.Network)
+		}
+		for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+			if strict.Env[k] != "" {
+				t.Errorf("strict egress must set no proxy env, got %s=%q", k, strict.Env[k])
+			}
+		}
+		if len(strict.ExtraHosts) != 0 {
+			t.Errorf("strict egress must add no --add-host, got %v", strict.ExtraHosts)
+		}
+	})
 }
 
 func TestWebEnabled(t *testing.T) {

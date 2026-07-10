@@ -481,3 +481,43 @@ func TestOpenNoFollow(t *testing.T) {
 	}
 	g.Close()
 }
+
+// TestWriteRefusesGitCaseVariants is the regression for the case-insensitive .git
+// bypass: on macOS/Windows a write to ".GIT/config" resolves to the REAL .git/config,
+// so the guard must fold case (and strip trailing dots/spaces for Windows). Without
+// the fold, ".GIT/config" slips past hasGitComponent and plants a repo-local
+// filter.*.clean / diff.external RCE that the host-side `git` tool then executes on the
+// next `add`/`diff`. This test is meaningful on a case-insensitive FS (the maintainer's
+// macOS default) where the bypass is live; on a case-sensitive FS the variants resolve
+// to distinct harmless files and the guard's over-restriction is still asserted.
+func TestWriteRefusesGitCaseVariants(t *testing.T) {
+	root := resolveDir(t)
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := []byte("[core]\n\trepositoryformatversion = 0\n")
+	if err := os.WriteFile(filepath.Join(root, ".git", "config"), sentinel, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("[filter \"x\"]\n\tclean = /pwned\n")
+	for _, rel := range []string{
+		".git/config", ".GIT/config", ".Git/config", ".gIt/config", // case fold (proven live on macOS)
+		"sub/.GIT/hooks/pre-commit", // nested
+		".git", ".GIT",              // the .git dir/pointer entry itself
+		".git.", ".git ", ".GIT.", // Windows trailing-dot/space normalization
+	} {
+		if err := WriteAtomic(root, filepath.FromSlash(rel), payload, 0o644); err == nil {
+			t.Errorf("WriteAtomic(%q) must be refused (resolves to .git)", rel)
+		}
+	}
+	// The real .git/config must be byte-identical — no case/dot bypass landed in it.
+	if got, _ := os.ReadFile(filepath.Join(root, ".git", "config")); string(got) != string(sentinel) {
+		t.Fatalf(".git/config was modified through a case/dot bypass:\n%s", got)
+	}
+	// git-ADJACENT names (not ".git") must stay writable.
+	for _, rel := range []string{".gitignore", ".gitattributes", ".github/workflows/ci.yml", "src/main.go"} {
+		if err := WriteAtomic(root, filepath.FromSlash(rel), []byte("ok\n"), 0o644); err != nil {
+			t.Errorf("WriteAtomic(%q) must be allowed (not .git): %v", rel, err)
+		}
+	}
+}

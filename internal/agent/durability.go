@@ -44,11 +44,13 @@ func (c *Checkpoint) Complete(ctx context.Context, taskID, goal string, verified
 // wake registry owns resume, which would otherwise double it. One UpsertTask write.
 //
 // branch is the ref under which the drive's committed work was preserved across the nap
-// ("" when nothing was preserved). It is recorded in the row's Detail so a resume can
-// find and reattach to that committed work instead of starting from a fresh, empty
-// worktree — the durable half of the "committed work survives a sleep" guarantee. Detail
-// is a small JSON object so the schema stays forward-compatible (new fields default-zero
-// on an old row); an empty branch leaves Detail "" (byte-identical to the pre-fix row).
+// ("" when nothing was preserved). It is recorded in the row's Detail as a durable
+// RECOVERY anchor — the committed work survives the sleep and stays discoverable under
+// this ref (the "committed work survives a sleep" guarantee: it is never lost). NOTE: no
+// code reads this back yet — the wake re-engages a fresh drive, so this is recovery-only;
+// auto-reattach onto the ref is a documented follow-up. Detail is a small JSON object so
+// the schema stays forward-compatible (new fields default-zero on an old row); an empty
+// branch leaves Detail "" (byte-identical to the pre-fix row).
 func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal, branch string) error {
 	detail := ""
 	if branch != "" {
@@ -60,8 +62,9 @@ func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal, branch string) e
 }
 
 // suspendDetail is the JSON payload of a suspended task row: the ref under which the
-// drive's committed work was preserved, so a resume can reattach to it rather than
-// re-run from an empty tree.
+// drive's committed work was preserved (a durable recovery anchor). It is written on
+// suspend and is NOT yet read back on wake (auto-reattach is a follow-up) — the committed
+// work is recoverable under this ref, never lost.
 type suspendDetail struct {
 	Branch string `json:"branch,omitempty"`
 }
