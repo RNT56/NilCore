@@ -183,6 +183,17 @@ func chatMain(args []string) {
 	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console, proxyBindAddr(*cf.common.sandboxPref, *cf.common.runtime))
 	defer stopProxy()
 
+	// Rule of Two (§2): evaluate the lethal trifecta ONCE at startup — untrusted web input
+	// (A) ∧ private repo data (B, the mounted worktree) ∧ open egress (C). The shipped
+	// default egress is deny-all, so the verdict is Allow and this is byte-identical; only
+	// a wide/wildcard egress allowlist trips it. chat is attended, so a trip prompts once at
+	// the console. NILCORE_RULE_OF_TWO=0 opts out.
+	if err := enforceRuleOfTwo(log, ruleOfTwoEnforced(), !egress.Empty(), true, egress,
+		policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		"start a coding session combining untrusted web input, private repo data, and open egress"); err != nil {
+		fatal(err)
+	}
+
 	sess, err := buildChatSession(chatDeps{
 		flags:           cf,
 		provider:        prov,
