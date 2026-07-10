@@ -1235,6 +1235,16 @@ func serveMain(args []string) {
 		fmt.Fprintf(os.Stderr, "nilcore serve: web access on — search: %s, %d allowed host(s)\n", searchBackend, len(webAllow))
 	}
 
+	// Rule of Two (§2): serve is a HEADLESS daemon, so the lethal trifecta (untrusted web
+	// input ∧ private repo data ∧ open egress) with no human present is exactly the
+	// combination the Rule of Two refuses. Default egress is deny-all ⇒ Allow ⇒
+	// byte-identical; only a wide/wildcard egress config makes serve refuse to start (nil
+	// gate ⇒ fail-closed Refuse). Narrow the egress allowlist, or set NILCORE_RULE_OF_TWO=0
+	// to opt out.
+	if err := enforceRuleOfTwo(log, ruleOfTwoEnforced(), !egress.Empty(), true, egress, nil, ""); err != nil {
+		fatal(err)
+	}
+
 	// The self-timer registry behind the `sleep` tool — durable over the checkpointer's
 	// store, so wakes survive a restart (re-fired by the waker on next boot). Off
 	// without a checkpointer (nil ⇒ no `sleep` tool, no waker).

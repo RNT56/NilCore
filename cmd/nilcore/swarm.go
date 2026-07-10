@@ -191,6 +191,17 @@ func swarmMain(args []string) {
 // iff the run converged with an empty worklist AND the report's chain verifies (so a
 // tampered log can never read green); otherwise os.Exit(1) after printing the scoreboard.
 func swarmRun(d swarmDeps) {
+	// Rule of Two (§2): swarm is a HEADLESS batch path, so the lethal trifecta (untrusted
+	// web input ∧ private repo data ∧ open egress) with no human present is the combination
+	// the Rule of Two refuses. Axis C is evaluated over the operator's --egress-allow widen
+	// — the open-egress vector; the preset's own hosts are curated verify-pack hosts and
+	// roster.EgressFor narrows per role, so this fails safe. Default (no --egress-allow) ⇒
+	// empty ⇒ Allow ⇒ byte-identical; a wide/wildcard widen makes swarm refuse to start (nil
+	// gate ⇒ fail-closed). Set NILCORE_RULE_OF_TWO=0 to opt out.
+	swarmEgress := policy.Egress{Allowed: splitCSV(*d.flags.egressAllow)}
+	if err := enforceRuleOfTwo(d.log, ruleOfTwoEnforced(), len(swarmEgress.Allowed) > 0, true, swarmEgress, nil, ""); err != nil {
+		fatal(err)
+	}
 	asm, err := buildSwarm(d)
 	if err != nil {
 		fatal(err)
