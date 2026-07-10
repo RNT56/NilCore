@@ -8,7 +8,7 @@ without adding a Go module, and keeping the default binary byte-identical until 
 Read order: `CLAUDE.md` §2 (invariants) → `docs/ARCHITECTURE.md` (providers) → this file → `docs/TASKS.md`
 (the Phase-15 queue rows + specs).
 
-> **Status: SHIPPED.** The provider upgrade (T01–T06, T10–T12, T15–T16) merged in PR #61.
+> **Status: SHIPPED.** The provider upgrade's non-web waves (T01–T06, T10–T12) merged in PR #61 (this Phase-15 DAG runs T01–T14 — there is no T15/T16).
 > **Web search (T07 · T08 · T09) is now shipped too** — the `model.BuiltinTool` foundation it
 > depended on landed via the computer-use work (#60). Native render: Anthropic tools-entry
 > (`web_search_20250305`), OpenAI top-level `web_search_options`, OpenRouter `web` plugin —
@@ -41,12 +41,17 @@ reference adapter (already complete); it is touched only where parity informs th
 
 ---
 
-## 1. Where we are today
+## 1. Where we started (pre-upgrade baseline)
 
-`internal/provider` exposes three vendors behind the `model.Provider` seam (`anthropic`, `openai`,
-`openrouter`); OpenRouter reuses the OpenAI Chat Completions adapter at a different base URL. Anthropic is
-complete; OpenAI/OpenRouter are correct for the basics (non-stream + streaming, role mapping, tool_calls,
-base64 vision, `finish_reason`→`stop_reason`, usage, ctx-aware interrupt). The decisive gaps:
+> This section is the **starting point** the upgrade addressed, not current state — every gap below is
+> now closed by the SHIPPED work (a fourth `openai-compatible` vendor, configurable BaseURL, the
+> `max_completion_tokens` swap, reasoning/structured-output fields, typed errors, and the
+> capability-selected web-search paths). Read it for the *why*, not the *now*.
+
+`internal/provider` exposed three vendors behind the `model.Provider` seam (`anthropic`, `openai`,
+`openrouter`); OpenRouter reused the OpenAI Chat Completions adapter at a different base URL. Anthropic was
+complete; OpenAI/OpenRouter were correct for the basics (non-stream + streaming, role mapping, tool_calls,
+base64 vision, `finish_reason`→`stop_reason`, usage, ctx-aware interrupt). The decisive gaps at that point:
 
 - The chat adapter's `baseURL` is an **unexported, hardcoded field with no setter** — so an arbitrary
   OpenAI-compatible endpoint is **unreachable today** (the only generic path is `openrouter`, which targets
@@ -65,7 +70,10 @@ A sandboxed, `guard.Wrap`'d **client-side web search/fetch** already ships
 
 ## 2. State-of-the-art gap matrix
 
-| Capability | Providers | Today | Target | Importance |
+The "Pre-upgrade" column is the baseline the upgrade started from; every ❌ below is now closed by the
+SHIPPED adapter (the one row already flipped to ✅ is the typed-error/`Retry-After` seam, wired at merge).
+
+| Capability | Providers | Pre-upgrade | Target | Importance |
 |---|---|---|---|---|
 | `max_completion_tokens` | OpenAI/Azure | ❌ hardcoded `max_tokens`, rejected by gpt-5.x/o-series | selectable single key (REPLACE, never both) | **must (blocker)** |
 | Reasoning-effort control | OpenAI `reasoning_effort`, OpenRouter `reasoning{}` | ❌ always model default | operator-set `none…xhigh` (+ budget on OR) | **must** |
@@ -158,8 +166,11 @@ corrupt the turn).
 
 ## 5. Cross-phase dependency
 
-P15-T07/T08/T09 extend `model.BuiltinTool` (web-search variant) and a new `web_search_result` block. That
+P15-T07/T08/T09 extend `model.BuiltinTool` (web-search variant). That
 `BuiltinTool` seam arrives with the computer-use work; until it is in `main`, the web-search waves cannot build.
+(The originally-planned distinct `web_search_result` block was **not** shipped — see §4: the I7 fence was
+realized as drop-on-decode of the provider's server-tool blocks instead. No `web_search_result` block type
+exists in the code.)
 **Wave 1 (T01/T03/T12) and the non-web SOTA waves (T02/T04/T05/T06/T10/T11) do not depend on it** and proceed
 independently. Sequence the web-search waves after the `BuiltinTool` foundation merges.
 
@@ -181,7 +192,7 @@ independently. Sequence the web-search waves after the `BuiltinTool` foundation 
 | **T10** | Onboarding config + wizard for compat vendor | `internal/onboard/*` (+tests) | T02 | M |
 | **T11** | Metering/pricing for new ids + authoritative `usage.cost` | `meter/pricer.go` (+test) | T03 | M |
 | **T12** | Egress allowlist extensibility (sandbox only) | `policy/egress.go` (+test) | — | S |
-| **T13** | Eval coverage (compat, reasoning, structured, native search) | `eval/provider-compat/` | T06,T08,T09 | M |
+| **T13** | Eval coverage (compat, reasoning, structured, native search) — **NOT BUILT** (`eval/provider-compat/` does not exist; hermetic shape/byte-identity tests gate the feature today) | `eval/provider-compat/` | T06,T08,T09 | M |
 | **T14** | 📄 Docs: PREREQUISITES + ARCHITECTURE + TASKS *(contract, serialised)* | `docs/{PREREQUISITES,ARCHITECTURE,TASKS}.md` | T02,T03,T06,T08,T09,T10,T11,T12 | M |
 
 ## 7. Parallel execution waves
@@ -196,7 +207,7 @@ Each wave's `Owns` sets are pairwise-disjoint; every dependency resolves to a st
 | 4 | T06 · T07 · T10 · T11 | `openrouter_extras.go` ‖ `builtin.go`+`openai_websearch.go` ‖ `onboard/*` ‖ `meter/*` |
 | 5 | T08 *(alone)* | co-edits `openai.go`+`native.go`+`model.go` |
 | 6 | T09 *(alone)* | new `cmd/nilcore/webcap.go` |
-| 7 | T13 *(alone)* | new `eval/provider-compat/` |
+| 7 | T13 *(alone — NOT BUILT)* | new `eval/provider-compat/` |
 | 8 | T14 *(alone)* | serialised contract docs |
 
 **Critical path:** T01 → T05 → T07 → T08 → T09 → T13 → T14. Peak fan-out: Wave 1 (3) and Wave 4 (4).

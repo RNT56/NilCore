@@ -321,7 +321,7 @@ On accept, immediately emit `KindStatus`: `queued: "<text>" (delivered after thi
 Normal message = **QUEUE**; an `!`/`/steer` **prefix** = **STEER** (the shipped trigger). The channel Emitter sink is a thin adapter over `Channel.Update`, coalesced. _(A Telegram inline "🛑 Steer" button — reusing the existing inline-keyboard + authorized-callback plumbing to arm steer on a thread's next message — is a planned enhancement, not yet built; the prefix trigger is the live path.)_
 
 **Per-message authorization in a dedicated intake goroutine (adv #5 — load-bearing):** today `Authorized.Receive` (authorized.go:43) is a blocking one-at-a-time loop consumed by `server.Serve`'s outer loop (server.go:35), which is busy inside `Run` for the whole current task and not calling `Receive` again — so it **cannot** deliver a mid-task message. The new design therefore:
-1. Runs a **separate per-thread intake goroutine** that reads the channel and calls `Authorized.Permit(req.Sender)` on **every** message (queue AND steer) before `Inbox.Push`. An unauthorized message is dropped + logged `unauthorized_steer`/`unauthorized_command` and never reaches the loop. The intake goroutine owns a `Permit`-based filter — it does **not** reuse `Authorized.Receive` (that would steal requests from the outer loop).
+1. Runs a **separate per-thread intake goroutine** that reads the channel and calls `Authorized.Permit(req.Sender)` on **every** message (queue AND steer) before `Inbox.Push`. An unauthorized message is dropped + logged `unauthorized_command` and never reaches the loop. The intake goroutine owns a `Permit`-based filter — it does **not** reuse `Authorized.Receive` (that would steal requests from the outer loop).
 2. Pins `Session.Sender` from the **first** authorized request; `Turn` refuses any message whose sender ≠ `Session.Sender` (a thread can be reached by multiple senders).
 3. Verifies the concrete `channel.Channel` impls are safe for one goroutine calling `Receive` while another calls `Update` on the same thread (Telegram long-poll vs send-message); if not, serialize sends through a transport mutex — **distinct** from any lock the intake path holds.
 
@@ -334,13 +334,30 @@ Normal message = **QUEUE**; an `!`/`/steer` **prefix** = **STEER** (the shipped 
 - **I3 / I4 no ambient authority / sandboxed:** steer is **text into the model's context only**; it carries no executable payload. The loop's only executor stays `Box.Exec` in the hardened container (`--network none`, `--cap-drop=ALL`, RO rootfs). The classifier carries no secrets. Serve-mode steer is admitted **only after** per-message `Permit`.
 - **Gate unchanged:** a steered "push to prod" still reaches `policy.GateStructured` → `Approver` (chat `GuardedApprove`, re-authorized). Steer does **not** pre-authorize a gate; the principal still gets one explicit prompt. `AwaitingGate` routes through the existing approver.
 - **Budget — conversation-scoped (adv #1, BLOCKER):** the budget Ledger keys by an opaque task string and the **per-task** ceiling resets per key (`Charge`, budget.go:89-94); only `gceiling` is conversation-wide. A per-drive task ID (fine for worktree/eventlog) **must not** be the budget key. So: **the Session owns ONE `meter.Provider.Task = s.ID` reused across every drive**, AND the wiring calls `Ledger.SetGlobalCeiling` at session construction as the conversation wall. The router's classifier uses that same metered provider. Acceptance test: N back-to-back continue-drives hit `budget.ErrCeiling` at the conversation ceiling, not N×ceiling.
-- **Steer storm bounded (adv: R6):** steer never resets the dollar/token budget or the ctx deadline. It MAY grant a bounded `+k` (k≈10) step credit under an absolute `MaxSteps` ceiling and a per-conversation `MaxSteers`; past that it is accepted as a message granting no steps. Rapid steers **coalesce** (drain-all batches into one delivered user turn, one model call) → log `steer_coalesced{count}`. The dollar ceiling and `WithDeadline` wall are the storm-proof backstops; the step counter `i` is never reset.
+- **Steer storm bounded (adv: R6):** steer never resets the dollar/token budget or the ctx deadline. It MAY grant a bounded `+k` (k≈10) step credit under an absolute `MaxSteps` ceiling and a per-conversation `MaxSteers`; past that it is accepted as a message granting no steps. Rapid steers **coalesce** (a single `Drain()` returns every queued message as one batch, folded into one delivered user turn, one model call) → logged as `queue_drain{count}` (the design's separate `steer_coalesced` event was never built). The dollar ceiling and `WithDeadline` wall are the storm-proof backstops; the step counter `i` is never reset.
 - **I5 append-only:** all new kinds metadata-only + redacted; bodies never logged.
 - **I7 untrusted-as-data:** the steer is the *principal's* trusted instruction → un-`Wrap`'d user turn; everything from a tool/file/peer/bus stays `guard.Wrap`'d. **Fencing is immutable once applied** — a steer is a NEW user turn and MUST NOT cause the harness to un-fence or "merge" any previously-`Wrap`'d data in `History`. Authorization at the channel is the ONLY promotion to principal-trust.
-- **Persistence (adv #7, mandatory for serve):** a SIGTERM mid-conversation must not silently become "restart." Checkpoint the Session crash-atomically via the existing single-`UpsertTask` write into `store.Task.Detail`: (a) the bounded `summarize.ContextSummary` work-state (never raw transcripts), (b) the current `Route`/`Active` driver, (c) any **undrained** queued inbox messages. `Checkpoint.Resume` reconstitutes the Session and **re-delivers undrained queued messages** before continuing, rebuilding the worktree from the last **verified** tip (`RunState.TipSHA`), never a torn tree. For `nilcore chat` durability is optional (the user is present); for serve it is required. If full `History` is too large, persist the bounded summary as the seed and document the lossy-but-continuous resume.
+- **Persistence (adv #7) — as SHIPPED (`internal/session/persist.go`):** a SIGTERM mid-conversation must not silently become "restart." What actually shipped is narrower than the sketch above: the Session persists only the **bounded `WorkState`** — the `summarize.ContextSummary` (goal/constraints/decisions/remaining), the active-driver route name, the integration `Branch`, the data-only `LastOutcome`, and the user-set `Mode`/`AskLevel` postures — through a two-method `Store` seam (`SaveConversation`/`LoadConversation`, satisfied by `*agent.Checkpoint`). **Raw `History` and the undrained inbox queue never touch disk** (History is reconstructable from the append-only log if needed). `Session.Restore` (called once after `New`, before the first `Turn`) rehydrates that `WorkState` so a follow-up **re-enters the driver named by `State.Active`** — continue, not restart. There is **no** re-delivery of undrained queued messages and **no** `RunState.TipSHA` worktree rebuild — those parts of the design were not built. Two write paths land the snapshot: the drive goroutine calls `persist` after each terminal fold, and the front door calls `Checkpoint(ctx)` on clean shutdown (`chat.go` after `sess.Wait()`, emitting `session_persist{manual:true}`). Both **detach the write from the caller's cancellation** (`detachForWrite` = `WithoutCancel`+5s), which is REQUIRED, not defensive: every terminal drive reaches `persist` *after* its own drive ctx was cancelled, so a ctx-honoring `database/sql` store would otherwise silently reject every write. Persistence is BEST-EFFORT: a nil `Store` is in-memory only; a store error is logged metadata-only and never fails a drive (the verifier and the event log remain the authorities). For `nilcore chat` durability is optional (the user is present); for serve it is the continue-across-restart backstop.
 
-### New event-log kinds (metadata only, redacted)
-`session_open{id,sender,repo}` · `session_turn{phase,len_text}` · `session_route{route,reason_len}` · `session_followup{mode,phase}` · `session_continue{driver}` · `session_drive_start`/`session_drive_done{driver,route,verified,reason}` · `session_fold{decisions,remaining_len}` · `session_close` · `user_message{mode,len}` · `steer_interrupt{step,phase}` · `queue_drain{count}` · `steer_coalesced{count}` · `task_cancel{cause}` · `unauthorized_steer{sender}` · `surface{surface_kind,step}`. These layer **above** the loop kinds (`model_call`, `tool_exec`, `verify`, `super_*`, `project_*`) so the trail is replayable end-to-end. `Log.Append` is already mutex-safe + nil-safe (eventlog.go:86); the log's `Err()` halt-gate still applies.
+### New event-log kinds (metadata only, redacted) — as SHIPPED
+
+The kinds the shipped session/loop code actually emits (verified against the source):
+`session_open{sender,thread}` (server) · `session_route{route,len_text}` (a pinned mode adds `mode`) · `session_answer` ·
+`session_followup{mode,phase}` · `session_drive_start` / `session_drive_done{route,verified}` (route also in the Event `Backend` field) ·
+`session_fold` · `session_suspended` · `session_mode` · `session_ask_level` · `session_compact` ·
+`session_branch_clear` · `session_gate_ask` / `session_gate_answer` / `session_gate_reply` ·
+`session_cancel` · `session_clear` · `context_add` · `session_persist` / `session_restore` (persistence) ·
+`user_message{mode,len}` (inbox) · `steer_interrupt{step,phase}` · `queue_drain{count}` ·
+`task_cancel` (native loop). These layer **above** the loop kinds (`model_call`, `tool_exec`,
+`verify`, `super_*`, `project_*`) so the trail is replayable end-to-end. `Log.Append` is mutex-safe +
+nil-safe (eventlog.go:253); the log's `Err()` halt-gate (eventlog.go:334) still applies.
+
+The original design sketched several kinds that were **never built or were renamed** before shipping —
+do not expect them in the log: `session_turn` (folded into `session_followup`), `session_continue`
+(a continue re-enter is logged as `session_route`), `session_close`, `steer_coalesced`, and
+`surface` (the live-reasoning sink is `internal/emit`, an in-process bus, not an eventlog kind — see
+§5.2). An unauthorized mid-drive message is logged as `unauthorized_command` (channel/server), NOT the
+design's `unauthorized_steer`.
 
 ---
 
@@ -348,7 +365,7 @@ Normal message = **QUEUE**; an `!`/`/steer` **prefix** = **STEER** (the shipped 
 
 - **`nilcore chat [-dir ./repo]`** — the primary front door: constructs one `Session` with a terminal `Sink`, the `internal/chat` stdin reader goroutine, a metered provider keyed by `s.ID`, and `SetGlobalCeiling` from `-budget`. No allowlist (the terminal user is the principal by construction; the Session records `principal:"local"`).
 - **`nilcore serve -channel telegram`** reuses the SAME `Session`: `server.Server` gains a per-thread `map[threadID]*Session` and the concurrent per-thread intake goroutine (§5.4). Telegram/Slack thus get queue+steer. The empty-allowlist refusal (main.go:514-518) stays.
-- **Default `bare nilcore` → `chat`** (today it prints usage; the conversational front door becomes the natural default). `nilcore -goal …` keeps the existing flag-prefixed dispatch (main.go:82-84) unchanged.
+- **Default `bare nilcore` → `chat`** (SHIPPED: zero-arg `nilcore` launches the interactive chat REPL — the conversational front door is the natural default). `nilcore -goal …` keeps the flag-prefixed dispatch to the single-task runner unchanged.
 - **`run` / `build` / `serve` remain** for scripting/CI — `runMain` (one bounded native task) and `buildMain` (supervisor/project) are byte-identical (nil Inbox/Emitter).
 
 Wiring sites: `runMain`/`serveMain`/`envFactory`/`buildStack` in `cmd/nilcore/{main.go,build.go}` — where the Session is constructed, `ShouldSupervise` supplied, and `meterProvider(prov, ledger, s.ID)` keyed by the conversation.
@@ -498,8 +515,14 @@ no proxy egress path (empty netns), so web access requires the container backend
 
 `session.ParseControl` is the single control-verb parser the REPL and the serve intake
 both call on principal top-level input only (post-`Authorized.Permit`; never on `Turn`/
-inbox/tool text — I7), so `/discuss /plan /execute /auto /add /clear /mode /status
-/context /cancel` work identically over the keyboard and over Telegram/Slack. The REPL
+inbox/tool text — I7), so the shipped verbs — `/discuss` (`/ask` alias) `/plan /execute
+/auto /add /save /clear /mode /status /context /cancel` (`/stop` alias) `/diff /apply
+/questions` (`/ask-less` `/ask-more` sugar) — work identically over the keyboard and over
+Telegram/Slack. `/save` and `/apply` are the two exceptions: both are parsed everywhere but
+ACTED ON only by the terminal front door — over a channel the serve path refuses each (a
+remote principal must never drive a host-side file write or a branch merge onto the
+operator's HEAD), while the verified branch is kept for the local terminal to `/apply`. `/steer` (and a bare `!`) are deliberately NOT controls — they stay
+steer messages, classified by `classifyInterrupt` on `Turn`. The REPL
 prompt shows a per-mode glyph (auto ◇, discuss ◆, plan ▣, execute ▶) and a clockwise
 context-usage ring (◔◑◕●, degrading to `context NN%` off a TTY). `meter.CtxWindow` +
 `meter.Provider.OnUsage` feed `Session.ContextUsage`; near 80% of the window the prior

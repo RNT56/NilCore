@@ -159,7 +159,7 @@ config-schema contract task (`EXT-01-T11`).
 ### 2.1 The leasing control plane (`internal/fleet`)
 
 The control plane **replaces the in-process scheduler loop with a leasing loop** while keeping the
-exact `scheduler.Task{ID, Run}` unit (`scheduler.go:23-26`) and the swarm's `Shard` type. Today
+exact `scheduler.Task{ID, Run}` unit (`scheduler.go:29-32`) and the swarm's `Shard` type. Today
 `swarm.Runner.RunPass` maps `[]Shard` onto `scheduler.New(K)` or `spawn.DAGScheduler{MaxConcurrent:K}`
 (`SWARM.md:584-589`). EXT-01 introduces a `fleet.Driver` seam the runner targets:
 
@@ -190,9 +190,10 @@ reusing the `scheduler`/`spawn.DAGScheduler` cap discipline to bound provisionin
 
 ### 2.2 Cross-host shard state (`internal/fleet/state.go`)
 
-This is the durability machinery `docs/SWARM.md` deliberately left local-only. EXT-01 wires the
-**unbuilt multi-agent `RunState`/`ResumePlan`** (`internal/agent/durability.go:148-306, 328-387`,
-"a documented follow-on", `ROADMAP-EXTERNAL-INFRA.md:46`) for cross-host handoff:
+This is the durability machinery `docs/SWARM.md` deliberately left local-only. The multi-agent
+`RunState`/`ResumePlan` (`internal/agent/durability.go:148-306, 328-387`) is **now wired for
+single-host** supervise/project resume (`cmd/nilcore/resume.go` `resumeSupervise`); EXT-01
+**extends** it for cross-host handoff:
 
 - Each shard is a `store.Task` in a **fleet-distinct Status namespace** (`fleet-leased`,
   `fleet-running`, `fleet-verified`, `fleet-orphaned`) so the native `InFlight`/`InFlightSupervise`
@@ -267,7 +268,7 @@ Key properties the security review (G2) must confirm:
 | Local re-verify in `RemoteDriver` | `evverify.ArtifactVerifier` (`var _ verify.Verifier`, the per-shard I2 gate, `SWARM.md:133`) | The worker's `Result.SelfClaimed` stays **advisory**; the **local** verifier overwrites self-claimed statuses against the **re-fetched** worktree before merge. No remote self-report ships work (I2). |
 | `credproxy` | `secrets.SecretStore` + `box.ExecWithEnv` by name | Adds standing authority **only** as a scoped, TTL-bounded, gated capability; the real cred stays in the store, never to the model (I3). |
 | `ExternalProvisioner` | `secrets.ExternalStore` shell-hook pattern (`external.go:48-63`) | Provisioning is an operator-configured command — no cloud SDK in the core (I6); the worker image is a **sandbox** (I4). |
-| Cross-host state | `agent.Checkpoint`/`RunState`/`ResumePlan` (`durability.go`) + `store` single-writer | Reuses the built-but-unwired durable machinery; every transition is one crash-atomic `UpsertTask` and one append-only event (I5). |
+| Cross-host state | `agent.Checkpoint`/`RunState`/`ResumePlan` (`durability.go`) + `store` single-writer | Reuses the single-host-wired durable machinery, extended cross-host; every transition is one crash-atomic `UpsertTask` and one append-only event (I5). |
 | Promotion | `policy.GateAction{PromoteToBase}` (`gateaction.go:28-31, 94-101`) | **Unchanged**: one gated action, human approver, nil-approver-deny. The fleet constructs no new `GateActionType` and never auto-lands (never-land). |
 
 ---
@@ -402,7 +403,7 @@ Owns unit**, so its files form a serialized sub-chain (the one intra-package cha
   lease transition, never per token.
 
 ### EXT-01-T06 — Cross-host shard state (RunState wiring)  · serial after T05
-- **Goal:** persist shard state cross-host by wiring the **built-but-unwired** multi-agent
+- **Goal:** persist shard state cross-host by **extending** the single-host-wired multi-agent
   `RunState`/`ResumePlan` (`durability.go:148-306, 328-387`) into the fleet, so a control-plane
   restart re-leases only un-merged shards with zero lost progress.
 - **Depends on:** EXT-01-T05.

@@ -4,7 +4,7 @@
 
 > **Where this sits in the canon.** This is the *consolidated current-state* reference. It is **not** the technical law. When this file and a spoke doc (or the code) disagree, the **spoke doc and the code win** — fix this file. Authoritative sources: [`CLAUDE.md`](../CLAUDE.md) (constitution + invariants), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (decided architecture + frozen contract), [`docs/TASKS.md`](TASKS.md) (master work DAG), [`CHANGELOG.md`](../CHANGELOG.md) (append-only ledger). The first three are contract files.
 >
-> **Snapshot:** v1.1.0 (2026-06-21) + unreleased work. Phases 0–16 (the Phase-16 closed-loop pillars 1–7) + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
+> **Snapshot:** v1.1.0 (2026-06-21) + unreleased work. Phases 0–16 (all eight Phase-16 closed-loop pillars, including Pillar 8 — the unified orchestration kernel, default-on) + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
 
 ---
 
@@ -30,7 +30,7 @@ There is no other index of the documentation set; this is it.
 | [`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`](ROADMAP-EVIDENCE-ARTIFACTS.md) | Verifier-backed artifact factory |
 | [`docs/ROADMAP-PROVIDERS.md`](ROADMAP-PROVIDERS.md) | Multi-provider + web search |
 | [`docs/PREREQUISITES.md`](PREREQUISITES.md) | Deps, accounts, keys, local setup |
-| [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) | Phase 16 — closing the evidence loop + graduated auto-approval (shipped — Pillars 1–7) |
+| [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) | Phase 16 — closing the evidence loop + graduated auto-approval (shipped — all eight pillars, incl. Pillar 8 kernel) |
 | [`docs/IMPLEMENTATION-PLANS.md`](IMPLEMENTATION-PLANS.md) · [`UPGRADE-PATH.md`](UPGRADE-PATH.md) · [`HORIZON.md`](HORIZON.md) · [`EXT-EXECUTION-PLANS.md`](EXT-EXECUTION-PLANS.md) · [`ROADMAP-EXTERNAL-INFRA.md`](ROADMAP-EXTERNAL-INFRA.md) | Rationale / future / gated work |
 
 ---
@@ -284,6 +284,9 @@ Bare **`nilcore`** = `nilcore chat`. One terminal, one conversation (`session.Se
 | `/mode` | Show the active mode |
 | `/add <path\|url>` | Attach a read-only context root, or fetch a URL via sandboxed `web_fetch` |
 | `/save <file.md>` | Write the agent's last answer/plan to a `.md`/`.markdown`/`.txt` file — relative-only, symlink-confined, **no overwrite**. Principal-initiated (not a model write tool). Acted on by the local terminal/TUI only; serve **refuses** it. |
+| `/diff` | Preview the verified work kept from the last `execute` run — a bounded, read-only diffstat + diff head of the kept branch. No kept branch ⇒ "nothing to preview". |
+| `/apply` | Merge that kept verified branch into your branch — an **irreversible** action routed through the structured promote-to-base gate (asks for approval; the graduated-auto-approval envelope may auto-admit). |
+| `/questions <less\|more\|off\|normal>` | Dial how often the agent may ask clarifying questions; `/ask-less` and `/ask-more` are one-notch sugar. Bare `/questions` shows the current level. |
 | `/context` | Window usage; warns it will auto-compact at ≥80% |
 | `/clear` | Reset history (keeps mode + roots); refused mid-drive |
 | `/status` | Phase, mode, attached-root count, gauge |
@@ -315,7 +318,7 @@ In `auto`, a cheap metered ~256-token JSON classifier (with a no-model fallback 
 
 ### Live surface, budget, persistence
 - **Streaming UI** (`termui`): a bottom live line — your prompt when idle; a braille spinner + cycling verb + elapsed + token estimate + "`!` to steer" when working; finalized glyph lines (`·` intent, `▸` tool, `✓`/`✗` verify, `⤺` steer-ack) scroll above. Off a TTY (SSH/pipe/CI/`TERM=dumb`/`NO_COLOR`) it degrades to clean plain lines (I6).
-- **Context gauge:** ring runes `○`(<25) `◔`(≥25) `◑`(≥50) `◕`(≥75) `●`(≥100); colour green <60 / amber 60–85 / red >85. The `/clear` nudge fires at ≥85%; auto-compaction near **80%** (summarizes prior turns, keeps the latest verbatim).
+- **Context gauge:** ring runes `○`(<25) `◔`(≥25) `◑`(≥50) `◕`(≥75) `●`(≥100); colour green <60 / amber 60–85 / red >85. The red `/clear` nudge fires above **85%** (at exactly 85% the ring is still amber, so no nudge yet); auto-compaction near **80%** (summarizes prior turns, keeps the latest verbatim).
 - **Budget wall:** one `budget.Ledger` keyed by the conversation id — default **$10** (`-budget`). Every drive, the classifier, chat replies, and the summarize fold-back charge the *same* ceiling; a breach (`ErrCeiling`) aborts.
 - **Resume:** a SQLite checkpointer persists *bounded* WorkState (summary + active route + branch + last outcome + pinned mode), never transcripts. Restart prints `↻ resumed the previous conversation`.
 - **`/add` roots** mount read-only into each drive's read/search tools (never writable).
@@ -500,21 +503,34 @@ Dispatch (`cmd/nilcore/main.go`): bare `nilcore` → chat; a `-`-prefixed argv (
 
 ## 14. Configuration & environment
 
-**`nilcore init`** writes a secret-free `config.json` (`onboard.Config`: `Providers[]`, `Executor`, `Advisor`, `Backend`, `PreferredBackend`, `Runtime`, `Image`, `Channel{Type,TokenRefs,Allow}`, `Web{Enabled,Allow,Search,SearchKeyRef,Profile,ProfileFile}`, `Codex`/`Claude` delegated config, pool tiers, routing). **`nilcore config show`** prints it — the de-facto config-key reference. **`nilcore doctor`** is the exit-0/1 host-readiness gate (keys resolve, runtime on PATH, sandbox probe, allowlist sane) — distinct from `inspect health` (which probes the log). Operator runbook + full env table: [`OPERATIONS.md`](OPERATIONS.md).
+**`nilcore init`** writes a secret-free `config.json` (`onboard.Config`: `Providers[]`, `Executor`, `Advisor`, `Backend`, `PreferredBackend`, `Runtime`, `Image`, `Channel{Type,TokenRefs,Allow}`, `Web{Enabled,Allow,Search,SearchKeyRef,Profile,ProfileFile}`, `Codex`/`Claude` delegated config, pool tiers, routing). **`nilcore config show`** prints it — the de-facto config-key reference. **`nilcore doctor`** is the exit-0/1 host-readiness gate (keys resolve, runtime on PATH, sandbox probe, allowlist sane) — distinct from `inspect health` (which probes the log). Operator runbook (opt-in surfaces, web access, autonomy, registry): [`OPERATIONS.md`](OPERATIONS.md).
 
 ### Key environment variables
 | Area | Variables |
 |---|---|
 | Model / providers | `NILCORE_MODEL`, `NILCORE_ADVISOR`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NILCORE_COMPAT_BASE_URL`/`_AUTH_SCHEME`/`_KEY_ENV`, `NILCORE_OPENROUTER_PROVIDER`/`_MODELS`/`_REASONING`/`_TRANSFORMS`/`_PLUGINS`, `NILCORE_RESPONSE_FORMAT`, `NILCORE_TOOL_CHOICE` (OpenRouter/OpenAI extras; JSON where noted, ignored if malformed) |
 | Delegated backends | `NILCORE_CLAUDE_MODEL`/`_EFFORT`, `NILCORE_CODEX_MODEL`/`_EFFORT`, `CODEX_API_KEY` |
-| Sandbox / verify | `NILCORE_SANDBOX`, `NILCORE_RUNTIME`, `NILCORE_IMAGE`, `NILCORE_BROWSER_VERIFY`, `NILCORE_VERIFY_PACKS`, `NILCORE_EVIDENCE_VERIFY`, `NILCORE_EVIDENCE_MAX_AGE` (the last three fold into the vcache key + are validated at boot — a bad value exits 2) |
+| Sandbox / verify | `NILCORE_SANDBOX`, `NILCORE_RUNTIME`, `NILCORE_IMAGE`, `NILCORE_BROWSER_VERIFY`, `NILCORE_VERIFY_PACKS`, `NILCORE_EVIDENCE_VERIFY`, `NILCORE_EVIDENCE_MAX_AGE` (all four evidence toggles fold into the verify-cache key; `NILCORE_VERIFY_PACKS` + `NILCORE_EVIDENCE_MAX_AGE` are additionally validated at boot — a bad value exits 2), `NILCORE_VCACHE` / `NILCORE_FLAKEPROBE` (verify-cache + one-shot flake re-run, both default-ON), `NILCORE_TIERED_VERIFY` (scoped fast-red path, opt-in) |
 | Web / egress | `NILCORE_EGRESS_PROFILE`, `BRAVE_API_KEY`, `NILCORE_WEB_SEARCH_NATIVE`, `NILCORE_WEB_SEARCH_MAX_USES` |
 | Connectors | `NILCORE_ALLOWLIST`, `TELEGRAM_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `NILCORE_MCP_CONFIG`, `NILCORE_MCP_RESOURCES`, `NILCORE_SKILLS_DIR`, `NILCORE_WEBHOOK_SECRET`, `NILCORE_WEBHOOK_LABEL`, `NILCORE_FORGE_TOKEN` |
 | Computer use | `NILCORE_COMPUTER_USE`, `NILCORE_COMPUTER_NATIVE`, `NILCORE_COMPUTER_MODEL`, `NILCORE_BROWSE_MODEL`, `NILCORE_DESKTOP_HOST` (=`1`), `NILCORE_DESKTOP_ALLOW_APPS`, `NILCORE_DESKTOP_STOP`, `NILCORE_DESKTOP_DRIVER`, `NILCORE_BROWSER`, `NILCORE_MAC_SCALE` (Retina backing-scale override, 1–4) |
 | Code intel | `NILCORE_EMBED_KEY`, `NILCORE_EMBED_MODEL`, `NILCORE_EMBED_BASE_URL` (OpenAI-compatible embeddings endpoint), `NILCORE_LSP_COMMAND`, `NILCORE_LIVE_INDEX` |
 | Secrets / audit | `NILCORE_VAULT_PASSPHRASE`, `NILCORE_LOG_HMAC_KEY`, `NILCORE_SECRET_EXTERNAL_CMD` (activates the external-command SecretStore backend — the 4th I3 backend) |
-| Autonomy | `NILCORE_REQUEUE`, `NILCORE_REQUEUE_MAX_ATTEMPTS`, `NILCORE_TRUST_DEFAULT` |
-| Non-interactive init (`onboard.FromEnv`) | `NILCORE_BACKEND`, `NILCORE_EXECUTOR`, `NILCORE_WEB_SEARCH` (scripted, prompt-free `nilcore init` inputs) |
+| Orchestration & closed-loop | `NILCORE_KERNEL` (route through the unified kernel; default-ON, `=0` escape hatch), `NILCORE_EXPERIENCE` (derived experience projection), `NILCORE_LESSONS` (distil verifier-failure scars), `NILCORE_FLYWHEEL` / `NILCORE_AUTONOMY` (serve-only: background flywheel / autonomy daemon), `NILCORE_REQUEUE`, `NILCORE_REQUEUE_MAX_ATTEMPTS`, `NILCORE_TRUST_DEFAULT` (=`1`; cost-aware trust oracle for single-backend runs) |
+| Graduated auto-approval | `NILCORE_AUTOAPPROVE_PRESET` (`conservative\|standard\|trusted` — seeds the envelope), `NILCORE_AUTOAPPROVE_OFF` (=`1`; global kill-switch, also `.nilcore/AUTOAPPROVE_OFF`), `NILCORE_SELFIMPROVE_AUTOAPPROVE` (=`1`; separate double-opt-in for auto-merging self-improve edits — **see the behaviour-change note below**), `NILCORE_SELFACC` / `_MAX` / `_FILE` (closed-loop self-acceptance checks) |
+| Non-interactive init (`onboard.FromEnv`) | `NILCORE_BACKEND`, `NILCORE_EXECUTOR`, `NILCORE_WEB_SEARCH`, `NILCORE_WEB_ALLOW` (scripted, prompt-free `nilcore init` inputs) |
+
+**Names written in suffix form above, spelled out** (so they are findable by their exact name):
+`NILCORE_COMPAT_BASE_URL`, `NILCORE_COMPAT_AUTH_SCHEME`, `NILCORE_COMPAT_KEY_ENV`;
+`NILCORE_OPENROUTER_PROVIDER`, `NILCORE_OPENROUTER_MODELS`, `NILCORE_OPENROUTER_REASONING`, `NILCORE_OPENROUTER_TRANSFORMS`, `NILCORE_OPENROUTER_PLUGINS`;
+`NILCORE_CLAUDE_MODEL`, `NILCORE_CLAUDE_EFFORT`, `NILCORE_CODEX_MODEL`, `NILCORE_CODEX_EFFORT` (these four are read by prefix construction in `resolveDelegated`, `cmd/nilcore/main.go:2323`);
+`NILCORE_SELFACC`, `NILCORE_SELFACC_MAX`, `NILCORE_SELFACC_FILE`.
+
+**Value semantics (a footgun worth stating):** most feature flags gate on *presence* — any non-empty value, **including `=0`**, enables them. The exceptions are the default-ON verify/kernel flags (`NILCORE_VCACHE`, `NILCORE_FLAKEPROBE`, `NILCORE_KERNEL`), which honour `0`/`off`/`false`/`no` to turn OFF, and `NILCORE_EXPERIENCE` (a default-OFF opt-in that likewise honours those negatives). `NILCORE_TIERED_VERIFY` is a default-OFF opt-in that needs `1`/`on`/`true`/`yes`. The `=1`-exactly gates are `NILCORE_DESKTOP_HOST`, `NILCORE_AUTOAPPROVE_OFF`, `NILCORE_SELFIMPROVE_AUTOAPPROVE`, and `NILCORE_TRUST_DEFAULT`. The grouped table above is the fullest env reference in the docs; [`OPERATIONS.md`](OPERATIONS.md) adds the operator runbook for the opt-in surfaces.
+
+> **Behaviour changes at `573a4df` that alter what an existing setting DOES.** Two settings that previously did nothing now take real effect — check yours before upgrading:
+> - **`NILCORE_SELFIMPROVE_AUTOAPPROVE=1` now performs a real merge.** Before, `selfimprove.Flow.Propose` logged `self_edit_merged` and reported success while **nothing was merged**; the verified branch was only preserved. It now lands the edit. The guards are unchanged — the edit must be verifier-green, `selfimprove.DefaultScope` still forbids `internal/verify/`, the core loop and every contract file, and the execution-time changed-paths screen still fails closed — but if you had this set, it was a no-op and now it is not.
+> - **`nilcore swarm` shards now reach their preset's declared hosts.** The per-shard egress allowlist was computed and then dropped, so every shard ran `--network none` (which is why the `research` preset could never verify green and `--egress-allow` was inert). The role-intersected allowlist is now enforced by a proxy for each shard box. Deny-all presets (`audit`, `ui`) stay `--network none`; a proxy that cannot bind fails closed. The active allowlist is printed at start and recorded as a `swarm_egress` event.
 
 ---
 

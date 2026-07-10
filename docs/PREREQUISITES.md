@@ -12,7 +12,7 @@ Everything you need to build, run, and contribute to NilCore. Source of truth fo
 | make | any | `make verify` is the gate |
 | golangci-lint | latest | lint gate in CI and locally |
 | jq | any | inspecting the JSONL event log and CLI streams |
-| SQLite | 3.x | Phase 4 memory store |
+| SQLite (`sqlite3` CLI) | 3.x, optional | **only** for hand-inspecting the store; the Phase-4 store itself is embedded pure-Go (`modernc.org/sqlite`, `CGO_ENABLED=0`) and needs no system SQLite to build or run |
 
 Install Go from <https://go.dev/dl/>. Install Podman from <https://podman.io/> (rootless is the default on modern Linux). On macOS use `podman machine` or Docker Desktop. Install golangci-lint per <https://golangci-lint.run/>.
 
@@ -51,7 +51,7 @@ The delegating backends are configurable, not key-only — every knob is optiona
 | `NILCORE_EMBED_KEY` | semantic code search (opt-in, Phase 10) | OpenAI-compatible embeddings key; off ⇒ lexical fallback (byte-identical) |
 | `NILCORE_FORGE_TOKEN` | gated draft-PR open (`watch`/`schedule --open-pr`) | the agent never merges; push runs in the approved prepare step |
 | `NILCORE_WEBHOOK_SECRET` | `serve --webhook` (HMAC verification) | shared secret for SCM/CI webhook signatures |
-| Tailscale auth key | tsnet remote access (optional, later) | if exposing over a tailnet |
+| Tailscale auth key | tsnet remote access (**planned, not built**) | only relevant if the future tailnet path ships |
 
 **Secrets never reach the model.** `nilcore init` (below) stores them in the **SecretStore** — the OS keychain (macOS Keychain / Linux Secret Service) or an encrypted-file vault on a headless host — and they are injected per run into request headers or child-process env, never into a prompt, log, or config file. The full design (backends, headless-VPS master key, redaction) is in **`docs/SECRETS.md`**. A gitignored `.env` is supported only for CI/advanced use.
 
@@ -120,11 +120,11 @@ A PR cannot merge unless CI is green. Merge to `main` additionally requires the 
 
 ## 7. Platform notes
 
-- Podman rootless and Firecracker microVMs (the Phase-2 stronger-isolation option) are Linux/KVM only.
-- On macOS, the container sandbox runs inside the Podman/Docker VM; Firecracker is not available — use containers there.
-- `tsnet` (optional remote-access path) embeds Tailscale in the binary; no exposed ports, identity over the tailnet.
+- The **namespace + Landlock** sandbox (no runtime, image, or daemon: user/mount/pid/net namespaces + Landlock + seccomp) is the shipped stronger-isolation backend and is **Linux only** — `-sandbox auto` prefers it wherever the kernel supports it and falls back to a container otherwise. A **Firecracker microVM** tier is **planned, not built** (gated `EXT-08`, `docs/ROADMAP-EXTERNAL-INFRA.md`): the sandbox ships exactly two backends today — container and namespace.
+- On macOS the namespace backend is unavailable (it needs a Linux kernel), so the **container** sandbox is the only backend — it runs inside the Podman/Docker VM.
+- **Remote access** over a Tailscale tailnet (`tsnet`, no exposed ports, identity over the tailnet) is a documented future option and is **not built** — shipping it would add a Go module dependency, so it is deliberately absent until justified (I6).
 - **Install:** one cross-compiled binary (`darwin`/`linux` × `amd64`/`arm64`) — a Homebrew tap on macOS, a curl-pipe-sh installer plus a sample systemd unit on a Linux VPS (task P1-T13).
-- **Secret backend by host:** macOS → Keychain; Linux desktop → Secret Service; headless VPS → encrypted-file vault with a `0600` key-file (or systemd-creds / passphrase). Auto-detected; see `docs/SECRETS.md`.
+- **Secret backend by host:** macOS → Keychain; Linux desktop → Secret Service; headless VPS → encrypted-file vault with a `0600` key-file (or a passphrase / systemd-creds / KMS master key). An external command hook (`NILCORE_SECRET_EXTERNAL_CMD`) can front a corporate secret manager. Auto-detected; see `docs/SECRETS.md`.
 
 ## 8. Opt-in capability prerequisites (Phase 9–12)
 

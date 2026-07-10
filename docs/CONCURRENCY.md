@@ -12,7 +12,13 @@ This design was produced and then **adversarially reviewed** (five lenses: deadl
 
 ## 1. As-is (grounded)
 
-The shipped build path runs every subagent **synchronously and serially**, and several correctness properties *depend on that serialism*.
+> _This section is the **pre-Phase-8 baseline** the design below started from — the serial world
+> and the then-unwired concurrent machinery. **§5 records what has since shipped:** Phase 1 & 2
+> concurrency are now live (the `DAGScheduler` is wired into `super.dispatch` via `dispatchConcurrent`,
+> and the `internal/strongcap` worker limiter is in place). Read §1's present-tense "serial" /
+> "unwired" / "instantiated in no production path" claims as that starting point, not today's code._
+
+The shipped build path ran every subagent **synchronously and serially**, and several correctness properties *depend on that serialism*.
 
 ### 1.1 The live spawn path is serial
 - `internal/super/dispatch.go:130` — `res := s.Spawn(ctx, spec)` is a **blocking synchronous** call inside the per-`tool_use`-block dispatch switch. One worker runs to completion before the next block is processed.

@@ -15,10 +15,15 @@ scoreboard**.
 > vote, no "the model says it looks right." A worker wins **only** by producing a checkable
 > artifact that passes its verify-pack.
 
-This document is a **plan**, not yet shipped. It is structured so a fleet of parallel agents
-can execute it under the `CLAUDE.md` §5 work-selection rule with zero collision. Promoting its
-task specs into `docs/TASKS.md` (and the layer-map rows into `docs/ARCHITECTURE.md`) is itself
-the final, serialized contract task (SW-T18).
+> **Status: SHIPPED (Phase 12, merged to `main`).** This was an implementation plan; it has
+> since been executed in full — `nilcore swarm` and the swarm-aware `report`/`--format matrix|json`
+> extensions are live, all `SW-T0x` tasks below landed, and SW-T18 promoted the specs into
+> `docs/TASKS.md` / `docs/ARCHITECTURE.md`. The document is kept verbatim as the **design-of-record**;
+> read the task DAG and acceptance blocks below as the record of what was built, not pending work.
+
+Originally structured so a fleet of parallel agents could execute it under the `CLAUDE.md` §5
+work-selection rule with zero collision. Promoting its task specs into `docs/TASKS.md` (and the
+layer-map rows into `docs/ARCHITECTURE.md`) was itself the final, serialized contract task (SW-T18).
 
 ---
 
@@ -123,7 +128,7 @@ table the research swarm exists to produce.
 ## §2 As-is: what already ships
 
 The single most important fact for this plan: **the artifact-verification layer is not net-new.**
-It is **Phase 11 "the spine," already in the working tree** (`feat/p11-verified-artifacts`). This
+It is **Phase 11 "the spine," already shipped in the tree** (merged to `main`). This
 phase **reuses and extends** it — it never rebuilds it.
 
 ### 2.1 The shipped Phase-11 spine (reuse, do not rebuild)
@@ -256,7 +261,7 @@ verify.Composite[
   `verify.Detect`'s "unknown ⇒ true"). `box==nil` ⇒ networked claims resolve `Unverifiable` while
   schema/variance still run.
 
-### 5.2 The five verify-packs
+### 5.2 The seven verify-packs
 
 | Pack | Status | Checks |
 |---|---|---|
@@ -342,6 +347,17 @@ the runner stamps per-shard start/end (`MarkRunning`→`Record` elapsed) **and**
 immutable copy-out. A `//go:build tui` Charm dashboard renders the same `Snapshot` (zero Charm in
 the default binary). Keystone test: at run end `Board.Snapshot()` **equals**
 `ReplaySwarmReport(...).Swarm` field-by-field (live == replay).
+
+> _Shipped-state note (features-review reconciliation):_ of the Kinds declared in
+> `internal/swarm/board/kinds.go`, only **`scoreboard_snapshot`** (`board.go`, via `EmitSnapshot`)
+> and **`swarm_pass_clean`** (`cmd/nilcore/swarm.go`, on a clean pass) are actually emitted by the
+> board. The other declared constants — `swarm_start` / `shard_enqueued` / `shard_dispatched` /
+> `shard_verified` / `shard_requeued` / `shard_exhausted` / `swarm_done` — are **not emitted**; the
+> live per-shard trail is written by `internal/swarm/queue.go` under the free strings
+> `shard_queued` / `running` / `passed` / `failed` / `exhausted` / `skipped`, and `swarm_done` is a
+> free literal in `internal/swarm/passes.go`. Wall-clock is measured in-process (there is no
+> `swarm_start` event), and the report projection reads only `scoreboard_snapshot` and
+> `swarm_pass_clean`.
 
 ### 7.2 Report projection (`internal/report`, SW-T06, additive)
 
@@ -607,9 +623,9 @@ lands **before** the swarm-orchestration tasks (SW-T09…SW-T17), per the prompt
 - **Notes:** leaf imports `budget`/`meter`/`eventlog`/`termui`/`artifact` (read-only) + stdlib; never the orchestrator or the swarm runner. **Distinct dir from `internal/swarm`**, so it is parallel-safe with the T10–T13 chain.
 
 #### SW-T15 — swarm preset bundles + new roster roles
-- **Goal:** the five named bundles (§8.1), a fail-closed `Resolve` (inverts `verify.Detect`), and the two additive roster roles (`RoleAuditor`/`RoleUI`).
+- **Goal:** the six named bundles (§8.1), a fail-closed `Resolve` (inverts `verify.Detect`), and the two additive roster roles (`RoleAuditor`/`RoleUI`).
 - **Depends on:** SW-T05, SW-T09, SW-T07. **Owns:** `internal/swarm/preset/` (`preset.go`, `resolve.go`, `*_test.go`), `internal/roster/roster.go` (additive Role consts), `internal/roster/worker.go` (their Profiles/System).
-- **Acceptance:** `Preset{Name,Kind,Role,Profile,VerifyPacks,Egress,FanIn∈{collate,merge},Shape∈{flat,dag},Sharder,WorkerTier,PlannerTier}`; the five bundles per §8.1 (research **reuses the existing `RoleTypedResearch`** — ReadOnly false, web fetch true; code reuses `RoleImplementer`; audit/ui use the **new** `RoleAuditor`/`RoleUI`); `Lookup`/`Resolve` return `(_,false)`/`ErrUnknownPack` for unknown (cmd FATALs); the returned registry has **no** always-pass verifier; `Profiles(...)` derives egress = union of selected packs' `HostsFor` (not hand-typed); `RoleAuditor`/`RoleUI` write capability via `Profile.ReadOnly:false` (**not** the hardcoded `Role.ReadOnly()` helper — a test asserts `Profile.ReadOnly==false` AND `Role.ReadOnly()==true` to exercise the documented gotcha).
+- **Acceptance:** `Preset{Name,Kind,Role,Profile,VerifyPacks,Egress,FanIn∈{collate,merge},Shape∈{flat,dag},Sharder,WorkerTier,PlannerTier}`; the six bundles per §8.1 (research **reuses the existing `RoleTypedResearch`** — ReadOnly false, web fetch true; code reuses `RoleImplementer`; audit/ui use the **new** `RoleAuditor`/`RoleUI`); `Lookup`/`Resolve` return `(_,false)`/`ErrUnknownPack` for unknown (cmd FATALs); the returned registry has **no** always-pass verifier; `Profiles(...)` derives egress = union of selected packs' `HostsFor` (not hand-typed); `RoleAuditor`/`RoleUI` write capability via `Profile.ReadOnly:false` (**not** the hardcoded `Role.ReadOnly()` helper — a test asserts `Profile.ReadOnly==false` AND `Role.ReadOnly()==true` to exercise the documented gotcha).
 - **Verify:** `make verify`; `go test ./internal/swarm/preset/... ./internal/roster/...`: each preset resolves with correct Kind/Role/FanIn/Shape/packs; `Resolve("garbage")` ⇒ `ErrUnknownPack`; write roles rely on `Profile.ReadOnly`; egress == pack `HostsFor` union; existing roster tests stay green (additive consts).
 - **Notes:** `preset` imports `swarm` one-directionally (`swarm` never imports `preset`). `roster.go`/`worker.go` are leaves (not frozen). ui/browser is CI-only, fails closed (no browser image ⇒ all-red, never false green). audit/benchmark presets name packs that now exist (SW-T02/T03).
 
@@ -725,7 +741,7 @@ own merge; rebase resolves trivial append conflicts), e.g.:
 - **SW-T17** — `nilcore swarm` subcommand + buildSwarm + dispatch wiring. _Owns:_ cmd/nilcore/swarm.go,main.go. _(Phase 12)_
 ```
 
-**README.md** (SW-T18): a "Verified swarm mode" section (the headline command, the five presets one line
+**README.md** (SW-T18): a "Verified swarm mode" section (the headline command, the six presets one line
 each, the product line), the extended `nilcore report` usage, the default-off/byte-identical note, and the
 honest caveats.
 

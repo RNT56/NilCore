@@ -96,9 +96,9 @@ These tasks use a **distinct `U<tier>-T<NN>` namespace** so they never collide w
 - `U1-T0x` — Tier 1 · `U2-T0x` — Tier 2 · `U3-0x` — Tier 3 (architectural, gated)
 - External-infra items carry an `EXT-NN` id and live in `docs/ROADMAP-EXTERNAL-INFRA.md`.
 
-**Phase reservation.** The highest *shipped* phase is **Phase 7** (`CHANGELOG.md:59,61`; `docs/TASKS.md:513`). **Phase 8 is reserved** for the in-progress multi-agent-concurrency workstream and must not be reused here. **Promoting any task below into the canonical `docs/TASKS.md` DAG is itself a dedicated, serialized contract task** (`docs/TASKS.md` is a contract file). When promoted, these become **Phase 9+** or land as named non-phase workstreams (the `M-`/`W-`/`X-` precedent in `CHANGELOG.md:35,38,49`).
+**Phase reservation.** *This section was written when **Phase 7** was the shipped tip.* Since then Phases 8–16 have all shipped (`docs/TASKS.md:147`): Phase 8 was the multi-agent-concurrency workstream, and — as the Tier headers below record — **Tiers 1–2 landed as Phase 9 / Phase 10.** **Promoting any (still-unbuilt) task below into the canonical `docs/TASKS.md` DAG is itself a dedicated, serialized contract task** (`docs/TASKS.md` is a contract file). When promoted, a task takes the next free phase or lands as a named non-phase workstream (the `M-`/`W-`/`X-` precedent in `CHANGELOG.md`).
 
-> **Housekeeping the promotion task should also do:** the `[Unreleased]` section currently contains a stray merge-conflict artifact (`=======` at `CHANGELOG.md:28`) between two workstream blocks — resolve it when next editing the CHANGELOG. And do not cite `internal/config`: it was **retired** and folded into `internal/onboard` (`docs/TASKS.md:509`).
+> **Housekeeping the promotion task should also do:** do not cite `internal/config` — it was **retired** and folded into `internal/onboard`. _(An earlier note here flagged a stray `=======` merge-conflict artifact at `CHANGELOG.md:28`; that has since been resolved — no such artifact remains.)_
 
 ---
 

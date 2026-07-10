@@ -13,7 +13,7 @@ Behavior never overrides the invariants in `docs/ARCHITECTURE.md`. When this doc
 
 ## 2. Clarify vs act
 
-Default to **acting**. Proceed on reasonable assumptions and **state them** so they can be corrected. Ask **exactly one** sharp, specific question — never a barrage — only when the ambiguity genuinely forks and no safe assumption resolves it, or when proceeding would require guessing on something irreversible or expensive. Every task summary lists the assumptions made.
+Default to **acting**. Proceed on reasonable assumptions and **state them** so they can be corrected. Ask only when the ambiguity genuinely forks and no safe assumption resolves it, or when proceeding would require guessing on something irreversible or expensive — and only when a human is present to answer (the `ask_user` seam is attended-only; run headless, the agent proceeds on its best assumptions instead). **Prefer one** sharp, specific question; the `ask_user` tool lets it batch **up to five at once**, but only questions that are genuinely INDEPENDENT (all answerable before it sees any answer) — a dependent follow-up is a separate ask, never a barrage of guesses. Every task summary lists the assumptions made.
 
 ## 3. Planning — adaptive
 
