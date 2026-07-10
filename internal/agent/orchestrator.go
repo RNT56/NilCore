@@ -306,7 +306,50 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		_ = o.Checkpoint.Begin(ctx, t) // durable: mark running (P6-T03)
 	}
 
-	wt, err := worktree.Create(ctx, o.BaseRepo, t.ID)
+	// AUTO-REATTACH (durable resume): if a predecessor drive in this SAME session
+	// self-suspended (the `sleep` tool) and preserved its committed work under a
+	// suspend/ ref, base this resumed drive on that work instead of a fresh HEAD
+	// worktree — so the agent picks up where its earlier self left off rather than
+	// re-driving from scratch and orphaning the preserved commits. Correlation is by
+	// the stable session prefix (ResumeBranch). No suspended predecessor ⇒ branch==""
+	// and the default HEAD path below is byte-identical to before.
+	var wt *worktree.Worktree
+	var err error
+	var resumeBranch, resumedFrom string
+	if o.Checkpoint != nil {
+		if b, sid, rerr := o.Checkpoint.ResumeBranch(ctx, t.ID); rerr != nil {
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resume_lookup",
+				Detail: map[string]any{"error": rerr.Error()}})
+		} else {
+			resumeBranch, resumedFrom = b, sid
+		}
+	}
+	if resumeBranch != "" {
+		leaf := strings.ReplaceAll(t.ID, "/", "-")
+		rwt, cerr := worktree.CreateFrom(ctx, o.BaseRepo, "task/"+t.ID, leaf, resumeBranch)
+		if cerr != nil {
+			// A stale/unresolvable suspend ref (already swept, or its commit is gone):
+			// FALL BACK to a fresh HEAD worktree — today's behavior, no regression, no
+			// data loss. The predecessor row is left "suspended" for a later sweep.
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resume_fallback",
+				Detail: map[string]any{"branch": resumeBranch, "resumed_from": resumedFrom, "error": cerr.Error()}})
+			resumeBranch, resumedFrom = "", ""
+		} else {
+			wt = rwt
+			// Retire the predecessor so it is never reattached twice AND its anchor
+			// becomes GC-eligible; then delete the consumed ref immediately so it does
+			// not linger (the sweep is only a backstop for the crash-before-here case).
+			if o.Checkpoint != nil {
+				_ = o.Checkpoint.Complete(ctx, resumedFrom, t.Goal, false)
+			}
+			worktree.DeleteBranch(ctx, o.BaseRepo, resumeBranch)
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resumed",
+				Detail: map[string]any{"resumed_from": resumedFrom, "branch": resumeBranch}})
+		}
+	}
+	if wt == nil {
+		wt, err = worktree.Create(ctx, o.BaseRepo, t.ID)
+	}
 	if err != nil {
 		// The checkpoint was already marked running (Begin above). Finalize it so a
 		// restart's Resume does not re-drive a task whose setup already faulted here. A

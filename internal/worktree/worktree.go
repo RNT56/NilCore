@@ -460,6 +460,27 @@ func DeleteBranches(ctx context.Context, baseRepo, prefix string) {
 	}
 }
 
+// ListBranches returns the short-names of every local branch under prefix (e.g.
+// "suspend/") in baseRepo. It is the read half of the durable-anchor sweep
+// (agent.Checkpoint.SweepSuspended): the suspend/ recovery anchors a nap leaves behind
+// accumulate across restarts and must be reclaimed once resolved. It mirrors
+// DeleteBranches' `branch --list <prefix>*` query and runs the same hardened git (I4),
+// so a repo-authored hook/config can never execute on the host. Empty (not an error)
+// when nothing matches the prefix.
+func ListBranches(ctx context.Context, baseRepo, prefix string) ([]string, error) {
+	out, err := git(ctx, baseRepo, "branch", "--list", prefix+"*", "--format=%(refname:short)")
+	if err != nil {
+		return nil, fmt.Errorf("list branches %s*: %w", prefix, err)
+	}
+	var branches []string
+	for _, b := range strings.Split(strings.TrimSpace(out), "\n") {
+		if b = strings.TrimSpace(b); b != "" {
+			branches = append(branches, b)
+		}
+	}
+	return branches, nil
+}
+
 // PinBranch force-creates (or moves) `branch` to point at `sha` in baseRepo. It is
 // the durable-resume anchor: the run-end branch sweep (DeleteBranches) only reclaims
 // the throwaway task/ rebase/ integrate/ read/ prefixes, so a branch under a
