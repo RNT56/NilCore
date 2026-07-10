@@ -89,6 +89,11 @@ func (w *wsConn) WriteText(s string) error { return w.writeFrame(0x1, []byte(s))
 // Close closes the underlying connection.
 func (w *wsConn) Close() error { return w.conn.Close() }
 
+// maxWSFrameBytes bounds a single inbound WebSocket frame so a crafted length header
+// can't OOM/panic the process on allocation (parity with internal/cdp's 64 MiB cap).
+// Slack control/text frames are tiny; a real payload never approaches this.
+const maxWSFrameBytes = 64 << 20
+
 func (w *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 	h := make([]byte, 2)
 	if _, err = io.ReadFull(w.r, h); err != nil {
@@ -110,6 +115,11 @@ func (w *wsConn) readFrame() (opcode byte, payload []byte, err error) {
 			return 0, nil, err
 		}
 		length = int(binary.BigEndian.Uint64(ext))
+	}
+	// Bound an untrusted frame length before allocating, so a crafted header can't
+	// OOM/panic the process on `make` (length<0 catches a >maxInt Uint64 wrap).
+	if length < 0 || length > maxWSFrameBytes {
+		return 0, nil, fmt.Errorf("slack ws: frame length %d exceeds the %d-byte cap", length, maxWSFrameBytes)
 	}
 	var mask []byte
 	if masked {

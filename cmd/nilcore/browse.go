@@ -67,6 +67,7 @@ type browseFlags struct {
 	readRepo    *bool
 	extract     *string
 	model       *string
+	secrets     *string
 }
 
 func registerBrowseFlags(fs *flag.FlagSet) browseFlags {
@@ -86,6 +87,7 @@ func registerBrowseFlags(fs *flag.FlagSet) browseFlags {
 		readRepo:    fs.Bool("read", false, "also mount read-only repo tools (adds the private-data axis to the Rule-of-Two check)"),
 		extract:     fs.String("extract", "", "extraction mode: record findings as a verifier-gated artifact at this id (e.g. -extract release-facts); the harness re-derives every finding before the run is done (I2)"),
 		model:       fs.String("model", "", "the single model for this browse run (default: "+defaultGUIModel+", a strong GUI model; or set NILCORE_BROWSE_MODEL)"),
+		secrets:     fs.String("secrets", "", "comma-separated ALLOWLIST of secret names the agent may type via {{secret:NAME}} (also NILCORE_BROWSE_SECRETS); default empty ⇒ no secret may be typed (fail closed) — the fence against typing an arbitrary env var into a page"),
 	}
 }
 
@@ -142,18 +144,25 @@ func browseMain(args []string) {
 		fmt.Fprintln(os.Stderr, "nilcore browse: WARNING — a non-container sandbox has no egress allowlist proxy; the browser will be unable to reach any host. Use -sandbox container.")
 	}
 
-	// Rule of Two (capguard): a browse agent always ingests untrusted input (A).
-	// Private data (B) is on only when repo read tools are mounted. Open egress (C)
-	// is derived from the resolved allowlist (a wildcard or a broad list). All three
-	// at once requires the human gate; headless with no gate fails closed.
+	// Operator-declared secret-name allowlist (fail-closed default empty): the only names
+	// the agent may resolve via {{secret:NAME}}. It also feeds the Rule-of-Two axis B below.
+	secretNames := parseSecretNames(*bf.secrets, os.Getenv("NILCORE_BROWSE_SECRETS"))
+
+	// Rule of Two (capguard): a browse agent always ingests untrusted input (A). Private
+	// data (B) is on when repo read tools are mounted OR a secret allowlist is declared — a
+	// session that can type a site credential holds private data even with -read=false, so
+	// it must count axis B (otherwise it would evade the gate). Open egress (C) is derived
+	// from the resolved allowlist (a wildcard or a broad list). All three at once requires
+	// the human gate; headless with no gate fails closed.
 	approver := policy.NewConsoleApprover(os.Stdin, os.Stdout)
+	secretCapable := len(secretNames) > 0
 	caps := capguard.Capabilities{
 		UntrustedInput: true,
-		PrivateData:    *bf.readRepo,
+		PrivateData:    *bf.readRepo || secretCapable,
 		EgressHosts:    egress.Allowed,
 		Reasons: map[string]string{
 			"A": "browse-agent",
-			"B": ternary(*bf.readRepo, "repo-read-mounted", ""),
+			"B": privateDataReason(*bf.readRepo, secretCapable),
 			"C": "profile:" + *bf.profile,
 		},
 	}
@@ -172,11 +181,15 @@ func browseMain(args []string) {
 	}
 
 	// Secret resolver: {{secret:NAME}} is resolved env-first then SecretStore (I3),
-	// host-side, and never reaches the model context or the log.
-	secrets := func(name string) (string, bool) {
+	// host-side, and never reaches the model context or the log — but ONLY for a name on
+	// the operator-declared allowlist. Wrapping the env-first resolver in AllowlistResolver
+	// is the exfil fence: an unlisted name (e.g. {{secret:ANTHROPIC_API_KEY}}) resolves to
+	// not-found, so substituteSecrets refuses to type it. Default empty allowlist ⇒ no
+	// secret may be typed at all.
+	secrets := browsersession.AllowlistResolver(secretNames, func(name string) (string, bool) {
 		v := strings.TrimSpace(b.cred(name))
 		return v, v != ""
-	}
+	})
 
 	driver := strings.TrimSpace(os.Getenv("NILCORE_BROWSER"))
 	if driver == "" {
@@ -263,6 +276,40 @@ func ternary(cond bool, a, b string) string {
 		return a
 	}
 	return b
+}
+
+// parseSecretNames builds the operator-declared secret-name allowlist for a browse/desktop
+// task from the -secrets flag unioned with the NILCORE_*_SECRETS env var (both comma-
+// separated, whitespace-trimmed, empties dropped). Empty result ⇒ no {{secret:NAME}} may
+// be typed (fail closed) — the fence against exfiltrating an arbitrary process env var by
+// typing it into a page/field. Shared by browse and desktop.
+func parseSecretNames(flagVal, envVal string) []string {
+	var out []string
+	for _, raw := range []string{flagVal, envVal} {
+		for _, n := range strings.Split(raw, ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// privateDataReason names why the Rule-of-Two private-data axis (B) is set: repo-read tools
+// mounted, and/or a declared secret allowlist (a session that can type a site credential
+// holds private data even with -read=false). "" only when neither holds. Shared by browse
+// and desktop.
+func privateDataReason(readRepo, secretCapable bool) string {
+	switch {
+	case readRepo && secretCapable:
+		return "repo-read-mounted+secrets-declared"
+	case readRepo:
+		return "repo-read-mounted"
+	case secretCapable:
+		return "secrets-declared"
+	default:
+		return ""
+	}
 }
 
 // browseEventSink adapts the browse tool's trajectory Steps to the append-only

@@ -23,6 +23,12 @@ type Trigger struct {
 	Enabled bool                                         // master on/off
 	Gate    func(action string) bool                     // the orchestrator's gate (irreversible)
 	Start   func(ctx context.Context, goal string) error // start a task
+	// Limiter, when set, bounds how OFTEN self-starts may fire (a per-day cap plus a
+	// cooldown) on top of any execution mutex the caller holds — the denial-of-wallet
+	// fence for untrusted, headless triggers like the webhook intake, where a signed
+	// delivery proves only that it was relayed, not that a human authorized a run. nil
+	// disables the bound, so operator-initiated sources (cron, watch) stay unlimited.
+	Limiter *RateLimiter
 	Log     *eventlog.Log
 }
 
@@ -50,6 +56,18 @@ func (t *Trigger) Handle(ctx context.Context, sig Signal) (started bool, err err
 	// trigger_start audit event — so guard BEFORE the event so the bool and the
 	// audit trail both reflect reality.
 	if t.Start == nil {
+		return false, nil
+	}
+
+	// Rate fence (denial-of-wallet): the execution mutex only SERIALIZES runs; this
+	// bounds how MANY self-starts fire (per-day cap + cooldown) so a stream of
+	// validly-signed but unauthorized deliveries cannot spin up unbounded runs. A
+	// rejected self-start is audited (I5) with its reason and reported as not-started,
+	// so neither the bool nor the trail claims work that never began. A nil Limiter is
+	// unbounded (checked LAST, so a denied or nil-Start action never charges budget).
+	if ok, reason := t.Limiter.Allow(); !ok {
+		t.Log.Append(eventlog.Event{Kind: "trigger_ratelimited",
+			Detail: map[string]any{"source": sig.Source, "goal": action, "reason": reason}})
 		return false, nil
 	}
 

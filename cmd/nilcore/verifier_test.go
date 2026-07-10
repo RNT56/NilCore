@@ -23,19 +23,20 @@ import (
 type fakeVerifierBox struct {
 	dir      string
 	exit     int
+	stdout   string            // returned as Result.Stdout (e.g. a fetched body for web.quote_exists)
 	envSeen  map[string]string // last env passed to ExecWithEnv (secret-leak assertions)
 	cmdsSeen []string
 }
 
 func (b *fakeVerifierBox) Exec(_ context.Context, cmd string) (sandbox.Result, error) {
 	b.cmdsSeen = append(b.cmdsSeen, cmd)
-	return sandbox.Result{ExitCode: b.exit}, nil
+	return sandbox.Result{ExitCode: b.exit, Stdout: b.stdout}, nil
 }
 
 func (b *fakeVerifierBox) ExecWithEnv(_ context.Context, cmd string, env map[string]string) (sandbox.Result, error) {
 	b.cmdsSeen = append(b.cmdsSeen, cmd)
 	b.envSeen = env
-	return sandbox.Result{ExitCode: b.exit}, nil
+	return sandbox.Result{ExitCode: b.exit, Stdout: b.stdout}, nil
 }
 
 func (b *fakeVerifierBox) Workdir() string { return b.dir }
@@ -559,6 +560,37 @@ func writeURLArtifact(t *testing.T, root, id, sourceURL string) string {
 	return id
 }
 
+// writeQuoteArtifact writes a KindReport artifact whose single claim ASSERTS a Value
+// ("v1") verified by the VALUE-CHECKING web.quote_exists — the genuinely-verifiable
+// green fixture. A KindReport claim must carry a Value (schema), and a value-bearing
+// claim must name a verifier that inspects that Value (evverify's anti-hollow-green
+// gate) — so url_resolves is inadequate here. Run with NILCORE_VERIFY_PACKS=web (so
+// quote_exists resolves) and a fakeVerifierBox whose stdout contains the Value:
+// quote_exists fetches the body through the box and checks the Value appears in it.
+func writeQuoteArtifact(t *testing.T, root, id, sourceURL string) string {
+	t.Helper()
+	a := &artifact.Artifact{
+		ID:        id,
+		Kind:      artifact.KindReport,
+		Title:     "wiring",
+		CreatedAt: time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC),
+		Claims: []artifact.Claim{{
+			ID:    id + "-c1",
+			Field: "f1",
+			Evidence: artifact.Evidence{
+				Value:     "v1",
+				SourceURL: sourceURL,
+				Verifier:  "web.quote_exists",
+				Status:    artifact.StatusPass, // self-written; the verifier must overwrite it
+			},
+		}},
+	}
+	if err := artifact.Write(root, a); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	return id
+}
+
 func readReport(t *testing.T, v verify.Verifier) verify.Report {
 	t.Helper()
 	rep, err := v.Check(context.Background())
@@ -599,8 +631,9 @@ func TestEvidenceVerifierWiring(t *testing.T) {
 	t.Run("set + artifact present + pass => build first, evidence appended, green", func(t *testing.T) {
 		t.Setenv("NILCORE_EVIDENCE_VERIFY", "1")
 		t.Setenv("NILCORE_BROWSER_VERIFY", "")
-		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0} // exit 0 ⇒ url_resolves Pass
-		writeURLArtifact(t, box.dir, "rep", "https://example.com")
+		t.Setenv("NILCORE_VERIFY_PACKS", "web")                          // register web.quote_exists (value-checking)
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0, stdout: "v1"} // 2xx + body contains the claimed Value
+		writeQuoteArtifact(t, box.dir, "rep", "https://example.com")
 
 		v := behavioralVerifier(box, "true")
 		comp, ok := v.(verify.Composite)

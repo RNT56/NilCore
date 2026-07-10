@@ -298,6 +298,16 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 			return resp, nil
 		}
 		lastErr = err
+		// A cancelled/expired parent context is a deliberate interruption (a user steer
+		// or a session Cancel), NOT a provider fault — do NOT record a breaker failure
+		// for it. Recording it here let 4 consecutive mid-stream steers open the breaker
+		// and then fail EVERY drive in the process on a perfectly healthy provider
+		// ("breakers open") for the cooldown. streamOnce already returned the PARTIAL
+		// resp alongside the ctx error, so surface it verbatim to preserve mid-stream
+		// steer state; do NOT wrap it in a fresh Response{}.
+		if ctx.Err() != nil {
+			return resp, fmt.Errorf("attempt %d: %w", attempt+1, err)
+		}
 		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
 		// Live text was already painted: retrying would return the full text after a
 		// partial was shown (double-paint), breaking the forwarded==returned invariant.
@@ -309,13 +319,6 @@ func (r *Resilient) streamWithRetry(ctx context.Context, p Provider, b *breaker,
 		// caller's terminal check fires and stops the walk (no retry, no failover).
 		if isTerminalAPIError(err) {
 			return Response{}, err
-		}
-		// A cancelled/expired parent context is terminal — do not keep retrying.
-		// streamOnce already returned the PARTIAL resp alongside the ctx error, so
-		// surface it verbatim (partial + wrapped ctx err) to preserve mid-stream
-		// steer state; do NOT wrap it in a fresh Response{}.
-		if ctx.Err() != nil {
-			return resp, fmt.Errorf("attempt %d: %w", attempt+1, err)
 		}
 		// If this provider's breaker just opened, stop spending its retry budget.
 		if !b.allow(r.now(), r.opts.BreakerThreshold) {
@@ -407,16 +410,19 @@ func (r *Resilient) callWithRetry(ctx context.Context, p Provider, b *breaker, s
 			return resp, nil
 		}
 		lastErr = err
+		// A cancelled/expired parent context is a deliberate interruption (a user steer
+		// or a session Cancel), NOT a provider fault — return WITHOUT recording a breaker
+		// failure, so repeated cancels can't open the breaker and then fail every drive
+		// in the process on a healthy provider.
+		if ctx.Err() != nil {
+			return Response{}, fmt.Errorf("attempt %d: %w", attempt+1, err)
+		}
 		b.recordFailure(r.now(), r.opts.BreakerThreshold, r.opts.BreakerCooldown)
 		// A terminal *APIError (non-retryable, e.g. 401/403) cannot succeed on a
 		// retry — return it as-is so the caller's terminal check fires and stops
 		// the whole walk (no further retry, no failover).
 		if isTerminalAPIError(err) {
 			return Response{}, err
-		}
-		// A cancelled/expired parent context is terminal — do not keep retrying.
-		if ctx.Err() != nil {
-			return Response{}, fmt.Errorf("attempt %d: %w", attempt+1, err)
 		}
 		// If this provider's breaker just opened, stop spending its retry budget.
 		if !b.allow(r.now(), r.opts.BreakerThreshold) {

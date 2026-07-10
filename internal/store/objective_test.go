@@ -328,3 +328,88 @@ func TestObjectiveIdempotentReopen(t *testing.T) {
 		t.Errorf("reopened objective mismatch: %+v", got)
 	}
 }
+
+// TestObjectiveCadenceMigratedViaOpen closes the regression-detection gap for the
+// success-cadence migration. TestObjectiveLegacyDBOpensClean creates NO objectives
+// table, so schema.sql makes it fresh WITH retry_period_ns / last_success already
+// present and migrateObjectiveCadence is a no-op there — deleting the migrate call
+// from Open would leave that test green. This instead stands up an objectives table
+// that already EXISTS but LACKS those two columns, then opens via the real Open() path.
+// schema.sql's CREATE TABLE IF NOT EXISTS cannot alter the existing table, so ONLY the
+// Go migration invoked by Open can add the columns — so if that call is ever dropped
+// from Open, the column assertions below fail and the suite turns RED.
+func TestObjectiveCadenceMigratedViaOpen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy_cadence.db")
+
+	// Pre-cadence objectives table: no retry_period_ns / last_success columns.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.ExecContext(ctx, `CREATE TABLE objectives (
+		id TEXT PRIMARY KEY, goal TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 0,
+		enabled INTEGER NOT NULL DEFAULT 1, min_period_ns INTEGER NOT NULL DEFAULT 0,
+		last_run TEXT NOT NULL DEFAULT '')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.ExecContext(ctx,
+		`INSERT INTO objectives (id, goal, priority, enabled, min_period_ns, last_run)
+		 VALUES ('old', 'keep CI green', 5, 1, ?, '')`, int64(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open through the REAL migration pipeline.
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open legacy cadence DB: %v", err)
+	}
+
+	// The migrated columns are writable/readable through the typed API on the legacy
+	// row — this alone fails if the columns are missing (PutObjective/GetObjective
+	// reference them), and it also proves the pre-existing row survived intact.
+	success := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	if err := s.PutObjective(ctx, objective.Objective{
+		ID: "old", Goal: "keep CI green", Priority: 5, Enabled: true,
+		MinPeriod: 6 * time.Hour, RetryPeriod: time.Hour, LastSuccess: success,
+	}); err != nil {
+		t.Fatalf("write migrated columns via Open()-migrated DB: %v", err)
+	}
+	if got, err := s.GetObjective(ctx, "old"); err != nil {
+		t.Fatalf("get: %v", err)
+	} else if got.RetryPeriod != time.Hour || !got.LastSuccess.Equal(success) {
+		t.Errorf("migrated columns not persisted: retry=%v last_success=%v", got.RetryPeriod, got.LastSuccess)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Assert directly against the on-disk schema that both columns now exist, so the
+	// intent ("Open migrates the columns") is checked head-on, not only via behavior.
+	for _, col := range []string{"retry_period_ns", "last_success"} {
+		if !objectivesHasColumn(t, path, col) {
+			t.Errorf("Open() did not migrate objectives.%s onto a legacy DB", col)
+		}
+	}
+}
+
+// objectivesHasColumn reports whether the objectives table has the named column, read
+// via a fresh connection's pragma_table_info (the store's hasColumn is unexported). The
+// store is closed before this is called, so there is no concurrent handle on the file.
+func objectivesHasColumn(t *testing.T, path, col string) bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM pragma_table_info('objectives') WHERE name = ?`, col).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}

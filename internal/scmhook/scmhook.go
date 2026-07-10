@@ -45,7 +45,10 @@ type Handler struct {
 	// from the SecretStore and is never logged.
 	Secret string
 	// TriggerLabel, when set, restricts issue events to issues carrying this label
-	// (e.g. "nilcore"). Empty means any labeled issue qualifies.
+	// (e.g. "nilcore"). Empty is FAIL-CLOSED: a bare "opened" issue never qualifies
+	// (anyone can open one on a public repo — not an authorized trigger); only an
+	// explicit "labeled" action does, since adding a label requires repo triage
+	// permission. A set label narrows further to that specific label.
 	TriggerLabel string
 	// Handle routes an accepted Signal (typically trigger.Trigger.Handle). Required.
 	Handle func(ctx context.Context, sig trigger.Signal) (bool, error)
@@ -187,7 +190,17 @@ func (h *Handler) mapEvent(event string, body []byte) (trigger.Signal, bool) {
 		if p.Action != "labeled" && p.Action != "opened" {
 			return trigger.Signal{}, false
 		}
-		if h.TriggerLabel != "" && !hasLabel(p.Issue.Labels, h.TriggerLabel) {
+		if h.TriggerLabel != "" {
+			// A specific label is configured: only an issue carrying it qualifies
+			// (whether the event is "opened" already-labeled or a later "labeled").
+			if !hasLabel(p.Issue.Labels, h.TriggerLabel) {
+				return trigger.Signal{}, false
+			}
+		} else if p.Action != "labeled" {
+			// FAIL-CLOSED default (no NILCORE_WEBHOOK_LABEL): a bare "opened" issue is
+			// NOT an authorized trigger — anyone can open one on a public repo, and a
+			// valid HMAC only proves the forge relayed it. Require an explicit "labeled"
+			// action (adding a label needs repo triage permission) to self-start.
 			return trigger.Signal{}, false
 		}
 		// The attacker-controllable title is embedded as data inside a fixed,

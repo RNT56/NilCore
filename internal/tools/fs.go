@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -340,10 +339,14 @@ func searchRoot(b *strings.Builder, root string, relative bool, glob string, re 
 			return nil
 		}
 		// Never read through a symlink (I4 worktree confinement). filepath.WalkDir
-		// yields a symlink as a non-dir entry without descending it, but os.ReadFile
-		// would follow it — so a symlink planted in-tree by the sandboxed shell could
-		// otherwise leak out-of-worktree file contents to the model. The sibling
-		// ReadTool is hardened via worktreefs.OpenNoFollow; search must match it.
+		// yields a symlink as a non-dir entry without descending it — the cached
+		// readdir type lets us skip it here. But that type is a snapshot: a
+		// sandboxed process racing the walk can swap this entry for a symlink AFTER
+		// WalkDir recorded it as a regular file, and a plain os.ReadFile would then
+		// FOLLOW the swapped link and leak out-of-worktree content (an I4 TOCTOU).
+		// So we both skip the statically-present link here AND read via readNoFollow
+		// (O_NOFOLLOW) below — matching the sibling ReadTool's hardening — so a
+		// swapped-in final-component link is refused rather than followed.
 		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
@@ -352,9 +355,9 @@ func searchRoot(b *strings.Builder, root string, relative bool, glob string, re 
 				return nil
 			}
 		}
-		data, err := os.ReadFile(path)
+		data, err := readNoFollow(path)
 		if err != nil {
-			return nil // unreadable file: skip
+			return nil // unreadable file or a swapped-in symlink (O_NOFOLLOW ELOOP): skip
 		}
 		label := path
 		if relative {

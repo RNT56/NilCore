@@ -223,10 +223,51 @@ func buildMain(args []string) {
 	if err != nil {
 		fatal(err)
 	}
+	// FIX 2: preserve (and, when approved, land) the converged deliverable BEFORE the
+	// deferred stack.cleanup() sweeps the integrate/ working branches — otherwise the
+	// verified tip is DELETED and the run leaves nothing behind (base was never advanced;
+	// converge only RECORDS the gate approval). context.Background() so a run that spent
+	// its whole -deadline still preserves the tip. Mirrors chat/serve delivery discipline.
+	deliverBuild(context.Background(), stack.repo, out, log)
 	reportBuild(out)
 	if !out.Done {
 		os.Exit(1)
 	}
+}
+
+// deliverBuild preserves the converged, verifier-green integration tip so the run's
+// deliverable survives the run-end branch sweep (stack.cleanup deletes every task/ rebase/
+// integrate/ read/ branch). It is REQUIRED because the project loop's converge gates the
+// promote but never merges: an approved PromoteToBase only sets Outcome.Promoted + logs, so
+// without this the verified work is destroyed and base is left untouched.
+//
+// It pins the tip under the durable nilcore/kept/ prefix (mirroring chat/serve's
+// pinKeptBranch — that prefix is NOT swept) and, when the operator APPROVED the promote at
+// the gate (out.Promoted), also lands it on the base branch so the approval actually advances
+// base. A merge conflict/failure leaves the kept branch in place (never a partial base). A
+// non-Done or branch-less run has nothing verified to preserve. Best-effort + operator-facing:
+// every outcome prints where the deliverable is.
+func deliverBuild(ctx context.Context, repo string, out project.Outcome, log *eventlog.Log) {
+	if !out.Done || out.Branch == "" {
+		return
+	}
+	// Pin first so the verified SHA survives the sweep regardless of the merge below
+	// (best-effort: on any git fault pinKeptBranch returns the original name).
+	kept := pinKeptBranch(ctx, repo, out.Branch, log)
+	if out.Promoted {
+		tip, conflict, merr := mergeKeptBranch(ctx, repo, kept)
+		switch {
+		case conflict:
+			fmt.Printf("kept:       %s (promote approved but the merge conflicts — base unchanged; merge it manually)\n", kept)
+		case merr != nil:
+			fmt.Printf("kept:       %s (promote approved but the merge failed: %v — base unchanged)\n", kept, merr)
+		default:
+			worktree.DeleteBranch(ctx, repo, kept) // landed ⇒ the kept ref is redundant
+			fmt.Printf("promoted:   base advanced to %s\n", shortSHA(tip))
+		}
+		return
+	}
+	fmt.Printf("kept:       %s (verified deliverable — merge it with: git merge %s)\n", kept, kept)
 }
 
 // defaultAdvisorMaxCalls / defaultEscalateAfter back the resolveAdvisor call above
@@ -549,6 +590,42 @@ func buildStack(d buildDeps) (buildAssembly, error) {
 		MaxIterations: d.maxIter,
 		Budget:        ledger,
 		Deadline:      time.Time{}, // wall-clock is enforced by the ctx deadline in buildMain
+	}
+
+	// FIX 1: the converged PromoteToBase gate must key on the merge TARGET base (the
+	// base repo's current branch), not the source integration tip — otherwise the
+	// GradedApprover's "never auto-approve main/prod" floor keys on the tip and can never
+	// fire (project.Loop.BaseBranch). The loop is a leaf and runs no git, so resolve the
+	// branch here and hand it over as data. A detached HEAD (no symbolic ref) leaves it
+	// empty ⇒ converge falls back to the tip (the pre-fix behavior).
+	if base, berr := baseBranchName(context.Background(), repo); berr == nil {
+		loop.BaseBranch = base
+	}
+
+	// FIX 4: the loop's done-detection must judge the MERGED integration tip, not the
+	// untouched base repo dir. Workers commit to task/ branches and the integrator folds
+	// them into an integrate/ tip; nothing checks that tip out into `repo`, so a base-dir
+	// judge would verify an EMPTY base (a fresh run could never green a red bar; an already-
+	// green base would converge goal-blind, I2). VerifyTip cuts a throwaway worktree from
+	// the tip and runs the project verifier AND every criterion over IT, re-binding each
+	// criterion's command to the tip worktree's sandbox (the seeded criteria are bound to
+	// the base box). It mirrors buildVerifyFunc's tip-worktree shape.
+	loop.VerifyTip = func(ctx context.Context, tip string, criteria []project.Criterion) (bool, int) {
+		wt, werr := worktree.CreateFrom(ctx, repo, "verify/"+shortID(), "verify-"+shortID(), tip)
+		if werr != nil {
+			// Could not cut the tip worktree ⇒ the check could not run ⇒ NOT done (I2: a
+			// check we could not run is never a pass). Report the whole bar unmet so the loop
+			// keeps working rather than false-greening on an un-run verify.
+			return false, len(criteria) + 1
+		}
+		defer func() { _ = wt.Cleanup() }()
+		env := newEnv(wt.Path())
+		rebound := make([]project.Criterion, len(criteria))
+		for i, c := range criteria {
+			rebound[i] = project.Criterion{Description: c.Description, Command: c.Command,
+				Verifier: verify.New(env.Box, c.Command)}
+		}
+		return project.JudgeProject(ctx, vrec.wrap(env.Verifier), rebound)
 	}
 
 	// Vacuous-verifier guard (design risk #6): a greenfield bootstrap MUST leave a

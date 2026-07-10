@@ -156,6 +156,25 @@ func TestGitTool(t *testing.T) {
 	}
 }
 
+// TestGitShowRejectsLeadingDashRev is the option-injection regression for safeRev: a
+// rev beginning with '-' (e.g. "--ext-diff") must be rejected BEFORE it reaches
+// `git show --stat <rev>`, so a model-supplied rev can never be read as a git option.
+// The rejection is pure-regex (it fires before exec), so this needs no git binary.
+func TestGitShowRejectsLeadingDashRev(t *testing.T) {
+	dir := t.TempDir()
+	for _, rev := range []string{"--ext-diff", "-c", "--output=/tmp/x", "-HEAD"} {
+		if _, err := run(t, GitTool{}, dir, `{"op":"show","rev":"`+rev+`"}`); err == nil {
+			t.Errorf("show must reject leading-dash rev %q as an option injection", rev)
+		}
+	}
+	// A legit rev must still pass the character validator. It may fail later (no repo /
+	// git absent), but never with the "disallowed characters" rejection.
+	if _, err := run(t, GitTool{}, dir, `{"op":"show","rev":"HEAD~1"}`); err != nil &&
+		strings.Contains(err.Error(), "disallowed characters") {
+		t.Errorf("legit rev HEAD~1 wrongly rejected by safeRev: %v", err)
+	}
+}
+
 func TestSymlinkEscapeRejected(t *testing.T) {
 	dir := t.TempDir()
 	outside := t.TempDir()

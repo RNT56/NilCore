@@ -54,14 +54,15 @@ func lessonsMain(args []string) {
 // wireLessons folds the distilled lessons into cross-project memory at run start so
 // the next same-class task surfaces prior scars as context (LRN-T03 wiring). It is
 // the closed-loop half of `nilcore lessons`. DEFAULT-OFF: with NILCORE_LESSONS unset
-// it does nothing, so the run is byte-identical. It is best-effort — distilling reads
+// (or set to 0/off/false/no) it does nothing, so the run is byte-identical. It is
+// best-effort — distilling reads
 // the log READ-ONLY and fails closed on a broken chain (no lessons over forged
 // evidence, I5); a distill or remember error is reported to stderr but never aborts
 // the run (a learning aid must not break a working run). The records are structural
 // only (verifier_id + fail_class + count — I7), and memory.Remember dedupes, so
 // repeated runs do not pile up duplicates.
 func wireLessons(logPath string, mem *memory.Memory) {
-	if mem == nil || os.Getenv("NILCORE_LESSONS") == "" {
+	if mem == nil || !envOptIn("NILCORE_LESSONS") {
 		return
 	}
 	recs, err := lessons.Distill(logPath)

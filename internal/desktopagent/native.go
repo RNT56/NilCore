@@ -30,6 +30,12 @@ type NativeComputerTool struct {
 	EventSink   EventSink
 	Approver    Approver // human gate for irreversible actions; nil ⇒ fail closed on one (I2)
 
+	// GateAllMutations routes EVERY mutating action through the Approver (not just
+	// irreversibleTarget matches) — set on the host-control tier (--mac-host). Pixel mode
+	// already makes irreversibleTarget nearly blind (coordinate clicks have no accessible
+	// target), so this is what actually gates a destructive action on the REAL desktop.
+	GateAllMutations bool
+
 	mu       sync.Mutex
 	steps    int
 	stagnant int
@@ -82,8 +88,10 @@ func (n *NativeComputerTool) RunWithImage(ctx context.Context, _ string, input j
 	// Irreversible-action gate, symmetric with Path B (I2). In pixel mode a click is
 	// coordinate-based (no accessible target), so this mainly catches an Enter/Return
 	// submit on a window that names a consequential action; a nil Approver fails CLOSED.
-	// A blocked action consumes a step so a retrying model still terminates.
-	if sig := irreversibleTarget(act, n.Sess.Latest()); sig != "" {
+	// A blocked action consumes a step so a retrying model still terminates. On the
+	// host-control tier (GateAllMutations) every mutation is gated, since pixel-mode
+	// observations give the classifier no target on the REAL desktop.
+	if sig := mutationGate(act, n.Sess.Latest(), n.GateAllMutations); sig != "" {
 		if n.Approver == nil || !n.Approver.Approve("computer "+act.Op+" on irreversible target ("+sig+")") {
 			body := fmt.Sprintf("the %s on %q was BLOCKED by the irreversible-action gate (matched %q) — not performed. A human must approve it; report this and finish if you cannot proceed.", act.Op, sig, sig)
 			return guard.Wrap("computer gate", body), nil, nil

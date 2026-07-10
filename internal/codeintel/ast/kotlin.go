@@ -29,7 +29,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -93,7 +92,7 @@ func (kotlinParser) calls(path string) (map[string][]string, error) {
 // a type or companion object opens a receiver block; a `fun` is a method when it has an
 // explicit extension receiver, or when nested inside a type, else a free function.
 func kotlinScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open kotlin file: %w", err)
 	}

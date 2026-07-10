@@ -308,6 +308,13 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 
 	wt, err := worktree.Create(ctx, o.BaseRepo, t.ID)
 	if err != nil {
+		// The checkpoint was already marked running (Begin above). Finalize it so a
+		// restart's Resume does not re-drive a task whose setup already faulted here. A
+		// ctx-cancel during create (SIGTERM/deadline) belongs to the Interrupt sweep
+		// (running→interrupted, a deliberate resume point), so leave that case untouched.
+		if o.Checkpoint != nil && ctx.Err() == nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
+		}
 		return Outcome{}, fmt.Errorf("create worktree: %w", err)
 	}
 	// keepBranch is flipped on only for a verified success under KeepBranch (D4):
@@ -367,13 +374,58 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		// resumer skips it — the wake owns resume, so re-driving here would double it.
 		// Propagate the sentinel so the session unwinds with no verdict/notification.
 		if errors.Is(err, backend.ErrSuspended) {
-			if o.Checkpoint != nil {
-				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal)
+			// PRESERVE the committed work across the nap. The default worktree cleanup
+			// `git branch -D`s the task branch, which would DESTROY every commit the agent
+			// made before sleeping — directly contradicting the sleep guidance ("your
+			// uncommitted edits are discarded — commit them first", which implies commits
+			// survive). So before the disposable task/<id> worktree is cleaned up we pin its
+			// committed HEAD under a distinct, collision-safe, sweep-safe ref
+			// (suspend/<id>, mirroring the resume/ durable-anchor convention): the commits
+			// stay reachable for the wake to resume, while uncommitted working-tree edits
+			// remain disposable exactly as the guidance states. Best-effort — a Head/pin
+			// failure is logged and we still record what we can and unwind cleanly.
+			branch := "suspend/" + t.ID
+			if sha, herr := wt.Head(ctx); herr != nil {
+				branch = ""
+				o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "suspend_preserve",
+					Detail: map[string]any{"error": herr.Error()}})
+			} else if perr := worktree.PinBranch(ctx, o.BaseRepo, branch, sha); perr != nil {
+				branch = ""
+				o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "suspend_preserve",
+					Detail: map[string]any{"error": perr.Error()}})
 			}
-			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended"})
-			return Outcome{Backend: be.Name(), Summary: res.Summary}, backend.ErrSuspended
+			if o.Checkpoint != nil {
+				// Record the preserved branch in the durable checkpoint so a resume can find
+				// and reattach to the committed work rather than starting from an empty tree.
+				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal, branch)
+			}
+			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended",
+				Detail: map[string]any{"branch": branch}})
+			return Outcome{Backend: be.Name(), Summary: res.Summary, Branch: branch}, backend.ErrSuspended
+		}
+		// A genuine backend fault is terminal: finalize the durable checkpoint so a
+		// restart's Resume does not re-drive a task the live process already failed. But a
+		// ctx-cancel fault (SIGTERM/deadline on the single-task path, which surfaces as a
+		// model-step context.Canceled error) is NOT ours to finalize — the SIGTERM Interrupt
+		// sweep owns that row (running→interrupted, a deliberate resume point), so we leave
+		// it untouched to preserve that handling.
+		if o.Checkpoint != nil && ctx.Err() == nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
 		}
 		return Outcome{Backend: be.Name()}, fmt.Errorf("backend: %w", err)
+	}
+
+	// A cancelled task ctx (operator /cancel, SIGTERM, or a deadline) makes a well-behaved
+	// backend return a CLEAN interrupted Result (native.go returns Result{Summary:
+	// "interrupted: ..."}, nil). Running the final verify on the dead ctx would fail with
+	// "context canceled" and mis-surface the interrupt as a verify FAULT ("Run errored").
+	// So on a cancelled ctx we SKIP verification and return the clean interrupted Outcome:
+	// the work was cut short, not completed, so there is nothing to gate. We do NOT finalize
+	// the checkpoint here — the SIGTERM Interrupt sweep owns that row (deliberate resume).
+	if ctx.Err() != nil {
+		o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "task_interrupted",
+			Detail: map[string]any{"cause": ctx.Err().Error()}})
+		return Outcome{Backend: res.Backend, Summary: res.Summary}, nil
 	}
 
 	// Source of truth: re-run the project's checks no matter which backend ran.
@@ -381,6 +433,20 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	// self-report never decides whether the work ships (invariant I2).
 	rep, err := env.Verifier.Check(ctx)
 	if err != nil {
+		// A ctx cancelled DURING the verify (an interrupt landing after the check above)
+		// makes Check fail with context.Canceled — the same interrupt caught before the
+		// verify, just later. Surface it as a clean interrupted outcome, not a "final verify"
+		// fault, and leave the row to the Interrupt sweep (do not finalize it).
+		if ctx.Err() != nil {
+			o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "task_interrupted",
+				Detail: map[string]any{"cause": ctx.Err().Error(), "at": "verify"}})
+			return Outcome{Backend: res.Backend, Summary: res.Summary}, nil
+		}
+		// A genuine verify fault is terminal: finalize the checkpoint so a restart's Resume
+		// does not re-drive a task the live process already failed.
+		if o.Checkpoint != nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
+		}
 		return Outcome{Backend: res.Backend, Summary: res.Summary}, fmt.Errorf("final verify: %w", err)
 	}
 	// Detail["class"] is the deterministic task-class bucket (trust.Classify), added
@@ -496,7 +562,23 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 	if o.Oracle != nil || o.Cost != nil {
 		class = trust.Classify(t.Goal)
 	}
+	// Track the race worktrees PARALLEL to their candidates so a KeepBranch race can
+	// PRESERVE the winner's (Release, keep the branch) instead of destroying every race
+	// worktree. One deferred sweep cleans up every worktree EXCEPT the preserved winner
+	// (keptIdx, set by runRace); keptIdx stays -1 on the default (non-KeepBranch) path, so
+	// every worktree is Cleanup'd exactly as before (byte-identical). This replaces the
+	// former per-iteration `defer rwt.Cleanup()`.
 	var cands []route.Candidate
+	var wts []*worktree.Worktree
+	keptIdx := -1
+	defer func() {
+		for i, w := range wts {
+			if i == keptIdx {
+				continue // the preserved winner: Released (branch kept), never Cleanup'd
+			}
+			_ = w.Cleanup()
+		}
+	}()
 	if o.multiBackend() {
 		// Multi path: race the DISTINCT configured backends (one fresh worktree per
 		// ordered name) so route.Race competes DIFFERENT backends and the verifier
@@ -512,7 +594,6 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 			if err != nil {
 				continue
 			}
-			defer func() { _ = rwt.Cleanup() }()
 			rt := t
 			rt.Dir = rwt.Path()
 			renv := o.NewEnvFor(rt.Dir, name)
@@ -521,11 +602,14 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 				rc.Cost = o.Cost(class, name)
 			}
 			cands = append(cands, rc)
+			wts = append(wts, rwt)
 		}
 		if len(cands) == 0 {
 			return Outcome{}, false
 		}
-		return o.runRace(ctx, t, cands)
+		out, ok, kept := o.runRace(ctx, t, cands, wts)
+		keptIdx = kept
+		return out, ok
 	}
 
 	// Single path — byte-identical when the oracle is unwired: raceN copies of the
@@ -538,16 +622,18 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 		if err != nil {
 			continue
 		}
-		defer func() { _ = rwt.Cleanup() }()
 		rt := t
 		rt.Dir = rwt.Path()
 		renv := o.NewEnv(rt.Dir)
 		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: renv.Verifier, Task: rt, Class: class})
+		wts = append(wts, rwt)
 	}
 	if len(cands) == 0 {
 		return Outcome{}, false
 	}
-	return o.runRace(ctx, t, cands)
+	out, ok, kept := o.runRace(ctx, t, cands, wts)
+	keptIdx = kept
+	return out, ok
 }
 
 // raceEscalateDetail enriches a race_escalate event's Detail with the RTE-T05
@@ -613,17 +699,77 @@ func withFailureEvidence(constraints []string, failClass, verifierOutput string)
 // status and write back facts. Both the single (N-copies) and multi (distinct
 // backends) paths feed identical candidates here, so the single path stays
 // byte-identical — only the candidate SET differs between them.
-func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate) (Outcome, bool) {
+//
+// wts is the worktree parallel to each candidate; the returned keptIdx is the index
+// runRace wants SPARED from the caller's cleanup sweep (the preserved KeepBranch winner)
+// or -1 (clean everything). It preserves the RACE winner's branch under KeepBranch
+// exactly as the non-race single-task path preserves a lone verified success — without
+// this, every race-won KeepBranch result returned Branch:"" and its verified work was
+// destroyed, silently breaking the -race-n "keep a verifier-green one" contract for the
+// chat /apply, watch/schedule --open-pr, decompose and selfimprove consumers.
+func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate, wts []*worktree.Worktree) (Outcome, bool, int) {
 	rres, ok := route.Race(ctx, cands, o.Log)
 	if !ok {
-		return Outcome{}, false
+		return Outcome{}, false, -1
 	}
 	out := Outcome{Backend: rres.Backend, Summary: rres.Summary, Verified: true}
+	keptIdx := -1
+	// Preserve the race winner's branch under KeepBranch. route.Race returns only the
+	// winning Result (never the winning index), so identifyRaceWinner recovers WHICH
+	// worktree carried the verified work; we then commit any uncommitted verified state,
+	// Release (keep) that branch, report its name in the Outcome, and hand the caller the
+	// index to spare from cleanup. It runs BEFORE OnSuccess so the write-back sees the
+	// branch, matching the non-race path's ordering.
+	if o.KeepBranch {
+		if w := o.identifyRaceWinner(ctx, cands, rres); w >= 0 {
+			wt := wts[w]
+			if _, _, cerr := wt.Commit(ctx, "nilcore: "+t.Goal); cerr != nil {
+				o.Log.Append(eventlog.Event{Task: t.ID, Kind: "keep_branch_commit",
+					Detail: map[string]any{"error": cerr.Error()}})
+			}
+			if rerr := wt.Release(); rerr != nil {
+				o.Log.Append(eventlog.Event{Task: t.ID, Kind: "worktree_release",
+					Detail: map[string]any{"error": rerr.Error()}})
+			} else {
+				out.Branch = wt.Branch()
+				keptIdx = w
+			}
+		}
+	}
 	if o.Checkpoint != nil {
 		_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, true)
 	}
 	if o.OnSuccess != nil {
 		o.OnSuccess(ctx, t, out)
 	}
-	return out, true
+	return out, true, keptIdx
+}
+
+// identifyRaceWinner recovers the index in cands of the worktree whose verified work
+// route.Race selected, so KeepBranch can preserve THAT worktree's branch. route.Race
+// returns only the winning Result (Backend + Summary), never the winning index, so we
+// recover it here: when exactly one candidate carries the winner's backend name the
+// mapping is unambiguous (the multi-backend race — distinct backends, no re-verify);
+// when several share it (the single-backend N-copies race) we re-verify in index order
+// and take the FIRST verifier-green one, matching route.Race's own lowest-index-passer
+// rule. The re-verify runs at most once per matching candidate and ONLY on the KeepBranch
+// path, so the default path pays nothing. Returns -1 when the winner cannot be identified
+// (e.g. a flaky re-verify), in which case the caller preserves nothing and every worktree
+// is cleaned up — a safe degradation to the old Branch:"" behavior, never a false branch.
+func (o *Orchestrator) identifyRaceWinner(ctx context.Context, cands []route.Candidate, winner backend.Result) int {
+	var matches []int
+	for i, c := range cands {
+		if c.Backend.Name() == winner.Backend {
+			matches = append(matches, i)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	for _, i := range matches {
+		if rep, err := cands[i].Verifier.Check(ctx); err == nil && rep.Passed {
+			return i
+		}
+	}
+	return -1
 }

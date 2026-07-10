@@ -417,6 +417,19 @@ func resolveExistingPrefix(p string) (string, error) {
 	return filepath.Join(append([]string{real}, missing...)...), nil
 }
 
+// hasGitComponent reports whether rel — an OS-separated path relative to the
+// worktree root — has a component exactly equal to ".git" (the entry itself or any
+// segment inside a ".git" directory). ".gitignore"/".gitattributes"/".github" are
+// NOT ".git", so legitimate tracked files are unaffected.
+func hasGitComponent(rel string) bool {
+	for _, comp := range strings.Split(rel, string(os.PathSeparator)) {
+		if comp == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
 // writeNoFollow performs the atomic temp + rename against an already-confined target
 // path. root is the confinement boundary the no-follow parent-dir check is bounded to
 // (see mkdirAllNoFollow): a symlinked component AT OR BELOW root is refused, one ABOVE
@@ -424,6 +437,23 @@ func resolveExistingPrefix(p string) (string, error) {
 // perm <= 0 ⇒ preserve existing perms on overwrite (default 0644 for a new file); a
 // positive perm is used verbatim.
 func writeNoFollow(root, p string, content []byte, perm os.FileMode) error {
+	// Refuse to write into a repository's .git metadata. This is the single chokepoint
+	// every host-side writer funnels through (WriteAtomic and WriteConfined both land
+	// here), so the guard covers the file tools, patch, format, edit_checked, rename,
+	// structural-replace and plan at once. The host-side `git` tool runs REAL git in
+	// this worktree, and repo-local .git/config (diff.external, filter.*.clean/smudge,
+	// gpg.program) plus .git/hooks are host code-execution vectors — a model can drive
+	// these writers with an attacker-chosen path, so planting .git metadata (or
+	// repointing the .git gitdir file) through a file write must not be possible
+	// (CLAUDE.md §2 I4). Git manages .git through its OWN process, never through this
+	// path, so legitimate VCS operations are unaffected. boundaryTail yields p's tail
+	// below the canonical worktree root — computed in the same symlink-space, so a
+	// symlinked host ancestor cannot spoof the relative path; on the escape/unresolvable
+	// error we skip (mkdirAllNoFollow rejects the same case just below, fail-closed).
+	if _, rel, err := boundaryTail(root, filepath.Clean(p)); err == nil && hasGitComponent(rel) {
+		return fmt.Errorf("refusing to write inside .git: %q", p)
+	}
+
 	dir := filepath.Dir(p)
 	// Create parent dirs with a symlink-safe stepwise walk instead of os.MkdirAll:
 	// MkdirAll follows an EXISTING directory component even if it is a symlink, so a

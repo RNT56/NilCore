@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -259,4 +260,127 @@ func TestReadDescriptionTeachesPaging(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestWriteRefusesDotGit is the I4 regression for the repo-local git-config RCE: the
+// file tools must refuse to write any path whose location is the ".git" entry or lies
+// inside a ".git" directory, so a model cannot plant .git/config (diff.external /
+// filter.*.clean), a .git hook, a nested repo's .git, or repoint the linked-worktree
+// .git pointer file — each of which turns a later host-side `git add`/`diff`/`commit`
+// into host code execution. The guard also creates NOTHING at the refused path.
+func TestWriteRefusesDotGit(t *testing.T) {
+	dir := t.TempDir()
+	for _, p := range []string{
+		".git/config",           // full-clone: plant diff.external / filter.*.clean
+		".git/hooks/pre-commit", // full-clone: plant a hook
+		"sub/.git/x",            // a nested repo's .git anywhere in the tree
+		".git",                  // the .git pointer file itself (linked-worktree gitdir repoint)
+		"./.git/config",         // a normalizing path must not slip past the guard
+	} {
+		if _, err := run(t, WriteTool{}, dir, `{"path":"`+p+`","content":"x"}`); err == nil {
+			t.Errorf("WriteTool must refuse to write %q inside .git", p)
+		}
+		if _, statErr := os.Lstat(filepath.Join(dir, filepath.Clean(p))); statErr == nil {
+			t.Errorf("WriteTool created %q despite refusing", p)
+		}
+	}
+	// The refused writes must not have created the .git or sub directories either.
+	for _, d := range []string{".git", "sub"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, d)); statErr == nil {
+			t.Errorf("a refused .git write created directory %q", d)
+		}
+	}
+}
+
+// TestEditRefusesDotGit: edit likewise refuses at the write step. It reads the target
+// (a pre-existing config placed out-of-band, as a real repo has), computes the
+// replacement, then the write into .git is refused and the file is left untouched.
+func TestEditRefusesDotGit(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(gitDir, "config")
+	const original = "[core]\n\tbare = false\n"
+	if err := os.WriteFile(cfg, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, EditTool{}, dir, `{"path":".git/config","old":"false","new":"true"}`); err == nil {
+		t.Fatal("EditTool must refuse to edit a file inside .git")
+	}
+	if got, err := os.ReadFile(cfg); err != nil || string(got) != original {
+		t.Fatalf("EditTool modified .git/config despite refusing: %q err=%v", got, err)
+	}
+}
+
+// TestWriteAllowsGitAdjacentNames: names that merely START with ".git" are NOT the
+// ".git" directory and must still be writable — the guard is component-exact.
+func TestWriteAllowsGitAdjacentNames(t *testing.T) {
+	dir := t.TempDir()
+	for _, p := range []string{".gitignore", ".gitattributes", ".github/workflows/ci.yml", "src/main.go"} {
+		if _, err := run(t, WriteTool{}, dir, `{"path":"`+p+`","content":"ok"}`); err != nil {
+			t.Errorf("legit write %q must succeed (only exact .git is refused): %v", p, err)
+		}
+	}
+}
+
+// TestSearchRefusesSymlinkSwappedDuringWalk is the FIX-3 regression: searchRoot reads
+// via readNoFollow (O_NOFOLLOW), so an entry WalkDir recorded as a regular file that a
+// racing process then swaps for a symlink to an out-of-worktree secret is refused at
+// open rather than followed. A hammer goroutine flips one entry between a benign file
+// and such a symlink while searches run; the secret's needle must NEVER surface. On
+// the fixed code the O_NOFOLLOW open always refuses the link, so this is stable-green;
+// only the old os.ReadFile path could leak. Run under -race.
+func TestSearchRefusesSymlinkSwappedDuringWalk(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET_SWAP_NEEDLE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Benign siblings so the walk dwells in the directory, widening the swap window.
+	for i := 0; i < 24; i++ {
+		writeFixture(t, dir, "f"+strconv.Itoa(i)+".txt", "benign\n")
+	}
+	hot := filepath.Join(dir, "hot.txt")
+	if err := os.WriteFile(hot, []byte("benign\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Confirm symlinks work here (mirrors sibling tests); skip cleanly otherwise.
+	probe := hot + ".probe"
+	if err := os.Symlink(secret, probe); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	_ = os.Remove(probe)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Remove(hot)
+			if i%2 == 0 {
+				_ = os.Symlink(secret, hot) // swap in a link to the outside secret
+			} else {
+				_ = os.WriteFile(hot, []byte("benign\n"), 0o644) // swap back to a regular file
+			}
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		got, _ := run(t, SearchTool{}, dir, `{"pattern":"SECRET_SWAP_NEEDLE"}`)
+		if strings.Contains(got, "SECRET_SWAP_NEEDLE") {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("search followed a symlink swapped in during the walk (I4 TOCTOU leak): %q", got)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

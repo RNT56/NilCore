@@ -27,20 +27,22 @@ import (
 )
 
 // recBox is a hermetic sandbox.Sandbox stand-in. It records how many commands it ran and
-// returns a fixed exit code, so a test drives the per-claim curl verdict (ExitCode 0 =>
-// web.url_resolves StatusPass; non-zero => StatusUnverifiable) without any network, and can
-// assert the per-claim layer was never reached (calls == 0).
+// returns a fixed exit code + canned stdout, so a test drives the per-claim curl verdict
+// (web.quote_exists: exit 0 with a body containing the claimed Value => StatusPass; a
+// non-zero exit => StatusUnverifiable) without any network, and can assert the per-claim
+// layer was never reached (calls == 0).
 type recBox struct {
 	mu       sync.Mutex
 	calls    int
 	exitCode int
+	stdout   string
 }
 
 func (b *recBox) Exec(_ context.Context, _ string) (sandbox.Result, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.calls++
-	return sandbox.Result{ExitCode: b.exitCode}, nil
+	return sandbox.Result{ExitCode: b.exitCode, Stdout: b.stdout}, nil
 }
 
 func (b *recBox) ExecWithEnv(ctx context.Context, cmd string, _ map[string]string) (sandbox.Result, error) {
@@ -69,17 +71,20 @@ func writeArtifact(t *testing.T, root string, a *artifact.Artifact) string {
 	return filepath.Join(root, ".nilcore", "artifacts", a.ID+".json")
 }
 
-// urlClaim builds a well-formed report claim bound to web.url_resolves with a valid,
-// key-free https source — the shape passes schema, so the per-claim curl verdict decides.
-func urlClaim(id string) artifact.Claim {
+// quoteClaim builds a well-formed report claim bound to web.quote_exists — a VALUE-CHECKING
+// verifier (the asserted Value must appear in the fetched body). The shape passes schema, so
+// the per-claim body verdict decides: with recBox.stdout carrying the Value the claim greens;
+// a non-2xx exit reds it. (web.url_resolves is deliberately NOT used for a value-bearing
+// claim: bound to one it is refused as a hollow green — see TestBuildRefusesHollowURLGreen.)
+func quoteClaim(id string) artifact.Claim {
 	return artifact.Claim{
 		ID:        id,
 		Field:     "homepage",
-		Statement: "the site resolves",
+		Statement: "the body carries the value",
 		Evidence: artifact.Evidence{
 			Value:     "ok",
 			SourceURL: "https://example.com/" + id,
-			Verifier:  "web.url_resolves",
+			Verifier:  "web.quote_exists",
 			Status:    artifact.StatusPass, // self-written; the verifier MUST overwrite it
 		},
 	}
@@ -105,7 +110,7 @@ func TestBuildSchemaShortCircuits(t *testing.T) {
 	root := t.TempDir()
 	// Bad shape: a report with an EMPTY title (schema requires "title") => CodeMissingField
 	// at Named[0]. The claim itself is well-formed so ONLY the missing title is the defect.
-	bad := reportArtifact("a1", urlClaim("c1"))
+	bad := reportArtifact("a1", quoteClaim("c1"))
 	bad.Title = ""
 	rel := writeArtifact(t, root, bad)
 
@@ -128,8 +133,9 @@ func TestBuildSchemaShortCircuits(t *testing.T) {
 }
 
 // TestBuildGreenVsRed: over a structurally valid artifact, the composite's verdict is the
-// I2 per-claim verdict. A box returning exit 0 makes web.url_resolves pass (Passed=true);
-// a box returning a non-zero exit makes it Unverifiable, so the composite is NOT green.
+// I2 per-claim verdict. A box returning exit 0 with a body that CONTAINS the claimed Value
+// makes web.quote_exists pass (Passed=true); a box returning a non-zero exit makes it
+// Unverifiable, so the composite is NOT green.
 func TestBuildGreenVsRed(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -142,9 +148,11 @@ func TestBuildGreenVsRed(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			rel := writeArtifact(t, root, reportArtifact("g1", urlClaim("c1")))
+			rel := writeArtifact(t, root, reportArtifact("g1", quoteClaim("c1")))
 
-			box := &recBox{exitCode: tc.exitCode}
+			// stdout carries the claimed Value ("ok"), so on exit 0 quote_exists finds it in
+			// the body and passes; on a non-zero exit the body is never reached (Unverifiable).
+			box := &recBox{exitCode: tc.exitCode, stdout: "ok"}
 			plan, err := Build(NameWeb, box, rel, DefaultSchemas())
 			if err != nil {
 				t.Fatalf("Build(web): unexpected error: %v", err)
@@ -164,11 +172,47 @@ func TestBuildGreenVsRed(t *testing.T) {
 	}
 }
 
+// TestBuildRefusesHollowURLGreen is the I2 "hollow green" guard at the assembler level: a
+// value-bearing report claim bound to web.url_resolves must NOT green even when the source
+// RESOLVES (box exit 0). url_resolves never inspects the claimed Value, so greening it would
+// ship a fabricated Value as "verified". The ArtifactVerifier's strength gate refuses the
+// binding (Unverifiable), reddening the whole composite.
+func TestBuildRefusesHollowURLGreen(t *testing.T) {
+	root := t.TempDir()
+	// A well-shaped report claim that ASSERTS a Value but binds it to the value-blind
+	// url_resolves — the exact hollow-green a worker could otherwise ship.
+	hollow := artifact.Claim{
+		ID:        "c1",
+		Field:     "gdp",
+		Statement: "a fabricated fact",
+		Evidence: artifact.Evidence{
+			Value:     "GDP grew 3.2%",
+			SourceURL: "https://example.com/c1",
+			Verifier:  "web.url_resolves",
+			Status:    artifact.StatusPass, // self-written; must be overwritten
+		},
+	}
+	rel := writeArtifact(t, root, reportArtifact("hollow1", hollow))
+
+	box := &recBox{exitCode: 0, stdout: "anything"} // the source RESOLVES (a 2xx)
+	plan, err := Build(NameWeb, box, rel, DefaultSchemas())
+	if err != nil {
+		t.Fatalf("Build(web): unexpected error: %v", err)
+	}
+	rep, err := plan.Verifier.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: unexpected error: %v", err)
+	}
+	if rep.Passed {
+		t.Fatalf("a value-bearing url_resolves claim must NOT green (hollow green); got Passed=true: %s", rep.Output)
+	}
+}
+
 // TestBuildOneRedAmongGreen: a single red claim fails the WHOLE composite — Green requires
 // every claim StatusPass, so a swarm shard can never ship with a red claim masked by greens.
 func TestBuildOneRedAmongGreen(t *testing.T) {
 	root := t.TempDir()
-	rel := writeArtifact(t, root, reportArtifact("m1", urlClaim("c1"), urlClaim("c2")))
+	rel := writeArtifact(t, root, reportArtifact("m1", quoteClaim("c1"), quoteClaim("c2")))
 
 	// The stub returns the SAME exit code for every call; a non-zero code reds both claims.
 	// (A per-claim-selective stub is unnecessary: the property under test is "any non-pass
@@ -191,7 +235,7 @@ func TestBuildOneRedAmongGreen(t *testing.T) {
 // never a silent no-op verifier. This is the fail-closed inversion of verify.Detect.
 func TestBuildUnknownName(t *testing.T) {
 	root := t.TempDir()
-	rel := writeArtifact(t, root, reportArtifact("u1", urlClaim("c1")))
+	rel := writeArtifact(t, root, reportArtifact("u1", quoteClaim("c1")))
 
 	if _, err := Build("does-not-exist", &recBox{}, rel, DefaultSchemas()); err == nil {
 		t.Fatalf("Build with an unknown pack name must return an error, got nil")
@@ -203,7 +247,7 @@ func TestBuildUnknownName(t *testing.T) {
 // before SW-T05; this pins that they are wired.)
 func TestBuildKnownNames(t *testing.T) {
 	root := t.TempDir()
-	rel := writeArtifact(t, root, reportArtifact("k1", urlClaim("c1")))
+	rel := writeArtifact(t, root, reportArtifact("k1", quoteClaim("c1")))
 
 	for _, name := range []string{
 		NameWeb, NameSoftware, NameFinance, NameUI,
@@ -220,7 +264,7 @@ func TestBuildKnownNames(t *testing.T) {
 // check fails closed to Unverifiable with no box), never a spurious pass.
 func TestBuildNilBoxStillComposes(t *testing.T) {
 	root := t.TempDir()
-	rel := writeArtifact(t, root, reportArtifact("n1", urlClaim("c1")))
+	rel := writeArtifact(t, root, reportArtifact("n1", quoteClaim("c1")))
 
 	plan, err := Build(NameWeb, nil, rel, DefaultSchemas())
 	if err != nil {
@@ -239,7 +283,7 @@ func TestBuildNilBoxStillComposes(t *testing.T) {
 // still fires and reds the verdict — proving the structural gate runs without a box.
 func TestBuildNilBoxSchemaFailsClosed(t *testing.T) {
 	root := t.TempDir()
-	bad := reportArtifact("nb1", urlClaim("c1"))
+	bad := reportArtifact("nb1", quoteClaim("c1"))
 	bad.Title = "" // schema: missing required title
 	rel := writeArtifact(t, root, bad)
 
@@ -260,7 +304,7 @@ func TestBuildNilBoxSchemaFailsClosed(t *testing.T) {
 // egress host-set, so their PackPlan.Hosts is nil (no allowlist to cross-check).
 func TestBuildHostsForLocalPacks(t *testing.T) {
 	root := t.TempDir()
-	rel := writeArtifact(t, root, reportArtifact("h1", urlClaim("c1")))
+	rel := writeArtifact(t, root, reportArtifact("h1", quoteClaim("c1")))
 
 	for _, name := range []string{NameAudit, NameBenchmark, NameCode} {
 		plan, err := Build(name, &recBox{}, rel, DefaultSchemas())

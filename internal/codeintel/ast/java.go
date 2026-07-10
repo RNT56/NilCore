@@ -23,7 +23,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 )
 
@@ -90,7 +89,7 @@ func (javaParser) calls(path string) (map[string][]string, error) {
 // backend, differing only in header shapes — a Java type opens a receiver block and the
 // methods/constructors inside it carry that type as their receiver).
 func javaScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open java file: %w", err)
 	}

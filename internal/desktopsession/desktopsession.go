@@ -29,6 +29,33 @@ import (
 // sandbox; it is never returned to the model or written to the log (I3).
 type SecretResolver func(name string) (value string, ok bool)
 
+// AllowlistResolver wraps inner so it resolves ONLY names on the operator-declared,
+// per-task allowlist. A name absent from allow returns ok=false, so substituteSecrets
+// fails closed ("refusing to type a placeholder") instead of typing it. An empty (or
+// nil) allow resolves NOTHING — the fail-closed default: an operator must explicitly
+// declare which secret names a desktop task may type. This is the exfiltration fence:
+// without it, an env-first resolver would hand the model ANY process env var the moment
+// it typed the placeholder (e.g. a hostile/injected model typing {{secret:ANTHROPIC_API_KEY}}
+// into a field). inner may be nil (treated as resolve-nothing). Sibling of
+// browsersession.AllowlistResolver.
+func AllowlistResolver(allow []string, inner SecretResolver) SecretResolver {
+	set := make(map[string]struct{}, len(allow))
+	for _, n := range allow {
+		if n = strings.TrimSpace(n); n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	return func(name string) (string, bool) {
+		if _, ok := set[name]; !ok {
+			return "", false
+		}
+		if inner == nil {
+			return "", false
+		}
+		return inner(name)
+	}
+}
+
 // Options configure a desktop session launch.
 type Options struct {
 	Driver  string         // in-sandbox driver command (default "nilcore-desktop")

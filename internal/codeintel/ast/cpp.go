@@ -30,7 +30,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -113,7 +112,7 @@ func (cppParser) calls(path string) (map[string][]string, error) {
 // regardless of nesting (its Recv comes from the qualifier, not the stack); an in-class
 // method only counts inside a class receiver; a free function otherwise.
 func cppScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open cpp file: %w", err)
 	}

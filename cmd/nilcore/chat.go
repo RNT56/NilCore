@@ -36,6 +36,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,6 +128,13 @@ func chatMain(args []string) {
 	// the live tool off.
 	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
+	// Resolve `-backend auto` (and a config `backend: auto`) to a concrete backend
+	// BEFORE resolveProvider — exactly as run/serve do — otherwise the primary
+	// conversational front door fatals with `unknown backend "auto"` on a value the
+	// rest of the CLI accepts.
+	if *cf.common.backendName == "auto" {
+		*cf.common.backendName = resolveAutoBackend(cf.common, b, log)
+	}
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -466,6 +474,13 @@ func splitHosts(s string) []string {
 // a container-backend capability. The container reaches the host-side proxy via the
 // runtime's host alias (host.containers.internal for podman, host.docker.internal
 // for docker, with an --add-host so it resolves on docker-Linux too).
+// egressWarnOnce/egressStrictWarnOnce bound the container-egress security advisories
+// to one line per process (applyContainerEgress runs per drive / per swarm worker).
+var (
+	egressWarnOnce       sync.Once
+	egressStrictWarnOnce sync.Once
+)
+
 func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, runtime string) {
 	if egress.Empty() || proxyAddr == "" {
 		return
@@ -474,6 +489,23 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 	if !ok {
 		return
 	}
+	// The container backend's egress allowlist is enforced by a COOPERATIVE proxy over a
+	// bridged network — a model-emitted command that ignores HTTP(S)_PROXY (curl
+	// --noproxy, raw sockets, /dev/tcp) can still reach arbitrary hosts, including cloud
+	// metadata (see sandbox.Container.AllowEgressVia). NILCORE_EGRESS_STRICT lets an
+	// operator who needs a hard boundary refuse cooperative egress — egress then stays
+	// deny-all (--network none) — rather than pretend the allowlist is a wall. Hard
+	// allowlisted egress isn't available on the container backend, so this fails closed;
+	// the namespace backend (Linux) is the hard-boundary option.
+	if envOptIn("NILCORE_EGRESS_STRICT") {
+		egressStrictWarnOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_STRICT set — refusing cooperative container egress; egress stays deny-all (--network none). Use the namespace backend (Linux) for a hard egress boundary, or unset to accept proxy-cooperative egress.")
+		})
+		return
+	}
+	egressWarnOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "nilcore: container egress allowlist is enforced by a cooperative proxy — a sandboxed command that bypasses HTTP(S)_PROXY (curl --noproxy, raw sockets, /dev/tcp) can still reach arbitrary hosts. For a hard egress boundary use the namespace backend (Linux); set NILCORE_EGRESS_STRICT=1 to fail closed.")
+	})
 	_, port, err := net.SplitHostPort(proxyAddr)
 	if err != nil {
 		return
@@ -1278,15 +1310,16 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	}
 	if adv.prov != nil {
 		// A fresh advisor per drive so its per-drive consult ceiling is honored,
-		// exactly as the run path's buildBackend does.
-		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+		// exactly as the run path's buildBackend does. Metered against the conversation
+		// budget wall (§6/§7) — a raw adv.prov would let strong-model consults escape it.
+		n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
 	}
 	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
 	// the conversational loop gets the same worktree-aware `live` tool the run path
 	// has — previously only `buildBackend` (run/watch/propose-edit) wired it, so the
 	// advertised front door silently lacked it. Off by default (nil seam).
-	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+	if envOptIn("NILCORE_LIVE_INDEX") {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
 	// Operator steering (P10-T01): an authoritative project steering file

@@ -70,6 +70,15 @@ type ComputerTool struct {
 	EventSink   EventSink
 	Approver    Approver // human gate for irreversible actions; nil ⇒ fail closed on one (I2)
 
+	// GateAllMutations routes EVERY mutating action through the Approver, not only
+	// irreversibleTarget matches. It is set on the native-macOS host-control tier
+	// (cmd/nilcore/desktop.go --mac-host): there the CV-only observation yields refs with
+	// empty Name/Value and never populates FocusedWindow/Title, so irreversibleTarget is
+	// structurally blind and would gate NOTHING on the REAL desktop. With this set, a
+	// delete/pay click on the host is actually gated. Contained (sandboxed) mode leaves it
+	// false — behavior unchanged, only irreversible targets gate.
+	GateAllMutations bool
+
 	mu       sync.Mutex
 	steps    int
 	stagnant int
@@ -164,7 +173,9 @@ func (c *ComputerTool) RunWithImage(ctx context.Context, _ string, input json.Ra
 	// silently performing it. This does NOT rely on the prompt instruction — a model that
 	// ignores it still cannot act. A blocked action consumes a step (budget-bounded, like
 	// the browser tier) so a model that keeps retrying a blocked action still terminates.
-	if sig := irreversibleTarget(act, c.Sess.Latest()); sig != "" {
+	// On the host-control tier (GateAllMutations), where the CV-only observation gives the
+	// classifier no accessible target, EVERY mutation is gated instead.
+	if sig := mutationGate(act, c.Sess.Latest(), c.GateAllMutations); sig != "" {
 		if c.Approver == nil || !c.Approver.Approve("desktop "+act.Op+" on irreversible target ("+sig+")") {
 			body := fmt.Sprintf("the %s on %q was BLOCKED by the irreversible-action gate (matched %q) — it was not performed. A human must approve it; report this and finish if you cannot proceed.", act.Op, sig, sig)
 			if c.EventSink != nil {
@@ -292,6 +303,37 @@ var irreversibleSignals = []string{
 	"refund", "consent", "accept terms", "accept all", "accept cookies",
 	"i agree", "subscribe", "unsubscribe", "erase", "format", "shut down",
 	"send", "submit",
+}
+
+// mutationGate reports the reason act must be approved before it actuates the desktop,
+// or "" when it may proceed ungated. It returns the irreversibleTarget signal when the
+// action's resolved target names a consequential operation; and, when gateAll is set (the
+// host-control tier — see ComputerTool.GateAllMutations), ANY mutating op, since on the
+// REAL desktop the CV-only observation carries no accessible names for irreversibleTarget
+// to classify (it is structurally blind there, so it alone would gate nothing). This is
+// what makes the per-action gate real on --mac-host.
+func mutationGate(a desktopwire.Act, latest desktopwire.Observation, gateAll bool) string {
+	if sig := irreversibleTarget(a, latest); sig != "" {
+		return sig
+	}
+	if gateAll && isMutatingOp(a.Op) {
+		return "host mutation"
+	}
+	return ""
+}
+
+// isMutatingOp reports whether op drives the real mouse/keyboard (a state-actuating action)
+// as opposed to a read-only observe or a bounded wait. On the host-control tier every such
+// op is gated (GateAllMutations); observe/wait/scroll stay ungated (scroll only moves the
+// view — it commits nothing — and gating it would flood the operator with approvals).
+func isMutatingOp(op string) bool {
+	switch op {
+	case desktopwire.OpClick, desktopwire.OpType, desktopwire.OpKey,
+		desktopwire.OpDrag, desktopwire.OpMouseDown, desktopwire.OpMouseUp:
+		return true
+	default:
+		return false
+	}
 }
 
 // irreversibleTarget reports the matched signal phrase when act is a consequential

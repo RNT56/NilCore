@@ -348,7 +348,9 @@ func (s *Store) PutMemory(ctx context.Context, m Memory) (int64, error) {
 	return id, nil
 }
 
-// QueryMemory returns memory for a scope (and project, for project scope).
+// QueryMemory returns all memory for a scope (and project, for project scope) in
+// ascending insertion order (oldest first). It full-scans the partition; the hot
+// task-start path uses QueryMemoryRecent to bound the read instead.
 func (s *Store) QueryMemory(ctx context.Context, scope, project string) ([]Memory, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, scope, project, mkey, mvalue, created FROM memory WHERE scope = ? AND project = ? ORDER BY id`,
@@ -357,6 +359,67 @@ func (s *Store) QueryMemory(ctx context.Context, scope, project string) ([]Memor
 		return nil, fmt.Errorf("query memory: %w", err)
 	}
 	defer rows.Close()
+	return scanMemory(rows)
+}
+
+// QueryMemoryRecent returns at most limit rows for a scope (and project) — the NEWEST
+// by insertion id, but ORDERED oldest-first so a caller keeps the "newest is the tail"
+// rendering QueryMemory already yields. A non-positive limit means unbounded (identical
+// to QueryMemory). It exists so the task-start context read fetches only the handful it
+// renders rather than scanning a partition that grows one row per verified task: the
+// inner ORDER BY id DESC LIMIT ? picks the newest window off the id primary key, and the
+// outer ORDER BY id ASC restores insertion order for the render.
+func (s *Store) QueryMemoryRecent(ctx context.Context, scope, project string, limit int) ([]Memory, error) {
+	if limit <= 0 {
+		return s.QueryMemory(ctx, scope, project)
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, scope, project, mkey, mvalue, created FROM (
+			SELECT id, scope, project, mkey, mvalue, created FROM memory
+			WHERE scope = ? AND project = ? ORDER BY id DESC LIMIT ?
+		) ORDER BY id ASC`,
+		scope, project, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query memory recent: %w", err)
+	}
+	defer rows.Close()
+	return scanMemory(rows)
+}
+
+// PruneMemory bounds a partition's growth: it keeps only the newest `keep` rows (by
+// insertion id) whose mkey starts with keyPrefix and deletes the rest, returning how
+// many were removed. It is the storage-side GC for the unbounded task:<id> family
+// memWriteBack appends one row per verified task to — QueryMemoryRecent bounds the READ,
+// this bounds STORAGE. Only prefix-matching rows are considered and deleted, so other
+// keys in the same partition (e.g. distilled facts) are never touched. A non-positive
+// keep is a no-op — it refuses to wipe a partition to empty. The delete is a single
+// statement (a correlated subquery, not a second open cursor), so it stays within the
+// store's single-connection discipline.
+func (s *Store) PruneMemory(ctx context.Context, scope, project, keyPrefix string, keep int) (int, error) {
+	if keep <= 0 {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM memory
+		 WHERE scope = ? AND project = ? AND mkey LIKE ? ESCAPE '\'
+		   AND id NOT IN (
+		       SELECT id FROM memory
+		       WHERE scope = ? AND project = ? AND mkey LIKE ? ESCAPE '\'
+		       ORDER BY id DESC LIMIT ?
+		   )`,
+		scope, project, likePrefix(keyPrefix), scope, project, likePrefix(keyPrefix), keep)
+	if err != nil {
+		return 0, fmt.Errorf("prune memory: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("prune memory: %w", err)
+	}
+	return int(n), nil
+}
+
+// scanMemory reads a Memory row set — the shared body of QueryMemory/QueryMemoryRecent.
+func scanMemory(rows *sql.Rows) ([]Memory, error) {
 	var out []Memory
 	for rows.Next() {
 		var m Memory
@@ -368,6 +431,14 @@ func (s *Store) QueryMemory(ctx context.Context, scope, project string) ([]Memor
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// likePrefix turns a literal key prefix into a LIKE pattern matching that exact prefix
+// followed by anything, escaping the LIKE metacharacters (\ % _) under ESCAPE '\' so a
+// prefix that happens to contain one still matches literally.
+func likePrefix(prefix string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(prefix) + "%"
 }
 
 // Task is a durable orchestrator task record. Detail is an opaque JSON blob the

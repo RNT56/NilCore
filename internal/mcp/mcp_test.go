@@ -49,6 +49,43 @@ func TestStdioRoundTripHonorsCtxOnStalledRead(t *testing.T) {
 	}
 }
 
+// TestStdioRoundTripBoundsResponse: a hostile or buggy MCP server that returns an
+// enormous reply must NOT be read unbounded into host memory — roundTrip fails once
+// the reply exceeds the per-message cap, well before the ctx deadline. Regression for
+// the MCP OOM (server output is untrusted, I7).
+func TestStdioRoundTripBoundsResponse(t *testing.T) {
+	cConn, sConn := net.Pipe()
+	defer cConn.Close()
+	// Server drains the request, then streams a valid-JSON reply far larger than the
+	// cap (a never-ending "result" string). net.Pipe is synchronous, so an unbounded
+	// reader would keep pulling bytes forever; the boundedReader must stop it.
+	go func() {
+		buf := make([]byte, 4096)
+		_, _ = sConn.Read(buf) // consume the request
+		_, _ = sConn.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"x":"`))
+		chunk := []byte(strings.Repeat("A", 1<<16))
+		for i := 0; i < (maxMCPResponseBytes/len(chunk))+64; i++ {
+			if _, err := sConn.Write(chunk); err != nil {
+				return // client tore down after hitting the cap — expected
+			}
+		}
+		_ = sConn.Close()
+	}()
+	st := newStdioTransport(cConn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := st.roundTrip(ctx, rpcRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call"})
+	if err == nil {
+		t.Fatal("roundTrip accepted an over-limit response (unbounded read)")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bound did not trip before the ctx deadline — reader was effectively unbounded: %v", err)
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("want a size-limit error, got %v", err)
+	}
+}
+
 // TestGenerateWrappersSanitizesTraversalToolName: an UNTRUSTED tool name (server output)
 // containing path traversal must be confined — the descriptor stays inside the server dir
 // and the JSON keeps the original name so the model still invokes the right tool.

@@ -150,7 +150,11 @@ func Symbols(path string) ([]Symbol, error) {
 	if p == nil {
 		return nil, nil
 	}
-	return p.symbols(path)
+	syms, err := p.symbols(path)
+	if skipErr(err) {
+		return nil, nil // symlinked or oversized file: skip cleanly, like an unsupported ext
+	}
+	return syms, err
 }
 
 // References extracts called/selected names (the reference edges) from a source
@@ -160,7 +164,11 @@ func References(path string) ([]Reference, error) {
 	if p == nil {
 		return nil, nil
 	}
-	return p.references(path)
+	refs, err := p.references(path)
+	if skipErr(err) {
+		return nil, nil // symlinked or oversized file: skip cleanly, like an unsupported ext
+	}
+	return refs, err
 }
 
 // Calls returns, per top-level function/method, the names it calls — the raw
@@ -171,5 +179,9 @@ func Calls(path string) (map[string][]string, error) {
 	if p == nil {
 		return nil, nil
 	}
-	return p.calls(path)
+	calls, err := p.calls(path)
+	if skipErr(err) {
+		return nil, nil // symlinked or oversized file: skip cleanly, like an unsupported ext
+	}
+	return calls, err
 }

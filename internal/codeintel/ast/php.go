@@ -28,7 +28,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -95,7 +94,7 @@ func (phpParser) calls(path string) (map[string][]string, error) {
 // method, otherwise a free function. The `#` comment form and the PHP tags are blanked
 // before brace.go's stripLine handles `//` / `/* */` / strings.
 func phpScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open php file: %w", err)
 	}

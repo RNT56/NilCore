@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -538,6 +539,81 @@ func TestRun_PromoteDenied(t *testing.T) {
 	}
 	if !out.Done || out.Promoted {
 		t.Fatalf("denied promote: done=%t promoted=%t, want true/false", out.Done, out.Promoted)
+	}
+}
+
+// The promote gate action must key on the merge TARGET base branch (BaseBranch), NOT
+// the source integration tip. GradedApprover.scopeFor reads GateAction.Branch for both
+// the earned-trust bucket AND the "never auto-approve main/prod" floor, so a tip there
+// would let that structural floor go silent (a latent auto-merge-into-main hazard). The
+// source tip must ride in the action Detail for the audit trail.
+func TestRun_PromoteGateTargetsBaseNotTip(t *testing.T) {
+	l := baseLoop(t)
+	var green atomic.Bool
+	l.Verifier = func(string) verify.Verifier { return &togglePass{&green} }
+	l.SeedCriteria([]Criterion{{Command: "c1", Verifier: &togglePass{&green}}})
+	l.RunSlice = func(_ context.Context, _ Slice, _ State) (SliceResult, error) {
+		green.Store(true)
+		return SliceResult{Branch: "integrate/tip", Verified: true}, nil
+	}
+	l.BaseBranch = "main" // the merge TARGET the promote advances
+
+	var gotAction policy.GateAction
+	l.Gate = func(a policy.GateAction) bool { gotAction = a; return true }
+
+	out, err := l.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.Done || !out.Promoted {
+		t.Fatalf("converge: done=%t promoted=%t, want true/true", out.Done, out.Promoted)
+	}
+	if gotAction.Branch != "main" {
+		t.Errorf("gate action Branch = %q, want the target base %q (not the source tip)", gotAction.Branch, "main")
+	}
+	if gotAction.Branch == "integrate/tip" {
+		t.Error("gate keyed on the SOURCE tip — isProtectedBase can never fire (FIX 1 regression)")
+	}
+	if !strings.Contains(gotAction.Detail, "integrate/tip") {
+		t.Errorf("gate action Detail = %q, want it to carry the source tip integrate/tip", gotAction.Detail)
+	}
+}
+
+// The loop's done-detection must judge the MERGED integration tip, not the untouched
+// base repo dir: the run's work lives on integrate/ branches, never checked out into
+// st.Repo, so a base-dir judge would verify an empty base and never converge (I2). With
+// VerifyTip wired, a hard-RED base Verifier must be bypassed once a tip exists.
+func TestRun_JudgesTipNotBase(t *testing.T) {
+	l := baseLoop(t)
+	// The base Verifier is hard red — a base-dir judge would stall to MaxIterations.
+	l.Verifier = func(string) verify.Verifier { return &fixedVerifier{pass: false} }
+	var green atomic.Bool
+	l.RunSlice = func(_ context.Context, _ Slice, _ State) (SliceResult, error) {
+		green.Store(true)
+		return SliceResult{Branch: "integrate/tip", Verified: true}, nil
+	}
+	// VerifyTip greens once the slice advances the tip — proving judge consults the tip.
+	var tipJudged int32
+	l.VerifyTip = func(_ context.Context, tip string, _ []Criterion) (bool, int) {
+		atomic.AddInt32(&tipJudged, 1)
+		if tip != "integrate/tip" {
+			t.Errorf("VerifyTip got tip %q, want the integration tip integrate/tip", tip)
+		}
+		if green.Load() {
+			return true, 0
+		}
+		return false, 1
+	}
+
+	out, err := l.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Reason != ReasonConverged || !out.Done {
+		t.Fatalf("got reason=%q done=%t, want converged/true via the tip judge (not the red base)", out.Reason, out.Done)
+	}
+	if atomic.LoadInt32(&tipJudged) == 0 {
+		t.Fatal("VerifyTip was never consulted — the loop judged the base, not the tip")
 	}
 }
 

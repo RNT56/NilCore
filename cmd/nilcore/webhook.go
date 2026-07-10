@@ -6,13 +6,27 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/eventlog"
+	"nilcore/internal/memory"
 	"nilcore/internal/scmhook"
 	"nilcore/internal/trigger"
+)
+
+// Self-start rate-fence defaults (denial-of-wallet). The listener is headless and
+// fed by untrusted, replayable-signed deliveries, so the count of self-starts is
+// bounded even though the run mutex already serializes them. Both are overridable
+// (NILCORE_WEBHOOK_MAX_PER_DAY / NILCORE_WEBHOOK_MIN_INTERVAL) and fail SAFE — a
+// missing or bad value clamps to the bounded default, never to unbounded.
+const (
+	defaultWebhookMaxPerDay   = 20
+	defaultWebhookMinInterval = time.Minute
 )
 
 // startWebhookListener mounts the SCM/CI webhook intake (P9-T04) alongside the
@@ -26,18 +40,32 @@ import (
 // `nilcore -goal`. The listener is bound to ctx and shut down on serve exit. A
 // missing secret disables the intake (fail-closed) rather than accepting unsigned
 // requests.
-func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boot, log *eventlog.Log, dir, secret string) {
+//
+// Denial-of-wallet fence: a valid HMAC only proves a forge relayed the delivery, not
+// that a human authorized a run, so two bounds cap the COST/content a stream of
+// signed-but-unauthorized deliveries can incur — a per-day self-start cap plus a
+// cooldown (trigger.RateLimiter, on TOP of the serial mutex), and a fail-closed label
+// default: with NILCORE_WEBHOOK_LABEL unset a bare "opened" issue does NOT self-start
+// (see scmhook.mapEvent), so a drive-by opened issue on a public repo cannot trigger.
+func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boot, log *eventlog.Log, dir, secret string, mem *memory.Memory, ckpt *agent.Checkpoint) {
 	if secret == "" {
 		fmt.Fprintln(os.Stderr, "nilcore serve: --webhook set but NILCORE_WEBHOOK_SECRET is empty; webhook intake disabled (fail-closed)")
 		return
 	}
 	// Share the run's blast-radius budget across its sandbox/egress (BR-T02/T03); the
 	// gate stays a hardcoded headless deny (I3). nil when off ⇒ unfenced, byte-identical.
-	orch := buildRunOrchestrator(c, b, log, dir, mintBlastBudget(*c.blastRadius, log))
+	// Reuse serve's ALREADY-OPENED persistence (mem/ckpt) via buildRunOrchestratorWith —
+	// buildRunOrchestrator would open a SECOND single-writer handle to nilcore.db, and
+	// this listener runs UNDER serve (which already opened one), so the two would contend
+	// on the single-writer lock (busy_timeout stalls / SQLITE_BUSY).
+	orch := buildRunOrchestratorWith(c, b, log, dir, mintBlastBudget(*c.blastRadius, log), mem, ckpt)
 	var mu sync.Mutex // serialize self-started runs on the single orchestrator
 	trig := &trigger.Trigger{
 		Enabled: true,
 		Gate:    func(string) bool { return false }, // headless: irreversible deny-defaults (I3)
+		// Bound the NUMBER of self-starts (the mutex only serializes them): a per-day cap
+		// + cooldown so untrusted signed deliveries cannot spin up unbounded runs (I5-audited).
+		Limiter: &trigger.RateLimiter{MaxPerDay: webhookMaxPerDay(), MinInterval: webhookMinInterval()},
 		Start: func(ctx context.Context, goal string) error {
 			mu.Lock()
 			defer mu.Unlock()
@@ -72,4 +100,35 @@ func startWebhookListener(ctx context.Context, addr string, c commonFlags, b boo
 		}
 	}()
 	fmt.Fprintf(os.Stderr, "nilcore serve: webhook intake on http://%s/webhook (label=%q)\n", addr, os.Getenv("NILCORE_WEBHOOK_LABEL"))
+}
+
+// webhookMaxPerDay reads the self-start daily cap from NILCORE_WEBHOOK_MAX_PER_DAY.
+// Unset/blank ⇒ defaultWebhookMaxPerDay; a non-positive or unparseable value clamps
+// to the default (fail-safe to a bound, never to unbounded — a broken value must not
+// disable the denial-of-wallet fence).
+func webhookMaxPerDay() int {
+	raw := strings.TrimSpace(os.Getenv("NILCORE_WEBHOOK_MAX_PER_DAY"))
+	if raw == "" {
+		return defaultWebhookMaxPerDay
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultWebhookMaxPerDay
+	}
+	return n
+}
+
+// webhookMinInterval reads the cooldown between self-starts from
+// NILCORE_WEBHOOK_MIN_INTERVAL (a Go duration, e.g. "60s"). Unset/blank ⇒
+// defaultWebhookMinInterval; a negative or unparseable value clamps to the default.
+func webhookMinInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("NILCORE_WEBHOOK_MIN_INTERVAL"))
+	if raw == "" {
+		return defaultWebhookMinInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		return defaultWebhookMinInterval
+	}
+	return d
 }

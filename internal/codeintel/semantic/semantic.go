@@ -108,16 +108,35 @@ func OpenModel(path string, e Embedder, model string) (*Index, error) {
 		db.Close()
 		return nil, fmt.Errorf("semantic schema: %w", err)
 	}
-	// Bring pre-D2-T01 databases up to the current schema. SQLite has no
-	// IF NOT EXISTS for ADD COLUMN, so a duplicate-column error here is benign
-	// and means the column already exists.
-	if _, err := db.Exec(`ALTER TABLE docs ADD COLUMN hash TEXT`); err != nil &&
-		!strings.Contains(err.Error(), "duplicate column name") {
+	// Bring pre-D2-T01 databases up to the current schema: add the content-hash column
+	// if it is absent. SQLite has no IF NOT EXISTS for ADD COLUMN, so guard the ALTER
+	// with pragma_table_info rather than swallowing a driver-specific "duplicate column
+	// name" error string — the pragma check does not depend on the driver's wording.
+	if has, err := docsHasColumn(db, "hash"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("semantic schema migrate: %w", err)
+		return nil, fmt.Errorf("semantic schema inspect: %w", err)
+	} else if !has {
+		if _, err := db.Exec(`ALTER TABLE docs ADD COLUMN hash TEXT`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("semantic schema migrate: %w", err)
+		}
 	}
 	// An index opened against existing data must build its graph on first use.
 	return &Index{db: db, emb: e, model: model, dirty: true}, nil
+}
+
+// docsHasColumn reports whether the docs table already has the named column, using
+// pragma_table_info so the migration guard is a data lookup rather than a match on the
+// driver's error text. It mirrors internal/store's hasColumn; OpenModel has no context
+// yet (it runs before the Index exists), so this uses the non-context db handle.
+func docsHasColumn(db *sql.DB, column string) (bool, error) {
+	rows, err := db.Query(`SELECT 1 FROM pragma_table_info('docs') WHERE name = ?`, column)
+	if err != nil {
+		return false, fmt.Errorf("table_info(docs): %w", err)
+	}
+	defer rows.Close()
+	found := rows.Next()
+	return found, rows.Err()
 }
 
 // Close closes the index.

@@ -68,6 +68,7 @@ type desktopFlags struct {
 	model       *string
 	macHost     *bool
 	macProbe    *bool
+	secrets     *string
 }
 
 func registerDesktopFlags(fs *flag.FlagSet) desktopFlags {
@@ -88,6 +89,7 @@ func registerDesktopFlags(fs *flag.FlagSet) desktopFlags {
 		model:       fs.String("model", "", "the single model for this computer-use run (default: "+defaultGUIModel+", a strong GUI model; or set NILCORE_COMPUTER_MODEL)"),
 		macHost:     fs.Bool("mac-host", false, "NATIVE macOS HOST CONTROL: drive your REAL Mac desktop (UNSANDBOXED — host ambient authority, I4 relaxed). Requires NILCORE_DESKTOP_HOST=1 + the nilcore-desktop-darwin driver on PATH. See docs/ROADMAP-COMPUTER-USE-DARWIN.md"),
 		macProbe:    fs.Bool("mac-probe", false, "check macOS host-control readiness (Screen Recording + cliclick/Accessibility) and exit non-zero if not ready — a host-readiness gate, no goal needed"),
+		secrets:     fs.String("secrets", "", "comma-separated ALLOWLIST of secret names the agent may type via {{secret:NAME}} (also NILCORE_DESKTOP_SECRETS); default empty ⇒ no secret may be typed (fail closed) — the fence against typing an arbitrary env var into a field"),
 	}
 }
 
@@ -144,10 +146,19 @@ func desktopMain(args []string) {
 
 	native := *df.native || strings.TrimSpace(os.Getenv("NILCORE_COMPUTER_NATIVE")) != ""
 	approver := policy.NewConsoleApprover(os.Stdin, os.Stdout)
-	secrets := func(name string) (string, bool) {
+
+	// Operator-declared secret-name allowlist (fail-closed default empty): the only names
+	// the agent may resolve via {{secret:NAME}}. Wrapping the env-first resolver in
+	// AllowlistResolver is the exfil fence — an unlisted name (e.g. {{secret:ANTHROPIC_API_KEY}})
+	// resolves to not-found, so substituteSecrets refuses to type it. It also feeds the
+	// Rule-of-Two axis B in the contained-mode capguard below. Applies to BOTH the host and
+	// contained paths.
+	secretNames := parseSecretNames(*df.secrets, os.Getenv("NILCORE_DESKTOP_SECRETS"))
+	secretCapable := len(secretNames) > 0
+	secrets := desktopsession.AllowlistResolver(secretNames, func(name string) (string, bool) {
 		v := strings.TrimSpace(b.cred(name))
 		return v, v != ""
-	}
+	})
 
 	var (
 		box   sandbox.Sandbox
@@ -197,13 +208,16 @@ func desktopMain(args []string) {
 			fmt.Fprintln(os.Stderr, "nilcore desktop: WARNING — the desktop image needs a container (or microVM) sandbox; the namespace backend has no X11 desktop. Use -sandbox container.")
 		}
 
+		// Private data (axis B) is on when repo read tools are mounted OR a secret allowlist
+		// is declared — a session that can type a site credential holds private data even
+		// with -read=false, so it must count axis B (otherwise it would evade the gate).
 		caps := capguard.Capabilities{
 			UntrustedInput: true,
-			PrivateData:    *df.readRepo,
+			PrivateData:    *df.readRepo || secretCapable,
 			EgressHosts:    egress.Allowed,
 			Reasons: map[string]string{
 				"A": "desktop-agent",
-				"B": ternary(*df.readRepo, "repo-read-mounted", ""),
+				"B": privateDataReason(*df.readRepo, secretCapable),
 				"C": ternary(*df.profile != "", "profile:"+*df.profile, ""),
 			},
 		}
@@ -238,16 +252,22 @@ func desktopMain(args []string) {
 	// NILCORE_COMPUTER_NATIVE) advertises Anthropic's native `computer` beta tool,
 	// translating its actions to the SAME driver. Both share the governed body.
 	// The console approver (also the Rule-of-Two / host-control session gate above) is the
-	// per-action irreversible gate: the computer tool routes a delete/pay/accept-terms
-	// click, or an Enter-to-submit on such a dialog, through it (deny-default headless),
-	// symmetric with the browse tier. Without it, an irreversible desktop action would
-	// only be checked by the prompt + the one-time session gate.
+	// per-action gate. In CONTAINED mode it routes a delete/pay/accept-terms click, or an
+	// Enter-to-submit on such a dialog, through the human gate (deny-default headless),
+	// classified from the accessible target — symmetric with the browse tier.
+	// In HOST-CONTROL mode (--mac-host) that name-based classifier is BLIND: the CV-only
+	// observation gives refs empty Name/Value and never sets FocusedWindow/Title, so no
+	// click/type/key would match. GateAllMutations therefore routes EVERY mutating action
+	// on the REAL desktop through the gate, so a destructive host action cannot slip past.
 	var computer tools.Tool
 	if native {
-		computer = &desktopagent.NativeComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver}
+		computer = &desktopagent.NativeComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver, GateAllMutations: *df.macHost}
 		fmt.Fprintln(os.Stderr, "nilcore desktop: Path A (native Anthropic computer tool) enabled — pixel-mode, vendor-locked to Anthropic for this run.")
 	} else {
-		computer = &desktopagent.ComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver}
+		computer = &desktopagent.ComputerTool{Sess: sess, MaxSteps: *df.maxSteps, EventSink: desktopEventSink(log), Approver: approver, GateAllMutations: *df.macHost}
+	}
+	if *df.macHost {
+		fmt.Fprintln(os.Stderr, "nilcore desktop: host-control per-action gate ARMED — every click/type/key/drag on your REAL desktop must be approved.")
 	}
 	reg := computerToolRegistry(computer, *df.readRepo)
 
