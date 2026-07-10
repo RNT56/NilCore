@@ -349,7 +349,7 @@ func TestDefaultSchemasRoundTrips(t *testing.T) {
 // report's SchemaDefects section is permanently empty.
 func TestBuildWithSinkEmitsSchemaEvent(t *testing.T) {
 	root := t.TempDir()
-	bad := reportArtifact("s1", urlClaim("c1"))
+	bad := reportArtifact("s1", quoteClaim("c1"))
 	bad.Title = "" // schema: missing required title ⇒ a defect at Named[0]
 	rel := writeArtifact(t, root, bad)
 
@@ -387,7 +387,7 @@ func TestBuildWithSinkEmitsSchemaEvent(t *testing.T) {
 // a working plan over the same malformed artifact — no panic, no event, same red verdict.
 func TestBuildNoSinkStillComposes(t *testing.T) {
 	root := t.TempDir()
-	bad := reportArtifact("s2", urlClaim("c1"))
+	bad := reportArtifact("s2", quoteClaim("c1"))
 	bad.Title = ""
 	rel := writeArtifact(t, root, bad)
 

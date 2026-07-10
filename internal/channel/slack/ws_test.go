@@ -21,20 +21,22 @@ func frameHeader127(length uint64) []byte {
 }
 
 // TestReadFrameRejectsOversizedLength proves the frame-length cap: a crafted 8-byte
-// extended length that exceeds maxWSFrameBytes, or that wraps negative when narrowed to
+// extended length that exceeds maxFramePayload, or that wraps negative when narrowed to
 // int, is rejected with an error BEFORE `payload = make([]byte, length)`. Without the
 // guard the oversized case would allocate (then fail on the missing payload with an EOF,
 // not the cap error) and the wrap-negative case would `make([]byte, <negative>)` and
-// PANIC. Asserting the returned error names the cap ("exceeds") — not an EOF, not a
-// panic — is what makes this discriminating for the guard specifically.
+// PANIC. The cap is checked on the raw uint64 before the narrowing cast, so both the
+// merely-huge and the high-bit (wrap-negative) values are rejected. Asserting the
+// returned error names the cap ("too large") — not an EOF, not a panic — is what makes
+// this discriminating for the guard specifically.
 func TestReadFrameRejectsOversizedLength(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		length uint64
 	}{
-		{"over-cap", uint64(maxWSFrameBytes) + 1},
-		// High bit set: Uint64 -> int64 narrows to a negative length (MinInt64),
-		// which an unguarded make() would reject with a panic.
+		{"over-cap", uint64(maxFramePayload) + 1},
+		// High bit set: the raw uint64 (>MaxInt64) both exceeds the cap AND would narrow
+		// to a negative length, which an unguarded make() would reject with a panic.
 		{"wrap-negative", 0x8000000000000000},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,7 +50,7 @@ func TestReadFrameRejectsOversizedLength(t *testing.T) {
 			if payload != nil {
 				t.Errorf("no payload should be allocated for a rejected frame, got %d bytes", len(payload))
 			}
-			if !strings.Contains(err.Error(), "exceeds") {
+			if !strings.Contains(err.Error(), "too large") {
 				t.Errorf("error should name the frame-length cap (got %q); an EOF here would mean the huge make() ran", err)
 			}
 		})
