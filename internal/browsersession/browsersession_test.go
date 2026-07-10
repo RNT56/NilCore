@@ -151,9 +151,11 @@ func TestTypedSecretScrubbedFromObservation(t *testing.T) {
 	const secret = "s3cr3t-token-value"
 	ft := &fakeTransport{reply: func(seq int, a browserwire.Act) browserwire.SessionResponse {
 		// The driver reflows the typed value into a plain text field's value + page text
-		// (a text/API-key input the snapshot does NOT treat as secret).
+		// (a text/API-key input the snapshot does NOT treat as secret) AND into the page
+		// URL (a GET-form submit that puts the value in a query param — the URL reaches
+		// the model via renderObservation's "url:" line and the event log).
 		return browserwire.SessionResponse{Seq: seq, Observation: browserwire.Observation{
-			Version: 2, URL: "http://x.test/",
+			Version: 2, URL: "http://x.test/search?token=" + secret + "&ok=1",
 			Title: "token is " + secret,
 			Text:  "your api key: " + secret + " (saved)",
 			Refs: []browserwire.Ref{
@@ -177,21 +179,22 @@ func TestTypedSecretScrubbedFromObservation(t *testing.T) {
 	if ft.got[0].Text != secret {
 		t.Fatalf("secret not substituted before send: %q", ft.got[0].Text)
 	}
-	// …but must NOT appear anywhere in the observation returned to the model.
-	if strings.Contains(obs.Title, secret) || strings.Contains(obs.Text, secret) {
-		t.Fatalf("secret reflowed into observation text/title: %+v", obs)
+	// …but must NOT appear anywhere in the observation returned to the model —
+	// including the URL (the query-param reflow that renderObservation prints).
+	if strings.Contains(obs.URL, secret) || strings.Contains(obs.Title, secret) || strings.Contains(obs.Text, secret) {
+		t.Fatalf("secret reflowed into observation url/text/title: %+v", obs)
 	}
 	for _, r := range obs.Refs {
 		if strings.Contains(r.Name, secret) || strings.Contains(r.Value, secret) {
 			t.Fatalf("secret reflowed into a ref name/value: %+v", r)
 		}
 	}
-	if !strings.Contains(obs.Text, "«secret»") || !strings.Contains(obs.Refs[0].Value, "«secret»") {
+	if !strings.Contains(obs.URL, "«secret»") || !strings.Contains(obs.Text, "«secret»") || !strings.Contains(obs.Refs[0].Value, "«secret»") {
 		t.Fatalf("scrubbed value should be replaced by the sentinel: %+v", obs)
 	}
 	// Latest() must also be scrubbed (it is what the tool renders).
-	if strings.Contains(s.Latest().Text, secret) {
-		t.Fatalf("Latest() still carries the plaintext secret: %q", s.Latest().Text)
+	if strings.Contains(s.Latest().Text, secret) || strings.Contains(s.Latest().URL, secret) {
+		t.Fatalf("Latest() still carries the plaintext secret: %q / %q", s.Latest().Text, s.Latest().URL)
 	}
 }
 

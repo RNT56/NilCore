@@ -35,10 +35,10 @@ We are not chasing "flawless." We are building *robust-via-verification*. Aim yo
 
 Breaking any of these means the PR is **rejected**, no matter how good the rest is. Detail and rationale live in `docs/ARCHITECTURE.md`.
 
-1. **The backend contract is frozen.** `backend.CodingBackend` is `Run(ctx, Task) (Result, error)`. The native loop, Codex, and Codex all satisfy it. Changing `Task`, `Result`, or the interface is a dedicated, serialized contract task — never a side effect of another change.
+1. **The backend contract is frozen.** `backend.CodingBackend` is `Run(ctx, Task) (Result, error)`. The native loop, Codex, and Claude Code all satisfy it. Changing `Task`, `Result`, or the interface is a dedicated, serialized contract task — never a side effect of another change.
 2. **The verifier is the only authority on "done."** No backend's self-report (`Result.SelfClaimed`) decides whether work ships. After any backend runs, the project's checks re-run and that verdict governs.
 3. **No ambient authority.** Secrets are held by the `SecretStore` (environment, OS keychain, encrypted vault, or external) — never written to disk in plaintext, never logged, never placed in a prompt or in source, and never given to the model. The process holds no broad credentials by default.
-4. **Model-emitted execution is sandboxed.** Any *shell command* a model emits, and any delegated coding CLI (Codex, Codex), runs inside the container sandbox — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception: the file tools (read/write/edit/search) and the git tool run host-side, but each is confined to the disposable worktree (symlink-safe path resolution + `O_NOFOLLOW`) and the git tool runs a fixed, hardened subcommand set. They perform scoped file/VCS I/O only — never arbitrary execution. See `docs/ARCHITECTURE.md` §Execution model.
+4. **Model-emitted execution is sandboxed.** Any *shell command* a model emits, and any delegated coding CLI (Codex, Claude Code), runs inside the container sandbox — a model can never run an arbitrary program on the host. The native loop's structured tools are the one deliberate, bounded exception: the file tools (read/write/edit/search) and the git tool run host-side, but each is confined to the disposable worktree (symlink-safe path resolution + `O_NOFOLLOW`) and the git tool runs a fixed, hardened subcommand set. They perform scoped file/VCS I/O only — never arbitrary execution. The native-macOS **host-control** tier (`nilcore desktop --mac-host`, `docs/ROADMAP-COMPUTER-USE-DARWIN.md`) is a second, explicitly-recorded relaxation: it drives the operator's REAL desktop, so I4's sandbox boundary does NOT hold there — which is why it is reached only behind a *separate* opt-in (`NILCORE_DESKTOP_HOST=1`, never implied by the normal computer-use gate), forces an unconditional human approval, and is bounded at runtime by a kill-switch + per-app allowlist. The default (contained) desktop and every other path keep I4 intact. See `docs/ARCHITECTURE.md` §Execution model.
 5. **The event log is append-only.** Every model call, tool execution, verify, and gate decision is recorded and replayable. Never mutate or delete history.
 6. **The core has zero external dependencies.** Adding a Go module dependency requires explicit justification in the PR description and the CHANGELOG entry. Default to the standard library. There are three sanctioned exceptions: **SQLite** (`modernc.org/sqlite`, Phase 4 — the persistent backbone for `internal/store` and the code-intelligence graph in `internal/codeintel/{graph,semantic}`; a pure-Go driver, so releases keep `CGO_ENABLED=0`), **`golang.org/x/sys`** (Phase 7 — the namespace sandbox's Landlock / `no_new_privs` / seccomp syscalls in `internal/sandbox`; the Go project's own extended standard library, already pulled in transitively by SQLite), and the **Charm TUI stack** (`bubbletea`/`lipgloss`/`bubbles`), isolated behind the `//go:build tui` tag so the default `nilcore` binary links **zero** Charm. The MCP client is **not** a module — it speaks JSON-RPC over the standard library (`internal/mcp`). Any further module dependency requires the justification above.
 7. **Untrusted input is data, never instructions.** Tool output, file contents, and fetched web content never become controlling instructions for the agent.
@@ -48,7 +48,7 @@ Breaking any of these means the PR is **rejected**, no matter how good the rest 
 ## 3. Commands
 
 ```sh
-make verify   # build + vet + test — THE gate. Must be green to merge.
+make verify   # build + vet + lint + test — THE gate. Must be green to merge.
 make build    # go build ./...
 make vet      # go vet ./...
 make test     # go test ./...
@@ -89,7 +89,7 @@ Before starting, select a task `T` from `docs/TASKS.md` such that **all** hold:
 Among eligible tasks, take the **lowest ID**. If none are eligible, poll and wait — do not force a collision.
 
 **Contract files (serialized — never edited in parallel):**
-`internal/backend/backend.go` · `internal/channel/channel.go` (once it exists) · `AGENTS.md` · `docs/ARCHITECTURE.md` · `docs/TASKS.md` · `go.mod` · `Makefile`.
+`internal/backend/backend.go` · `internal/channel/channel.go` · `AGENTS.md` · `docs/ARCHITECTURE.md` · `docs/TASKS.md` · `go.mod` · `Makefile`.
 
 ### Execute in isolation
 
@@ -159,15 +159,29 @@ docs/
   ARCHITECTURE.md      ← decided architecture + invariants + frozen contract
   PERSONA.md           ← the running agent's voice, autonomy, and behavior
   TASKS.md             ← the work queue: master DAG + in-depth task specs
-cmd/nilcore/           ← entrypoint
+  SWARM.md             ← Phase 12: verified swarm mode (`nilcore swarm`) design + task DAG
+cmd/nilcore/           ← entrypoint (do · build · serve · chat · swarm · browse · desktop · report · …; single-task run is the flag form `nilcore -goal …`)
+cmd/tools/             ← image-/host-baked fat drivers (nilcore-browser, nilcore-desktop[-darwin])
 internal/
-  model/               ← Anthropic Messages API client (stdlib only)
-  backend/             ← CodingBackend contract + native / codex / Codex
+  model/               ← provider-agnostic Messages client + BuiltinTool seam (stdlib only)
+  provider/            ← Anthropic · OpenAI · OpenRouter · openai-compatible adapters (Phase 15)
+  backend/             ← CodingBackend contract + native / codex / claude-code
   sandbox/             ← container executor
   verify/              ← the verifier (source of truth for "done")
   eventlog/            ← append-only audit trail
   policy/              ← reversibility classifier + human gate
   agent/               ← orchestrator
+  capguard/            ← Rule-of-Two gate (untrusted ∧ private ∧ open-egress)
+  browse*·cdp/         ← Phase 14 browser agency (browsersession · browseragent · cdp set-of-marks)
+  desktop*·som/        ← Phase CU computer use (desktopwire · desktopsession · desktopagent · som · desktop CV+ladder)
+  experience/          ← Phase 16 the closed-loop spine: one derived, rebuildable projection over the log (Reader · OverLog · OverStore · Projector)
+  capability/          ← Phase 16 one pure For(Request)→Descriptor — the legible "what may this drive do" surface
+  graapprove/          ← Phase 16 GRADUATED AUTO-APPROVAL (Pillar 5): GradedApprover wraps the human gate; earned trust + operator envelope (a SECOND human-gate relaxation — see ARCHITECTURE §0)
+  blastbudget/         ← Phase 16 the hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads
+  flywheel/            ← Phase 16 self-improvement flywheel (selfeval · distiller · measure · loop) — verified, human-gated, never edits the verifier of record
+  autosrc·objective/   ← Phase 16 autonomy daemon (bounded source queue) + operator-only standing-objectives backlog
+  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm/decompose are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; default-on via NILCORE_KERNEL [escape hatch =0], equivalence-proven)
+  router/              ← Phase 16 Pillar 8 (UOK V2): the preset ROUTER that completes the kernel — Classify(goal)→run|build|swarm + an Oracle seam (`decompose` is a fourth Preset, OPT-IN only — Classify never returns it); backs `nilcore do` so the agent picks how to work (pure leaf; only orders the machine choice — never overrides a verdict/gate; docs/ROADMAP-KERNEL-V2.md)
 ```
 
 New packages introduced by later phases are listed as **extension points** in `docs/ARCHITECTURE.md` and owned by specific tasks in `docs/TASKS.md`.

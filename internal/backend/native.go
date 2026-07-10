@@ -454,6 +454,7 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 	wrapUpSent := false      // the one-shot budget wrap-up notice (item 4), at most once per run
 	lastInput := 0           // the provider-reported input tokens of the last call (0 = none/stale)
 	overflowStreak := 0      // consecutive context-overflow faults: one recovery, then fail as before
+	outputCapStreak := 0     // times we've halved maxTok after a "max_tokens too large" 400 (bounded)
 	sys := n.systemFor()     // base + role + (peer ask-guidance), computed once
 
 	for i := 0; i < steps; i++ {
@@ -624,6 +625,17 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 						i-- // retry the SAME step: the overflowed call did no work
 						continue
 					}
+					// Output-cap 400 (item, LOW): a model may reject the harness's default
+					// output cap when its own ceiling is lower and it cannot infer the limit
+					// for us. Rather than die terminally, halve the cap (bounded) and retry.
+					if newTok, ok := reduceOutputCap(maxTok, outputCapStreak, err); ok {
+						n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "output_cap_retry",
+							Detail: map[string]any{"step": i, "from": maxTok, "to": newTok}})
+						outputCapStreak++
+						maxTok = newTok
+						i-- // retry the SAME step with a smaller cap
+						continue
+					}
 					// A genuine transport/decode error — the existing error path.
 					return Result{Backend: n.Name()}, fmt.Errorf("model step %d: %w", i, err)
 				}
@@ -664,13 +676,24 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 					i-- // retry the SAME step: the overflowed call did no work
 					continue
 				}
+				// Output-cap 400 (item, LOW): the model rejected the harness's default
+				// output cap as too large. Halve it (bounded) and retry rather than dying.
+				if newTok, ok := reduceOutputCap(maxTok, outputCapStreak, err); ok {
+					n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "output_cap_retry",
+						Detail: map[string]any{"step": i, "from": maxTok, "to": newTok}})
+					outputCapStreak++
+					maxTok = newTok
+					i-- // retry the SAME step with a smaller cap
+					continue
+				}
 				// The existing error path, unchanged: a genuine transport/model fault.
 				return Result{Backend: n.Name()}, fmt.Errorf("model step %d: %w", i, err)
 			}
 		}
-		// A successful call ends any overflow streak and refreshes the live
+		// A successful call ends any overflow / output-cap streak and refreshes the live
 		// input-token measure the proactive compactor watches (item 6).
 		overflowStreak = 0
+		outputCapStreak = 0
 		lastInput = resp.Usage.InputTokens
 		n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "model_call",
 			Detail: map[string]any{"step": i, "stop": resp.StopReason, "out_tokens": resp.Usage.OutputTokens}})
@@ -724,8 +747,27 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 			}
 		}
 
-		// Record the assistant turn verbatim so the conversation stays coherent.
-		msgs = append(msgs, model.Message{Role: "assistant", Content: resp.Content})
+		// Record the assistant turn so the conversation stays coherent — but NEVER as
+		// empty content. A reply with err==nil, no tool calls, and zero content blocks
+		// (StopReason is not "max_tokens", so the salvage above did not fire) must not be
+		// appended verbatim: a nil/empty Content marshals to "content":null on the NEXT
+		// request (Anthropic 400 "content: expected list"; OpenAI 400 for a role:assistant
+		// message with neither content nor tool_calls), and isCtxOverflow does not match,
+		// so the run dies terminally and discards the worktree. This IS reachable — a
+		// native web-search turn (NILCORE_WEB_SEARCH_NATIVE) whose only blocks are
+		// server_tool_use / web_search_tool_result decodes to EMPTY content (the provider
+		// keeps only text/tool_use). Substitute a minimal, valid, non-empty text block so
+		// history stays marshalable; the turn then carries no tool_use, so the "No tool
+		// call detected" nudge below folds a user turn and the loop makes progress rather
+		// than poisoning history. (Provider-side fix reduces the trigger; this is the
+		// backstop.)
+		assistantContent := resp.Content
+		if len(assistantContent) == 0 {
+			assistantContent = []model.Block{{Type: "text", Text: "(the model returned an empty reply)"}}
+			n.Log.Append(eventlog.Event{Task: t.ID, Backend: n.Name(), Kind: "empty_reply",
+				Detail: map[string]any{"step": i, "stop": resp.StopReason}})
+		}
+		msgs = append(msgs, model.Message{Role: "assistant", Content: assistantContent})
 
 		// PAUSE-AND-RECONSIDER (CV-T01): the model's thinking is done and its
 		// proposed actions are in resp.Content, but NOTHING has run yet. A steer
@@ -1124,6 +1166,12 @@ func (n *Native) Run(ctx context.Context, t Task) (Result, error) {
 				consecutiveFailures = 0 // re-consult only after another run of failures, not every one
 			}
 			fail := append(results, model.Block{Type: "text", Text: failText})
+			// Include any tool-produced images (a co-emitted browser screenshot, D1-T02):
+			// finish can be co-emitted with an image tool in the same turn, and the vision
+			// model should see what actually rendered when it reconsiders after the fail.
+			// They ride AFTER every tool_result (Anthropic ordering); a text block between
+			// is fine — only tool_result blocks must lead the user turn. nil ⇒ no-op.
+			fail = append(fail, pendingImages...)
 			msgs = append(msgs, model.Message{Role: "user", Content: fail})
 			continue
 		}
@@ -1500,6 +1548,58 @@ func isCtxOverflow(err error) bool {
 		}
 	}
 	return false
+}
+
+// isOutputCapError reports whether a model-call error is a terminal client 400/422
+// whose vendor message says the requested OUTPUT-token cap is too large for the
+// model — distinct from a context-window overflow (isCtxOverflow, handled by
+// compaction). A model whose own output ceiling is below the harness default (16384)
+// and that cannot infer the limit for us rejects the cap; we can fix that by lowering
+// it. Matching requires BOTH an output-cap name AND an out-of-range signal so a
+// generic 400 (or the "input length and max_tokens exceed context limit" overflow,
+// which names max_tokens but is NOT an output-cap error) stays terminal.
+func isOutputCapError(err error) bool {
+	var ae *model.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	if ae.StatusCode != 400 && ae.StatusCode != 422 {
+		return false
+	}
+	if isCtxOverflow(err) {
+		return false // a context overflow is compacted, not down-capped
+	}
+	msg := strings.ToLower(ae.Message)
+	namesCap := strings.Contains(msg, "max_tokens") ||
+		strings.Contains(msg, "max_output_tokens") ||
+		strings.Contains(msg, "max_completion_tokens") ||
+		strings.Contains(msg, "maximum output tokens")
+	if !namesCap {
+		return false
+	}
+	for _, m := range []string{"too large", "greater than", "less than or equal", "at most", "must be", "maximum", "exceed", "> "} {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// reduceOutputCap halves the per-call output cap (down to a floor) when the model
+// rejected it as too large, returning the reduced cap and true so the caller retries
+// the SAME step. It is bounded by streak (max attempts) so a mis-recognized error can
+// never spin: from the 16384 default it steps 8192→4096→2048→1024, covering the
+// common 4K/8K model ceilings, then falls through to the terminal error path.
+func reduceOutputCap(maxTok, streak int, err error) (int, bool) {
+	const floor, maxAttempts = 1024, 4
+	if streak >= maxAttempts || maxTok <= floor || !isOutputCapError(err) {
+		return 0, false
+	}
+	next := maxTok / 2
+	if next < floor {
+		next = floor
+	}
+	return next, true
 }
 
 // renderProse flattens turns into role-prefixed prose for the summarizer: text

@@ -111,7 +111,7 @@ func gateProject(g *driveGate, run session.RunProjectFunc) session.RunProjectFun
 	if g == nil {
 		return run
 	}
-	return func(ctx context.Context, goal string, seed summarize.ContextSummary, out emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
-		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, out, gate) })
+	return func(ctx context.Context, goal string, seed summarize.ContextSummary, in session.InboxHandle, out emit.Emitter, gate policy.Approver) (session.DriveOutcome, error) {
+		return g.runOutcome(ctx, goal, func(c context.Context) (session.DriveOutcome, error) { return run(c, goal, seed, in, out, gate) })
 	}
 }

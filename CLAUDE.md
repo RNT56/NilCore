@@ -48,7 +48,7 @@ Breaking any of these means the PR is **rejected**, no matter how good the rest 
 ## 3. Commands
 
 ```sh
-make verify   # build + vet + test — THE gate. Must be green to merge.
+make verify   # build + vet + lint + test — THE gate. Must be green to merge.
 make build    # go build ./...
 make vet      # go vet ./...
 make test     # go test ./...
@@ -89,7 +89,7 @@ Before starting, select a task `T` from `docs/TASKS.md` such that **all** hold:
 Among eligible tasks, take the **lowest ID**. If none are eligible, poll and wait — do not force a collision.
 
 **Contract files (serialized — never edited in parallel):**
-`internal/backend/backend.go` · `internal/channel/channel.go` (once it exists) · `CLAUDE.md` · `docs/ARCHITECTURE.md` · `docs/TASKS.md` · `go.mod` · `Makefile`.
+`internal/backend/backend.go` · `internal/channel/channel.go` · `CLAUDE.md` · `docs/ARCHITECTURE.md` · `docs/TASKS.md` · `go.mod` · `Makefile`.
 
 ### Execute in isolation
 
@@ -180,8 +180,8 @@ internal/
   blastbudget/         ← Phase 16 the hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads
   flywheel/            ← Phase 16 self-improvement flywheel (selfeval · distiller · measure · loop) — verified, human-gated, never edits the verifier of record
   autosrc·objective/   ← Phase 16 autonomy daemon (bounded source queue) + operator-only standing-objectives backlog
-  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; default-on via NILCORE_KERNEL [escape hatch =0], equivalence-proven)
-  router/              ← Phase 16 Pillar 8 (UOK V2): the preset ROUTER that completes the kernel — Classify(goal)→run|build|swarm + an Oracle seam; backs `nilcore do` so the agent picks how to work (pure leaf; only orders the machine choice — never overrides a verdict/gate; docs/ROADMAP-KERNEL-V2.md)
+  kernel/              ← Phase 16 Pillar 8: the UNIFIED orchestration kernel — one recursive Run over Node/Envelope; run/build/swarm/decompose are presets, the router picks an envelope not a machine (pure leaf; machines inject as RunFunc/Plan/Integrate; default-on via NILCORE_KERNEL [escape hatch =0], equivalence-proven)
+  router/              ← Phase 16 Pillar 8 (UOK V2): the preset ROUTER that completes the kernel — Classify(goal)→run|build|swarm + an Oracle seam (`decompose` is a fourth Preset, OPT-IN only — Classify never returns it); backs `nilcore do` so the agent picks how to work (pure leaf; only orders the machine choice — never overrides a verdict/gate; docs/ROADMAP-KERNEL-V2.md)
 ```
 
 New packages introduced by later phases are listed as **extension points** in `docs/ARCHITECTURE.md` and owned by specific tasks in `docs/TASKS.md`.

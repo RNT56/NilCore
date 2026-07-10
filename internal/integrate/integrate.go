@@ -73,17 +73,25 @@ type MergeItem struct {
 //
 // Escalate is set whenever the supervisor must re-plan around this branch (a
 // conflict or a verify failure). Err carries any unexpected git/verify error
-// (an aborted run), distinct from a normal conflict/red-tree disposition.
+// (an aborted run), distinct from a normal conflict/red-tree disposition — e.g. a
+// merge that failed for a NON-conflict reason (an unresolvable/!mergeable ref) sets
+// Err+Escalate WITHOUT Conflict, since the tree never entered a merge state.
+//
+// TreeDirty marks the one unrecoverable case: a real conflict whose `git merge
+// --abort` itself failed, leaving the worktree mid-merge. Integrate STOPS folding
+// further branches when it sees TreeDirty (any further merge would cascade spurious
+// conflicts onto the dirty tree); the maximal green prefix already merged survives.
 type MergeResult struct {
-	ID       string
-	Branch   string
-	PreSHA   string // integration tip before this merge was attempted
-	SHA      string // merge commit sha when Merged && Verified; else == PreSHA after rollback
-	Merged   bool   // a clean (conflict-free) merge was committed
-	Verified bool   // the project verifier passed on the merged tree
-	Conflict bool   // the merge had conflicts and was aborted
-	Escalate bool   // the supervisor should re-plan around this branch
-	Err      error  // unexpected error (not a normal conflict/red outcome)
+	ID        string
+	Branch    string
+	PreSHA    string // integration tip before this merge was attempted
+	SHA       string // merge commit sha when Merged && Verified; else == PreSHA after rollback
+	Merged    bool   // a clean (conflict-free) merge was committed
+	Verified  bool   // the project verifier passed on the merged tree
+	Conflict  bool   // the merge had conflicts and was aborted
+	Escalate  bool   // the supervisor should re-plan around this branch
+	TreeDirty bool   // abort failed → tree left mid-merge; integration must stop
+	Err       error  // unexpected error (not a normal conflict/red outcome)
 }
 
 // Integrator folds subagent branches into one integration worktree, re-verifying
@@ -160,7 +168,15 @@ func (it *Integrator) Integrate(ctx context.Context, order []MergeItem) (*worktr
 				Escalate: true, Err: fmt.Errorf("read integration tip: %w", err)})
 			break
 		}
-		results = append(results, it.mergeOne(ctx, dir, env, item, preSHA))
+		res := it.mergeOne(ctx, dir, env, item, preSHA)
+		results = append(results, res)
+		if res.TreeDirty {
+			// A conflict whose `merge --abort` failed left the tree mid-merge / dirty.
+			// No further branch can be safely folded onto it — every subsequent merge
+			// would cascade spurious conflicts — so stop here. The maximal green prefix
+			// already merged is preserved on the worktree tip for the caller to inspect.
+			break
+		}
 	}
 
 	return wt, results, nil
@@ -205,13 +221,28 @@ func (it *Integrator) mergeOne(ctx context.Context, dir string, env Env, item Me
 		"-c", "user.email=agent@nilcore.local", "-c", "user.name=nilcore",
 		"merge", "--no-ff", "--no-commit", item.Branch)
 	if mergeErr != nil {
-		// A merge that does not apply cleanly leaves the tree mid-merge. Abort to
-		// restore the pre-merge tip exactly, then escalate — the conflicting branch
-		// is untouched in the base repo and preserved for a re-plan / retry.
+		// Distinguish a real content CONFLICT (git entered a merge and left the tree
+		// mid-merge, MERGE_HEAD set) from a NON-conflict merge failure — an
+		// unresolvable/!mergeable ref or a tooling fault — where git never created a
+		// merge state. Mislabeling the latter as a conflict sends the supervisor down the
+		// wrong re-plan path, and there is no merge to abort.
+		if !mergeInProgress(ctx, dir) {
+			// No merge state to roll back: the tree is still exactly at preSHA
+			// (undirtied). This is NOT a conflict — surface it as an unexpected error to
+			// escalate on. The loop may safely continue onto the next branch.
+			res.Escalate = true
+			res.Err = fmt.Errorf("merge %s failed (not a conflict): %w (%s)", item.Branch, mergeErr, strings.TrimSpace(out))
+			return res
+		}
+		// A real conflict leaves the tree mid-merge. Abort to restore the pre-merge tip
+		// exactly, then escalate — the conflicting branch is untouched in the base repo
+		// and preserved for a re-plan / retry.
 		if _, aerr := git(ctx, dir, "merge", "--abort"); aerr != nil {
-			// Could not even abort: surface the original conflict plus the abort
-			// failure so the audit trail shows the tree may be dirty.
-			res.Conflict, res.Escalate = true, true
+			// Could not even abort: the tree is left MID-MERGE / dirty. Folding the next
+			// branch onto it would cascade spurious conflicts, so mark the tree dirty
+			// (Integrate breaks the loop on TreeDirty) and surface the original conflict
+			// plus the abort failure for the audit trail.
+			res.Conflict, res.Escalate, res.TreeDirty = true, true, true
 			res.Err = fmt.Errorf("merge %s conflicted and abort failed: %v (%s)", item.Branch, aerr, strings.TrimSpace(out))
 			it.logConflict(item, preSHA, true)
 			return res
@@ -298,7 +329,11 @@ func (it *Integrator) logRollback(item MergeItem, preSHA, mergeSHA string) {
 // fsmonitor binary, or external config can never execute on the host during a
 // host-side merge/abort/reset over model-authored content (I4). Both halves of
 // the clamp must always travel together.
-func git(ctx context.Context, dir string, args ...string) (string, error) {
+//
+// It is a package var (not a plain func) ONLY so a test can substitute the runner to
+// force a hard-to-provoke failure (e.g. a `merge --abort` that itself fails, exercising
+// the TreeDirty stop path). Production code never reassigns it.
+var git = func(ctx context.Context, dir string, args ...string) (string, error) {
 	full := append(tools.HardenArgs(), args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	cmd.Dir = dir
@@ -308,6 +343,16 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 		return string(out), fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
+}
+
+// mergeInProgress reports whether the worktree at dir is mid-merge (MERGE_HEAD present):
+// `git rev-parse -q --verify MERGE_HEAD` exits 0 iff the ref exists. It lets mergeOne
+// tell a real content conflict (git entered a merge and left it mid-merge) from a
+// non-conflict merge failure (an unresolvable/!mergeable ref, a tooling fault) where git
+// never created a merge state — so each is labeled and rolled back correctly.
+func mergeInProgress(ctx context.Context, dir string) bool {
+	_, err := git(ctx, dir, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+	return err == nil
 }
 
 // branchContained reports whether item.Branch is already an ancestor of tip (the

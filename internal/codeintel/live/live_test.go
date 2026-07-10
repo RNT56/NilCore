@@ -122,6 +122,57 @@ func TestLiveRemoveDropsDeletedFile(t *testing.T) {
 	}
 }
 
+// TestIndexDirSkipsSymlinksAndVendor proves IndexDir does not follow a planted
+// symlink (I4 — an out-of-worktree file would otherwise be parsed into the graph) and
+// prunes dependency trees (node_modules) so the live graph reflects the project's own
+// source, not vendored dependencies (which could also exhaust an indexing budget).
+func TestIndexDirSkipsSymlinksAndVendor(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	outside := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "real.go"), []byte("package p\nfunc Real() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules", "dep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node_modules", "dep", "dep.go"), []byte("package dep\nfunc Dep() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(outside, "secret.go")
+	if err := os.WriteFile(secret, []byte("package s\nfunc Secret() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlinkOK := true
+	if err := os.Symlink(secret, filepath.Join(dir, "evil.go")); err != nil {
+		symlinkOK = false
+		t.Logf("symlink unsupported: %v", err)
+	}
+
+	ix := &live.Index{Graph: openGraph(t)}
+	if err := ix.IndexDir(ctx, dir); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := ix.Graph.Nodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saw := map[string]bool{}
+	for _, n := range nodes {
+		saw[n.Name] = true
+	}
+	if !saw["Real"] {
+		t.Error("Real (real in-tree source) should be indexed")
+	}
+	if saw["Dep"] {
+		t.Error("Dep (under node_modules) should be pruned by IndexDir")
+	}
+	if symlinkOK && saw["Secret"] {
+		t.Error("Secret (out-of-tree, reachable only via a planted symlink) must not be indexed (I4)")
+	}
+}
+
 func TestLiveMemoryFusion(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

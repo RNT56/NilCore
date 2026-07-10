@@ -142,12 +142,35 @@ func (CodeintelTool) Run(ctx context.Context, workdir string, input json.RawMess
 	return renderBundle(workdir, in.Query, indexed, bundle), nil
 }
 
+// indexSkipDirs are directory names never descended into when indexing source for
+// the AST/graph tools: VCS internals and dependency/build trees whose files are not
+// the project's own source. Hidden dirs (a leading ".") are pruned separately, which
+// already covers .git/.venv/.idea/.svn/.hg/.nilcore. Mirrors cmd/nilcore/repomap.go's
+// skip set and internal/tools/importgraph.go so one query never wastes the
+// maxIndexedFiles cap on a vendored node_modules that sorts ahead of real source.
+var indexSkipDirs = map[string]bool{
+	"node_modules": true, "vendor": true, "__pycache__": true,
+	"dist": true, "build": true,
+}
+
+// indexSkipDir reports whether a directory NAME (never the walk root itself — the
+// caller guards that) should be pruned from a source index: a named dependency/build
+// tree or any hidden dir.
+func indexSkipDir(name string) bool {
+	return indexSkipDirs[name] || strings.HasPrefix(name, ".")
+}
+
 // sourceFilesUnder returns the source files under root in deterministic order, for
 // every language the AST layer supports (ast.SupportedExtensions — Go and Python
-// today, D3-T02), skipping .git (and any vendored/hidden VCS dir) so the index is
-// reproducible. It mirrors SearchTool's walk discipline: only files under the
-// worktree are ever touched, and an unreadable subtree is reported as a walk error,
-// not silently half-indexed.
+// today, D3-T02). It mirrors SearchTool's walk discipline for I4 confinement: a
+// symlink is NEVER followed (a link planted in-tree by the sandboxed shell could
+// otherwise leak out-of-worktree file content when parsed host-side), and VCS
+// internals + dependency/build trees (node_modules, vendor, dist, build,
+// __pycache__, and any hidden dir such as .git) are pruned — both so the index is
+// reproducible and so the maxIndexedFiles cap is spent on the project's own source
+// rather than a vendored node_modules that sorts ahead of it. Only files under the
+// worktree are ever touched; an unreadable subtree surfaces as a walk error, not a
+// silent half-index.
 func sourceFilesUnder(root string) ([]string, error) {
 	supported := map[string]bool{}
 	for _, e := range ast.SupportedExtensions() {
@@ -159,9 +182,18 @@ func sourceFilesUnder(root string) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			// Prune dependency/VCS/hidden dirs — but never the walk root itself (its
+			// base name might coincidentally match, which would skip the whole tree).
+			if path != root && indexSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Never follow a symlink (I4 worktree confinement). WalkDir yields a symlink
+		// as a non-dir entry without descending it, but ast.Symbols/graph.BuildFile
+		// would os.ReadFile THROUGH it — so a symlink planted in-tree by the sandboxed
+		// shell could leak out-of-worktree file contents. Skip it, mirroring SearchTool.
+		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
 		if supported[strings.ToLower(filepath.Ext(d.Name()))] {

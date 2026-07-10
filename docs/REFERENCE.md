@@ -4,7 +4,7 @@
 
 > **Where this sits in the canon.** This is the *consolidated current-state* reference. It is **not** the technical law. When this file and a spoke doc (or the code) disagree, the **spoke doc and the code win** — fix this file. Authoritative sources: [`CLAUDE.md`](../CLAUDE.md) (constitution + invariants), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (decided architecture + frozen contract), [`docs/TASKS.md`](TASKS.md) (master work DAG), [`CHANGELOG.md`](../CHANGELOG.md) (append-only ledger). The first three are contract files.
 >
-> **Snapshot:** v1.1.0 (2026-06-21) + unreleased work. Phases 0–15 + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
+> **Snapshot:** v1.1.0 (2026-06-21) + unreleased work. Phases 0–16 (all eight Phase-16 closed-loop pillars, including Pillar 8 — the unified orchestration kernel, default-on) + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
 
 ---
 
@@ -30,7 +30,7 @@ There is no other index of the documentation set; this is it.
 | [`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`](ROADMAP-EVIDENCE-ARTIFACTS.md) | Verifier-backed artifact factory |
 | [`docs/ROADMAP-PROVIDERS.md`](ROADMAP-PROVIDERS.md) | Multi-provider + web search |
 | [`docs/PREREQUISITES.md`](PREREQUISITES.md) | Deps, accounts, keys, local setup |
-| [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) | Phase 16 — closing the evidence loop + graduated auto-approval (planned) |
+| [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) | Phase 16 — closing the evidence loop + graduated auto-approval (shipped — all eight pillars, incl. Pillar 8 kernel) |
 | [`docs/IMPLEMENTATION-PLANS.md`](IMPLEMENTATION-PLANS.md) · [`UPGRADE-PATH.md`](UPGRADE-PATH.md) · [`HORIZON.md`](HORIZON.md) · [`EXT-EXECUTION-PLANS.md`](EXT-EXECUTION-PLANS.md) · [`ROADMAP-EXTERNAL-INFRA.md`](ROADMAP-EXTERNAL-INFRA.md) | Rationale / future / gated work |
 
 ---
@@ -46,7 +46,7 @@ There is no other index of the documentation set; this is it.
 | `1.0.0` | 2026-06-20 | Phases 7–12 + deferred D1–D4 (the v1 product) |
 | `1.0.1` | 2026-06-21 | Fixes |
 | `1.1.0` | 2026-06-21 | Phase 13 (model-driven routing + Trust Ledger) |
-| **Unreleased** | — | Phase 14 (browse), CU + CU-MAC (desktop / macOS host), Phase 15 (providers + web search), chat `/ask` + `/save`, TUI verb parity, docs promotion |
+| **Unreleased** | — | Phase 14 (browse), CU + CU-MAC (desktop / macOS host), Phase 15 (providers + web search), Phase 16 (closed-loop: unified kernel, `nilcore do` router, `decompose`, lessons, flywheel, graduated auto-approval, autonomy daemon), chat `/ask` + `/save`, TUI verb parity, docs promotion, defect-hunt + features-review fix passes |
 
 `version` is `dev` unless ldflags-stamped at build (`-X main.version=<tag>`); an un-stamped binary reports the VCS revision.
 
@@ -72,6 +72,7 @@ There is no other index of the documentation set; this is it.
 | **CU** | Desktop computer use (`nilcore desktop`, Path B + native Path A) | ROADMAP-COMPUTER-USE.md |
 | **CU-MAC** | Native-macOS host control (`desktop --mac-host`, MVP + hardening) | ROADMAP-COMPUTER-USE-DARWIN.md |
 | **15** | OpenAI / OpenRouter / openai-compatible provider upgrade + web search | ROADMAP-PROVIDERS.md |
+| **16** | Closed-loop autonomy — unified orchestration kernel, goal→preset router (`nilcore do`) + recursive `decompose`, learned lessons + verify-cache, human-gated flywheel, graduated auto-approval (blast-budget fenced), autonomy daemon | ROADMAP-CLOSED-LOOP.md |
 
 **Deferred items D1–D4 (shipped):** D1 behavioral browser verification (`NILCORE_BROWSER_VERIFY`), D2 semantic HNSW code search (`NILCORE_EMBED_KEY`), D3 multi-language code intelligence (pure-Go, not tree-sitter), D4 gated draft PR (`--open-pr`). All additive, opt-in, pure stdlib — no module added.
 
@@ -81,20 +82,20 @@ There is no other index of the documentation set; this is it.
 
 | Metric | Value |
 |---|---|
-| Go packages | **103** (95 under `internal/`) |
-| Source files (non-test) | **282** |
-| Test files | **271** |
-| Lines of Go — `internal/` + `cmd/` (non-test) | **~60,100** |
-| Lines of Go — with tests | **~113,800** |
+| Go packages | **120** (111 under `internal/`) |
+| Source files (non-test) | **375** |
+| Test files | **406** |
+| Lines of Go — `internal/` + `cmd/` (non-test) | **~89,200** |
+| Lines of Go — `internal/` + `cmd/` with tests | **~175,900** |
 | Runtime dependencies (default binary) | **2** — pure-Go SQLite (`modernc.org/sqlite`) + `golang.org/x/sys` |
 | Optional (build-tag) deps | Charm TUI stack (`bubbletea`/`lipgloss`/`bubbles`), only under `//go:build tui` |
 | Invariants held | **7 / 7** |
 
-*(These supersede the README "receipts," which were stamped at an earlier phase and now understate the tree.)*
+*(The README "receipts" were refreshed to roughly match these in #97; the counts above are the authoritative current snapshot and drift slightly as work lands.)*
 
 ### 1.4 Current working state
 
-Active branch `feat/chat-ask-alias-save`; the unreleased CHANGELOG block is the source of truth for in-flight work. This file and the README pointer to it are the only docs-tree additions on the branch.
+The unreleased CHANGELOG block is the source of truth for in-flight work (it drifts by the hour as parallel branches merge); this reference is a periodically-refreshed consolidation, not a live mirror.
 
 ---
 
@@ -119,7 +120,7 @@ The complete current map of the binary, grouped by role. One line per package, s
 ### Entrypoints (`cmd/`)
 | Package | Role |
 |---|---|
-| `cmd/nilcore` | The CLI: argv dispatch + every subcommand's wiring (chat/tui/run/build/swarm/serve/browse/desktop/report/trace/trust/inspect/watch/schedule/mcp-call/propose-edit/registry/init/doctor/config/secret/version) |
+| `cmd/nilcore` | The CLI: argv dispatch + every subcommand's wiring (chat/do/tui/serve/build/swarm/decompose/flows/browse/desktop/report/trace(·why)/trust/experience/capability/lessons/flywheel/objective/auto-approvals/selfacc/inspect/watch/schedule/mcp-call/propose-edit/registry/init/doctor/config/secret/version; single-task run is the flag form `nilcore -goal …`) |
 | `cmd/tools/nilcore-browser` | In-sandbox pure-Go headless-browser driver (CDP + interactive flow mode), baked into the image |
 | `cmd/tools/nilcore-desktop` | In-sandbox virtual-desktop driver (Xvfb + scrot/xdotool/AT-SPI, runs the Set-of-Marks ladder) |
 | `cmd/tools/nilcore-desktop-darwin` | Native-macOS host desktop driver (shells `screencapture` + `cliclick`; the CU-MAC MVP) |
@@ -144,6 +145,7 @@ The complete current map of the binary, grouped by role. One line per package, s
 |---|---|
 | `internal/session` | Persistent conversational state container — modes, the router, persistence, drivers, control parsing |
 | `internal/inbox` | User→agent mid-work message seam (queue / steer) |
+| `internal/ask` | The attended-only `ask_user` outbound box (1–5 clarifying questions; nil ⇒ never advertised, fail-closed) |
 | `internal/emit` | Live reasoning/intent sink |
 | `internal/termui` | Terminal renderer — the live line + spinner + context gauge, TTY/plain degradation |
 | `internal/verb` | "Thinking" microcopy engine (spinner frame + cycling present-participle verb) |
@@ -158,6 +160,7 @@ The complete current map of the binary, grouped by role. One line per package, s
 |---|---|
 | `internal/super` | The agentic supervisor (plan / spawn / message / integrate / code / finish) |
 | `internal/project` | The outer project loop (plan→slice→integrate→verify→reflect→re-plan) |
+| `internal/agenticflows` | Declarative agentic-flows DAG (`nilcore flows`), routed through the DAG-honoring swarm code preset |
 | `internal/planner` | Goal → inspectable, contract-first task tree |
 | `internal/spawn` | Subtasks as scoped subworkers in parallel worktrees + the DAG scheduler |
 | `internal/roster` | The role system (research / understand / plan / implement / review) |
@@ -199,7 +202,20 @@ The complete current map of the binary, grouped by role. One line per package, s
 | `internal/cron` | Time-driven trigger source (`@hourly`/`@daily`/`HH:MM` or a fixed interval) |
 | `internal/wake` | The durable self-scheduled timer behind serve's `sleep` tool |
 | `internal/maint` | Housekeeping — stale worktree GC, dead delegate containers, log rotation |
-| `internal/selfimprove` | The gated self-edit flow (scope allow/deny; verified + human-gated) |
+| `internal/selfimprove` | The gated self-edit flow (scope allow/deny; verified + human-gated; a real `Flow.Merge` lands the verified branch) |
+
+### Closed-loop autonomy (Phase 16)
+| Package | Role |
+|---|---|
+| `internal/kernel` | The unified orchestration kernel — one recursive `Run` over Node/Envelope; run/build/swarm/decompose are presets (pure leaf; machines inject as RunFunc/Plan/Integrate) |
+| `internal/router` | The preset router — `Classify(goal)` → run \| build \| swarm \| decompose (+ an Oracle seam); backs `nilcore do` (only orders the machine choice, never overrides a verdict/gate) |
+| `internal/experience` | One derived, rebuildable projection over the log (Reader · OverLog · OverStore · Projector; rotation-aware) |
+| `internal/capability` | One pure `For(Request)→Descriptor` — the legible "what may this drive do" surface |
+| `internal/graapprove` | Graduated auto-approval (Pillar 5) — `GradedApprover` wraps the human gate; earned trust (per scope-family) + operator envelope; the second human-gate relaxation |
+| `internal/blastbudget` | The hard runtime fence (hosts · irreversible · sandbox wall · per-day auto-approval $) the auto-approval envelope reads |
+| `internal/flywheel` (+`distiller`,`loop`,`measure`,`selfeval`) | The verified, human-gated self-improvement flywheel — never edits the verifier of record |
+| `internal/autosrc` | The autonomy daemon's bounded source queue |
+| `internal/objective` | The operator-only standing-objectives backlog (idle self-service) |
 
 ### Observability, store & cost
 | Package | Role |
@@ -219,7 +235,7 @@ The complete current map of the binary, grouped by role. One line per package, s
 | `internal/codeintel/repomap` | PageRank repo-map for orientation |
 | `internal/codeintel/semantic` | Pure-Go HNSW semantic index (degrades to lexical without an embedder) |
 | `internal/codeintel/lsp` | Minimal LSP client (compiler-grade cross-language defs/refs) |
-| `internal/codeintel/impact` | Impact set (which tests) + Ochiai SBFL fault localization (where the bug) |
+| `internal/codeintel/impact` | Impact set + affected tests (blast radius / which tests to run) |
 | `internal/codeintel/retrieve` | Fusion of the lenses → a budgeted, provenance-tagged Context Bundle |
 | `internal/codeintel/live` | Incremental worktree-aware re-index + memory fusion (the `live` tool) |
 | `internal/embed` | Provider-backed text embedder satisfying `semantic.Embedder` |
@@ -242,7 +258,7 @@ The complete current map of the binary, grouped by role. One line per package, s
 | Package | Role |
 |---|---|
 | `internal/paths` | Per-OS config / data / cache directory resolution |
-| `eval`, `eval/browse`, `eval/desktop` | The measure-first evaluation harness (scores configs; pass@1/pass^k) — not linked into the binary |
+| `eval`, `eval/browse`, `eval/desktop`, `eval/self` | The measure-first evaluation harness (scores configs; pass@1/pass^k) — not linked into the binary |
 
 ---
 
@@ -268,6 +284,9 @@ Bare **`nilcore`** = `nilcore chat`. One terminal, one conversation (`session.Se
 | `/mode` | Show the active mode |
 | `/add <path\|url>` | Attach a read-only context root, or fetch a URL via sandboxed `web_fetch` |
 | `/save <file.md>` | Write the agent's last answer/plan to a `.md`/`.markdown`/`.txt` file — relative-only, symlink-confined, **no overwrite**. Principal-initiated (not a model write tool). Acted on by the local terminal/TUI only; serve **refuses** it. |
+| `/diff` | Preview the verified work kept from the last `execute` run — a bounded, read-only diffstat + diff head of the kept branch. No kept branch ⇒ "nothing to preview". |
+| `/apply` | Merge that kept verified branch into your branch — an **irreversible** action routed through the structured promote-to-base gate (asks for approval; the graduated-auto-approval envelope may auto-admit). |
+| `/questions <less\|more\|off\|normal>` | Dial how often the agent may ask clarifying questions; `/ask-less` and `/ask-more` are one-notch sugar. Bare `/questions` shows the current level. |
 | `/context` | Window usage; warns it will auto-compact at ≥80% |
 | `/clear` | Reset history (keeps mode + roots); refused mid-drive |
 | `/status` | Phase, mode, attached-root count, gauge |
@@ -299,7 +318,7 @@ In `auto`, a cheap metered ~256-token JSON classifier (with a no-model fallback 
 
 ### Live surface, budget, persistence
 - **Streaming UI** (`termui`): a bottom live line — your prompt when idle; a braille spinner + cycling verb + elapsed + token estimate + "`!` to steer" when working; finalized glyph lines (`·` intent, `▸` tool, `✓`/`✗` verify, `⤺` steer-ack) scroll above. Off a TTY (SSH/pipe/CI/`TERM=dumb`/`NO_COLOR`) it degrades to clean plain lines (I6).
-- **Context gauge:** ring runes `○`(<25) `◔`(≥25) `◑`(≥50) `◕`(≥75) `●`(≥100); colour green <60 / amber 60–85 / red >85. The `/clear` nudge fires at ≥85%; auto-compaction near **80%** (summarizes prior turns, keeps the latest verbatim).
+- **Context gauge:** ring runes `○`(<25) `◔`(≥25) `◑`(≥50) `◕`(≥75) `●`(≥100); colour green <60 / amber 60–85 / red >85. The red `/clear` nudge fires above **85%** (at exactly 85% the ring is still amber, so no nudge yet); auto-compaction near **80%** (summarizes prior turns, keeps the latest verbatim).
 - **Budget wall:** one `budget.Ledger` keyed by the conversation id — default **$10** (`-budget`). Every drive, the classifier, chat replies, and the summarize fold-back charge the *same* ceiling; a breach (`ErrCeiling`) aborts.
 - **Resume:** a SQLite checkpointer persists *bounded* WorkState (summary + active route + branch + last outcome + pinned mode), never transcripts. Restart prints `↻ resumed the previous conversation`.
 - **`/add` roots** mount read-only into each drive's read/search tools (never writable).
@@ -317,7 +336,7 @@ The *voice* is the model's; each *behaviour* is enforced at a code site, not a p
 | Trait | Means | Enforced at |
 |---|---|---|
 | **Terse senior engineer** | Lead with the answer; no preamble/emoji; push back | Model voice; terse operational prompts; quality via verifier + cross-model review |
-| **Clarify vs act** | Act on stated assumptions; ask ≤1 sharp question only on an irreversible fork | `native.go` "Do not ask the user questions; act."; router routes meta-questions to a reply; workers ask the *supervisor* |
+| **Clarify vs act** | Default to acting on stated assumptions; when a human is synchronously reachable the loop may put **1–5 sharp `ask_user` questions** (attended-only — a headless front door leaves the tool unadvertised) | `native.go` "Default to acting: proceed on reasonable assumptions and state them…" + the advertised `ask_user`/`set_ask_level` tools; router routes meta-questions to a reply; workers ask the *supervisor* |
 | **Adaptive planning** | Cheap → interleave; complex → plan | The router's one cheap classifier; the advisor doubles as planner |
 | **Advisor escalation** | Consult a strong advisor when stuck — knowing *when* is the character | `advisor`: `ask_advisor` + auto-escalate after K verify failures; advice only, seeded with a summary |
 | **Proactive-act** | Self-start *reversible* work; irreversible hits the gate; announce it | `trigger`: auto-start reversible, gate irreversible; default-off; audited |
@@ -426,7 +445,7 @@ Three nested machines over one contract, one rule (the verifier decides): the **
 ## 12. Memory, code intelligence, evidence & observability
 
 - **Cross-project memory** (`memory`) — durable scope-keyed records in SQLite, fused into context (the `live` tool returns worktree edits fused with project memory; the orchestrator writes durable conventions back). Distinct from the per-conversation checkpoint.
-- **Code intelligence** (`codeintel`) — **19 parser backends / 34 extensions**, pure-Go (no tree-sitter/CGO; JavaScript and TypeScript share one backend). Pipeline: AST → SQLite call graph (recursive-CTE reachability) → PageRank repo-map → semantic HNSW (opt-in `NILCORE_EMBED_KEY`/`NILCORE_EMBED_MODEL`, degrades to lexical) → LSP (`NILCORE_LSP_COMMAND`) → impact set + Ochiai fault localization → live worktree-aware index (`NILCORE_LIVE_INDEX`) → a budgeted, provenance-tagged retrieval bundle. ([`CODE-INTELLIGENCE.md`](CODE-INTELLIGENCE.md))
+- **Code intelligence** (`codeintel`) — **19 parser backends / 34 extensions**, pure-Go (no tree-sitter/CGO; JavaScript and TypeScript share one backend). Pipeline: AST → SQLite call graph (recursive-CTE reachability) → PageRank repo-map → semantic HNSW (opt-in `NILCORE_EMBED_KEY`/`NILCORE_EMBED_MODEL`, degrades to lexical) → LSP (`NILCORE_LSP_COMMAND`) → impact set + affected tests → live worktree-aware index (`NILCORE_LIVE_INDEX`) → a budgeted, provenance-tagged retrieval bundle. ([`CODE-INTELLIGENCE.md`](CODE-INTELLIGENCE.md))
 - **Verifier-backed artifacts** (`artifact`) — code is one artifact type among reports/matrices/specs/benchmarks/dossiers. Every `Claim` carries `Evidence{value, source_url, verifier, status}`; green only if a sandboxed check *affirmatively passed* — the worker's self-claim is **overwritten**; an unregistered verifier ⇒ `unverifiable`. Domain **verify-packs** supply the checks. ([`ROADMAP-EVIDENCE-ARTIFACTS.md`](ROADMAP-EVIDENCE-ARTIFACTS.md))
 - **Observability** (read-only over the log): `report` (text/md/html/json/matrix; refuses green over a broken chain), `trace`/`why` (causal tree), `trust` (backend strength scoreboard), `inspect [health]` (rollup + 0/1 probe). Durable backbone: SQLite `store`.
 
@@ -440,16 +459,25 @@ Dispatch (`cmd/nilcore/main.go`): bare `nilcore` → chat; a `-`-prefixed argv (
 |---|---|
 | `nilcore` / `chat` | Interactive conversational front door |
 | `tui` | Full-screen Charm TUI variant (needs `tui` build tag) |
+| `do -goal "…"` | Route a goal to the fitting preset (run \| build \| swarm \| decompose) and dispatch (`-dry-run` previews, `-as` forces one) |
 | `-goal "…"` *(run)* | Run one task to completion in a disposable worktree |
 | `build -goal "…" [-new ./svc]` | Drive a whole project to a verifier-green tree (multi-agent) |
 | `swarm -goal "…" -preset …` | Verified swarm: typed artifacts, requeue-until-clean |
+| `decompose -goal "…"` | Split a goal into independent sub-goals, run each in its own worktree, merge-and-re-verify into one tip (kernel recursion) |
+| `flows validate\|run <file>` | Preflight / execute a portable agentic-flows DAG (routed through the swarm code preset) |
 | `serve -channel telegram` | Listen on Telegram/Slack (+ `--webhook`) |
 | `watch` / `schedule` | Self-start from signals / on cron (+ `--open-pr`) |
 | `browse` / `desktop` | Browser / desktop computer-use (`--mac-host` gated) |
 | `propose-edit -goal … -paths …` | Gated self-edit of own prompts/skills/tools |
+| `flywheel [--once]` | Self-improvement loop (eval → mine failures → propose a gated fix; human-gated, a real `Flow.Merge` lands the verified branch) |
 | `mcp-call <server> <tool>` | Invoke a configured MCP tool |
 | `registry list\|install` | Manage local skills |
-| `report` / `trace` (`why`) / `trust` / `inspect [health]` | Read-only views over the audit log |
+| `report` / `trace` (`why`, `--tui`) / `trust` / `inspect [health]` | Read-only views over the audit log (`trace --tui` = interactive explorer, needs the `tui` build) |
+| `experience` / `capability` | Learned-state scoreboard / a drive's exact capability descriptor |
+| `lessons` | Recurring verifier-failure patterns the agent has learned from |
+| `auto-approvals [-denied]` | Account of past graduated auto-approvals + the per-class undo story |
+| `objective <list\|add\|disable\|enable>` | Manage the standing-objectives backlog (operator-only) |
+| `selfacc <propose\|check>` | Review self-authored acceptance verifiers (operator-gated; `NILCORE_SELFACC`) |
 | `init` / `doctor` / `config show` / `secret set <name>` | Onboard / readiness gate / show config / store a secret |
 | `version` (`-v`) / `help` (`-h`) | Build version / usage |
 
@@ -475,20 +503,34 @@ Dispatch (`cmd/nilcore/main.go`): bare `nilcore` → chat; a `-`-prefixed argv (
 
 ## 14. Configuration & environment
 
-**`nilcore init`** writes a secret-free `config.json` (`onboard.Config`: `Providers[]`, `Executor`, `Advisor`, `Backend`, `PreferredBackend`, `Runtime`, `Image`, `Channel{Type,TokenRefs,Allow}`, `Web{Enabled,Allow,Search,SearchKeyRef,Profile,ProfileFile}`, `Codex`/`Claude` delegated config, pool tiers, routing). **`nilcore config show`** prints it — the de-facto config-key reference. **`nilcore doctor`** is the exit-0/1 host-readiness gate (keys resolve, runtime on PATH, sandbox probe, allowlist sane) — distinct from `inspect health` (which probes the log). Operator runbook + full env table: [`OPERATIONS.md`](OPERATIONS.md).
+**`nilcore init`** writes a secret-free `config.json` (`onboard.Config`: `Providers[]`, `Executor`, `Advisor`, `Backend`, `PreferredBackend`, `Runtime`, `Image`, `Channel{Type,TokenRefs,Allow}`, `Web{Enabled,Allow,Search,SearchKeyRef,Profile,ProfileFile}`, `Codex`/`Claude` delegated config, pool tiers, routing). **`nilcore config show`** prints it — the de-facto config-key reference. **`nilcore doctor`** is the exit-0/1 host-readiness gate (keys resolve, runtime on PATH, sandbox probe, allowlist sane) — distinct from `inspect health` (which probes the log). Operator runbook (opt-in surfaces, web access, autonomy, registry): [`OPERATIONS.md`](OPERATIONS.md).
 
 ### Key environment variables
 | Area | Variables |
 |---|---|
-| Model / providers | `NILCORE_MODEL`, `NILCORE_ADVISOR`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NILCORE_COMPAT_BASE_URL`/`_AUTH_SCHEME`/`_KEY_ENV` |
+| Model / providers | `NILCORE_MODEL`, `NILCORE_ADVISOR`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NILCORE_COMPAT_BASE_URL`/`_AUTH_SCHEME`/`_KEY_ENV`, `NILCORE_OPENROUTER_PROVIDER`/`_MODELS`/`_REASONING`/`_TRANSFORMS`/`_PLUGINS`, `NILCORE_RESPONSE_FORMAT`, `NILCORE_TOOL_CHOICE` (OpenRouter/OpenAI extras; JSON where noted, ignored if malformed) |
 | Delegated backends | `NILCORE_CLAUDE_MODEL`/`_EFFORT`, `NILCORE_CODEX_MODEL`/`_EFFORT`, `CODEX_API_KEY` |
-| Sandbox / verify | `NILCORE_SANDBOX`, `NILCORE_RUNTIME`, `NILCORE_IMAGE`, `NILCORE_BROWSER_VERIFY` |
+| Sandbox / verify | `NILCORE_SANDBOX`, `NILCORE_RUNTIME`, `NILCORE_IMAGE`, `NILCORE_BROWSER_VERIFY`, `NILCORE_VERIFY_PACKS`, `NILCORE_EVIDENCE_VERIFY`, `NILCORE_EVIDENCE_MAX_AGE` (all four evidence toggles fold into the verify-cache key; `NILCORE_VERIFY_PACKS` + `NILCORE_EVIDENCE_MAX_AGE` are additionally validated at boot — a bad value exits 2), `NILCORE_VCACHE` / `NILCORE_FLAKEPROBE` (verify-cache + one-shot flake re-run, both default-ON), `NILCORE_TIERED_VERIFY` (scoped fast-red path, opt-in) |
 | Web / egress | `NILCORE_EGRESS_PROFILE`, `BRAVE_API_KEY`, `NILCORE_WEB_SEARCH_NATIVE`, `NILCORE_WEB_SEARCH_MAX_USES` |
 | Connectors | `NILCORE_ALLOWLIST`, `TELEGRAM_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, `NILCORE_MCP_CONFIG`, `NILCORE_MCP_RESOURCES`, `NILCORE_SKILLS_DIR`, `NILCORE_WEBHOOK_SECRET`, `NILCORE_WEBHOOK_LABEL`, `NILCORE_FORGE_TOKEN` |
-| Computer use | `NILCORE_COMPUTER_USE`, `NILCORE_COMPUTER_NATIVE`, `NILCORE_COMPUTER_MODEL`, `NILCORE_BROWSE_MODEL`, `NILCORE_DESKTOP_HOST` (=`1`), `NILCORE_DESKTOP_ALLOW_APPS`, `NILCORE_DESKTOP_STOP`, `NILCORE_DESKTOP_DRIVER`, `NILCORE_BROWSER` |
-| Code intel | `NILCORE_EMBED_KEY`, `NILCORE_EMBED_MODEL`, `NILCORE_LSP_COMMAND`, `NILCORE_LIVE_INDEX` |
-| Secrets / audit | `NILCORE_VAULT_PASSPHRASE`, `NILCORE_LOG_HMAC_KEY` |
-| Autonomy | `NILCORE_REQUEUE`, `NILCORE_REQUEUE_MAX_ATTEMPTS`, `NILCORE_TRUST_DEFAULT` |
+| Computer use | `NILCORE_COMPUTER_USE`, `NILCORE_COMPUTER_NATIVE`, `NILCORE_COMPUTER_MODEL`, `NILCORE_BROWSE_MODEL`, `NILCORE_DESKTOP_HOST` (=`1`), `NILCORE_DESKTOP_ALLOW_APPS`, `NILCORE_DESKTOP_STOP`, `NILCORE_DESKTOP_DRIVER`, `NILCORE_BROWSER`, `NILCORE_MAC_SCALE` (Retina backing-scale override, 1–4) |
+| Code intel | `NILCORE_EMBED_KEY`, `NILCORE_EMBED_MODEL`, `NILCORE_EMBED_BASE_URL` (OpenAI-compatible embeddings endpoint), `NILCORE_LSP_COMMAND`, `NILCORE_LIVE_INDEX` |
+| Secrets / audit | `NILCORE_VAULT_PASSPHRASE`, `NILCORE_LOG_HMAC_KEY`, `NILCORE_SECRET_EXTERNAL_CMD` (activates the external-command SecretStore backend — the 4th I3 backend) |
+| Orchestration & closed-loop | `NILCORE_KERNEL` (route through the unified kernel; default-ON, `=0` escape hatch), `NILCORE_EXPERIENCE` (derived experience projection), `NILCORE_LESSONS` (distil verifier-failure scars), `NILCORE_FLYWHEEL` / `NILCORE_AUTONOMY` (serve-only: background flywheel / autonomy daemon), `NILCORE_REQUEUE`, `NILCORE_REQUEUE_MAX_ATTEMPTS`, `NILCORE_TRUST_DEFAULT` (=`1`; cost-aware trust oracle for single-backend runs) |
+| Graduated auto-approval | `NILCORE_AUTOAPPROVE_PRESET` (`conservative\|standard\|trusted` — seeds the envelope), `NILCORE_AUTOAPPROVE_OFF` (=`1`; global kill-switch, also `.nilcore/AUTOAPPROVE_OFF`), `NILCORE_SELFIMPROVE_AUTOAPPROVE` (=`1`; separate double-opt-in for auto-merging self-improve edits — **see the behaviour-change note below**), `NILCORE_SELFACC` / `_MAX` / `_FILE` (closed-loop self-acceptance checks) |
+| Non-interactive init (`onboard.FromEnv`) | `NILCORE_BACKEND`, `NILCORE_EXECUTOR`, `NILCORE_WEB_SEARCH`, `NILCORE_WEB_ALLOW` (scripted, prompt-free `nilcore init` inputs) |
+
+**Names written in suffix form above, spelled out** (so they are findable by their exact name):
+`NILCORE_COMPAT_BASE_URL`, `NILCORE_COMPAT_AUTH_SCHEME`, `NILCORE_COMPAT_KEY_ENV`;
+`NILCORE_OPENROUTER_PROVIDER`, `NILCORE_OPENROUTER_MODELS`, `NILCORE_OPENROUTER_REASONING`, `NILCORE_OPENROUTER_TRANSFORMS`, `NILCORE_OPENROUTER_PLUGINS`;
+`NILCORE_CLAUDE_MODEL`, `NILCORE_CLAUDE_EFFORT`, `NILCORE_CODEX_MODEL`, `NILCORE_CODEX_EFFORT` (these four are read by prefix construction in `resolveDelegated`, `cmd/nilcore/main.go:2323`);
+`NILCORE_SELFACC`, `NILCORE_SELFACC_MAX`, `NILCORE_SELFACC_FILE`.
+
+**Value semantics (a footgun worth stating):** most feature flags gate on *presence* — any non-empty value, **including `=0`**, enables them. The exceptions are the default-ON verify/kernel flags (`NILCORE_VCACHE`, `NILCORE_FLAKEPROBE`, `NILCORE_KERNEL`), which honour `0`/`off`/`false`/`no` to turn OFF, and `NILCORE_EXPERIENCE` (a default-OFF opt-in that likewise honours those negatives). `NILCORE_TIERED_VERIFY` is a default-OFF opt-in that needs `1`/`on`/`true`/`yes`. The `=1`-exactly gates are `NILCORE_DESKTOP_HOST`, `NILCORE_AUTOAPPROVE_OFF`, `NILCORE_SELFIMPROVE_AUTOAPPROVE`, and `NILCORE_TRUST_DEFAULT`. The grouped table above is the fullest env reference in the docs; [`OPERATIONS.md`](OPERATIONS.md) adds the operator runbook for the opt-in surfaces.
+
+> **Behaviour changes at `573a4df` that alter what an existing setting DOES.** Two settings that previously did nothing now take real effect — check yours before upgrading:
+> - **`NILCORE_SELFIMPROVE_AUTOAPPROVE=1` now performs a real merge.** Before, `selfimprove.Flow.Propose` logged `self_edit_merged` and reported success while **nothing was merged**; the verified branch was only preserved. It now lands the edit. The guards are unchanged — the edit must be verifier-green, `selfimprove.DefaultScope` still forbids `internal/verify/`, the core loop and every contract file, and the execution-time changed-paths screen still fails closed — but if you had this set, it was a no-op and now it is not.
+> - **`nilcore swarm` shards now reach their preset's declared hosts.** The per-shard egress allowlist was computed and then dropped, so every shard ran `--network none` (which is why the `research` preset could never verify green and `--egress-allow` was inert). The role-intersected allowlist is now enforced by a proxy for each shard box. Deny-all presets (`audit`, `ui`) stay `--network none`; a proxy that cannot bind fails closed. The active allowlist is printed at start and recorded as a `swarm_egress` event.
 
 ---
 

@@ -181,6 +181,8 @@ func TestLocatorEscapeIsUnverifiableWithNoBoxCall(t *testing.T) {
 		{"dotdot segment", "../etc/passwd:1"},
 		{"nested dotdot", "internal/../../secret:3"},
 		{"leading slash", "/etc/passwd:1"},
+		{"leading dash path (sed/grep option)", "-rfoo.go:1"},
+		{"leading double-dash option-like path", "--version:1"},
 		{"single quote in path", "a'b.go:1"},
 		{"whitespace in path", "a b.go:1"},
 		{"control byte in path", "a\tb.go:1"},
@@ -447,6 +449,27 @@ func TestFindingReproduces(t *testing.T) {
 		}
 		if box.calls() != 0 {
 			t.Fatalf("quoted pattern made %d box.Exec calls, want 0", box.calls())
+		}
+	})
+
+	// A leading '-' pattern is a grep OPTION-injection ("-rfoo" ⇒ -r -f oo). It must be
+	// refused BEFORE the grep runs — the fake box fails the test if Exec is reached.
+	t.Run("pattern with a leading dash => Unverifiable, no box call", func(t *testing.T) {
+		for _, pat := range []string{"-rfoo", "--include=*.go", "-n"} {
+			box := boxReturning("1:x\n", 0)
+			st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", pat, "1"))
+			if st != artifact.StatusUnverifiable {
+				t.Fatalf("leading-dash pattern %q = %q, want unverifiable", pat, st)
+			}
+			if box.calls() != 0 {
+				t.Fatalf("leading-dash pattern %q made %d box.Exec calls, want 0 (must refuse before grep)", pat, box.calls())
+			}
+		}
+		// Control: a pattern with an INNER dash (not leading) is fine and reaches the box.
+		box := boxReturning("1:a-b\n", 0)
+		st, _ := checkFindingReproduces(ctx, box, claim(IDFindingReproduces, "x.go:1", "a-b", "1"))
+		if st != artifact.StatusPass {
+			t.Fatalf("inner-dash pattern = %q, want pass (only a LEADING dash is refused)", st)
 		}
 	})
 

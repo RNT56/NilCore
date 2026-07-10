@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -260,4 +261,100 @@ func waitGate(t *testing.T, b *Bot, id string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("gate %q never registered", id)
+}
+
+// errRT is a RoundTripper that always fails, so http.Client.Do wraps its error in a
+// *url.Error carrying the request URL (which embeds the bot token in its path).
+type errRT struct{ err error }
+
+func (e errRT) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
+
+// TestCallScrubsTokenFromTransportError proves a transport failure never leaks the bot
+// token: the token is in the request URL, so the *url.Error string would otherwise contain
+// it. call must redact it (I3 defense-in-depth) even though callers discard the error today.
+func TestCallScrubsTokenFromTransportError(t *testing.T) {
+	const token = "123456:SUPERSECRETTOKEN"
+	b := New(token)
+	b.baseURL = "http://telegram.invalid"
+	b.http = &http.Client{Transport: errRT{err: errors.New("dial tcp: connection refused")}}
+
+	err := b.call(context.Background(), "getUpdates", map[string]any{"x": 1}, nil)
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "SUPERSECRET") {
+		t.Fatalf("bot token leaked in error: %q", err.Error())
+	}
+}
+
+// TestUpdateClipsLongMessage proves a progress line over the Bot API cap is clipped, so it
+// is not sent whole (→ HTTP 400 → the whole update dropped).
+func TestUpdateClipsLongMessage(t *testing.T) {
+	var gotText string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			gotText, _ = body["text"].(string)
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	b := New("t")
+	b.baseURL = srv.URL
+	ctx, cancel := ctx5(t)
+	defer cancel()
+
+	if err := b.Update(ctx, "99", strings.Repeat("a", 5000)); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if n := len([]rune(gotText)); n > telegramTextLimit {
+		t.Fatalf("Update text not clipped: %d runes (cap %d)", n, telegramTextLimit)
+	}
+}
+
+// TestTelegramRetryAfterParsing pins the bounded backoff and that the JSON body's
+// parameters.retry_after wins over the header.
+func TestTelegramRetryAfterParsing(t *testing.T) {
+	if got := telegramRetryAfter("", []byte(`{"parameters":{"retry_after":4}}`)); got != 4*time.Second {
+		t.Errorf("body retry_after=4 → %v, want 4s", got)
+	}
+	if got := telegramRetryAfter("2", []byte(`{}`)); got != 2*time.Second {
+		t.Errorf("header Retry-After=2 → %v, want 2s", got)
+	}
+	if got := telegramRetryAfter("", []byte(`{}`)); got != rateRetryDefault {
+		t.Errorf("no hint → %v, want default %v", got, rateRetryDefault)
+	}
+	if got := telegramRetryAfter("", []byte(`{"parameters":{"retry_after":99999}}`)); got != rateRetryMax {
+		t.Errorf("absurd retry_after → %v, want cap %v", got, rateRetryMax)
+	}
+}
+
+// TestTelegramCallRetriesOn429 proves a rate-limited call is retried (bounded) then
+// succeeds — the gate/ask/final message is not dropped to a 429.
+func TestTelegramCallRetriesOn429(t *testing.T) {
+	old := rateRetryDefault
+	rateRetryDefault = time.Millisecond
+	defer func() { rateRetryDefault = old }()
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{}`) // no retry_after → default (1ms in test)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	b := New("t")
+	b.baseURL = srv.URL
+	if err := b.Update(context.Background(), "99", "hi"); err != nil {
+		t.Fatalf("Update after a 429 retry: %v", err)
+	}
+	if n := hits.Load(); n != 2 {
+		t.Fatalf("server hit %d times, want 2", n)
+	}
 }

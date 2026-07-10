@@ -1,6 +1,6 @@
 # Roadmap — Pillar 8: the Unified Orchestration Kernel (UOK)
 
-> **Status:** SHIPPED + **default-ON** (Phase 16, Pillar 8; flipped to default-on in PR #78 after the equivalence harness stayed green — escape hatch `NILCORE_KERNEL=0|off|false|no` reverts to the legacy machine path, byte-identical). The §0 cutover routed `run`/`build`/`swarm`/`chat` through one kernel, proven against the legacy machines by an equivalence harness. **For the routing design this roadmap is superseded by [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md)** — which builds the preset router (`nilcore do`) the kernel was designed for and records that the native recursive engine (`MaxDepth>1`) is built + tested but **dormant in production** (every production envelope sets `Flat` only; the iterative project loop does not fit the one-shot recursion — see V2 for the full reasoning).
+> **Status:** SHIPPED + **default-ON** (Phase 16, Pillar 8; flipped to default-on in PR #78 after the equivalence harness stayed green — escape hatch `NILCORE_KERNEL=0|off|false|no` reverts to the legacy machine path, byte-identical). The §0 cutover routed `run`/`build`/`swarm`/`chat` through one kernel, proven against the legacy machines by an equivalence harness. **For the routing design this roadmap is superseded by [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md)** — which builds the preset router (`nilcore do`) the kernel was designed for and records that the native recursive engine (`kernel.Recursive`) is **no longer dormant**: the `decompose` preset (`nilcore decompose`, `do -as decompose`) is its production consumer, wiring `env.Decompose = kernel.Recursive` at `MaxDepth:1` (`cmd/nilcore/decompose.go:260`, `:217-218`). What remains built-but-unused in production is **multi-level recursion** (`MaxDepth>1`) — no envelope sets it — and re-expressing the iterative project loop as `Plan`/`Integrate` (it does not fit the one-shot recursion — see V2 for the full reasoning).
 >
 > **Read with:** [`CLAUDE.md`](../CLAUDE.md) §1/§2/§8, [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (the execution model + the frozen contract), [`docs/ROADMAP-CLOSED-LOOP.md`](ROADMAP-CLOSED-LOOP.md) §4 Pillar 8.
 
@@ -47,8 +47,9 @@ The cutover ships (1); (2) is the engine's reason to exist, built and tested up 
 | `run` | `orch.Execute` wrap | — (or project-loop wrap under `-auto-supervise`) | pass-through (orch owns its own dispatch) | 1 |
 | `build` | single-task fallback | `loop.Run` wrap | AlwaysDecompose | 1 |
 | `swarm` | single-task fallback | `controller.Run` wrap | AlwaysDecompose | 1 |
+| `decompose` (V2 K2-1) | child sub-goal → KeepBranch single-task run | `kernel.Recursive(plan, integrate)` — the native engine, merge-and-re-verify integrator | AlwaysDecompose | 1 |
 
-The chat router maps its `Route` (native/supervise/project) onto these envelopes, so "the router picks an envelope, not a machine" — with the legacy `Route`→Driver path unchanged when `NILCORE_KERNEL` is off.
+The `decompose` envelope (`cmd/nilcore/decompose.go:213-262`) is the one that actually drives `kernel.Recursive`; the other three wrap a legacy machine as `Flat`. The chat router maps its `Route` (native/supervise/project) onto the wrapping envelopes, so "the router picks an envelope, not a machine" — with the legacy `Route`→Driver path unchanged when `NILCORE_KERNEL` is off.
 
 ## §4 The invariant ledger
 
@@ -71,5 +72,5 @@ The chat router maps its `Route` (native/supervise/project) onto these envelopes
 
 ## §6 Honest caveats
 
-- The cutover ships the **monolithic-wrap** envelopes (equivalent + safe). **Native recursion** (`MaxDepth>1`, re-expressing the project loop / swarm as `Plan`/`Integrate`) is built + tested in the engine but is **dormant in production** — NO production envelope uses it (every envelope sets `Flat` only). [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md) records why the *iterative* project loop does not fit the *one-shot* recursion, and what a real recursive `decompose` preset would require before the engine has a live consumer.
+- The cutover shipped the **monolithic-wrap** envelopes (equivalent + safe), which set `Flat` only. The native recursive engine (`kernel.Recursive`, driven by `Plan`/`Integrate`) is **no longer dormant** — it was given a production consumer after the cutover: the `decompose` preset (`cmd/nilcore/decompose.go`) wires `env.Decompose = kernel.Recursive` and is reachable as `nilcore decompose` / `do -as decompose`. What is still built-but-unused in production is **multi-level recursion** (`MaxDepth>1` — `decompose` runs at `MaxDepth:1`) and re-expressing the iterative project loop / swarm as `Plan`/`Integrate`. [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md) §5 records how the `decompose` preset cashed the recursion IOU, and why the *iterative* project loop does not fit the *one-shot* recursion.
 - `NILCORE_KERNEL` is now **default-ON** (flipped in PR #78 after the equivalence harness stayed green): the kernel routes every entrypoint when unset; set `NILCORE_KERNEL=0|off|false|no` to revert to the legacy `Route`→machine path, byte-identical (the escape hatch retained for instant revert).

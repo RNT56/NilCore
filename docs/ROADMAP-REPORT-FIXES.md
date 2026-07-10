@@ -1,13 +1,13 @@
 # Roadmap — resolving the external review's findings
 
-A mid-2026 external review of NilCore raised four findings. Three are valid, in-scope, and resolved by the workstreams below (each its own verified PR); the fourth (full desktop computer use) is a **deliberate non-goal**, not a gap. Every workstream is **additive, opt-in, stdlib-only (no new module, `CGO_ENABLED=0`), and changes no invariant** — the default binary stays byte-identical.
+A mid-2026 external review of NilCore raised four findings. Three are valid, in-scope, and resolved by the workstreams R1–R3 below (each its own verified PR). The fourth (full desktop computer use) was declined at review time as a non-goal — but the stance was **later revisited and desktop computer use has since shipped as Phase CU** (`nilcore desktop`): sandbox-contained by default (I4-preserving), with the unsandboxed real-host tier (`--mac-host`) behind its own separate opt-in and the unconditional human gate (an explicitly recorded I4 relaxation, `docs/ROADMAP-COMPUTER-USE-DARWIN.md`). Every R1–R3 workstream is **additive, opt-in, stdlib-only (no new module, `CGO_ENABLED=0`), and changes no invariant** — the default binary stays byte-identical.
 
 | Finding | Verdict | Workstream |
 |---|---|---|
 | Code intelligence only parses Go + Python | Valid gap | **R2** — pure-Go TS/JS + Rust parser backends |
 | Codex / Claude Code delegation is hardcoded, key-only | Valid under-investment | **R1** — model/effort/args/env passthrough |
 | Browser observation, not control | Valid (in-scope extension) | **R3** — pure-Go CDP client + `--actions` flow driving |
-| No full desktop computer use | **Non-goal** — conflicts with the sandbox / no-ambient-authority thesis (I3/I4) | Not pursued; stays gated (`docs/ROADMAP-EXTERNAL-INFRA.md`) |
+| No full desktop computer use | Declined at review time as a non-goal (unsandboxed GUI control conflicts with I3/I4) — **stance later revisited** | **Since shipped as Phase CU** (`nilcore desktop`, gated by `NILCORE_COMPUTER_USE`): a sandbox-contained desktop tier (I4-preserving) plus a separately-gated `--mac-host` real-host tier (recorded I4 relaxation, `NILCORE_DESKTOP_HOST=1` + forced human gate + kill-switch) — `docs/ROADMAP-COMPUTER-USE-DARWIN.md` |
 
 ---
 
@@ -33,7 +33,7 @@ _Owns:_ `internal/codeintel/ast`.
 
 ## R3 — Browser interaction (the in-scope extension of behavioral verification)
 
-**Problem.** `browser_view` could *view* a page (title/text/console/screenshot) but not *act* on it — so behavioral verification couldn't test a **flow** (log in, submit a form). (Full desktop computer use — driving arbitrary GUI apps — stays a non-goal: it grants the kind of ambient control the sandbox/I3/I4 thesis refuses.)
+**Problem.** `browser_view` could *view* a page (title/text/console/screenshot) but not *act* on it — so behavioral verification couldn't test a **flow** (log in, submit a form). (Full desktop computer use — driving arbitrary GUI apps — was out of scope for *this* browser workstream; it has since shipped separately as Phase CU, sandbox-contained by default, with the unsandboxed host-control tier reached only behind its own explicit opt-in + unconditional gate — the recorded I4 relaxation the thesis requires, not ambient authority.)
 
 **Resolution.** A new pure-Go `internal/cdp`: a minimal RFC6455 WebSocket client + Chrome DevTools Protocol client (stdlib only — `net`, `crypto/sha1`, `crypto/rand`, `encoding/json`), supporting `Page.navigate`/`captureScreenshot`, `Runtime.evaluate` (title/text + selector→coordinates), and `Input.dispatchMouseEvent`/`dispatchKeyEvent`/`insertText` (click/type). `nilcore-browser` gains an `--actions <json>` mode (navigate / click / type / key / wait) that drives Chrome over CDP, then captures the **same** observation contract; the batch (no-actions) path is unchanged. The WebSocket codec, CDP request shapes, and the actions parser are unit-tested hermetically (an in-memory peer); the **live interactive run is CI-only** (extends the `browser-e2e` job), like `sandbox-linux`.
 

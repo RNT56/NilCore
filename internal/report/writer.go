@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"nilcore/internal/worktreefs"
@@ -63,15 +64,28 @@ func validRun(run string) error {
 	return nil
 }
 
-// validExt confirms ext is one of the closed allowlist {html,md,txt}. The ext must
+// validExt confirms ext is one of the closed allowlist {html,md,txt,json}. The ext must
 // also be a bare suffix (no dot, no separator) so it cannot itself escape the
 // layout — the allowlist already guarantees this, but we keep the rejection
-// explicit and actionable.
+// explicit and actionable. The "want one of ..." list is derived from allowedExts so
+// the message can never drift out of sync with the allowlist again.
 func validExt(ext string) error {
 	if _, ok := allowedExts[ext]; !ok {
-		return fmt.Errorf("report: ext %q not allowed (want one of html, md, txt)", ext)
+		return fmt.Errorf("report: ext %q not allowed (want one of %s)", ext, allowedExtList())
 	}
 	return nil
+}
+
+// allowedExtList renders the extension allowlist as a stable, comma-separated string
+// for the validExt error message, sorted so it is deterministic and always reflects
+// exactly what allowedExts accepts.
+func allowedExtList() string {
+	exts := make([]string, 0, len(allowedExts))
+	for e := range allowedExts {
+		exts = append(exts, e)
+	}
+	sort.Strings(exts)
+	return strings.Join(exts, ", ")
 }
 
 // reportRelPath is the worktree-relative path for a rendered report. It uses
@@ -87,7 +101,7 @@ func reportRelPath(run, ext string) string {
 // bytes from P11-T32, written verbatim.
 //
 // run is validated to a single safe path component and ext to the closed allowlist
-// {html,md,txt} BEFORE any byte is written, so no nested or escaping file can be
+// {html,md,txt,json} BEFORE any byte is written, so no nested or escaping file can be
 // created. A symlink planted at the target path is refused by worktreefs
 // (fail-closed) rather than followed. The 0 perm lets worktreefs default/preserve
 // the mode.

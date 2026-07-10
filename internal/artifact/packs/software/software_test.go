@@ -3,6 +3,7 @@ package software
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -257,4 +258,84 @@ func TestSoftwarePack(t *testing.T) {
 			t.Fatalf("missing repo = %q, want unverifiable", st)
 		}
 	})
+}
+
+// --- github_tag pagination (fix: absence from page 1 is not decisive) --------
+
+// fullTagPage returns a JSON array of exactly n decoy tag objects (none matching a real
+// target), i.e. a FULL page that signals "there may be more" to the pager.
+func fullTagPage(n int) string {
+	names := make([]string, n)
+	for i := range names {
+		names[i] = fmt.Sprintf(`{"name":"decoy-%04d"}`, i)
+	}
+	return "[" + strings.Join(names, ",") + "]"
+}
+
+// pagedTagBox routes by the &page=N query the pager appends: page 1..len(pages) return the
+// given bodies, any further page returns an empty list. Each call is a canned 200 curl. The
+// match anchors on "&page=" (not the bare "page=") so it does not collide with the
+// "per_page=100" segment, which contains "page=100".
+func pagedTagBox(pages ...string) *fakeBox {
+	return &fakeBox{exec: func(cmd string) (sandbox.Result, error) {
+		for i, body := range pages {
+			if strings.Contains(cmd, fmt.Sprintf("&page=%d", i+1)) {
+				return sandbox.Result{Stdout: curlOut(body, "200"), ExitCode: 0}, nil
+			}
+		}
+		return sandbox.Result{Stdout: curlOut("[]", "200"), ExitCode: 0}, nil
+	}}
+}
+
+// TestGitHubTagPaginatesToLaterPage is the discriminating fix test: the target tag sits on
+// page 2, behind a FULL page 1 of decoys. The pre-fix single-page fetch reported it absent
+// (a false Fail); the paginated walk must follow to page 2 and Pass.
+func TestGitHubTagPaginatesToLaterPage(t *testing.T) {
+	box := pagedTagBox(fullTagPage(100), `[{"name":"v2.5.0"},{"name":"v2.6.0"}]`)
+	st, _ := checkGitHubTag(context.Background(), box, claim(idTag, "https://github.com/owner/repo", "v2.5.0"))
+	if st != artifact.StatusPass {
+		t.Fatalf("tag on page 2 = %q, want Pass (must follow pagination beyond page 1)", st)
+	}
+}
+
+// TestGitHubTagAbsentAcrossPagesIsFail confirms Fail is still returned once the listing is
+// EXHAUSTED: a full page 1 then a short (final) page 2 without the tag ⇒ decisively absent.
+func TestGitHubTagAbsentAcrossPagesIsFail(t *testing.T) {
+	box := pagedTagBox(fullTagPage(100), `[{"name":"v1.0.0"}]`)
+	st, _ := checkGitHubTag(context.Background(), box, claim(idTag, "https://github.com/owner/repo", "v9.9.9"))
+	if st != artifact.StatusFail {
+		t.Fatalf("absent tag after an exhausted listing = %q, want Fail", st)
+	}
+}
+
+// TestGitHubTagBudgetExhaustedIsUnverifiable proves the fail-toward-unverifiable bound: if
+// EVERY page is full (the listing never ends within the page budget), absence cannot be
+// proven, so the verdict is Unverifiable — never a false Fail (I2). The bounded walk also
+// stops (it does not loop forever), asserted by a call count of exactly tagMaxPages.
+func TestGitHubTagBudgetExhaustedIsUnverifiable(t *testing.T) {
+	full := fullTagPage(100)
+	calls := 0
+	box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+		calls++
+		return sandbox.Result{Stdout: curlOut(full, "200"), ExitCode: 0}, nil
+	}}
+	st, _ := checkGitHubTag(context.Background(), box, claim(idTag, "https://github.com/owner/repo", "v9.9.9"))
+	if st != artifact.StatusUnverifiable {
+		t.Fatalf("unexhausted listing = %q, want Unverifiable (absence not proven)", st)
+	}
+	if calls != tagMaxPages {
+		t.Fatalf("paged %d times, want exactly the bounded %d (walk must stop, not loop)", calls, tagMaxPages)
+	}
+}
+
+// TestGitHubTagCanceledContextIsUnverifiable confirms the walk honors ctx cancellation
+// between pages rather than fetching unboundedly.
+func TestGitHubTagCanceledContextIsUnverifiable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled before the first page
+	box := pagedTagBox(fullTagPage(100))
+	st, _ := checkGitHubTag(ctx, box, claim(idTag, "https://github.com/owner/repo", "v1"))
+	if st != artifact.StatusUnverifiable {
+		t.Fatalf("canceled ctx = %q, want Unverifiable", st)
+	}
 }

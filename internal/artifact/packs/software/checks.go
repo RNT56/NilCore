@@ -264,9 +264,24 @@ func checkGitHubRelease(ctx context.Context, box sandbox.Sandbox, c artifact.Cla
 
 // --- github tag --------------------------------------------------------------
 
-// checkGitHubTag asserts a git tag named Evidence.Value exists in the repo named by
-// the SourceURL, via api.github.com/repos/<o>/<r>/tags (the paged tag list). Present
-// => Pass; a 2xx list without it => Fail; a non-2xx => Unverifiable.
+// tagsPerPage is GitHub's max page size for the tags listing, and tagMaxPages bounds the
+// walk so a repo with an unbounded number of tags can never spin the verifier forever. At
+// most tagsPerPage*tagMaxPages tags are inspected; beyond that we return Unverifiable (we
+// could not decisively prove absence), never a false Fail (I2). Each page is one box.Exec,
+// ctx-honored.
+const (
+	tagsPerPage = 100
+	tagMaxPages = 10
+)
+
+// checkGitHubTag asserts a git tag named Evidence.Value exists in the repo named by the
+// SourceURL, via api.github.com/repos/<o>/<r>/tags (the PAGED tag list). It walks pages
+// until the tag is found or a short/empty page proves the listing is exhausted: present =>
+// Pass; a fully-walked list without it => Fail; a non-2xx / fetch error => Unverifiable.
+// Absence from page 1 is NOT decisive — GitHub returns at most tagsPerPage tags per page, so
+// a real tag can sit on page 2+ and must not be reported missing (the false-RED this fixes).
+// If the page budget is exhausted before a short last page, we cannot prove absence and fail
+// toward Unverifiable rather than a false Fail.
 func checkGitHubTag(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) (artifact.Status, string) {
 	owner, repo, err := ownerRepo(c.Evidence.SourceURL)
 	if err != nil {
@@ -276,26 +291,40 @@ func checkGitHubTag(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) 
 	if err != nil {
 		return artifact.StatusUnverifiable, detail(err.Error())
 	}
-	u := "https://api.github.com/repos/" + owner + "/" + repo + "/tags?per_page=100"
-	code, body, reason, ok := fetchJSON(ctx, box, u, githubAccept)
-	if !ok {
-		return artifact.StatusUnverifiable, detail(reason)
-	}
-	if !is2xx(code) {
-		return artifact.StatusUnverifiable, detail(fmt.Sprintf("github tags API HTTP %d", code))
-	}
-	var tags []struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal([]byte(body), &tags); err != nil {
-		return artifact.StatusUnverifiable, detail("github tags parse error: " + err.Error())
-	}
-	for _, t := range tags {
-		if t.Name == tag {
-			return artifact.StatusPass, fmt.Sprintf("tag %s exists in %s/%s", tag, owner, repo)
+	for page := 1; page <= tagMaxPages; page++ {
+		// Honor cancellation between pages so a slow walk stays bounded by ctx.
+		if err := ctx.Err(); err != nil {
+			return artifact.StatusUnverifiable, detail("context canceled while paging github tags: " + err.Error())
 		}
+		u := fmt.Sprintf("https://api.github.com/repos/%s/%s/tags?per_page=%d&page=%d", owner, repo, tagsPerPage, page)
+		code, body, reason, ok := fetchJSON(ctx, box, u, githubAccept)
+		if !ok {
+			return artifact.StatusUnverifiable, detail(reason)
+		}
+		if !is2xx(code) {
+			return artifact.StatusUnverifiable, detail(fmt.Sprintf("github tags API HTTP %d", code))
+		}
+		var tags []struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(body), &tags); err != nil {
+			return artifact.StatusUnverifiable, detail("github tags parse error: " + err.Error())
+		}
+		for _, t := range tags {
+			if t.Name == tag {
+				return artifact.StatusPass, fmt.Sprintf("tag %s exists in %s/%s", tag, owner, repo)
+			}
+		}
+		if len(tags) < tagsPerPage {
+			// A short (or empty) page is the LAST page — the listing is exhausted and the tag
+			// is decisively absent. Only here is Fail correct.
+			return artifact.StatusFail, detail(fmt.Sprintf("tag %q not in %s/%s tag list", tag, owner, repo))
+		}
+		// A full page: more tags may follow — continue to the next page.
 	}
-	return artifact.StatusFail, detail(fmt.Sprintf("tag %q not in %s/%s tag list", tag, owner, repo))
+	// The page budget ran out before a short last page. We did NOT exhaust the listing, so
+	// absence is not proven: fail toward Unverifiable, never a false Fail (I2).
+	return artifact.StatusUnverifiable, detail(fmt.Sprintf("tag %q not found in the first %d pages of %s/%s tags (listing not exhausted)", tag, tagMaxPages, owner, repo))
 }
 
 // --- license -----------------------------------------------------------------

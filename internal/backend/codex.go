@@ -135,15 +135,32 @@ func lastEventText(jsonl string) string {
 	return last
 }
 
-// digText walks a few common shapes (text/message/delta, and nested
-// params/item objects) to find a text payload.
+// digText walks the shapes the delegated CLIs actually emit to find the human-readable
+// text payload:
+//
+//   - Codex: an item.completed event carries item.text (a string); some events carry a
+//     top-level text/delta string. The item/msg/params descent handles the nesting.
+//   - Claude Code stream-json: the FINAL answer rides a result event under the
+//     top-level "result" STRING key ({"type":"result","subtype":"success","result":...}),
+//     and an assistant event carries message.content as an ARRAY of
+//     {type:"text",text:...} blocks (message is an OBJECT, not a string). Earlier this
+//     handled neither, so every real claude-code run's Summary degraded to a raw-JSONL
+//     tail. digText now reads the result string, descends the message object, and
+//     extracts text from a content[] array.
 func digText(m map[string]any) string {
-	for _, k := range []string{"text", "message", "delta"} {
+	// Direct string payloads: Codex text/delta; Claude Code's result-event "result".
+	// "message" stays here too for the rare event that carries it as a plain string.
+	for _, k := range []string{"text", "result", "message", "delta"} {
 		if s, ok := m[k].(string); ok && s != "" {
 			return s
 		}
 	}
-	for _, k := range []string{"params", "item", "msg"} {
+	// A content[] array of blocks (Claude Code message.content): join its text blocks.
+	if s := textFromContent(m["content"]); s != "" {
+		return s
+	}
+	// Nested objects: Claude Code's message object, Codex's item/msg/params.
+	for _, k := range []string{"message", "params", "item", "msg"} {
 		if sub, ok := m[k].(map[string]any); ok {
 			if s := digText(sub); s != "" {
 				return s
@@ -151,6 +168,31 @@ func digText(m map[string]any) string {
 		}
 	}
 	return ""
+}
+
+// textFromContent extracts and concatenates the text of a content array as emitted by
+// Claude Code (message.content = [{type:"text",text:"..."}, ...]). Non-text blocks
+// (tool_use / tool_result) are skipped — their bodies are not the readable summary. A
+// non-array, or an array with no text blocks, yields "".
+func textFromContent(v any) string {
+	arr, ok := v.([]any)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, el := range arr {
+		blk, ok := el.(map[string]any)
+		if !ok {
+			continue
+		}
+		if typ, _ := blk["type"].(string); typ != "" && typ != "text" {
+			continue
+		}
+		if s, ok := blk["text"].(string); ok && s != "" {
+			b.WriteString(s)
+		}
+	}
+	return b.String()
 }
 
 func tailStr(s string, n int) string {

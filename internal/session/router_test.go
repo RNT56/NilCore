@@ -268,43 +268,6 @@ func TestRouteNilHeuristic(t *testing.T) {
 	}
 }
 
-// TestRouteClampDownBackstop covers the OPTIONAL, default-off ClampDownToNative
-// lever: it is INERT by default (proposal wins) and, when enabled, ONLY clamps a
-// large proposal DOWN to native when the heuristic says simple — it never upgrades.
-func TestRouteClampDownBackstop(t *testing.T) {
-	cases := []struct {
-		name  string
-		reply string
-		clamp bool
-		heur  func(string) bool
-		want  Route
-	}{
-		// Default-off: the supervise proposal wins even though the heuristic says simple.
-		{"default off ⇒ supervise wins", `{"route":"supervise"}`, false, alwaysSimple, RouteSupervise},
-		// Enabled + heuristic simple ⇒ clamp supervise down to native.
-		{"clamp on + simple ⇒ native", `{"route":"supervise"}`, true, alwaysSimple, RouteNative},
-		// Enabled + heuristic simple ⇒ clamp project down to native too.
-		{"clamp on + simple ⇒ project→native", `{"route":"project"}`, true, alwaysSimple, RouteNative},
-		// Enabled but heuristic complex ⇒ no clamp (proposal kept).
-		{"clamp on + complex ⇒ supervise kept", `{"route":"supervise"}`, true, alwaysComplex, RouteSupervise},
-		// Clamp is one-directional: it never UPGRADES a native proposal.
-		{"clamp on never upgrades native", `{"route":"native"}`, true, alwaysComplex, RouteNative},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cls := &scriptModel{reply: tc.reply}
-			r := &SupervisorFirstRouter{Classifier: cls, ShouldSupervise: tc.heur, ClampDownToNative: tc.clamp}
-			got, err := r.Route(context.Background(), "do the thing", WorkState{})
-			if err != nil {
-				t.Fatalf("Route err = %v", err)
-			}
-			if got != tc.want {
-				t.Errorf("route = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestParseRoute is a focused table test on the defensive parser.
 func TestParseRoute(t *testing.T) {
 	cases := []struct {

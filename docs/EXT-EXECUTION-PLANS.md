@@ -56,7 +56,7 @@ avoids duplication and keeps the single load-bearing rule (I3) enforced in one p
    must *compose with* this primitive, never re-mint their own — it is the single design that makes
    the whole tier safe under I3.
 2. **The leasing control plane.** `EXT-01`'s `internal/fleet` (`ControlPlane`/`Lease`/`LeaseStore`,
-   wiring the built-but-unwired `agent.durability.RunState`/`ResumePlan` for cross-host handoff)
+   extending the (now single-host-wired) `agent.durability.RunState`/`ResumePlan` to cross-host handoff)
    underpins **`EXT-05`** multi-tenant scheduling. Build it in EXT-01; EXT-05 layers tenancy on top.
 3. **Remote-fetch + signature/provenance verification.** `EXT-04` (remote-index client) and
    `EXT-07` (registry fetch/publish) share an identical pattern: a bounded, host-pinned stdlib

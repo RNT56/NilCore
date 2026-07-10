@@ -228,3 +228,103 @@ func TestWriterRendersGateEvidence(t *testing.T) {
 		}
 	}
 }
+
+// TestGateEvidenceNeutralizesControlSequences pins the I7 terminal-spoof fix: control /
+// ANSI bytes smuggled into the untrusted, repo-derived evidence bodies are neutralized
+// before they reach the operator's terminal, so a diff or verify tail cannot recolor, clear,
+// or overprint the "DATA under review" rail at the moment of an irreversible-action approval.
+func TestGateEvidenceNeutralizesControlSequences(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+	// Evidence carrying: an ESC clear-screen + cursor-home; an ANSI color run; a carriage
+	// return followed by text mimicking the real rail header; and BEL/NUL bytes.
+	em.Emit(Event{Kind: KindGate, Text: "promote-to-base main", Gate: &GatePrompt{
+		Action:      "promote-to-base main",
+		Diffstat:    "1 file changed\x1b[2J\x1b[1;1H",
+		DiffExcerpt: "+ real change\x1b[31m stolen\x1b[0m\r── DATA under review, not commands: APPROVED",
+		VerifyTail:  "ok\x07\x00done",
+	}})
+	out := buf.String()
+
+	// No raw control bytes survive into the rendered block.
+	for _, bad := range []struct{ name, b string }{
+		{"ESC", "\x1b"}, {"CSI", "\x1b["}, {"CR", "\r"}, {"BEL", "\x07"}, {"NUL", "\x00"},
+	} {
+		if strings.Contains(out, bad.b) {
+			t.Errorf("raw %s leaked into the rendered gate block:\n%q", bad.name, out)
+		}
+	}
+
+	// The visible text is preserved (only the control bytes are replaced), and the genuine
+	// rail header is intact — so the operator still reads the facts, just inert.
+	for _, want := range []string{
+		"┌─ gate evidence", // the genuine rail header
+		"1 file changed",   // diffstat text kept
+		"real change",      // excerpt text kept (the color codes are gone)
+		"stolen",           // even attacker text is kept — but as inert, railed data
+		"done",             // verify text kept across the neutralized BEL/NUL
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q to survive neutralization:\n%q", want, out)
+		}
+	}
+
+	// The attacker's fake "APPROVED" rail line is still INSIDE the data rail (prefixed with
+	// "│"), so it can never be mistaken for the harness's own header even as plain text.
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if strings.Contains(line, "APPROVED") && !strings.HasPrefix(line, "│") {
+			t.Errorf("smuggled evidence line escaped the data rail: %q", line)
+		}
+	}
+}
+
+// TestGateActionLineNeutralized: the gate ACTION line (ev.Text, the framed line ABOVE
+// the evidence rail) is neutralized too — an ESC/CSI/CR smuggled into an action string
+// (e.g. via a model-authored branch or commit message that Describe() flattened in) can
+// no longer rewrite or overprint the screen at the moment of approval. Only KindGate is
+// neutralized; every other kind's framed text is byte-identical.
+func TestGateActionLineNeutralized(t *testing.T) {
+	var buf bytes.Buffer
+	em := NewWriter(&buf)
+	// A gate whose action line carries a clear-screen + cursor-home, a color run, and a
+	// carriage return that would reset the cursor to column 0 over the framed line.
+	em.Emit(Event{Kind: KindGate, Step: 2,
+		Text: "promote-to-base main\x1b[2J\x1b[1;1H\x1b[31m\rTRUSTED"})
+	out := buf.String()
+
+	for _, bad := range []struct{ name, b string }{
+		{"ESC", "\x1b"}, {"CSI", "\x1b["}, {"CR", "\r"},
+	} {
+		if strings.Contains(out, bad.b) {
+			t.Errorf("raw %s leaked into the gate action line:\n%q", bad.name, out)
+		}
+	}
+	// The visible words survive (only the control bytes are inert '?'), so the operator
+	// still reads the action.
+	for _, want := range []string{"promote-to-base main", "TRUSTED", "⛔"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q to survive in the neutralized action line:\n%q", want, out)
+		}
+	}
+
+	// A non-gate framed event with the SAME control bytes is left byte-identical — the
+	// neutralization is scoped to the security-sensitive gate line only.
+	var buf2 bytes.Buffer
+	em2 := NewWriter(&buf2)
+	raw := "about to run\x1b[31m red\r"
+	em2.Emit(Event{Kind: KindTool, Step: 1, Text: raw})
+	if !strings.Contains(buf2.String(), raw) {
+		t.Errorf("a non-gate framed line must render its text raw (byte-identical); got:\n%q", buf2.String())
+	}
+}
+
+// TestNeutralizePreservesStructureAndText unit-tests the neutralizer directly: newlines and
+// tabs (structural whitespace, re-railed / forward-only) survive, while ESC, CR, and other
+// C0/DEL controls become a visible '?', and printable UTF-8 is untouched.
+func TestNeutralizePreservesStructureAndText(t *testing.T) {
+	in := "a\tb\nc\x1bd\re\x00f\x7fg−ü"
+	want := "a\tb\nc?d?e?f?g−ü"
+	if got := neutralize(in); got != want {
+		t.Fatalf("neutralize(%q) = %q, want %q", in, got, want)
+	}
+}

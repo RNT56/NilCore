@@ -3,6 +3,7 @@ package autosrc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -375,5 +376,113 @@ func TestBacklogOnNilDaemon(t *testing.T) {
 	var d *Daemon
 	if d.Backlog() != 0 {
 		t.Fatal("nil-daemon Backlog should be 0")
+	}
+}
+
+// TestEnqueueSignalSurvivesTransientFull is the focused, deterministic proof of the back-
+// pressure fix: on a full queue enqueueSignal must NOT return/drop — it holds the already-
+// consumed signal, retries, and lands it once a slot frees. (Under the pre-fix code the
+// pump returned on ErrQueueFull, killing the source and losing the signal.)
+func TestEnqueueSignalSurvivesTransientFull(t *testing.T) {
+	d := New(nil, Config{QueueCap: 1})
+	d.retryBackoff = time.Millisecond // keep retries snappy for the test
+	ctx := context.Background()
+
+	// Saturate the queue so the next enqueue hits ErrQueueFull.
+	if err := d.q.enqueue(sig("filler", 0)); err != nil {
+		t.Fatalf("prime enqueue: %v", err)
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- d.enqueueSignal(ctx, 0, sig("held", 0)) }()
+
+	// It must be retrying (blocked) — never returning early and never dropping the signal.
+	select {
+	case v := <-done:
+		t.Fatalf("enqueueSignal returned %v on a full queue; it must retry, not give up", v)
+	case <-time.After(60 * time.Millisecond):
+	}
+	if got := d.q.len(); got != 1 {
+		t.Fatalf("queue depth = %d during the stall; the held signal must be neither enqueued yet nor lost", got)
+	}
+
+	// Free a slot: the retry must now land the held signal and report success.
+	if _, ok, err := d.q.dequeue(ctx); !ok || err != nil {
+		t.Fatalf("dequeue filler: ok=%v err=%v", ok, err)
+	}
+	select {
+	case v := <-done:
+		if !v {
+			t.Fatal("enqueueSignal returned false after a slot freed; want true (enqueued)")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueueSignal never resumed after a slot freed — a live source would be stuck")
+	}
+
+	// The previously-blocked signal is really in the queue now (held, then landed).
+	s, ok, err := d.q.dequeue(ctx)
+	if !ok || err != nil || s.Signal.Goal != "held" {
+		t.Fatalf("dequeue held: goal=%q ok=%v err=%v", s.Signal.Goal, ok, err)
+	}
+}
+
+// TestDaemonSourceSurvivesBackpressure proves the end-to-end fix through Run: under a tiny
+// queue cap a fast source repeatedly saturates a slow handler, but the pump is never killed
+// by a full queue and NO signal is lost — every produced goal still reaches the handler once
+// the daemon catches up. Under the pre-fix code the pump returned on the first ErrQueueFull,
+// the source's feeder was orphaned, and most signals never arrived.
+func TestDaemonSourceSurvivesBackpressure(t *testing.T) {
+	const n = 40
+	var mu sync.Mutex
+	got := map[string]bool{}
+	handler := func(ctx context.Context, s trigger.Signal) error {
+		time.Sleep(time.Millisecond) // slower than the pump ⇒ the queue reliably fills
+		mu.Lock()
+		got[s.Goal] = true
+		mu.Unlock()
+		return nil
+	}
+
+	// Cap 1 + serial dispatch + a slow handler ⇒ a source pushing n signals hits
+	// ErrQueueFull repeatedly, exercising the retry path many times.
+	d := New(handler, Config{QueueCap: 1, Concurrency: 1})
+	d.retryBackoff = 200 * time.Microsecond
+
+	ch := make(chan QueuedSignal, n)
+	for i := 0; i < n; i++ {
+		ch <- sig(fmt.Sprintf("g%d", i), 0)
+	}
+	close(ch)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- d.Run(ctx, &chanSource{ch: ch}) }()
+
+	// Wait until every produced signal has been delivered — proving none were lost and the
+	// source kept producing across many full-queue stalls.
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		delivered := len(got)
+		mu.Unlock()
+		if delivered == n {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("only %d/%d signals delivered — a full queue killed the source", delivered, n)
+		default:
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
 	}
 }

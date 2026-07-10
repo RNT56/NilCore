@@ -32,7 +32,12 @@ func TestTranslateNative(t *testing.T) {
 		{`{"action":"left_mouse_down","coordinate":[3,4]}`, desktopwire.OpMouseDown, func(a desktopwire.Act) bool { return a.Coordinate[0] == 3 && a.Button == desktopwire.ButtonLeft }},
 		{`{"action":"left_mouse_up","coordinate":[3,4]}`, desktopwire.OpMouseUp, func(a desktopwire.Act) bool { return a.Coordinate[0] == 3 && a.Button == desktopwire.ButtonLeft }},
 		{`{"action":"type","text":"hi"}`, desktopwire.OpType, func(a desktopwire.Act) bool { return a.Text == "hi" }},
-		{`{"action":"key","text":"ctrl+s"}`, desktopwire.OpKey, func(a desktopwire.Act) bool { return a.Key == "ctrl+s" }},
+		{`{"action":"key","text":"ctrl+s"}`, desktopwire.OpKey, func(a desktopwire.Act) bool { return a.Key == "ctrl+s" && a.MS == 0 }},
+		// hold_key HOLDS the key for `duration` SECONDS — the duration must survive
+		// translation (carried in MS), not be dropped and degraded to a discrete tap.
+		{`{"action":"hold_key","text":"shift","duration":2}`, desktopwire.OpKey, func(a desktopwire.Act) bool { return a.Key == "shift" && a.MS == 2000 }},
+		// hold_key with no duration falls back to the 1s default (mirrors wait), never a 0-length tap.
+		{`{"action":"hold_key","text":"a"}`, desktopwire.OpKey, func(a desktopwire.Act) bool { return a.Key == "a" && a.MS == 1000 }},
 		{`{"action":"scroll","scroll_direction":"down","scroll_amount":3}`, desktopwire.OpScroll, func(a desktopwire.Act) bool { return a.Dir == "down" && a.Amount == 3 }},
 		{`{"action":"wait","duration":2}`, desktopwire.OpWait, func(a desktopwire.Act) bool { return a.MS == 2000 }},
 		{`{"action":"unknown_future_action"}`, desktopwire.OpObserve, nil}, // degrade safely

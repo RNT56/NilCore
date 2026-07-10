@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sync"
 	"time"
 )
 
@@ -177,11 +178,21 @@ func connect(ctx context.Context, spec ServerSpec) (*Client, func(), error) {
 	if err := cmd.Start(); err != nil {
 		return nil, nil, fmt.Errorf("start mcp server %q: %w", spec.Name, err)
 	}
-	client := NewClient(spec.Name, newStdioTransport(&processRW{w: stdin, r: stdout}))
+	// reap kills + waits the child exactly once. sync.Once makes it safe to call from BOTH
+	// the transport's Close (a ctx-cancelled round-trip tears the pipes down and reaps the
+	// child so it is not left a zombie until the next call) AND stop below (Manager evict /
+	// Close), which can race — two concurrent cmd.Wait() calls would otherwise be a bug.
+	var reapOnce sync.Once
+	reap := func() {
+		reapOnce.Do(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+	}
+	client := NewClient(spec.Name, newStdioTransport(&processRW{w: stdin, r: stdout, reap: reap}))
 	stop := func() {
-		_ = client.Close()
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		_ = client.Close() // closes the pipes and (via processRW.Close) reaps the child
+		reap()             // idempotent: guarantees the child is reaped even on an odd teardown path
 	}
 	return client, stop, nil
 }
@@ -201,10 +212,13 @@ func Call(ctx context.Context, spec ServerSpec, tool string, args json.RawMessag
 }
 
 // processRW bridges a subprocess's separate stdin (writer) and stdout (reader) into
-// one io.ReadWriteCloser for the stdio transport.
+// one io.ReadWriteCloser for the stdio transport. reap (optional) kills + waits the child;
+// closing the pipes on a ctx-cancelled round-trip then also reaps the process, so the child
+// is not left a zombie until the next call fails or the Manager tears the server down.
 type processRW struct {
-	w io.WriteCloser
-	r io.ReadCloser
+	w    io.WriteCloser
+	r    io.ReadCloser
+	reap func() // idempotent Kill+Wait of the child; nil for non-subprocess transports (tests)
 }
 
 func (p *processRW) Read(b []byte) (int, error)  { return p.r.Read(b) }
@@ -212,6 +226,9 @@ func (p *processRW) Write(b []byte) (int, error) { return p.w.Write(b) }
 func (p *processRW) Close() error {
 	werr := p.w.Close()
 	rerr := p.r.Close()
+	if p.reap != nil {
+		p.reap() // reap the child now (idempotent) so a cancelled round-trip leaves no zombie
+	}
 	if werr != nil {
 		return werr
 	}

@@ -41,13 +41,27 @@ func (ix *Index) Remove(ctx context.Context, path string) error {
 	return ix.Graph.RemoveFile(ctx, path)
 }
 
+// indexSkipDir reports whether a directory NAME (never the walk root itself — the
+// caller guards that) should be pruned when seeding the graph: a dependency/build
+// tree (node_modules, vendor, dist, build, __pycache__) or any hidden dir (a leading
+// ".", which covers .git). Mirrors the tools-package indexer + cmd/nilcore/repomap.go
+// so the live graph reflects the project's own source, not vendored dependencies.
+func indexSkipDir(name string) bool {
+	switch name {
+	case "node_modules", "vendor", "__pycache__", "dist", "build":
+		return true
+	}
+	return strings.HasPrefix(name, ".")
+}
+
 // IndexDir seeds the graph from every supported-language source file under dir
 // (the initial state a fresh run needs before Update keeps it current
 // incrementally). Supported extensions come from ast.SupportedExtensions (all 19
 // languages / 34 extensions the parser seam ships, not Go alone). Best-effort: a
-// file that does not parse is skipped, .git is pruned, and the walk is the only
-// full pass — thereafter Update touches one file at a time (P3-T16's "no full
-// re-index").
+// file that does not parse is skipped; a symlink is NEVER followed (I4: a link
+// planted in-tree could otherwise leak out-of-worktree file content when parsed
+// host-side); dependency/VCS/hidden dirs are pruned; and the walk is the only full
+// pass — thereafter Update touches one file at a time (P3-T16's "no full re-index").
 func (ix *Index) IndexDir(ctx context.Context, dir string) error {
 	supported := map[string]bool{}
 	for _, e := range ast.SupportedExtensions() {
@@ -58,9 +72,17 @@ func (ix *Index) IndexDir(ctx context.Context, dir string) error {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			// Prune dependency/VCS/hidden dirs — but never the walk root itself (its
+			// base name might coincidentally match, which would skip the whole tree).
+			if path != dir && indexSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Never follow a symlink (I4): WalkDir yields it as a non-dir entry without
+		// descending, but BuildFile would os.ReadFile through it — a planted link
+		// could leak out-of-worktree content. Skip it.
+		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
 		if supported[strings.ToLower(filepath.Ext(d.Name()))] {

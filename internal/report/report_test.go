@@ -43,10 +43,58 @@ func TestReplayReport(t *testing.T) {
 	t.Run("GracefulDegradationNoClaimEvents", testGracefulDegradation)
 	t.Run("RetryHistoryFromClaimEvents", testRetryHistory)
 	t.Run("SeededArtifactFold", testSeededArtifact)
+	t.Run("SchemaDefects", testSchemaDefects)
 	t.Run("BrokenChainFailsClosed", testBrokenChain)
 	t.Run("FinalPassGate", testFinalPassGate)
 	t.Run("EmptyLog", testEmptyLog)
 	t.Run("MissingLogIsError", testMissingLog)
+}
+
+// testSchemaDefects proves a correctly-shaped schema_verify event projects into
+// SchemaDefectRows. The on-wire shape is EXACTLY what the SchemaVerifier's eventlog
+// sink emits (SW-T06): the artifact id at Detail["id"], and a "defects" list whose
+// entries carry the lowercase {code, field, claim_id, reason}. A field-name mismatch
+// here would silently leave SchemaDefects empty, so this locks the decoder to the shape.
+func testSchemaDefects(t *testing.T) {
+	events := []eventlog.Event{
+		{Task: "fin", Kind: "schema_verify", Detail: map[string]any{
+			"id":     "co-041",
+			"passed": false,
+			"defects": []map[string]any{
+				{"code": "missing_field", "field": "value", "claim_id": "co-041-rev", "reason": "value is empty"},
+				{"code": "missing_citation", "field": "source_url", "claim_id": "co-041-eps", "reason": "no source url"},
+			},
+		}},
+	}
+	m, err := ReplayReport(writeLog(t, events), "")
+	if err != nil {
+		t.Fatalf("ReplayReport: %v", err)
+	}
+	if len(m.SchemaDefects) != 2 {
+		t.Fatalf("want 2 schema defect rows, got %d: %+v", len(m.SchemaDefects), m.SchemaDefects)
+	}
+	want0 := SchemaDefectRow{
+		ArtifactID: "co-041", ClaimID: "co-041-rev", Field: "value",
+		Code: "missing_field", Reason: "value is empty",
+	}
+	if m.SchemaDefects[0] != want0 {
+		t.Errorf("schema defect row 0 = %+v, want %+v", m.SchemaDefects[0], want0)
+	}
+	if m.SchemaDefects[1].Code != "missing_citation" || m.SchemaDefects[1].ClaimID != "co-041-eps" {
+		t.Errorf("schema defect row 1 mismatch: %+v", m.SchemaDefects[1])
+	}
+
+	// A passing schema check (no defects) yields zero rows — and never an error.
+	clean := []eventlog.Event{
+		{Task: "fin", Kind: "schema_verify", Detail: map[string]any{"id": "co-041", "passed": true}},
+	}
+	mc, err := ReplayReport(writeLog(t, clean), "")
+	if err != nil {
+		t.Fatalf("ReplayReport (clean): %v", err)
+	}
+	if len(mc.SchemaDefects) != 0 {
+		t.Errorf("a passing schema check must yield zero defect rows, got %+v", mc.SchemaDefects)
+	}
 }
 
 // testFamilies asserts each verify-family Kind projects to a CheckResult with the

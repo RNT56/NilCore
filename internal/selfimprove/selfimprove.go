@@ -83,8 +83,21 @@ func (s Scope) CheckPath(path string) (ok bool, reason string) {
 // hook — one fence, one guarantee.
 type Flow struct {
 	Scope Scope
-	// Run executes the proposal's goal as a verified task (worktree + verify).
-	Run func(ctx context.Context, goal string) (verified bool, err error)
+	// Run executes the proposal's goal as a verified task (worktree + verify) and
+	// reports the branch holding the verified work. An empty branch means the run kept
+	// nothing to land, and Propose refuses to claim a merge over it.
+	Run func(ctx context.Context, goal string) (verified bool, branch string, err error)
+	// Merge lands the verified branch into the repo. It runs ONLY after the human gate
+	// approves, and its error is the sole authority on whether the edit shipped.
+	//
+	// This seam exists because Propose used to append `self_edit_merged` and return
+	// merged=true while nothing merged anything: the orchestrator's KeepBranch only
+	// PRESERVED the branch. Verified self-edit branches accumulated unmerged and
+	// unsurfaced, the flywheel's Summary.Merged counted ships that never happened, and
+	// the double opt-in NILCORE_SELFIMPROVE_AUTOAPPROVE auto-approved a merge that did
+	// not exist. A nil Merge now means the flow CANNOT land an edit, and Propose says so
+	// rather than reporting a phantom success.
+	Merge func(ctx context.Context, branch string) error
 	// Changed, when set, reports the repo-relative paths the run actually modified (e.g.
 	// a `git diff --name-only` over the run's worktree). Propose screens EVERY changed
 	// path against the scope AND the proposal's declared Paths and REFUSES to gate a run
@@ -101,8 +114,9 @@ type Flow struct {
 	Log     *eventlog.Log
 }
 
-// Propose runs the pipeline: scope-check → run as a verified task → human gate →
-// merge. Returns whether the edit merged.
+// Propose runs the pipeline: scope-check → run as a verified task → execution-time
+// path screen → human gate → merge. The returned bool means the edit ACTUALLY LANDED:
+// a nil Merge seam, an absent branch, or a failed merge all report false with an error.
 func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error) {
 	if ok, reason := f.Scope.Check(p); !ok {
 		f.Log.Append(eventlog.Event{Kind: "self_edit_rejected", Detail: map[string]any{"reason": reason}})
@@ -110,7 +124,7 @@ func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error)
 	}
 	f.Log.Append(eventlog.Event{Kind: "self_edit_accepted", Detail: map[string]any{"reason": p.Reason, "goal": p.Goal}})
 
-	verified, err := f.Run(ctx, p.Goal)
+	verified, branch, err := f.Run(ctx, p.Goal)
 	if err != nil {
 		return false, fmt.Errorf("self-edit run: %w", err)
 	}
@@ -148,7 +162,21 @@ func (f *Flow) Propose(ctx context.Context, p Proposal) (merged bool, err error)
 		f.Log.Append(eventlog.Event{Kind: "self_edit_gated"})
 		return false, nil
 	}
-	f.Log.Append(eventlog.Event{Kind: "self_edit_merged", Detail: map[string]any{"goal": p.Goal}})
+
+	// The gate approved. Now actually land it — and report merged=true only if we did.
+	if f.Merge == nil {
+		f.Log.Append(eventlog.Event{Kind: "self_edit_merge_unwired"})
+		return false, fmt.Errorf("self-edit approved but no merge is wired: the edit was NOT landed")
+	}
+	if branch == "" {
+		f.Log.Append(eventlog.Event{Kind: "self_edit_no_branch"})
+		return false, fmt.Errorf("self-edit approved but the run kept no verified branch to merge")
+	}
+	if merr := f.Merge(ctx, branch); merr != nil {
+		f.Log.Append(eventlog.Event{Kind: "self_edit_merge_failed", Detail: map[string]any{"error": merr.Error()}})
+		return false, fmt.Errorf("self-edit merge: %w", merr)
+	}
+	f.Log.Append(eventlog.Event{Kind: "self_edit_merged", Detail: map[string]any{"goal": p.Goal, "branch": branch}})
 	return true, nil
 }
 

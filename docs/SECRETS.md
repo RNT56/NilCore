@@ -22,16 +22,16 @@ Secrets are held by the **host process** (NilCore), never by the model. The mode
 
 ## 3. SecretStore backends
 
-A `SecretStore` interface with pluggable backends, auto-detected in this order:
+A `SecretStore` interface with pluggable backends. On the read path the resolver tries them **in this order** — the first backend that holds the named secret wins, and the environment is always the final fallback:
 
-1. **OS keychain** (preferred where a session exists): **macOS Keychain**; **Linux Secret Service** (libsecret / gnome-keyring / KWallet) over D-Bus.
-2. **Encrypted-file vault** (headless VPS): an AES-256-GCM file (`secrets.vault`) at the config path, sealed by a `0600` master key (`secrets.key`). This is the path that works with no desktop session — `nilcore init` provisions it automatically when no keychain is present, and the run path reads it back.
-3. **Environment** (CI / advanced): read directly from the process environment.
-4. **External** (production option): cloud KMS, Vault, or systemd-creds.
+1. **OS keychain** (zero-config auto-detected where its CLI is present): **macOS Keychain** (`security`); **Linux Secret Service** (`secret-tool`: libsecret / gnome-keyring / KWallet) over D-Bus.
+2. **Encrypted-file vault** (headless VPS; consulted only when the vault already exists on disk): an AES-256-GCM file (`secrets.vault`) at the config path, sealed by a 32-byte master key held in a `0600` key-file (`secrets.key`) or derived from a passphrase (§8). This is the path that works with no desktop session — `nilcore init` provisions it automatically when no keychain is present, and the run path reads it back.
+3. **External** command hook (production option; active only when configured): set **`NILCORE_SECRET_EXTERNAL_CMD`** to a command line (e.g. a Vault / cloud-KMS wrapper). NilCore invokes it as `<cmd> get <name>` and reads the value from stdout — the value never lands on argv. A hook that cannot be run is a loud misconfiguration error; a hook that runs and reports the secret absent (or emits nothing) falls through to the next backend. Consulted **before** the ambient environment fallback.
+4. **Environment** (CI / advanced; always tried last): the read-only `EnvStore`, read directly from the process environment.
 
-When no keychain CLI is available, `nilcore init` falls back to the encrypted-file vault (key-file default) rather than the read-only environment store, so onboarding succeeds on a headless host; the run path opens the same vault only if it exists, so a pure-environment run never writes files.
+Only the keychain and the environment are auto-detected with no setup; the encrypted vault and the external hook are used only when explicitly provisioned (a key/vault on disk, or `NILCORE_SECRET_EXTERNAL_CMD`). When no keychain CLI is available, `nilcore init` falls back to the encrypted-file vault (key-file default) rather than the read-only environment store, so onboarding succeeds on a headless host; the run path opens the same vault only if it exists, so a pure-environment run never writes files. Writes (`nilcore secret set`) target the keychain or the file vault — never the read-only environment store or the external hook.
 
-> **Known limitation (macOS keychain write).** Storing a secret on macOS uses `security add-generic-password`, which only accepts the value as a command-line argument — so during that one short-lived `security` process the value is briefly visible to other processes of the *same user* via `ps`. This is the documented `security` path; NilCore never logs the value, and Linux (`secret-tool`) reads it from stdin instead. The exposure window is the lifetime of one `init`-time write and is to the same user only; on a shared host, prefer the encrypted-file vault or an external store (KMS/Vault) for provisioning. Reads (`find-generic-password -w`) never put the secret in argv.
+> **Keychain writes keep the secret off argv.** Storing a secret on macOS runs `security add-generic-password -U … -w` with the value fed on **standard input** (a trailing `-w` with no inline value tells `security` to read the password from stdin), so the plaintext never appears in the process's command line where a same-user `ps` could read it. Linux (`secret-tool store`) likewise takes the value on stdin. Reads (`find-generic-password -w` on macOS, `secret-tool lookup` on Linux) never put the secret in argv either, and NilCore never logs the value. *(Earlier builds passed the secret as a `security` command-line argument, briefly exposing it via `ps`; that argv exposure has been removed — the value is now stdin-only on both platforms.)*
 
 ## 4. The trust boundary
 

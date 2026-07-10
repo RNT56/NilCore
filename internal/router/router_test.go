@@ -35,6 +35,45 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// TestClassifyWordBoundary pins the word-boundary matcher: common single-task phrasings
+// whose keywords appear only as a SUBSTRING of a larger word must fall through to the cheap
+// Run, never mis-route into the expensive build/swarm machines — while genuine build /
+// swarm / breadth phrasings still route as intended.
+func TestClassifyWordBoundary(t *testing.T) {
+	// The four verified substring mis-routes. Each is an ordinary single task ⇒ Run.
+	misroutes := []string{
+		"build and test the parser",    // "build an" ⊂ "build and"
+		"take a new approach to sync",  // "new app"  ⊂ "new approach"
+		"rebuild all the tests",        // "build a"  ⊂ "rebuild all"
+		"do the bulk of the work here", // bare "bulk" ⊂ "the bulk of"
+	}
+	for _, g := range misroutes {
+		if got := Classify(g); got != Run {
+			t.Errorf("Classify(%q) = %q, want Run (substring must not mis-route)", g, got)
+		}
+	}
+
+	// Genuine phrasings still route where intended.
+	genuine := []struct {
+		goal string
+		want Preset
+	}{
+		{"build a project from a spec", Build},
+		{"build an app with a REST API", Build},
+		{"scaffold a new service", Build},
+		{"run a swarm across every service", Swarm},
+		{"fix the flaky tests in parallel", Swarm},
+		{"rename the fixtures in bulk", Swarm}, // "in bulk" is the genuine breadth phrasing
+		{"decompose into subtasks", Run},       // decompose is opt-in, never auto-routed ⇒ safe default
+		{"build  a   project", Build},          // irregular whitespace still matches (collapseWS)
+	}
+	for _, c := range genuine {
+		if got := Classify(c.goal); got != c.want {
+			t.Errorf("Classify(%q) = %q, want %q", c.goal, got, c.want)
+		}
+	}
+}
+
 // stubOracle returns a fixed pick + opinion flag, recording what it was asked.
 type stubOracle struct {
 	pick       Preset

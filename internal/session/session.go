@@ -203,6 +203,15 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 
 		// In-flight: fold the follow-up into the running loop's Inbox (queue/steer).
 		mode := classifyInterrupt(text)
+		// The steer MARKER ('!' / '/steer') addresses the harness, not the model.
+		// Strip it from the message the loop folds so the model reads the instruction
+		// rather than the punctuation. The History entry above keeps the operator's
+		// literal line; the ask/gate branches returned already, so an ask answer
+		// beginning with '!' is still delivered verbatim.
+		folded := userMsg
+		if mode == inbox.Steer {
+			folded = userTurn(stripInterruptMarker(text))
+		}
 		s.Log.Append(eventlog.Event{
 			Task: s.ID,
 			Kind: "session_followup",
@@ -211,7 +220,7 @@ func (s *Session) Turn(ctx context.Context, text string) error {
 				"phase": phase.String(),
 			},
 		})
-		s.Inbox.Push(userMsg, mode)
+		s.Inbox.Push(folded, mode)
 		return nil
 	}
 
@@ -720,6 +729,23 @@ func classifyInterrupt(text string) inbox.Mode {
 		return inbox.Steer
 	}
 	return inbox.Queue
+}
+
+// stripInterruptMarker removes the steer prefix classifyInterrupt matched on, so
+// the folded user turn carries the operator's instruction without the control
+// mark. A bare marker ("!" / "/steer") yields the empty string; the loop treats
+// that as a pure interrupt with no added instruction.
+func stripInterruptMarker(text string) string {
+	t := strings.TrimLeft(text, " \t")
+	switch {
+	case strings.HasPrefix(t, "!"):
+		t = t[len("!"):]
+	case t == "/steer":
+		t = ""
+	case strings.HasPrefix(t, "/steer "):
+		t = t[len("/steer "):]
+	}
+	return strings.TrimSpace(t)
 }
 
 // userTurn builds the canonical one-block user message the loop folds in — the

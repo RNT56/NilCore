@@ -10,8 +10,11 @@
 //     audit-only (it sets Quarantined and logs), while guard.Wrap is the actual
 //     defense, applied unconditionally.
 //   - Authority asymmetry: Steer/Cancel may ONLY originate from the Supervisor.
-//     A subagent that forges one is rejected by Send and logged. Sender is
-//     harness-stamped on Send, never trusted from the model-supplied envelope.
+//     Send rejects (and logs) a supervisor-only Kind whose Sender is not the
+//     Supervisor. Sender is NOT rewritten by the bus — it is the caller's claimed
+//     principal, filled harness-side by bus.Peer (which stamps p.Self), so the model
+//     never sets it; a subagent also has no steer/cancel tool, so a forged supervisor
+//     Sender buys it nothing.
 //
 // I5 (append-only log): every bus_* event records METADATA ONLY (ids, kinds,
 // sizes, drop reasons) — never bodies. The shared *eventlog.Log is nil-safe.
@@ -62,13 +65,17 @@ func (k Kind) supervisorOnly() bool {
 	return k == KindSteer || k == KindCancel
 }
 
-// Message is the bus envelope. Control fields (Sender/To/Kind/CorrelationID) are
-// trusted, typed routing metadata; Payload and Artifacts are UNTRUSTED and are
-// guard.Wrapped on delivery. Sender is harness-stamped by Send — a value supplied
-// by the model is overwritten, so a subagent cannot impersonate the supervisor.
+// Message is the bus envelope. Control fields (To/Kind/CorrelationID) are typed
+// routing metadata; Payload and Artifacts are UNTRUSTED and are guard.Wrapped on
+// delivery. Sender is the caller's CLAIMED principal: the bus does NOT overwrite it
+// (identify stamps only ID/Time), so containment of the supervisor-only Steer/Cancel
+// does NOT rest on rewriting Sender. It rests instead on (1) the harness filling
+// Sender caller-side — bus.Peer stamps p.Self, so the model never chooses it — and
+// (2) Send rejecting a supervisor-only Kind whose Sender is not the Supervisor, plus
+// a subagent having no steer/cancel tool at all.
 type Message struct {
 	ID            string                   // harness-stamped unique id
-	Sender        string                   // harness-stamped principal (NOT model-claimed)
+	Sender        string                   // caller's claimed principal; the bus never rewrites it (bus.Peer fills it caller-side)
 	To            []AgentID                // explicit recipients (ignored when Broadcast)
 	Broadcast     bool                     // deliver to every registered agent except the sender
 	Kind          Kind                     // closed set; validated on Send

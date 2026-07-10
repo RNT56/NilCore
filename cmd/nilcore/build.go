@@ -1562,13 +1562,10 @@ func leafName(id string) string {
 	return string(r)
 }
 
-// truncate shortens s to at most n runes for a commit subject line.
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
+// truncate shortens s for a commit subject line, cutting on a RUNE boundary. It used
+// to slice bytes despite documenting runes, so a multi-byte goal could leave invalid
+// UTF-8 in a commit subject or a swarm summary. clipRunes is that operation.
+func truncate(s string, n int) string { return clipRunes(s, n) }
 
 // shortID mints a short, process-unique suffix for throwaway worktree branch names
 // (verify/code passes). Monotonic + nanosecond is sufficient — it is internal

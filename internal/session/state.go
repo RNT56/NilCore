@@ -23,10 +23,10 @@ import (
 	"nilcore/internal/summarize"
 )
 
-// Phase is the Session's conversational state. The Idle→Routing→Working→
-// Terminal→Idle spine is exactly today's orchestrator/loop flow, wrapped to be
-// re-enterable; AwaitingGate is the parked state while a drive blocks on the
-// human approver. Only the Working→Inbox edges (queue/steer) are new.
+// Phase is the Session's conversational state. The Idle→Routing→Working→Idle
+// spine is exactly today's orchestrator/loop flow, wrapped to be re-enterable;
+// AwaitingGate is the parked state while a drive blocks on the human approver.
+// Only the Working→Inbox edges (queue/steer) are new.
 type Phase int
 
 const (
@@ -38,9 +38,6 @@ const (
 	// Working: a drive goroutine owns the work; a Turn pushes to the inbox
 	// (queued or steered) instead of launching.
 	Working
-	// Terminal: the drive has finished and its result is being folded into the
-	// work-state; a transient state on the way back to Idle.
-	Terminal
 	// AwaitingGate: a drive is blocked on the human approver (an irreversible
 	// action). A Turn still pushes to the inbox; the gate answer resumes Working.
 	AwaitingGate
@@ -62,8 +59,6 @@ func (p Phase) String() string {
 		return "routing"
 	case Working:
 		return "working"
-	case Terminal:
-		return "terminal"
 	case AwaitingGate:
 		return "awaiting_gate"
 	case AwaitingInput:

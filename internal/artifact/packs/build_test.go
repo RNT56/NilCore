@@ -298,3 +298,64 @@ func TestDefaultSchemasRoundTrips(t *testing.T) {
 		t.Fatalf("sanity: an empty registry should not resolve KindReport")
 	}
 }
+
+// TestBuildWithSinkEmitsSchemaEvent proves the EventSink seam is real and USED: a malformed
+// artifact drives the schema verifier (Named[0]), and the sink threaded through BuildWithSink
+// receives a schema_verify event carrying the defect metadata. Without the plumbing the
+// report's SchemaDefects section is permanently empty.
+func TestBuildWithSinkEmitsSchemaEvent(t *testing.T) {
+	root := t.TempDir()
+	bad := reportArtifact("s1", urlClaim("c1"))
+	bad.Title = "" // schema: missing required title ⇒ a defect at Named[0]
+	rel := writeArtifact(t, root, bad)
+
+	var events []any
+	plan, err := BuildWithSink(NameFinance, &recBox{}, rel, DefaultSchemas(), func(ev any) { events = append(events, ev) })
+	if err != nil {
+		t.Fatalf("BuildWithSink: %v", err)
+	}
+	rep, err := plan.Verifier.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Passed {
+		t.Fatalf("malformed artifact must not pass")
+	}
+	// The schema layer must have emitted a schema_verify event carrying the defect.
+	var sev *schema.SchemaVerifyEvent
+	for i := range events {
+		if s, ok := events[i].(schema.SchemaVerifyEvent); ok {
+			sev = &s
+		}
+	}
+	if sev == nil {
+		t.Fatalf("no schema_verify event reached the sink (the seam is dead)")
+	}
+	if sev.ArtifactID != "s1" || sev.Passed {
+		t.Fatalf("event = %+v, want ArtifactID=s1 Passed=false", *sev)
+	}
+	if len(sev.Defects) == 0 {
+		t.Fatalf("event carried no defects")
+	}
+}
+
+// TestBuildNoSinkStillComposes confirms the backward-compatible Build (no sink) still yields
+// a working plan over the same malformed artifact — no panic, no event, same red verdict.
+func TestBuildNoSinkStillComposes(t *testing.T) {
+	root := t.TempDir()
+	bad := reportArtifact("s2", urlClaim("c1"))
+	bad.Title = ""
+	rel := writeArtifact(t, root, bad)
+
+	plan, err := Build(NameFinance, &recBox{}, rel, DefaultSchemas())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	rep, err := plan.Verifier.Check(context.Background())
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Passed {
+		t.Fatalf("malformed artifact must not pass")
+	}
+}

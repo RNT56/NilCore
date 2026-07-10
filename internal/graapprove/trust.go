@@ -42,10 +42,16 @@ type TrustView struct {
 }
 
 // Tally reports the scoreboard for a ScopeKey (zero value when absent).
+//
+// The caller passes the CONCRETE scope of the action it is deciding (a real branch);
+// the lookup normalizes it to the stable family the tallies are bucketed under, so a
+// per-run-unique branch still finds the history its family earned. trustScope is
+// idempotent, so passing an already-normalized key is also correct.
 func (v TrustView) Tally(k ScopeKey) Tally {
 	if v.tallies == nil {
 		return Tally{}
 	}
+	k.Scope = trustScope(k.Scope)
 	return v.tallies[k]
 }
 
@@ -148,7 +154,11 @@ func foldTallies(logPath string, from int64, tallies map[ScopeKey]Tally) (map[Sc
 		// win).
 		passed, _ := e.Detail["passed"].(bool)
 
-		k := ScopeKey{Type: action, Scope: scope}
+		// Tally against the scope FAMILY, not the concrete branch: the event records a
+		// per-run-unique scope ("task/trig-<nano>", an integration tip), so an
+		// exact-scope bucket would hold at most one outcome and never earn trust. The
+		// GradedApprover looks up the same family key.
+		k := ScopeKey{Type: action, Scope: trustScope(scope)}
 		t := tallies[k]
 		t.Total++
 		if passed {

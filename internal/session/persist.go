@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"nilcore/internal/eventlog"
 )
@@ -179,6 +180,8 @@ func (s *Session) persist(ctx context.Context, st WorkState) {
 		s.logPersist("session_persist", map[string]any{"error": true})
 		return
 	}
+	ctx, cancel := detachForWrite(ctx)
+	defer cancel()
 	if err := s.Store.SaveConversation(ctx, s.ID, st.Summary.Goal, string(blob)); err != nil {
 		s.logPersist("session_persist", map[string]any{"error": true})
 		return
@@ -187,6 +190,25 @@ func (s *Session) persist(ctx context.Context, st WorkState) {
 		"active":   st.Active.String(),
 		"len_blob": len(blob),
 	})
+}
+
+// persistWriteTimeout bounds a detached persistence write so a wedged store can
+// never hold the drive goroutine (or a shutdown checkpoint) open indefinitely.
+const persistWriteTimeout = 5 * time.Second
+
+// detachForWrite severs a persistence write from the caller's cancellation while
+// keeping its values (deadline/keys carried for tracing).
+//
+// This is REQUIRED, not defensive: every terminal drive reaches persist AFTER
+// clearDriveCancelLocked() has already fired the drive context's own cancel, and
+// Cancel()/SIGTERM cancel it too. A ctx-honoring store (database/sql checks
+// ctx.Err() before it ever reaches the driver) would therefore reject every
+// drive-time write, and persist swallows the error — so the conversation state
+// would silently never be written. The earned state is not the cancelled work;
+// it must outlive the cancellation, exactly as meter charges tokens already
+// spent via context.WithoutCancel.
+func detachForWrite(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), persistWriteTimeout)
 }
 
 // logPersist appends a metadata-only persistence audit event. The detail carries
@@ -222,6 +244,10 @@ func (s *Session) Checkpoint(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("session checkpoint marshal: %w", err)
 	}
+	// A clean shutdown checkpoint runs on the signal path, whose ctx is already
+	// cancelled by the time we get here — detach so the last write still lands.
+	ctx, cancel := detachForWrite(ctx)
+	defer cancel()
 	if err := s.Store.SaveConversation(ctx, s.ID, st.Summary.Goal, string(blob)); err != nil {
 		return fmt.Errorf("session checkpoint save: %w", err)
 	}

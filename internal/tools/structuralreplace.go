@@ -21,7 +21,6 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -123,7 +122,10 @@ func (StructuralReplaceTool) Run(ctx context.Context, workdir string, input json
 		}
 
 		fset := token.NewFileSet()
-		src, rerr := os.ReadFile(path)
+		// O_NOFOLLOW read (readNoFollow): sourceFilesUnder already skips symlinks, but a
+		// final-component symlink swapped in between the walk and this read would still
+		// leak an out-of-worktree file (I4 TOCTOU); readNoFollow refuses a swapped link.
+		src, rerr := readNoFollow(path)
 		if rerr != nil {
 			continue
 		}

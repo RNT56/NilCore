@@ -4,6 +4,8 @@
 >
 > **Audit remediation (2026-06):** a full-codebase audit found three Pillar-wirings that were built but not actually live — now wired: the autonomy daemon's **idle gating** (`drivegate.idle` feeds `BacklogConfig.Idle`, so objectives only run when serve is idle; was always-idle), the **experience projection consumer** (`nilcore experience -warm` reads the warm `OverStore` projection, `-rebuild` re-derives it; the projection was write-only), and **granular requeue** (`super.Supervisor.RequeueHook` is wired in `build.go` behind `NILCORE_REQUEUE`; was never set). The auto-approval **protected-branch floor** was also hardened (`isProtectedBase` now structurally denies main/master/release for any operator envelope, not just presets). All opt-in/byte-identical when unset.
 >
+> **Features-review remediation (2026-07, HEAD `573a4df`):** a features-completeness review found the headline — graduated auto-approval — was **structurally unreachable as shipped**. Every preset's `AllowBranches:["*"]` matched *nothing* (Go's `path.Match` keeps `*` segment-local, and every real gate scope is slash-y — `task/<id>`, a swarm integration tip), and the trust/rate/$ windows keyed on the exact, per-run-unique scope, so `MinSuccesses` was unsatisfiable and `MaxPerDay`/`MaxDollarsDay` never bound. It is now reachable and functional: `*` matches any non-empty scope, and trust/rate/$ accrue over a scope *family* (`trustScope`: `a/b→a/*`, a bare commit sha `→#commit`), while the protected-base floor + Allow/Deny still read the CONCRETE branch (§5). The same pass fixed Pillar 4's self-improve landing: `Propose` previously logged `self_edit_merged` and returned `merged=true` while **nothing merged** — there is now a real `Flow.Merge` seam, so `merged=true` means the edit truly landed (see [`docs/ROADMAP-SELF-IMPROVEMENT.md`](ROADMAP-SELF-IMPROVEMENT.md)).
+>
 > **Read with:** [`CLAUDE.md`](../CLAUDE.md) (invariants), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (the frozen contract + the execution model), [`docs/HORIZON.md`](HORIZON.md) (the candidate scan this program promotes), [`docs/PRINCIPLES.md`](PRINCIPLES.md) (#1 feedback loop, #9 earn improvement from evidence, #10 safety enables autonomy).
 
 ## Table of contents
@@ -55,7 +57,7 @@ Every change is **opt-in and default-off**; an operator who turns nothing on see
 
 | Shipped seam | File | Reused for |
 |---|---|---|
-| Trust Ledger (verifier-judged `race_outcome` + eval fold; fail-closed on broken chain) | `internal/trust/{ledger,selector,replay,router}.go` | Pillars 1, 2, 5 (earned-trust pattern) |
+| Trust Ledger (verifier-judged `race_outcome` + eval fold; fail-closed on broken chain) | `internal/trust/{ledger,selector,replay,classify}.go` (no `router.go` — the `trust.Router` seam was built in Phase 13 (#55) but never wired and was removed as dead in #88; live routing is the `agent.TrustOracle`/`trust.Selector` path) | Pillars 1, 2, 5 (earned-trust pattern) |
 | Live multi-backend routing | `internal/agent/orchestrator.go` (`Selector`/`Backends`/`NewEnvFor`) | Pillar 2 |
 | The policy gate (free-text + structured; closed `GateActionType`; nil approver default-denies) | `internal/policy/{policy,gateaction,approver}.go` | Pillars 5, 6 |
 | Append-only hash-chained log + `eventlog.Verify` | `internal/eventlog` | Pillars 1, 3, 5 (the evidence source of truth) |
@@ -94,7 +96,7 @@ Every change is **opt-in and default-off**; an operator who turns nothing on see
    cost-aware,       self-acceptance,            human gate; earned trust    hard runtime   trust→     backlog
    data-driven       verify cache)               + operator envelope)        fence)         gated      (one queue)
    escalation)                                                                               improve)
-                                          Pillar 8 (DEFERRED, §0-gated): unify all four machines into one recursive kernel
+                                          Pillar 8 (SHIPPED, default-on; NILCORE_KERNEL=0 escape hatch): all four machines unified into one recursive kernel
 ```
 
 The **experience layer (Pillar 1)** is the spine: a single derived, rebuildable projection over the existing store/log that every consumer reads (router, planner, auto-approval, flywheel). It is *never authoritative* — the append-only log is (I5); the projection is `Rebuild`-able from it. The **capability descriptor (Pillar 1)** is the legible "what may this drive do" struct the gate/sandbox/egress/capguard all read. Everything below consumes the spine; nothing below can mark work "done" or skip the verifier (I2).
@@ -109,7 +111,7 @@ Each pillar is **default-off and byte-identical when unused**, proven by a golde
 Two stdlib leaves. **`internal/experience`**: one `Reader` interface unifying the trust scoreboard, eval rollups, memory lessons, and replayed event-log outcomes over the existing store, with a single write path (`Projector.Fold` + `Rebuild`) and many readers. The event log stays the source of truth; the projection is derived and rebuildable (`exp_backend_standing`/`exp_config_standing`/`exp_meta` tables, each carrying a `source_seq` watermark + `chain_ok`). **`internal/capability`**: one pure `For(Request) → Descriptor` that reproduces today's scattered tools/shell/guard/egress/capguard choices byte-for-byte, emitting one metadata-only `capability` event per drive. **Opt-in:** nil `Reader` ⇒ static behaviour; `-experience`/`NILCORE_EXPERIENCE` wires it; `nilcore experience --rebuild` backfills. **Verdict from review: needs-fix** — the byte-identical golden must be generated from *live legacy output* at each real call site (`chat.go:544`, `browse.go:150`, `desktop.go:200`), enumerating every mode.
 
 ### Pillar 2 — Dynamic data-driven routing (`RTE`)
-Make trust-informed selection the **default** (a nil-safe `agent.TrustOracle` injected at the `cands` seam, `orchestrator.go:~285-301`), extended from backend to **model/tier**, **cost-aware** (combine pass-rate with `meter.Pricer` + `pool.Headroom` to pick the cheapest tier clearing a confidence bar, escalate on failure — HORIZON A6), and with **data-driven race-N and escalate-after** thresholds and adaptive budgets in place of fixed flags. A deterministic keyword `trust.Classify` buckets task-classes. **The oracle only orders/prunes/sizes candidacy — the verifier judges every race and decides shipping (I2).** Cold/low-confidence cell ⇒ static behaviour. **Opt-in:** `-trust-route`/`NILCORE_TRUST_DEFAULT=1`; `nilcore trust --route` shows what routing *would* do first. **Verdict: sound.**
+Make trust-informed selection the **default** (a nil-safe `agent.TrustOracle` injected at the `cands` seam, `orchestrator.go:~285-301`), extended from backend to **model/tier**, **cost-aware** (combine pass-rate with `meter.Pricer` + `pool.Headroom` to pick the cheapest tier clearing a confidence bar, escalate on failure — HORIZON A6), and with **data-driven race-N and escalate-after** thresholds and adaptive budgets in place of fixed flags. A deterministic keyword `trust.Classify` buckets task-classes. **The oracle only orders/prunes/sizes candidacy — the verifier judges every race and decides shipping (I2).** Cold/low-confidence cell ⇒ static behaviour. **Opt-in:** `NILCORE_TRUST_DEFAULT=1` wires the ledger-backed oracle (`agent.TrustOracle` / `agent.NewTrustRouteOracle`, `internal/agent/oracle.go`); the planned `-trust-route` flag and `nilcore trust --route` preview were **not** built. **Verdict: sound.**
 
 ### Pillar 3 — Learn from scars (`LRN`)
 Three additive pieces. **A8 lessons-memory** (`internal/memory/lessons`): mine the log for recurring verifier-failure *patterns* and write them back as deduped memory **data** (structural fields only — `verifier_id`, `fail_class`, counts — **never raw failing output**, per the review's I7 fix), surfaced next same-class task. **Self-generated acceptance** (`internal/verify/selfacc`): propose acceptance criteria up front; where no pack exists, author a *candidate* verifier — which is itself untrusted and **may only ever run as a sandboxed command/artifact verifier, never an in-process Go `CheckFunc`** (review's I4 fix), and maps to `Unverifiable` until proven. **A9 verify cache** (`internal/verify/vcache`): skip a verifier when worktree-content-hash + verifier-id + toolchain match a prior **chain-verified** `Pass` — and `vcache.Lookup` **must call `eventlog.Verify` and fail-closed-to-recompute on any chain error** (review's I2 fix). **Verdict: risky** — ships only with all three fixes. **Opt-in:** each behind its own env (`NILCORE_LESSONS`, `NILCORE_SELFACC`, `NILCORE_VCACHE`).
@@ -126,8 +128,8 @@ A `budget.Ledger` sibling (`internal/blastbudget`) bounding four axes: **distinc
 ### Pillar 7 — Autonomy daemon + objectives backlog (`AUTO`)
 **`internal/autosrc`**: one pluggable event-source registry + bounded priority queue folding file-signals, cron, webhooks, wake, *and* self-generated goals into one queue routed through `drivegate`. **`internal/objective`**: a store-backed standing-objectives backlog the agent pulls from when idle, executes reversibly through the verified orchestrator, gating only at the irreversible edge (composing with Pillar 5). Headless ⇒ irreversible deny-defaults unless an envelope is configured. Per the review's I7-adjacent fix, **objective CRUD is an operator-only host surface, unreachable from any sandboxed model tool** (a model must not enqueue its own standing objectives). **Verdict: sound.** **Opt-in:** folds into `serve`; the backlog source is off unless objectives exist.
 
-### Pillar 8 — Unified orchestration kernel (`UOK`) — DEFERRED, §0-gated
-One recursive `internal/kernel` primitive that runs a task and *dynamically* decides to stay flat or decompose-and-fan-out, with `run`/`build`/`swarm` becoming presets and the chat router picking an *envelope*, not a machine. **This is the final wave, separately §0-gated**, because the cutover (`UOK-T10`) re-homes all four entrypoints and edits contract files. It builds last, only after Pillars 1–7 prove the substrate, behind an **equivalence harness** (`UOK-T09`) that golden-diffs legacy-vs-kernel event-log sequences across *every* I2/gate-bearing path. The decompose branch **must always re-verify at the integrated tip** even when children are green (review's I2 fix). **Verdict: risky** — by design; gated. **Opt-in:** `NILCORE_KERNEL` until the cutover; after cutover the equivalence harness is the sole guarantee.
+### Pillar 8 — Unified orchestration kernel (`UOK`) — SHIPPED (§0 cutover authorized + merged)
+One recursive `internal/kernel` primitive that runs a task and *dynamically* decides to stay flat or decompose-and-fan-out, with `run`/`build`/`swarm` as presets and the chat/`nilcore do` router picking an *envelope*, not a machine. This was the final wave, separately §0-gated, because the cutover (`UOK-T10`) re-homed all four entrypoints and edited contract files. It built last, after Pillars 1–7 proved the substrate, behind an **equivalence harness** (`UOK-T09`) that golden-diffs legacy-vs-kernel event-log sequences across *every* I2/gate-bearing path. The decompose branch **always re-verifies at the integrated tip** even when children are green (review's I2 fix). **Verdict: risky by design; gated — now merged.** **Default-on:** the kernel is the default path; `NILCORE_KERNEL=0` is the escape hatch back to the legacy machines. **UOK V2** added the preset router (`internal/router`, `nilcore do`) that classifies a goal into run/build/swarm/decompose. See [`docs/ROADMAP-KERNEL.md`](ROADMAP-KERNEL.md) + [`docs/ROADMAP-KERNEL-V2.md`](ROADMAP-KERNEL-V2.md).
 
 ---
 
@@ -136,7 +138,7 @@ One recursive `internal/kernel` primitive that runs a task and *dynamically* dec
 The capability the operator asked for, designed to be **robust, opt-in, and trivially easy to turn on — where the easy path is the safe path.**
 
 ### The seam (why it's clean)
-`internal/policy` already exposes `Approver{ Approve(string) bool }`, `Gate` (free-text), and `GateStructured(GateAction, Approver)` over a **closed** `GateActionType` set `{PromoteToBase, Push, Deploy, OpenPR}`; a nil approver default-denies. Graduated auto-approval is a new approver that wraps the human one. The **only** policy edit is an additive optional interface + one branch:
+`internal/policy` already exposes `Approver{ Approve(string) bool }` (the free-text path) and `GateStructured(GateAction, Approver)` over a **closed** `GateActionType` set `{PromoteToBase, Push, Deploy, OpenPR, BindSelfAuthored}`; a nil approver default-denies. (There is no package-level `policy.Gate` function — the free-text gate is the `Approver.Approve(string)` method.) Graduated auto-approval is a new approver that wraps the human one. The **only** policy edit is an additive optional interface + one branch:
 
 ```go
 // GAA-T01 (serialized, contract-adjacent): additive, non-breaking.
@@ -172,7 +174,9 @@ The whole feature turns on with one choice in `nilcore init` (Enter = off) or `N
 |---|---|---|---|---|
 | **conservative** | OpenPR only | 5 green / 5 sample / 14d | 3/day | $0 |
 | **standard** | + PromoteToBase on **non-main** branches | 10 / 10 / 14d | 2/day | $0 |
-| **trusted** | + Deploy to **staging** (`prod*` always denied) | 20 / 20 / 7d | 2/day | $25/day |
+| **trusted** | + Deploy to **staging** (`prod*` always denied) | 20 / 20 / 7d | 2/day | $5/day |
+
+The `standard` and `trusted` presets also grant the `BindSelfAuthored` self-acceptance class (standard: 15 green / 15 / 7d, 3/day; trusted: 25 / 25 / 7d, 3/day; `conservative` does not) — binding a model-authored *sandboxed* verifier that can only ever *add* a passing criterion, never lower the bar (I2). The `trusted` Deploy clause's `$5/day` ceiling matches the `-blast-radius standard` fence; it is **dormant** today — no production code constructs a `policy.GateAction{Type: Deploy}`, so no deploy is ever auto-approved (see [`docs/ROADMAP-DEPLOY.md`](ROADMAP-DEPLOY.md)).
 
 ### The `GradedApprover` algorithm (`ApproveStructured`)
 On every decision, in order — any failure falls through to the human approver and logs an `auto_deny{reason}`:
@@ -182,6 +186,13 @@ On every decision, in order — any failure falls through to the human approver 
 4. **Trust bar** — `Green≥MinSuccesses ∧ Total≥MinSample ∧ LastGreen within RecencyDays ∧ ChainOK`.
 5. **Rate + dollars** — per-UTC-day count `<MaxPerDay`; day-spend via the **shared `blastbudget`** meter (never a second counter).
 6. **Pass ⇒** emit `auto_approve` with the **full evidence object** and return true. The free-text `Approve(string)` path **always delegates to the human** — free-text gates are never auto-approved.
+
+### Scope matching — family windows + a concrete-branch floor (the `573a4df` reachability fix)
+As first shipped this whole path was **structurally unreachable**; it is fixed at HEAD `573a4df`. Every preset's `AllowBranches:["*"]` matched *nothing* (Go's `path.Match` keeps `*` segment-local and every real scope is slash-y — `task/<id>`, a swarm integration tip), and keying trust/rate/$ on the exact, per-run-unique scope made `MinSuccesses` unsatisfiable and `MaxPerDay`/`MaxDollarsDay` non-binding. The current semantics (`internal/graapprove/meter.go`):
+
+- **`*` matches any non-empty scope** (`matchAny`); a blank/whitespace-only scope never matches — an action with no target has no bounded blast radius (fail-closed). Every other pattern keeps segment-local `path.Match`.
+- **Trust, rate, and $/day windows key on the scope FAMILY** (`trustScope`): `a/b → a/*`, a bare commit sha `→ #commit`, an already-stable name unchanged. Trust then means "this class of action against this family of target, verifier-green N times" — a *necessary* condition only.
+- **The protected-base floor and Allow/Deny read the CONCRETE branch** (`scopeFor(a) = a.Branch`); the kill-switch (worktree sentinel) and chain-verify (whole-log hash chain) are scope-independent global gates. So the family collapse only ever *narrows* who clears the trust bar — it never widens the floor. `isProtectedBase` structurally denies `main`/`master`/`release`/`release/*`/`release-*`/`trunk`/`stable` and `isProd` denies `prod*`, holding even against a hand-built envelope that omits them.
 
 ### The earned-trust source (`boundary_outcome`)
 A **dedicated, hash-chained** event emitted at each gate site *after the verifier verdict on the tip* — `Detail:{action, scope, passed:<verifier verdict, never SelfClaimed>, chain}`. `graapprove.BuildTrust(logPath)` folds these by `(Type,scope)`, then runs `eventlog.Verify`; **on a broken chain it returns empty tallies + `ChainOK=false`** (earns nothing over a tampered log — a tampered log can only *remove* trust, never forge it). Per the review: **the trust numerator counts only verifier-judged downstream outcomes and excludes prior auto-approval grants** (no self-reinforcement), and a chain-verify *error* (distinct from *empty*) denies explicitly.
@@ -322,7 +333,7 @@ Format: `ID — goal · depends · owns · verify`. Acceptance criteria for the 
 
 ### Pillar 7 — autonomy daemon + objectives (`AUTO`)
 - **AUTO-T01** — `objective` store table + typed CRUD. · — · `internal/store`, schema · additive; old-DB clean.
-- **AUTO-T02** — `internal/objective` leaf + idle-selection. · T01 · `internal/objective/` · `NextIdle`/`MarkRun`; deps stdlib.
+- **AUTO-T02** — `internal/objective` leaf + idle-selection. · T01 · `internal/objective/` · `NextIdle`/`MarkAttempt`/`MarkSuccess` (shipped as `MarkAttempt`+`MarkSuccess`, not `MarkRun`); deps stdlib.
 - **AUTO-T03** — `autosrc` registry + bounded priority queue. · — · `internal/autosrc/` · `container/heap`; drivegate-bounded.
 - **AUTO-T04** — existing sources as `autosrc` adapters (signals/cron/webhook/wake). · T03 · `internal/autosrc/adapters` · parity with today's verbs.
 - **AUTO-T05** — backlog source (idle self-service). · T02,T03 · `internal/autosrc/backlog.go` · reversible auto, irreversible gated.
@@ -330,7 +341,7 @@ Format: `ID — goal · depends · owns · verify`. Acceptance criteria for the 
 - **AUTO-T07** — `nilcore objective` management verb *(operator-only; XC-T06 test)*. · T01,T02 · `cmd/nilcore/objective.go` · unreachable from model tools.
 - **AUTO-T08** — docs + audit-trace surface *(SERIALIZED)*. · T06,T07 · `docs/*` · trace shows daemon-started work.
 
-### Pillar 8 — unified orchestration kernel (`UOK`, deferred/§0-gated)
+### Pillar 8 — unified orchestration kernel (`UOK`, SHIPPED; §0 cutover authorized + merged)
 - **UOK-T01** — staging doc `docs/ROADMAP-KERNEL.md`. · — · `docs/ROADMAP-KERNEL.md`.
 - **UOK-T02** — kernel leaf: `Node`/`Envelope`/`Outcome` + deps guard (no agent/session import). · T01 · `internal/kernel/`.
 - **UOK-T03** — `Granularity` policy interface + default sizer-backed policy. · T02.
@@ -361,7 +372,7 @@ Per the project's thesis-gate discipline (like `CU-T00`/the EXT tier), these are
 3. **STILL DEFERRED — Letting the flywheel edit verifiers** (denied by `selfimprove.DefaultScope`) is a distinct decision to widen the self-edit allow-list past the frozen `verify` package — never an implicit scope widen. Not taken; the flywheel cannot author or edit the verifier of record.
 4. **RECORDED — The blast-radius preset values** (`tight` = hosts 4 / irreversible 2 / wall 10m / $1-per-day; `standard` = hosts 8 / irreversible 5 / wall 20m / $5-per-day) are operator-approved policy, recorded in the ARCHITECTURE preset table.
 5. **RECORDED + enforced in code — The composition rule** that **no single flag transitively enables auto-approval** — each powerful relaxation needs its own recorded gate (`XC-T02`).
-6. **STILL DEFERRED — The kernel cutover (`UOK-T10`)** — re-homing run/build/swarm/chat onto one kernel and editing `CLAUDE.md`/`ARCHITECTURE.md`/`TASKS.md` — is a human-signed §0 decision taken only after Pillars 1–7 prove the substrate (now shipped, so the kernel is the remaining gated wave).
+6. **RECORDED — The kernel cutover (`UOK-T10`)** — re-homing run/build/swarm/chat onto one kernel and editing `CLAUDE.md`/`ARCHITECTURE.md`/`TASKS.md` — was a human-signed §0 decision taken after Pillars 1–7 proved the substrate. It is **now authorized + merged**: the kernel is the default path, `NILCORE_KERNEL=0` the escape hatch (see `docs/ROADMAP-KERNEL.md` / `-V2`).
 
 ---
 

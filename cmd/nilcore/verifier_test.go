@@ -603,23 +603,27 @@ func TestEvidenceVerifierWiring(t *testing.T) {
 		writeURLArtifact(t, box.dir, "rep", "https://example.com")
 
 		v := behavioralVerifier(box, "true")
-		comp, ok := v.(verify.Composite)
+		// Evidence legs are discovered at Check time (the artifact does not exist when
+		// the verifier is constructed), so the ordering is asserted over the list the
+		// composite builds per Check rather than over a frozen constructor result.
+		bc, ok := v.(behavioralComposite)
 		if !ok {
-			t.Fatalf("flag set + artifact present must return a Composite, got %#v", v)
+			t.Fatalf("flag set must return a behavioralComposite, got %#v", v)
 		}
-		if len(comp.Named) < 3 {
-			t.Fatalf("Composite must have build + schema + evidence, got %d verifiers", len(comp.Named))
+		named := bc.compose()
+		if len(named) < 3 {
+			t.Fatalf("Composite must have build + schema + evidence, got %d verifiers", len(named))
 		}
-		if comp.Named[0].Name != "checks" {
-			t.Fatalf("Named[0] must be the build verifier, got %q", comp.Named[0].Name)
+		if named[0].Name != "checks" {
+			t.Fatalf("Named[0] must be the build verifier, got %q", named[0].Name)
 		}
 		// The cheap structural shape gate runs before the per-claim evidence check, so a
 		// shape defect short-circuits first — matching the swarm path's packs.Build order.
-		if !strings.HasPrefix(comp.Named[1].Name, "schema") {
-			t.Fatalf("schema gate must follow the build verifier, got %q", comp.Named[1].Name)
+		if !strings.HasPrefix(named[1].Name, "schema") {
+			t.Fatalf("schema gate must follow the build verifier, got %q", named[1].Name)
 		}
-		if !strings.HasPrefix(comp.Named[2].Name, "evidence") {
-			t.Fatalf("evidence verifier must follow the schema gate, got %q", comp.Named[2].Name)
+		if !strings.HasPrefix(named[2].Name, "evidence") {
+			t.Fatalf("evidence verifier must follow the schema gate, got %q", named[2].Name)
 		}
 		if rep := readReport(t, v); !rep.Passed {
 			t.Fatalf("all-pass artifact + green build must be green, got: %s", rep.Output)

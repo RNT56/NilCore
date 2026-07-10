@@ -1,7 +1,8 @@
 package main
 
 // requeue_wiring.go — Pillar 4 wiring (P11-T23): drive GRANULAR requeue behind
-// NILCORE_REQUEUE / -requeue.
+// the NILCORE_REQUEUE + NILCORE_REQUEUE_MAX_ATTEMPTS environment variables (there
+// is no front-door flag; the env vars are the whole opt-in surface).
 //
 // WHY this file exists. internal/requeue is a pure leaf: it turns verifier-set
 // claim statuses into a Worklist, plans the MINIMAL focused re-dispatch subtasks,
@@ -59,16 +60,15 @@ import (
 )
 
 // requeueEnabled reports whether granular requeue is opted in. The pillar is
-// additive and OFF by default: only a non-empty NILCORE_REQUEUE (or the -requeue
-// flag, which the front door maps onto the same env) turns it on. Combined with a
-// MaxAttempts>0 budget this is what gates every requeue code path; unset ⇒ no hook,
-// byte-identical.
+// additive and OFF by default: only a non-empty NILCORE_REQUEUE environment
+// variable turns it on. Combined with a MaxAttempts>0 budget this is what gates
+// every requeue code path; unset ⇒ no hook, byte-identical.
 func requeueEnabled() bool {
 	return strings.TrimSpace(os.Getenv("NILCORE_REQUEUE")) != ""
 }
 
-// requeueMaxAttempts reads the per-Unit retry budget from -requeue-max-attempts
-// (front-door flag) via NILCORE_REQUEUE_MAX_ATTEMPTS, defaulting to 0. A budget of 0
+// requeueMaxAttempts reads the per-Unit retry budget from the
+// NILCORE_REQUEUE_MAX_ATTEMPTS environment variable, defaulting to 0. A budget of 0
 // disables requeue even when NILCORE_REQUEUE is set (requeue.Ledger reports every
 // Unit Exhausted at attempt 0), so the disabled path and the budget-consumed path are
 // one — no special-casing. A negative or unparseable value clamps to 0 (fail-safe to

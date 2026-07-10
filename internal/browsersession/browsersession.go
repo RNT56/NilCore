@@ -232,7 +232,7 @@ func (s *Session) rememberSecret(v string) {
 }
 
 // scrubObservation replaces every occurrence of a previously-typed secret value in the
-// observation (Text, Title, Console, and every Ref Name/Value) with secretSentinel,
+// observation (URL, Text, Title, Console, and every Ref Name/Value) with secretSentinel,
 // before the observation is recorded as latest and returned to the model. This is the
 // host-side backstop for secret reflow (I3): it is independent of the field's input type,
 // so a secret typed into a text/textarea/API-key/TOTP field — which the in-sandbox
@@ -255,6 +255,10 @@ func (s *Session) scrubObservation(o browserwire.Observation) browserwire.Observ
 	}
 	o.Text = scrub(o.Text)
 	o.Title = scrub(o.Title)
+	// URL too (I3): a {{secret:}} value that reflows into a GET-form/query-param URL
+	// (e.g. ?token=<secret>) would otherwise reach the model via renderObservation's
+	// "url: %s" line AND the append-only event log as plaintext.
+	o.URL = scrub(o.URL)
 	if len(o.Console) > 0 {
 		cs := make([]string, len(o.Console))
 		for i, c := range o.Console {

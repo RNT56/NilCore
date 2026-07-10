@@ -70,6 +70,18 @@ type OpenRouterPlugin struct {
 	Engine     string `json:"engine,omitempty"`
 }
 
+// hasPluginID reports whether plugins already contains an entry with the given id.
+// It is how newRequest avoids appending a duplicate "web" plugin when the operator
+// already configured one via WithOpenRouterPlugins.
+func hasPluginID(plugins []OpenRouterPlugin, id string) bool {
+	for _, p := range plugins {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureExtras returns o.openRouterExtras, lazily allocating it so the Option
 // setters can compose (each WithOpenRouter* adds to the same struct).
 func (o *OpenAI) ensureExtras() *openRouterExtras {

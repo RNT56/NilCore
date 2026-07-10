@@ -26,19 +26,90 @@ func dayKey(t time.Time) string {
 	return t.UTC().Format("2006-01-02")
 }
 
-// matchAny reports whether scope matches any glob pattern (path.Match semantics).
-// An empty scope never matches a non-empty pattern set unless a pattern explicitly
-// admits it. A malformed pattern is treated as a non-match (fail-safe: a bad
-// allowlist entry never widens admission, a bad denylist entry simply does not deny
-// — but deny entries are author-controlled host data, and the protected-branch
-// floor is enforced separately).
+// matchAny reports whether scope matches any glob pattern.
+//
+// A lone `*` means ANY scope. path.Match's `*` never crosses '/', but every real gate
+// scope is a slash-y branch (worktree.Create names them "task/<id>"; watch/schedule open
+// PRs from "task/trig-<nano>"), so the shipped presets' AllowBranches:["*"] matched
+// NOTHING and graduated auto-approval was structurally unreachable for its two live
+// classes. Widening `*` is safe because it is only ever an ALLOW predicate: the
+// protected-base floor (isProd/isProtectedBase, on both the scope and the destination
+// base), the operator's DenyBranches, the earned-trust bar, the per-day rate window and
+// the blast budget are each evaluated separately and still bound the decision.
+//
+// An EMPTY scope never matches: an action with no target has no bounded blast radius and
+// must never be auto-approved (fail-closed).
+//
+// Every other pattern keeps path.Match semantics, where `*` stays segment-local — so a
+// deliberate "feat/*" still admits feat/x and not feat/x/y. A malformed pattern is a
+// non-match (fail-safe: a bad allowlist entry never widens admission; deny entries are
+// author-controlled host data and the protected-branch floor is enforced separately).
 func matchAny(scope string, patterns []string) bool {
+	// TrimSpace, not `== ""`: a whitespace-only scope is just as targetless, and it
+	// would otherwise clear the floor (isProd/isProtectedBase both trim to "") and then
+	// match a lone `*`.
+	if strings.TrimSpace(scope) == "" {
+		return false
+	}
 	for _, p := range patterns {
+		if p == "*" {
+			return true
+		}
 		if ok, err := path.Match(p, scope); err == nil && ok {
 			return true
 		}
 	}
 	return false
+}
+
+// trustScope collapses a gate scope into the STABLE FAMILY that earned trust and the
+// per-day rate window accrue over.
+//
+// Every live gate scope is unique per run: worktree branches are "task/<taskID>",
+// watch/schedule open PRs from "task/trig-<unix-nano>", and a swarm promote names its
+// integration tip. Keying trust on the exact scope made `Green >= MinSuccesses`
+// unsatisfiable by construction — no scope is ever seen twice — and keying the rate
+// window on it made MaxPerDay unenforceable, since every auto-approval opened a fresh
+// window. Both now key on the family:
+//
+//	task/trig-1720512345  ->  task/*        (a branch namespace)
+//	feat/a/b              ->  feat/a/*
+//	9f3c1ab...            ->  #commit       (a bare commit sha)
+//	main, id@cmd-hash     ->  unchanged     (already stable)
+//
+// This is deliberately coarser than the exact branch: trust means "this agent has
+// completed THIS CLASS of action against THIS FAMILY of target, verifier-green, N
+// times". It is only ever a NECESSARY condition — the protected-base floor, the
+// operator's Allow/DenyBranches, the rate cap, and the blast budget each bound the
+// decision on the CONCRETE scope, which is what the audit event records.
+func trustScope(scope string) string {
+	s := strings.TrimSpace(scope)
+	if s == "" {
+		return ""
+	}
+	if i := strings.LastIndex(s, "/"); i > 0 {
+		return s[:i] + "/*"
+	}
+	if isCommitSHA(s) {
+		return "#commit"
+	}
+	return s
+}
+
+// isCommitSHA reports whether s is a bare hex commit id (abbreviated or full). Such a
+// scope is unique per run, so it collapses to one family rather than never recurring.
+func isCommitSHA(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return false
+		}
+	}
+	return true
 }
 
 // isProd reports whether a scope/environment is a production target. prod* is
@@ -97,7 +168,10 @@ func countAutoApprovalsToday(logPath, action, scope, today string) (int, error) 
 		}
 		a, _ := e.Detail["action"].(string)
 		s, _ := e.Detail["scope"].(string)
-		if a != action || s != scope {
+		// The event records the CONCRETE scope; the window counts the family, or a
+		// per-run-unique branch would open a fresh window on every auto-approval and
+		// MaxPerDay would never bind.
+		if a != action || trustScope(s) != trustScope(scope) {
 			continue
 		}
 		if dayKey(e.Time) == today {

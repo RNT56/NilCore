@@ -60,15 +60,21 @@ func (p Preset) Valid() bool {
 
 // swarmSignals mark a breadth / parallel objective — many independent pieces of work that
 // the verified swarm exists to fan out. Checked FIRST because parallel intent is the most
-// specialized (and most expensive) shape, so an explicit breadth signal should win.
+// specialized (and most expensive) shape, so an explicit breadth signal should win. Every
+// entry is matched on WORD BOUNDARIES (see containsWord), so a signal never fires inside a
+// larger word. "in bulk" (not a bare "bulk") is deliberate: the breadth reading is "do X
+// in bulk", whereas a bare "bulk" collides with the single-task idiom "the bulk of the
+// work" — the exact mis-route the boundary matcher and this phrasing together prevent.
 var swarmSignals = []string{
 	"swarm", "in parallel", "fan out", "fan-out", "for each", "for every",
 	"each of the", "across all", "across every", "every file", "every package",
-	"every module", "every service", "bulk ", "sweep the", "audit the codebase",
+	"every module", "every service", "in bulk", "sweep the", "audit the codebase",
 }
 
 // buildSignals mark a whole-project / scaffold task — the project loop's shape. Checked
-// AFTER swarm so "scaffold N services in parallel" routes to the swarm, not build.
+// AFTER swarm so "scaffold N services in parallel" routes to the swarm, not build. Matched
+// on WORD BOUNDARIES too, so "build a" fires on "build a service" but not on "build and
+// test" or "rebuild all", and "new app" fires on "new app" but not "new approach".
 var buildSignals = []string{
 	"build a", "build an", "build the project", "create a project", "create a new project",
 	"scaffold", "new project", "new service", "new app", "from scratch", "greenfield",
@@ -78,9 +84,13 @@ var buildSignals = []string{
 // Classify is the deterministic default router: a keyword bucket over the goal text that
 // picks the cheapest preset that fits. The order (swarm → build → run) biases toward the
 // cheapest, safest machine when no specialized signal is present — most goals are single
-// tasks, so Run is the fallthrough. The match is over inert lowercased data (I7).
+// tasks, so Run is the fallthrough. Signals match on WORD BOUNDARIES over inert, lowercased,
+// whitespace-collapsed data (I7): a bare signal fires only as a standalone word, so common
+// single-task phrasings ("build and test", "take a new approach", "rebuild all the tests",
+// "the bulk of the work") are NOT mis-routed into the expensive build/swarm machines by a
+// coincidental substring.
 func Classify(goal string) Preset {
-	g := strings.ToLower(goal)
+	g := collapseWS(strings.ToLower(goal))
 	if containsAny(g, swarmSignals) {
 		return Swarm
 	}
@@ -90,14 +100,54 @@ func Classify(goal string) Preset {
 	return Run
 }
 
+// containsAny reports whether any needle matches haystack on a word boundary.
 func containsAny(haystack string, needles []string) bool {
 	for _, n := range needles {
-		if strings.Contains(haystack, n) {
+		if containsWord(haystack, n) {
 			return true
 		}
 	}
 	return false
 }
+
+// containsWord reports whether needle occurs in haystack on WORD BOUNDARIES, mirroring
+// internal/policy.containsWord. A bare signal ("swarm", "scaffold", "in bulk") matches the
+// standalone word but NOT a larger word that merely contains it — the bug this fixes, where
+// raw substring matching mis-routed "build and test" (⊃ "build an") and "take a new
+// approach" (⊃ "new app") into the build machine. Multi-word / hyphenated phrase signals
+// ("build a", "fan-out", "every file") still match as phrases because a boundary is only
+// required at an end whose needle char is itself a word char. Both inputs are already
+// lowercased + whitespace-collapsed by the caller.
+func containsWord(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	for start := 0; ; {
+		i := strings.Index(haystack[start:], needle)
+		if i < 0 {
+			return false
+		}
+		i += start
+		end := i + len(needle)
+		leftOK := i == 0 || !isWordByte(needle[0]) || !isWordByte(haystack[i-1])
+		rightOK := end == len(haystack) || !isWordByte(needle[len(needle)-1]) || !isWordByte(haystack[end])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+// isWordByte reports whether b is an ASCII word character (letter, digit, underscore). The
+// goal is already lowercased, so only lowercase letters appear.
+func isWordByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
+// collapseWS collapses every run of whitespace to a single space and trims, so a signal is
+// not split by irregular spacing in a pasted, multi-line goal (mirrors
+// internal/policy.collapseWS).
+func collapseWS(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // Oracle is the optional seam a learned/model-backed router implements to override the
 // heuristic — e.g. one informed by the experience/lessons/trust ledgers (the closed-loop

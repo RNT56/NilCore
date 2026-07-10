@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -98,11 +101,17 @@ func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string
 			Log:     log,
 			LogPath: logPath,
 			Hash: func(ctx context.Context) (string, error) {
-				// Hash everything the verifier reads (the worktree), skipping VCS/agent state.
-				return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
+				return verifiedContentHash(ctx, box)
 			},
-			VerifierID: verifierID,
-			Toolchain:  verify.Toolchain(),
+			// The cache key must cover EVERY input that can change this composite's
+			// verdict, not just the project command: a pass recorded with the browser
+			// check off, or with a different pack list, must never replay as green once
+			// the operator turns those on (that would skip the gate entirely — I2).
+			VerifierID: behavioralVerifierID(verifierID),
+			// The checks execute inside the sandbox image, so the IMAGE's toolchain is
+			// what ran them; the host binary's runtime.Version() is not. Fold the sandbox
+			// identity in, or an image upgrade replays greens recorded under the old one.
+			Toolchain: verify.Toolchain() + "|" + sandboxIdentity(box),
 		})
 	}
 
@@ -115,7 +124,7 @@ func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string
 		fp := &verify.FlakeProbe{
 			Inner: v,
 			Hash: func(ctx context.Context) (string, error) {
-				return verify.ContentHashWorktree(ctx, box.Workdir(), ".git", ".nilcore")
+				return verifiedContentHash(ctx, box)
 			},
 		}
 		if log != nil {
@@ -162,9 +171,37 @@ func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string
 // Any other command (npm test, cargo test, pytest, "true", `go test ./pkg` on a
 // single package, a custom script) leaves the verifier UNWRAPPED — we cannot prove a
 // scoped Go red is that project's red.
+//
+// Both predicates are evaluated on the `go test` LEG of a compound command, never on
+// the whole string: `go build ./... && go test ./pkg` carries "./..." on its BUILD
+// leg while its test leg covers a single package, so a whole-string check would arm
+// the fast path over tests the full command never runs — a false red shipped as the
+// verdict, exactly what this gate exists to prevent.
 func tieredSound(verifyCmd string) bool {
-	c := strings.TrimSpace(verifyCmd)
-	return containsGoTest(c) && strings.Contains(c, "./...")
+	seg := goTestSegment(verifyCmd)
+	return seg != "" && strings.Contains(seg, "./...")
+}
+
+// goTestSegment isolates the leg of a compound verify command that invokes `go test`,
+// so flag replication and the soundness check read only that leg. The verify command
+// is harness-resolved (verify.Detect) or operator-set — never model-authored — so a
+// separator split is sufficient; we are disambiguating our own recipes, not parsing
+// hostile shell. Returns "" when no leg invokes `go test`.
+func goTestSegment(verifyCmd string) string {
+	segs := []string{verifyCmd}
+	for _, sep := range []string{"&&", "||", ";", "|"} {
+		var next []string
+		for _, s := range segs {
+			next = append(next, strings.Split(s, sep)...)
+		}
+		segs = next
+	}
+	for _, s := range segs {
+		if containsGoTest(s) {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 // containsGoTest reports whether cmd invokes `go test` as a COMMAND — the match
@@ -271,28 +308,39 @@ func scopedRedFunc(box sandbox.Sandbox, verifyCmd string) func(ctx context.Conte
 // goTestFlags extracts the go-test flags from the resolved verify command so the
 // scoped `go test` replicates the full run's behavior over the touched packages.
 // Only the flags that change WHICH tests/builds run (and can thus flip a red) are
-// copied — -short, -tags <v>/-tags=<v>, -count <v>/-count=<v>, -race. A dropped flag
-// would make the scoped run diverge from the full command's subset and red falsely
-// (e.g. -short skips a long test the full command also skips). It scans the whitespace
-// tokens of the command; the verify command is a harness-resolved string (verify.Detect
-// / operator-set), not model-authored, so a simple token scan is sufficient here.
+// copied — -short, -race, -tags, -count, and the test SELECTORS -run/-skip. A dropped
+// flag would make the scoped run diverge from the full command's subset and red
+// falsely: -short skips a long test the full command also skips, and a dropped -run
+// makes the scoped run execute tests the full command never gates on — the false red
+// this fast path must never produce.
+//
+// Flags are harvested from the `go test` LEG only. Scanning the whole compound string
+// grafts another leg's flags onto the scoped run (a `-tags` meant for `go build` would
+// silently change which test files compile).
 func goTestFlags(verifyCmd string) string {
-	toks := strings.Fields(verifyCmd)
+	toks := strings.Fields(goTestSegment(verifyCmd))
+	valued := map[string]bool{"-tags": true, "-count": true, "-run": true, "-skip": true}
 	var out []string
 	for i := 0; i < len(toks); i++ {
 		t := toks[i]
 		switch {
 		case t == "-short" || t == "-race":
 			out = append(out, t)
-		case t == "-tags" || t == "-count":
-			// space-separated value form: "-tags integration".
+		case valued[t]:
+			// space-separated value form: "-tags integration", "-run TestFoo".
 			out = append(out, t)
 			if i+1 < len(toks) {
 				out = append(out, toks[i+1])
 				i++
 			}
-		case strings.HasPrefix(t, "-tags=") || strings.HasPrefix(t, "-count="):
-			out = append(out, t) // "=" form carries its own value.
+		default:
+			// "=" form carries its own value: "-tags=integration", "-run=TestFoo".
+			for f := range valued {
+				if strings.HasPrefix(t, f+"=") {
+					out = append(out, t)
+					break
+				}
+			}
 		}
 	}
 	return strings.Join(out, " ")
@@ -477,28 +525,54 @@ func orchestratorVerifier(box sandbox.Sandbox, cmd string, log *eventlog.Log, lo
 // byte-identical and emit no evidence events; a future log-bearing caller (P11-T16)
 // passes its run log to get the audit trail. With every evidence/browser toggle off
 // this returns exactly verify.New(box, cmd) — the unset path is byte-identical.
+// Evidence legs are discovered at CHECK time, not at construction. Constructing
+// this verifier happens right after the worktree is cut and BEFORE the backend
+// runs, when .nilcore/artifacts/ is necessarily empty (it is gitignored, so a
+// fresh worktree never carries one). Globbing eagerly therefore froze the
+// composite with ZERO evidence legs and the run's own artifact was never checked
+// — the operator enabled NILCORE_EVIDENCE_VERIFY and got a build-only verdict.
+// The build path already solved this with lazyEvidenceVerifier; the app path
+// (run/chat/serve/resume) now does the same.
 func behavioralVerifierWithLog(box sandbox.Sandbox, cmd string, log *eventlog.Log) verify.Verifier {
 	base := verify.New(box, cmd)
 
-	var extra []verify.NamedVerifier
-	if bcmd := strings.TrimSpace(os.Getenv("NILCORE_BROWSER_VERIFY")); bcmd != "" {
-		extra = append(extra, verify.NamedVerifier{Name: "browser", V: verify.NewBrowser(box, bcmd)})
-	}
-	extra = append(extra, evidenceVerifiers(box, log)...)
+	browserCmd := strings.TrimSpace(os.Getenv("NILCORE_BROWSER_VERIFY"))
+	evidenceOn := strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_VERIFY")) != ""
 
-	if len(extra) == 0 {
+	if browserCmd == "" && !evidenceOn {
 		// No behavioral/evidence checks opted in: return the bare project verifier
 		// exactly as before, so the default path is byte-identical (P11-T05/P9-T03).
 		return base
 	}
+	return behavioralComposite{base: base, browserCmd: browserCmd, box: box, log: log}
+}
 
-	// Named[0] is always the build/"checks" verifier, so an evidence or browser
-	// check can never mask a red build: Composite short-circuits on the first
-	// failure and the build verifier runs first (I2).
-	named := make([]verify.NamedVerifier, 0, 1+len(extra))
-	named = append(named, verify.NamedVerifier{Name: "checks", V: base})
-	named = append(named, extra...)
-	return verify.Composite{Named: named}
+// behavioralComposite ANDs the project verifier with the opted-in behavioral and
+// evidence checks, re-discovering the artifact set on every Check.
+//
+// Named[0] is always the build/"checks" verifier, so an evidence or browser check
+// can never mask a red build: Composite short-circuits on the first failure and
+// the build verifier runs first (I2).
+type behavioralComposite struct {
+	base       verify.Verifier
+	browserCmd string
+	box        sandbox.Sandbox
+	log        *eventlog.Log
+}
+
+// compose builds the ordered verifier list for one Check, re-discovering the
+// artifacts present in the worktree at this instant.
+func (b behavioralComposite) compose() []verify.NamedVerifier {
+	named := make([]verify.NamedVerifier, 0, 4)
+	named = append(named, verify.NamedVerifier{Name: "checks", V: b.base})
+	if b.browserCmd != "" {
+		named = append(named, verify.NamedVerifier{Name: "browser", V: verify.NewBrowser(b.box, b.browserCmd)})
+	}
+	return append(named, evidenceVerifiers(b.box, b.log)...)
+}
+
+func (b behavioralComposite) Check(ctx context.Context) (verify.Report, error) {
+	return verify.Composite{Named: b.compose()}.Check(ctx)
 }
 
 // evidenceVerifiers returns one trailing NamedVerifier per artifact file present in
@@ -566,7 +640,9 @@ func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVer
 	for _, p := range paths {
 		out = append(out, verify.NamedVerifier{
 			Name: "schema:" + artifactID(p),
-			V:    &schema.SchemaVerifier{Reg: schemaReg, RelPath: p},
+			// The sink is what makes schema defects visible in the report (I5: a new
+			// append-only kind, never a mutation). nil log ⇒ nil sink ⇒ no events.
+			V: &schema.SchemaVerifier{Reg: schemaReg, RelPath: p, EventSink: sink},
 		})
 		av := &evverify.ArtifactVerifier{
 			Box:       box,
@@ -579,6 +655,102 @@ func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVer
 		out = append(out, verify.NamedVerifier{Name: "evidence:" + artifactID(p), V: av})
 	}
 	return out
+}
+
+// verifiedContentHash hashes everything the composite verifier READS, which is what
+// a replay cache must key on.
+//
+// ContentHashWorktree deliberately skips .nilcore (agent state: swarm collate roots
+// churn every pass), but when evidence verification is on, the artifacts under
+// .nilcore/artifacts ARE an input to the verdict — the evverify legs judge their
+// claims. Keying without them let an artifact be rewritten to carry failing claims
+// and still replay the chain-verified pass recorded against the old ones (I2). So we
+// fold the artifact bytes in exactly when they are read.
+//
+// Fail-closed: any read error propagates, and vcache treats a hash error as "do not
+// replay" (recompute), never as a hit.
+func verifiedContentHash(ctx context.Context, box sandbox.Sandbox) (string, error) {
+	root := box.Workdir()
+	tree, err := verify.ContentHashWorktree(ctx, root, ".git", ".nilcore")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_VERIFY")) == "" {
+		return tree, nil // artifacts are not read; keep them out of the key
+	}
+	art, err := artifactsHash(root)
+	if err != nil {
+		return "", fmt.Errorf("hashing artifacts: %w", err)
+	}
+	return tree + ":art=" + art, nil
+}
+
+// artifactsHash digests the artifact files the evidence legs verify, in the stable
+// order artifactFiles yields. Symlinks are skipped: evverify refuses them via
+// worktreefs (O_NOFOLLOW), so they contribute nothing to the verdict and must not
+// contribute to the key either (I4).
+func artifactsHash(root string) (string, error) {
+	h := sha256.New()
+	for _, p := range artifactFiles(root) {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return "", err
+		}
+		if !fi.Mode().IsRegular() {
+			continue
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return "", err
+		}
+		_, _ = io.WriteString(h, filepath.Base(p))
+		_, _ = io.WriteString(h, "\x00")
+		if _, err := io.Copy(h, f); err != nil {
+			f.Close()
+			return "", err
+		}
+		f.Close()
+		_, _ = io.WriteString(h, "\x00")
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// behavioralVerifierID folds every operator toggle that changes what the composite
+// verifier CHECKS into the cache identity, keeping the resolved command as a legible
+// prefix. The raw command alone is not the verifier's identity: a pass recorded with
+// NILCORE_BROWSER_VERIFY unset (or a narrower NILCORE_VERIFY_PACKS, or evidence off)
+// would otherwise replay as green after the operator enables them, silently skipping
+// the very gate they just turned on.
+//
+// The caller keeps passing the RAW command to tieredSound/scopedRedFunc and to the
+// verifier_id audit detail — this identity is for the cache key alone.
+func behavioralVerifierID(cmd string) string {
+	h := sha256.New()
+	for _, part := range []string{
+		"cmd", cmd,
+		"browser", os.Getenv("NILCORE_BROWSER_VERIFY"),
+		"evidence", os.Getenv("NILCORE_EVIDENCE_VERIFY"),
+		"packs", os.Getenv("NILCORE_VERIFY_PACKS"),
+		"max_age", os.Getenv("NILCORE_EVIDENCE_MAX_AGE"),
+	} {
+		_, _ = io.WriteString(h, part)
+		_, _ = io.WriteString(h, "\x00")
+	}
+	return cmd + "#" + hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// sandboxIdentity names the execution environment the verify command actually runs
+// in, so an image swap invalidates cached greens. A container carries its runtime and
+// image; other backends (namespace, nil) are identified by type.
+func sandboxIdentity(box sandbox.Sandbox) string {
+	switch b := box.(type) {
+	case nil:
+		return "none"
+	case *sandbox.Container:
+		return "container:" + b.Runtime + ":" + b.Image
+	default:
+		return fmt.Sprintf("%T", box)
+	}
 }
 
 // artifactFiles returns the absolute paths of every .nilcore/artifacts/*.json file
@@ -649,6 +821,27 @@ func evidenceEventSink(log *eventlog.Log) func(ev any) {
 	}
 	return func(ev any) {
 		switch e := ev.(type) {
+		case schema.SchemaVerifyEvent:
+			// The producer half of the report's SchemaDefects section. Without this case
+			// no schema_verify event ever reached a log, so that section was permanently
+			// empty on every real run even though the decoder existed. Detail is the
+			// struct's own json shape ({"id","kind","defects":[{code,field,claim_id,
+			// reason}],"passed"}) — harness-authored metadata only, never a model field.
+			defects := make([]any, 0, len(e.Defects))
+			for _, d := range e.Defects {
+				defects = append(defects, map[string]any{
+					"code":     d.Code,
+					"field":    d.Field,
+					"claim_id": d.ClaimID,
+					"reason":   d.Reason,
+				})
+			}
+			log.Append(eventlog.Event{Kind: schema.EventKind, Detail: map[string]any{
+				"id":      e.ArtifactID,
+				"kind":    string(e.Kind),
+				"defects": defects,
+				"passed":  e.Passed,
+			}})
 		case evverify.ClaimVerifyEvent:
 			log.Append(eventlog.Event{Kind: "claim_verify", Detail: map[string]any{
 				"claim_id":   e.ClaimID,
@@ -725,6 +918,37 @@ func validateVerifyPacks() error {
 	}
 	if err := packs.Select(names, evverify.New()); err != nil {
 		return fmt.Errorf("NILCORE_VERIFY_PACKS: %w", err)
+	}
+	return nil
+}
+
+// validateVerifyEnv is the boot-time gate over the whole opted-in verify surface.
+// It exists because validateVerifyPacks — documented as "the explicit startup
+// signal" — had no caller, so a typo'd pack name reddened every artifact at verify
+// time with no hint at the cause, and a malformed NILCORE_EVIDENCE_MAX_AGE silently
+// disabled the staleness demotion the operator configured (fail-OPEN for a
+// tightening). Both now refuse to start.
+func validateVerifyEnv() error {
+	if err := validateVerifyPacks(); err != nil {
+		return err
+	}
+	return validateEvidenceMaxAge()
+}
+
+// validateEvidenceMaxAge rejects a malformed staleness window at boot. An operator
+// who sets this knob is asking for a TIGHTER verdict; silently reading a typo as
+// "staleness disabled" hands them a looser one than they asked for.
+func validateEvidenceMaxAge() error {
+	raw := strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_MAX_AGE"))
+	if raw == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("NILCORE_EVIDENCE_MAX_AGE %q: not a Go duration (e.g. \"24h\"): %w", raw, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("NILCORE_EVIDENCE_MAX_AGE %q: must not be negative", raw)
 	}
 	return nil
 }

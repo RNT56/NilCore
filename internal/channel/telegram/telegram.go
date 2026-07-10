@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,13 +168,15 @@ func (b *Bot) Receive(ctx context.Context) (channel.TaskRequest, error) {
 	}
 }
 
-// Update sends a progress line to the thread (chat).
+// Update sends a progress line to the thread (chat). The text is plain (no parse_mode)
+// but still clipped to the Bot API cap: a >4096-char progress line is otherwise rejected
+// with HTTP 400 and the whole update is dropped.
 func (b *Bot) Update(ctx context.Context, threadID, message string) error {
 	chatID, err := strconv.ParseInt(threadID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("bad thread id %q: %w", threadID, err)
 	}
-	return b.call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": message}, nil)
+	return b.call(ctx, "sendMessage", map[string]any{"chat_id": chatID, "text": clipText(message)}, nil)
 }
 
 // telegramTextLimit is the Bot API per-message character cap (after entity parsing).
@@ -474,25 +477,102 @@ func (b *Bot) call(ctx context.Context, method string, payload any, out any) err
 		return err
 	}
 	url := b.baseURL + "/bot" + b.token + "/" + method
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
+	// Bounded retry on HTTP 429 so a rate-limited gate/ask/final message is not silently
+	// dropped: honor the retry_after Telegram returns (JSON parameters or Retry-After
+	// header), cap the wait, and give up after maxRateRetries. The body bytes are reusable,
+	// so each attempt rebuilds its own request.
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("content-type", "application/json")
+		resp, err := b.http.Do(req)
+		if err != nil {
+			// The token is embedded in the URL, so a transport failure is a *url.Error whose
+			// string contains it — scrub so the secret can never reach a log (I3).
+			return scrubToken(err, b.token)
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRateRetries {
+			if err := sleepCtx(ctx, telegramRetryAfter(resp.Header.Get("Retry-After"), raw)); err != nil {
+				return err
+			}
+			continue
+		}
+		if resp.StatusCode/100 != 2 {
+			return fmt.Errorf("telegram %s: %s", method, resp.Status)
+		}
+		if out != nil {
+			return json.Unmarshal(raw, out)
+		}
+		return nil
+	}
+}
+
+// Rate-limit backoff knobs (see call). maxRateRetries bounds the retry count; the wait is
+// floored at rateRetryDefault and capped at rateRetryMax so an absurd retry_after can never
+// park a call for long. rateRetryDefault is a var only so tests can shrink it.
+const (
+	maxRateRetries = 3
+	rateRetryMax   = 30 * time.Second
+)
+
+var rateRetryDefault = 1 * time.Second
+
+// telegramRetryAfter derives a bounded backoff from a 429 response: Telegram carries the
+// hint in the JSON body (parameters.retry_after) and sometimes a Retry-After header. A
+// missing/garbage value falls back to rateRetryDefault; the result is capped at rateRetryMax.
+func telegramRetryAfter(header string, body []byte) time.Duration {
+	secs := 0
+	var r struct {
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if json.Unmarshal(body, &r) == nil && r.Parameters.RetryAfter > 0 {
+		secs = r.Parameters.RetryAfter
+	} else if n, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && n > 0 {
+		secs = n
+	}
+	d := rateRetryDefault
+	if secs > 0 {
+		d = time.Duration(secs) * time.Second
+	}
+	if d > rateRetryMax {
+		d = rateRetryMax
+	}
+	return d
+}
+
+// sleepCtx sleeps for d, returning early (with its error) if ctx is cancelled — so a
+// backoff never outlives the request's context.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// scrubToken removes the bot token from an error's text. The token is embedded in every
+// request URL, so a transport failure yields a *url.Error whose message contains it;
+// callers discard these today, but scrubbing here guarantees the secret can never surface
+// in a future log (I3 defense-in-depth). Errors without the token are returned unchanged,
+// preserving their wrap chain.
+func scrubToken(err error, token string) error {
+	if err == nil || token == "" {
 		return err
 	}
-	req.Header.Set("content-type", "application/json")
-	resp, err := b.http.Do(req)
-	if err != nil {
-		return err
+	if s := err.Error(); strings.Contains(s, token) {
+		return errors.New(strings.ReplaceAll(s, token, "<redacted>"))
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("telegram %s: %s", method, resp.Status)
-	}
-	if out != nil {
-		return json.Unmarshal(raw, out)
-	}
-	return nil
+	return err
 }

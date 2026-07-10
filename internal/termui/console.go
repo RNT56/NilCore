@@ -29,6 +29,11 @@ type Console struct {
 	st        Style
 	streaming bool // tokens are flowing inline at the bottom (no live spinner)
 	spin      *spinState
+	// spinEvery is the live-line redraw cadence; 0 selects the 80ms default. It is
+	// a test seam only: set once at construction and never mutated, so the
+	// animator can read it without the lock (a fast tick drives the stop/animate
+	// race in tests). Production leaves it zero.
+	spinEvery time.Duration
 }
 
 // New returns a Console rendering to w, auto-detecting whether w is a styled
@@ -173,22 +178,38 @@ type spinState struct {
 	done   chan struct{}
 }
 
-// animate redraws the live line on a ticker until stopped. It takes the console
-// mutex for each redraw so it never interleaves with Line/Token writes.
+// animate redraws the live line on a ticker until stopped. Each redraw takes the
+// console mutex so it never interleaves with a Line/Token write.
+//
+// The tick branch uses TryLock, not Lock, and this is load-bearing: stopSpinLocked
+// closes s.stop and then joins this goroutine (<-s.done) WHILE HOLDING c.mu. Go's
+// select picks uniformly at random among ready cases, so a tick that fires in the
+// same instant the stop channel closes could win the race — and a blocking
+// c.mu.Lock() here would then wedge forever against the stopper's held lock while
+// the stopper wedged forever on the join. TryLock cannot block: if the lock is
+// held (which it always is during a join) the redraw is simply skipped, leaving
+// the loop free to observe the closed stop channel on its next turn and exit. A
+// dropped frame is purely cosmetic. This also preserves the ordering guarantee —
+// while the lock is held no redraw can slip between the join and a later write.
 func (c *Console) animate(s *spinState) {
 	defer close(s.done)
-	t := time.NewTicker(80 * time.Millisecond)
+	every := 80 * time.Millisecond
+	if c.spinEvery > 0 {
+		every = c.spinEvery
+	}
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
 		case <-s.stop:
 			return
 		case <-t.C:
-			c.mu.Lock()
-			if c.spin == s { // still the active spinner
-				c.drawLiveLocked()
+			if c.mu.TryLock() {
+				if c.spin == s { // still the active spinner
+					c.drawLiveLocked()
+				}
+				c.mu.Unlock()
 			}
-			c.mu.Unlock()
 		}
 	}
 }
