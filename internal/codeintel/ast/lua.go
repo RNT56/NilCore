@@ -32,7 +32,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -96,7 +95,7 @@ func (luaParser) calls(path string) (map[string][]string, error) {
 // maintains a stack of named function blocks, closing them as `end` brings depth back to their
 // open level. Spans of all open blocks are extended to each line before close-out.
 func luaScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open lua file: %w", err)
 	}

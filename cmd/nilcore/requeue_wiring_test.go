@@ -105,7 +105,10 @@ func writeRequeueArtifact(t *testing.T, root, id string) string {
 			ID:    id + "-c1",
 			Field: "f1",
 			Evidence: artifact.Evidence{
-				Value:     "v1",
+				// Value-less: this requeue path re-verifies through evverify.Default() (no
+				// schema gate), and web.url_resolves is a provenance check driven by the box
+				// exit (0 ⇒ Pass, non-0 ⇒ Unverifiable). A Value here would be a hollow green
+				// evverify now refuses; the requeue mechanism under test doesn't need one.
 				SourceURL: "https://example.com",
 				Verifier:  "web.url_resolves",
 				Status:    artifact.StatusFail,

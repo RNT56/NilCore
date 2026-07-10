@@ -27,7 +27,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -93,7 +92,7 @@ func (scalaParser) calls(path string) (map[string][]string, error) {
 // type opens a receiver block; a `def` is a method when nested inside a type, else a free
 // function; a `val`/`var` inside a type is a field.
 func scalaScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open scala file: %w", err)
 	}

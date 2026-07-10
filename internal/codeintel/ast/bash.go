@@ -28,7 +28,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -78,7 +77,7 @@ func (bashParser) calls(path string) (map[string][]string, error) {
 // collects candidate command references; after the walk it keeps only the references whose
 // name resolves to a function defined in this file (the self-contained call-graph heuristic).
 func bashScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open bash file: %w", err)
 	}

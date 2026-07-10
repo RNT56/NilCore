@@ -35,13 +35,40 @@ type Memory struct {
 // New wraps a store.
 func New(s *store.Store) *Memory { return &Memory{store: s} }
 
-// Write persists a record (defaulting to project scope).
+// Bounds on the task-summary key family.
+const (
+	// taskKeyPrefix marks the "task:<id>" family memWriteBack appends one row per
+	// verified task under. It is the only unbounded-per-task family, so it is the one
+	// the cap targets.
+	taskKeyPrefix = "task:"
+
+	// taskMemoryCap bounds how many task:<id> rows a single (scope, project) partition
+	// retains. memWriteBack writes one row per verified task with a UNIQUE key, so a
+	// brand-new task id never dedups and the partition would otherwise grow one row per
+	// task forever, while TaskContext renders only the newest ~10. The cap keeps the
+	// newest N and prunes older task rows on write; N is a few hundred — far above the
+	// handful rendered — so recall is unaffected and storage/query cost stay O(cap),
+	// not O(tasks-ever).
+	taskMemoryCap = 500
+)
+
+// Write persists a record (defaulting to project scope), then bounds the task:<id>
+// family so a long-lived project's partition never grows without limit.
 func (m *Memory) Write(ctx context.Context, r Record) error {
 	if r.Scope == "" {
 		r.Scope = ScopeProject
 	}
-	_, err := m.store.PutMemory(ctx, store.Memory{Scope: r.Scope, Project: r.Project, Key: r.Key, Value: r.Value})
-	return err
+	if _, err := m.store.PutMemory(ctx, store.Memory{Scope: r.Scope, Project: r.Project, Key: r.Key, Value: r.Value}); err != nil {
+		return err
+	}
+	// memWriteBack appends one task:<id> row per verified task, so cap that family to
+	// the newest taskMemoryCap on write. Other keys in the partition are left untouched.
+	if strings.HasPrefix(r.Key, taskKeyPrefix) {
+		if _, err := m.store.PruneMemory(ctx, r.Scope, r.Project, taskKeyPrefix, taskMemoryCap); err != nil {
+			return fmt.Errorf("cap task memory: %w", err)
+		}
+	}
+	return nil
 }
 
 // Query returns records in a scope (and project, for project scope), filtered by
@@ -51,6 +78,13 @@ func (m *Memory) Query(ctx context.Context, scope, project, keyword string) ([]R
 	if err != nil {
 		return nil, err
 	}
+	return filterRecords(recs, keyword), nil
+}
+
+// filterRecords maps store rows to Records, keeping those whose key or value contains
+// keyword (case-insensitive; an empty keyword keeps all). Shared by Query and the
+// bounded task-start read so both apply the same filter.
+func filterRecords(recs []store.Memory, keyword string) []Record {
 	kw := strings.ToLower(keyword)
 	var out []Record
 	for _, r := range recs {
@@ -58,7 +92,7 @@ func (m *Memory) Query(ctx context.Context, scope, project, keyword string) ([]R
 			out = append(out, Record{Scope: r.Scope, Project: r.Project, Key: r.Key, Value: r.Value})
 		}
 	}
-	return out, nil
+	return out
 }
 
 // Injection labels. Every rendered block opens with one of these so injected
@@ -102,11 +136,11 @@ func (m *Memory) Context(ctx context.Context, scope, project, keyword string, ma
 // background-context label; either scope being empty degrades to the other block
 // alone, and both empty degrades to "".
 func (m *Memory) TaskContext(ctx context.Context, project string, maxRecords int) (string, error) {
-	proj, err := m.Query(ctx, ScopeProject, project, "")
+	proj, err := m.recent(ctx, ScopeProject, project, maxRecords)
 	if err != nil {
 		return "", fmt.Errorf("project memory: %w", err)
 	}
-	glob, err := m.Query(ctx, ScopeGlobal, "", "")
+	glob, err := m.recent(ctx, ScopeGlobal, "", maxRecords)
 	if err != nil {
 		return "", fmt.Errorf("global memory: %w", err)
 	}
@@ -120,6 +154,22 @@ func (m *Memory) TaskContext(ctx context.Context, project string, maxRecords int
 		return projBlk, nil
 	}
 	return projBlk + "\n" + globBlk, nil
+}
+
+// recent returns at most `limit` of a scope's newest records, in oldest-first order
+// (so the existing "newest is the tail" rendering holds). It bounds the store read so
+// the task-start path fetches only the window TaskContext can render instead of scanning
+// a partition that grows one row per task. `limit` is the WHOLE render budget: splitBudget
+// can assign at most the full budget to a single scope (when the other is empty), so
+// `limit` rows per scope always suffices to fill the merged view, and a scope with fewer
+// rows is fetched whole — so the budget-flow math below is unchanged. A non-positive limit
+// is unbounded.
+func (m *Memory) recent(ctx context.Context, scope, project string, limit int) ([]Record, error) {
+	recs, err := m.store.QueryMemoryRecent(ctx, scope, project, limit)
+	if err != nil {
+		return nil, err
+	}
+	return filterRecords(recs, ""), nil
 }
 
 // splitBudget divides a total record budget between the project and global

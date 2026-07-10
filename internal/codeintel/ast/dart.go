@@ -29,7 +29,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -118,7 +117,7 @@ func (dartParser) calls(path string) (map[string][]string, error) {
 // receiver block; a getter/setter or a func/method/constructor is a method when nested in a
 // receiver, else a free function.
 func dartScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open dart file: %w", err)
 	}

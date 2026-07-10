@@ -14,9 +14,23 @@ import (
 // is per-call so parsing one file never depends on another.
 type goParser struct{}
 
+// parseGo reads path through the shared O_NOFOLLOW + size-capped opener (readSource)
+// and parses the bytes. Passing an explicit src matters for confinement: go/parser with
+// a nil src re-opens the path ITSELF and would follow a final-component symlink out of
+// the worktree (the I4 gap the other backends close via os.Open → openSource). Reading
+// first keeps Go behind the same guard, so a symlinked or oversized file yields
+// errSkipFile and the dispatcher turns it into a clean skip.
+func parseGo(fset *token.FileSet, path string) (*goast.File, error) {
+	src, err := readSource(path)
+	if err != nil {
+		return nil, err
+	}
+	return parser.ParseFile(fset, path, src, 0)
+}
+
 func (goParser) symbols(path string) ([]Symbol, error) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, 0)
+	f, err := parseGo(fset, path)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +65,7 @@ func (goParser) symbols(path string) ([]Symbol, error) {
 
 func (goParser) references(path string) ([]Reference, error) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, 0)
+	f, err := parseGo(fset, path)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +92,7 @@ func (goParser) references(path string) ([]Reference, error) {
 
 func (goParser) calls(path string) (map[string][]string, error) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, path, nil, 0)
+	f, err := parseGo(fset, path)
 	if err != nil {
 		return nil, err
 	}

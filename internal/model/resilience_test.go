@@ -190,6 +190,46 @@ func (f *partialCancelProvider) Stream(_ context.Context, _ string, _ []Message,
 
 func (f *partialCancelProvider) Model() string { return f.model }
 
+// cancelAwareProvider is a perfectly HEALTHY provider whose call returns the
+// context error whenever its context is already cancelled — modelling a user
+// steer or a session Cancel that interrupts the call mid-flight — and succeeds
+// otherwise. It is used to prove that a deliberate ctx cancel is NOT counted as a
+// provider failure by the breaker.
+type cancelAwareProvider struct {
+	model string
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *cancelAwareProvider) Complete(ctx context.Context, _ string, _ []Message, _ []Tool, _ int) (Response, error) {
+	return f.Stream(ctx, "", nil, nil, 0, nil)
+}
+
+func (f *cancelAwareProvider) Stream(ctx context.Context, _ string, _ []Message, _ []Tool, _ int, onChunk func(Chunk)) (Response, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Response{}, err
+	}
+	if onChunk != nil {
+		onChunk(Chunk{Text: f.model + "-ok"})
+	}
+	return Response{
+		Content:    []Block{{Type: "text", Text: f.model + "-ok"}},
+		StopReason: "end_turn",
+		Usage:      Usage{InputTokens: 1, OutputTokens: 1},
+	}, nil
+}
+
+func (f *cancelAwareProvider) Model() string { return f.model }
+
+func (f *cancelAwareProvider) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 // compile-time assertion: Resilient is itself a Streamer, so the loop sees a
 // streamer through the resilience wrapper (ST-T05).
 var _ Streamer = (*Resilient)(nil)
@@ -1033,4 +1073,79 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
+}
+
+// TestComplete_CancelDoesNotPoisonBreaker is the regression for the breaker-
+// poisoning bug: a deliberate context cancel (a user steer or a session Cancel)
+// was recorded as a provider failure, so a handful of consecutive mid-flight
+// cancels opened the breaker and then failed EVERY drive in the process on a
+// perfectly healthy provider for the whole cooldown. After the fix, repeated
+// cancels leave the breaker closed and a live call still succeeds.
+func TestComplete_CancelDoesNotPoisonBreaker(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	p := &cancelAwareProvider{model: "p"}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:       0,
+		BaseBackoff:      time.Millisecond,
+		BreakerThreshold: 2, // low threshold: the bug would trip after 2 cancels
+		BreakerCooldown:  time.Minute,
+	}, clock.Now)
+
+	// Cancel the provider mid-flight many times (well past the threshold).
+	for i := 0; i < 5; i++ {
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := r.Complete(cctx, "", nil, nil, 16); err == nil {
+			t.Fatalf("cancel %d: want a ctx error, got nil", i)
+		}
+	}
+
+	// The breaker must still be CLOSED: a live call reaches the provider and
+	// succeeds, rather than being skipped as "breaker open".
+	before := p.callCount()
+	resp, err := r.Complete(context.Background(), "", nil, nil, 16)
+	if err != nil {
+		t.Fatalf("healthy call after cancels failed (breaker wrongly opened by cancels?): %v", err)
+	}
+	if len(resp.Content) == 0 || resp.Content[0].Text != "p-ok" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if p.callCount() != before+1 {
+		t.Fatalf("provider was skipped on the healthy attempt: calls %d -> %d", before, p.callCount())
+	}
+}
+
+// TestStream_CancelDoesNotPoisonBreaker is the streaming twin: mid-stream steers
+// (the common case, since streaming is the longest phase) must not open the
+// breaker either.
+func TestStream_CancelDoesNotPoisonBreaker(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(0, 0)}
+	p := &cancelAwareProvider{model: "p"}
+	r := newTestResilient(t, []Provider{p}, Options{
+		MaxRetries:       0,
+		BaseBackoff:      time.Millisecond,
+		BreakerThreshold: 2,
+		BreakerCooldown:  time.Minute,
+	}, clock.Now)
+
+	for i := 0; i < 5; i++ {
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := r.Stream(cctx, "", nil, nil, 16, func(Chunk) {}); err == nil {
+			t.Fatalf("stream cancel %d: want a ctx error, got nil", i)
+		}
+	}
+
+	before := p.callCount()
+	var got []string
+	resp, err := r.Stream(context.Background(), "", nil, nil, 16, func(c Chunk) { got = append(got, c.Text) })
+	if err != nil {
+		t.Fatalf("healthy stream after cancels failed (breaker wrongly opened?): %v", err)
+	}
+	if resp.Content[0].Text != "p-ok" {
+		t.Fatalf("got %q, want p-ok", resp.Content[0].Text)
+	}
+	if p.callCount() != before+1 {
+		t.Fatalf("provider was skipped on the healthy stream: calls %d -> %d", before, p.callCount())
+	}
 }

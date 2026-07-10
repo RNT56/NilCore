@@ -70,6 +70,15 @@ func JudgeProject(ctx context.Context, projVerifier verify.Verifier, criteria []
 // It is the single call site the loop uses for both done-detection and the unmet
 // snapshot, so the two can never disagree.
 func (l *Loop) judge(ctx context.Context, st State) (done bool, unmet int) {
+	// Prefer the tip-aware authority once an integration tip exists: the run's verified
+	// work lives on that tip, never in st.Repo (the untouched base repo dir), so judging
+	// st.Repo would verify an EMPTY base — a fresh run could never green a red bar and an
+	// already-green base would converge goal-blind (I2). VerifyTip cuts a worktree from
+	// the tip and runs the project verifier + every criterion over IT (see Loop.VerifyTip).
+	// Until the first tip lands (st.Branch == "") or when unwired, judge st.Repo as before.
+	if l.VerifyTip != nil && st.Branch != "" {
+		return l.VerifyTip(ctx, st.Branch, st.Criteria)
+	}
 	var pv verify.Verifier
 	if l.Verifier != nil {
 		pv = l.Verifier(st.Repo)

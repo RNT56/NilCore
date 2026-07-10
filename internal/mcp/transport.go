@@ -91,11 +91,43 @@ type transport interface {
 // One shared reader means every round trip is serialized under mu, so two concurrent
 // callers can never interleave reads of the same stream (a real hazard under the
 // Manager's per-server reuse).
+// maxMCPResponseBytes caps a single MCP response so a hostile or buggy server
+// cannot exhaust host memory with one enormous reply. MCP servers are operator-
+// configured but typically third-party (npx/uvx) packages, and their output is
+// untrusted data (I7) — so the bound is real, not paranoia. Mirrors the provider
+// layer's 8 MiB read cap (internal/provider). The stdio decoder is shared across
+// messages, so it needs a per-message reset (boundedReader) rather than one
+// io.LimitReader over the whole stream.
+const maxMCPResponseBytes = 8 << 20
+
+// boundedReader caps how many bytes a single decode may consume from the wrapped
+// reader; reset() refreshes the per-message budget before each frame is decoded.
+type boundedReader struct {
+	r   io.Reader
+	n   int64
+	max int64
+}
+
+func (b *boundedReader) reset() { b.n = 0 }
+
+func (b *boundedReader) Read(p []byte) (int, error) {
+	if b.n >= b.max {
+		return 0, fmt.Errorf("mcp response exceeded %d-byte limit", b.max)
+	}
+	if int64(len(p)) > b.max-b.n {
+		p = p[:b.max-b.n]
+	}
+	n, err := b.r.Read(p)
+	b.n += int64(n)
+	return n, err
+}
+
 type stdioTransport struct {
 	mu     sync.Mutex
 	enc    *json.Encoder
 	dec    *json.Decoder
-	rd     *capReader // bounds bytes per decoded response (I7 OOM guard)
+	rd     *capReader     // bounds bytes per decoded response, measured from the read offset (I7 OOM guard)
+	lr     *boundedReader // second, per-message byte budget layered over rd (I7 OOM guard)
 	closer io.Closer
 	// closed is set the moment this connection is torn down (on a ctx-cancelled round-trip,
 	// or by the Manager). Once set, no further round-trip touches the shared enc/dec — that
@@ -107,10 +139,14 @@ type stdioTransport struct {
 }
 
 func newStdioTransport(rw io.ReadWriteCloser) *stdioTransport {
-	// The decoder reads through capReader so one hostile response can't grow json.Decoder's
-	// buffer without bound; the encoder writes straight to rw (writes are not the OOM vector).
+	// The decoder reads through two layered per-message OOM bounds so one hostile response can't
+	// grow json.Decoder's buffer without limit (I7): capReader wraps the pipe and caps bytes
+	// measured from the running read offset, and boundedReader wraps capReader with a fresh
+	// per-message budget the decoder reads through. The encoder writes straight to rw (writes are
+	// not the OOM vector).
 	rd := &capReader{r: rw, cap: maxResponseBytes}
-	return &stdioTransport{enc: json.NewEncoder(rw), dec: json.NewDecoder(rd), rd: rd, closer: rw}
+	lr := &boundedReader{r: rd, max: maxMCPResponseBytes}
+	return &stdioTransport{enc: json.NewEncoder(rw), dec: json.NewDecoder(lr), rd: rd, lr: lr, closer: rw}
 }
 
 func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResponse, error) {
@@ -163,7 +199,8 @@ func (t *stdioTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcResp
 		if err := ctx.Err(); err != nil {
 			return rpcResponse{}, err
 		}
-		t.rd.arm() // fresh per-response byte budget before each blocking decode (I7 OOM guard)
+		t.rd.arm()   // fresh per-response byte budget before each blocking decode (I7 OOM guard)
+		t.lr.reset() // and refresh the layered per-message budget so one giant reply can't OOM the host
 		ch := make(chan frame, 1)
 		go func() {
 			var resp rpcResponse
@@ -330,6 +367,10 @@ func (t *httpTransport) roundTrip(ctx context.Context, req rpcRequest) (rpcRespo
 	// body overflowed the cap, which is a hard error (never a truncated-but-"successful" decode).
 	lr := &io.LimitedReader{R: resp.Body, N: maxResponseBytes + 1}
 	var out rpcResponse
+	// Bound the response so a hostile/buggy server can't OOM the host (I7 — server output is
+	// untrusted). The body is already wrapped in an io.LimitedReader above; a reply that exhausts
+	// the cap is surfaced as a hard errResponseTooLarge rather than a truncated-but-"successful"
+	// decode.
 	if err := json.NewDecoder(lr).Decode(&out); err != nil {
 		if lr.N <= 0 {
 			return rpcResponse{}, fmt.Errorf("mcp http %s: %w", req.Method, errResponseTooLarge)
@@ -412,6 +453,11 @@ func readSSEResponse(body io.Reader, wantID int, method string) (rpcResponse, er
 				data.WriteByte('\n')
 			}
 			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			// Bound accumulation across many data: lines in one event (the scanner
+			// already caps a single line) so a hostile server can't OOM the host.
+			if data.Len() > maxMCPResponseBytes {
+				return rpcResponse{}, fmt.Errorf("mcp sse %s: response exceeded %d-byte limit", method, maxMCPResponseBytes)
+			}
 		}
 		// `event:`/`id:`/comment lines are ignored — only the JSON-RPC payload matters.
 	}

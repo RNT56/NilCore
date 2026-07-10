@@ -28,9 +28,11 @@ func (GitTool) Schema() json.RawMessage {
 // else is rejected so a model-supplied range can never smuggle a flag or path.
 var blameRange = regexp.MustCompile(`^\d+(,\d+)?$`)
 
-// safeRev permits only the characters a revision/ref needs (alnum plus ./_-^~), and
-// never a leading dash — so `rev` can never be read as a flag.
-var safeRev = regexp.MustCompile(`^[A-Za-z0-9_./^~-]+$`)
+// safeRev permits only the characters a revision/ref needs (alnum plus ./_-^~). The
+// FIRST character excludes dash, so `rev` can never be read as a flag: without the
+// anchor, the trailing `-` in the class matched a leading dash and a value like
+// `--ext-diff` would inject a git option into `git show --stat <rev>`.
+var safeRev = regexp.MustCompile(`^[A-Za-z0-9_./^~][A-Za-z0-9_./^~-]*$`)
 
 func (GitTool) Run(ctx context.Context, workdir string, input json.RawMessage) (string, error) {
 	var in struct {
@@ -58,9 +60,10 @@ func (GitTool) Run(ctx context.Context, workdir string, input json.RawMessage) (
 	case "status":
 		args = []string{"status", "--short"}
 	case "diff":
-		// `--` ends option parsing: model-supplied paths can never be read as
-		// flags (e.g. `--output=/tmp/x` would otherwise exfiltrate the diff).
-		args = append([]string{"diff", "--"}, in.Paths...)
+		// --no-ext-diff overrides any repo-local diff.external (defense-in-depth on top
+		// of the .git write-guard); `--` ends option parsing so model-supplied paths can
+		// never be read as flags (e.g. `--output=/tmp/x` would otherwise exfiltrate the diff).
+		args = append([]string{"diff", "--no-ext-diff", "--"}, in.Paths...)
 	case "add":
 		if len(in.Paths) == 0 {
 			args = []string{"add", "-A"}
@@ -98,7 +101,7 @@ func (GitTool) Run(ctx context.Context, workdir string, input json.RawMessage) (
 		if !safeRev.MatchString(rev) {
 			return "", fmt.Errorf("show rev contains disallowed characters")
 		}
-		args = []string{"show", "--stat", rev}
+		args = []string{"show", "--no-ext-diff", "--stat", rev}
 	default:
 		return "", fmt.Errorf("unsupported git op %q", in.Op)
 	}

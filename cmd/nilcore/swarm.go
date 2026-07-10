@@ -489,10 +489,20 @@ func buildSwarm(d swarmDeps) (swarmAssembly, error) {
 	// --- the per-worktree env factory (sandbox + project verifier), reused from
 	// build.go. The project verifier is only the raw build child for code/ui packs;
 	// the per-shard governing verifier is the packs.Build composite below. ---
+	//
+	// FIX 3: wire -blast-radius so the unattended safety envelope actually bounds the run
+	// (it was pulled in via registerCommon but never consumed, a silent no-op). The shared
+	// blast budget fences every shard's sandbox cumulative WALL-TIME (BR-T03) via attachBlast
+	// inside the factory — the SAME meter build/run thread in. nil when -blast-radius is off
+	// (the default) ⇒ unfenced, byte-identical. (The auto-approval $/count axes are moot here:
+	// the swarm's promote gate uses a nil approver that never auto-lands, so there is nothing
+	// to auto-approve.)
+	blast := mintBlastBudget(*sf.common.blastRadius, d.log)
 	newEnv := buildEnvFactory(buildDeps{
 		runtime:     *sf.common.runtime,
 		image:       *sf.common.image,
 		sandboxPref: *sf.common.sandboxPref,
+		blast:       blast,
 	}, *sf.common.checkCmd)
 
 	// --- the Integrator (FanInMerge / code preset only) or nil (FanInCollate). ---
@@ -767,13 +777,24 @@ func (a swarmAssembly) run(ctx context.Context) (swarm.Outcome, error) {
 		// Offer the converged tip to the single human gate. A nil approver
 		// default-denies, so this NEVER auto-lands; it records the gate decision.
 		if out.TipBranch != "" {
+			// FIX 1: the gate + earned-trust boundary key on the merge TARGET base (the base
+			// repo's current branch), NOT the source tip — GradedApprover.scopeFor reads
+			// GateAction.Branch for both the trust bucket AND the "never auto-approve main/prod"
+			// floor, so a tip there would let that structural floor go silent (a latent
+			// auto-merge-into-main hazard). Resolve the base branch; the source tip rides in
+			// Detail. A detached HEAD (no symbolic ref) leaves it empty ⇒ fall back to the tip.
+			target := out.TipBranch
+			if base, berr := baseBranchName(ctx, a.repo); berr == nil && base != "" {
+				target = base
+			}
 			// GAA-T04: record the verifier-green promote boundary so graapprove.TrustView
-			// can fold it into earned trust for promote-to-base on this tip — the swarm is a
-			// boundary_outcome SOURCE even though it never auto-lands itself. `passed` is the
-			// verifier verdict (clean ⇐ out.Done && Remaining==0 && chainOK), never a backend
-			// self-report (I2). Emitted before the gate so the audit order stays causal.
-			emitBoundaryOutcome(a.log(), policy.PromoteToBase.String(), out.TipBranch, true)
-			_ = a.gate(policy.GateAction{Type: policy.PromoteToBase, Branch: out.TipBranch})
+			// can fold it into earned trust for promote-to-base on the TARGET base — the swarm
+			// is a boundary_outcome SOURCE even though it never auto-lands itself. `passed` is
+			// the verifier verdict (clean ⇐ out.Done && Remaining==0 && chainOK), never a
+			// backend self-report (I2). Emitted before the gate so the audit order stays causal.
+			emitBoundaryOutcome(a.log(), policy.PromoteToBase.String(), target, true)
+			_ = a.gate(policy.GateAction{Type: policy.PromoteToBase, Branch: target,
+				Detail: "promote converged swarm tip " + out.TipBranch + " → " + target})
 		}
 	}
 	return out, nil

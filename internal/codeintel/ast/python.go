@@ -19,7 +19,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -86,7 +85,7 @@ func (pythonParser) calls(path string) (map[string][]string, error) {
 // no regex work for calls). Returning both keeps the three public methods consistent
 // (they agree on spans because they share this walk).
 func pythonScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open python file: %w", err)
 	}

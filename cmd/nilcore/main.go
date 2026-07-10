@@ -1023,10 +1023,11 @@ func autoSuperviseTrigger(prov model.Provider, log *eventlog.Log) func(goal stri
 // actions (I3/policy).
 func buildRunOrchestrator(c commonFlags, b boot, log *eventlog.Log, absDir string, blast *blastbudget.Budget) *agent.Orchestrator {
 	// Open the persistence backbone, then build the orchestrator over it. A one-shot
-	// command (propose-edit / watch / scheduler / webhook / `nilcore flywheel`) owns its
+	// command (propose-edit / watch / scheduler / standalone `nilcore flywheel`) owns its
 	// own store for the process lifetime. A long-running serve must NOT call this for its
-	// folds — it would open a SECOND single-writer handle to the same DB; serve uses
-	// buildRunOrchestratorWith with the store it already opened (see serveMain).
+	// folds — it would open a SECOND single-writer handle to the same DB; serve (and its
+	// embedded flywheel / autonomy daemon / webhook listener) use buildRunOrchestratorWith
+	// with the store it already opened (see serveMain).
 	mem, cp, _ := setupPersistence(log, *c.logPath)
 	return buildRunOrchestratorWith(c, b, log, absDir, blast, mem, cp)
 }
@@ -1184,7 +1185,7 @@ func serveMain(args []string) {
 	// built HERE (at startup) so a missing model key fails loudly at boot rather than
 	// inside the goroutine; each tick runs one bounded cycle (verifier + gate own every
 	// ship — I2). It never edits the verifier of record (selfimprove.DefaultScope).
-	if os.Getenv("NILCORE_FLYWHEEL") != "" {
+	if envOptIn("NILCORE_FLYWHEEL") {
 		// Reuse serve's already-opened persistence (mem/ckpt) — never re-open the store
 		// (one *sql.DB for the whole serve process; no competing single-writer handles).
 		fwBlast := mintBlastBudget(*c.blastRadius, log)
@@ -1270,7 +1271,7 @@ func serveMain(args []string) {
 	// objective CRUD is operator-only (XC-T06); the daemon only RUNS what an objective
 	// names. An empty backlog emits nothing, so this is inert until objectives exist.
 	autonomyOwnsWakes := false
-	if os.Getenv("NILCORE_AUTONOMY") != "" && serveStore != nil {
+	if envOptIn("NILCORE_AUTONOMY") && serveStore != nil {
 		// Reuse serve's already-opened persistence (mem/ckpt + serveStore) — the daemon
 		// shares the one *sql.DB for both its orchestrator and the objective backlog, so
 		// it never opens a competing single-writer handle to the same file.
@@ -1298,6 +1299,10 @@ func serveMain(args []string) {
 	// SCM/CI webhook intake (P9-T04), opt-in via --webhook: a signed GitHub webhook
 	// becomes a trigger.Signal on the same gated machinery, bounded by the serve ctx.
 	if *webhookAddr != "" {
+		// Pass serve's already-opened mem/ckpt so the webhook orchestrator shares the one
+		// store handle instead of opening a competing single-writer handle to nilcore.db,
+		// and the one shared serve blast fence (serveBlast) so the webhook run is bounded by
+		// the same envelope as the rest of serve (nil when off ⇒ unfenced).
 		startWebhookListener(ctx, *webhookAddr, c, b, log, absDir, b.cred("NILCORE_WEBHOOK_SECRET"), mem, ckpt, serveBlast)
 	}
 
@@ -1761,12 +1766,15 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
 	n.CtxWindow = meter.CtxWindow
 	if adv.prov != nil {
-		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+		// Meter the advisor against the same conversation/thread budget wall as the
+		// main provider (§6/§7) — a raw adv.prov would let strong-model consults escape
+		// the ceiling.
+		n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
 	}
 	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX —
 	// the serve loop gets the same `live` tool as the run/chat paths.
-	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+	if envOptIn("NILCORE_LIVE_INDEX") {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
 	// Cross-project memory + distilled lessons, and the operator's steering file —
@@ -2088,6 +2096,26 @@ func resolveAdvisor(backendName string, b boot, c commonFlags) advisorCfg {
 	return adv
 }
 
+// meteredAdvisor wraps the advisor's provider in the SAME budget meter as the main
+// loop's provider, so ask_advisor and auto-escalation consults on the (expensive)
+// strong model charge the per-run / per-conversation budget wall (§6/§7) instead of
+// escaping it. On the metered paths (chat/serve) the main loop's provider is a
+// *meter.Provider, whose Ledger we reuse. When the main provider is unmetered (a
+// path with no wall) or there is no advisor, advProv is returned unchanged — byte-
+// identical to before. Mirrors build.go, where advisorFor already runs on a metered
+// strong provider (build.go:545 documents that exact budget-escape fix for the build
+// path; run/chat/serve had kept the raw, unmetered advisor).
+func meteredAdvisor(main, advProv model.Provider) model.Provider {
+	if advProv == nil {
+		return nil
+	}
+	mp, ok := main.(*meter.Provider)
+	if !ok {
+		return advProv // the main loop isn't metered on this path: nothing to charge
+	}
+	return &meter.Provider{Inner: advProv, Ledger: mp.Ledger, Task: mp.Task + "-advisor", Price: meter.NewTable()}
+}
+
 // sandboxReport renders which sandbox backend `nilcore` will use on this host:
 // the namespace backend (no container runtime needed) when the kernel supports
 // it, else a container. It probes the live host, so it lives here rather than in
@@ -2380,9 +2408,10 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
 		}
-		// A fresh advisor per task so its per-task consult ceiling is honored.
+		// A fresh advisor per task so its per-task consult ceiling is honored. Metered
+		// against the main provider's wall (§6/§7) so strong-model consults can't escape it.
 		if adv.prov != nil {
-			n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+			n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
 			n.EscalateAfter = adv.escalateAfter
 		}
 		attachMemoryContext(n, mem, project)
@@ -2396,7 +2425,7 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
 		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;
 		// no full per-run index cost unless requested).
-		if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+		if envOptIn("NILCORE_LIVE_INDEX") {
 			n.LiveSession = liveSession(mem, project)
 		}
 		return n

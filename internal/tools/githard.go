@@ -14,12 +14,27 @@ import (
 // environment clamp (HardenedEnv).
 
 // HardenArgs returns the `-c` flags to prefix to every git invocation. They
-// neutralize the two repo-controlled code-execution vectors that survive the
-// environment clamp: per-repo hooks and the fsmonitor hook binary.
+// neutralize the repo-controlled code-execution vectors that survive the environment
+// clamp and that a command-line `-c` CAN cleanly override (it outranks repo-local
+// $GIT_DIR/config): per-repo hooks, the fsmonitor hook binary, and a forced-signed
+// commit's gpg.program (`commit.gpgSign=false` stops a repo-local
+// `commit.gpgSign=true`+`gpg.program=…` from invoking an attacker program on `commit`).
+//
+// We deliberately do NOT clamp `diff.external` here: `-c diff.external=` sets the
+// external-diff program to the EMPTY string, which git then tries to EXECUTE on any
+// non-empty diff ("cannot run : No such file or directory" → exit 128), breaking every
+// `git diff`. No `-c` value disables it (the correct switch, --no-ext-diff, is
+// per-command, not global). `diff.external`, the `filter.<name>.clean/smudge` drivers,
+// and named `diff.<name>.command` drivers are all covered instead by the PRIMARY
+// defense — refusing file writes inside `.git` (worktreefs.writeNoFollow) — so a
+// driver's definition can never be planted in repo-local .git/config to begin with;
+// the git tool additionally passes --no-ext-diff on its own diff/show ops (git.go).
+// These `-c` flags are defense-in-depth on top of the write-guard.
 func HardenArgs() []string {
 	return []string{
 		"-c", "core.hooksPath=/dev/null", // disable all repo hooks (pre-commit, etc.)
 		"-c", "core.fsmonitor=", // disable any fsmonitor hook binary
+		"-c", "commit.gpgSign=false", // never invoke gpg.program via a forced signed commit
 	}
 }
 

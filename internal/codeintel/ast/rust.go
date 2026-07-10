@@ -17,7 +17,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -78,7 +77,7 @@ func (rustParser) calls(path string) (map[string][]string, error) {
 // rustScan is the shared single pass; see jsScan for the structure (it mirrors that
 // backend, differing only in header shapes and the receiver being an `impl` block).
 func rustScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open rust file: %w", err)
 	}

@@ -521,3 +521,20 @@ func TestThroughRegistry(t *testing.T) {
 		t.Fatalf("Resolve status = %q, want Pass", st)
 	}
 }
+
+// TestVarianceBoundedRefusedStandalone is the I2 strength gate through the registry: the
+// box-free benchmark.variance_bounded re-measures NOTHING (it only checks the CV of the
+// worker's OWN model-authored samples), so bound as the sole verifier of a value-bearing
+// claim it is refused (Unverifiable) rather than greening self-supplied samples. A perf claim
+// that asserts a Value must use the re-measuring benchmark.script_threshold instead.
+func TestVarianceBoundedRefusedStandalone(t *testing.T) {
+	r := evverify.New()
+	RegisterAll(r)
+	// Perfectly-consistent OWN samples (CV 0): checkVarianceBounded ALONE would Pass this, so
+	// a green here would be the exact self-supplied hollow the gate exists to refuse.
+	val := specValue(t, "ns/op", 0, opLE, 0, 0.05, []float64{100, 100, 100})
+	st, _ := r.Resolve(context.Background(), &seqBox{}, claim(IDVarianceBounded, val, ""))
+	if st != artifact.StatusUnverifiable {
+		t.Fatalf("standalone variance_bounded on a value-bearing claim status = %q, want unverifiable", st)
+	}
+}

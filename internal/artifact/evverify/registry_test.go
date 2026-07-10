@@ -134,6 +134,72 @@ func TestRegistry(t *testing.T) {
 	})
 }
 
+// TestResolveStrengthBinding is the I2 "hollow green" gate: a claim that ASSERTS a Value
+// must be bound to a verifier that actually checks that Value. A value-blind verifier
+// (url_resolves / not_stale) or a box-free self-consistency check (variance_bounded) bound
+// to a value-bearing claim fails closed BEFORE the check runs — while a value-LESS claim
+// keeps the legitimate provenance use.
+func TestResolveStrengthBinding(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("value-bearing url_resolves fails closed (never a hollow green), box never reached", func(t *testing.T) {
+		r := Default() // registers web.url_resolves → checkURLResolves
+		// A box that WOULD pass url_resolves (curl -f exits 0 on a 2xx) — so without the gate
+		// this greens. The fabricated Value is never inspected by url_resolves.
+		box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+			return sandbox.Result{ExitCode: 0}, nil
+		}}
+		c := claimWithURL("web.url_resolves", "https://example.com/report")
+		c.Evidence.Value = "GDP grew 3.2% in Q2" // a value nothing here verifies
+		st, d := r.Resolve(ctx, box, c)
+		if st == artifact.StatusPass {
+			t.Fatal("a value-bearing claim on a value-blind verifier must NOT Pass (hollow green)")
+		}
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("status = %q, want unverifiable", st)
+		}
+		if box.lastCmd != "" {
+			t.Fatalf("the gate must fire BEFORE the check runs; box saw %q", box.lastCmd)
+		}
+		if !strings.Contains(d, "value-blind") {
+			t.Fatalf("detail %q should explain the value-blind refusal", d)
+		}
+	})
+
+	t.Run("value-LESS url_resolves is still allowed on a 2xx (legit use preserved)", func(t *testing.T) {
+		r := Default()
+		box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+			return sandbox.Result{ExitCode: 0}, nil
+		}}
+		// claimWithURL leaves Value empty — a pure "this URL resolves" assertion.
+		st, _ := r.Resolve(ctx, box, claimWithURL("web.url_resolves", "https://example.com"))
+		if st != artifact.StatusPass {
+			t.Fatalf("a value-less url_resolves claim on a 2xx must Pass; got %q", st)
+		}
+	})
+
+	t.Run("standalone variance_bounded is refused for a value-bearing claim, check never runs", func(t *testing.T) {
+		// Register a variance_bounded stub that WOULD Pass, to prove the gate fails closed
+		// before the box-free self-consistency check ever runs (it re-measures nothing, so it
+		// can never green a value-bearing claim standalone).
+		r := New()
+		ran := false
+		r.Register("benchmark.variance_bounded", func(context.Context, sandbox.Sandbox, artifact.Claim) (artifact.Status, string) {
+			ran = true
+			return artifact.StatusPass, "cv within ceiling"
+		})
+		c := claimWithURL("benchmark.variance_bounded", "")
+		c.Evidence.Value = `{"cv_max":0.05,"samples":[1,1,1]}`
+		st, _ := r.Resolve(ctx, &fakeBox{}, c)
+		if st != artifact.StatusUnverifiable {
+			t.Fatalf("standalone variance_bounded on a value-bearing claim must be Unverifiable; got %q", st)
+		}
+		if ran {
+			t.Fatal("the box-free check must NOT run — the gate fails closed before it")
+		}
+	})
+}
+
 func TestRegistryURLResolves(t *testing.T) {
 	ctx := context.Background()
 

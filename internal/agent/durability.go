@@ -42,8 +42,28 @@ func (c *Checkpoint) Complete(ctx context.Context, taskID, goal string, verified
 // is a non-runnable status that the restart resumer (Resume) skips — it only re-drives
 // "running"/"interrupted" — so the suspended drive is NOT re-driven on a restart; the
 // wake registry owns resume, which would otherwise double it. One UpsertTask write.
-func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal string) error {
-	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: "suspended"})
+//
+// branch is the ref under which the drive's committed work was preserved across the nap
+// ("" when nothing was preserved). It is recorded in the row's Detail so a resume can
+// find and reattach to that committed work instead of starting from a fresh, empty
+// worktree — the durable half of the "committed work survives a sleep" guarantee. Detail
+// is a small JSON object so the schema stays forward-compatible (new fields default-zero
+// on an old row); an empty branch leaves Detail "" (byte-identical to the pre-fix row).
+func (c *Checkpoint) Suspend(ctx context.Context, taskID, goal, branch string) error {
+	detail := ""
+	if branch != "" {
+		if b, err := json.Marshal(suspendDetail{Branch: branch}); err == nil {
+			detail = string(b)
+		}
+	}
+	return c.store.UpsertTask(ctx, store.Task{ID: taskID, Goal: goal, Status: "suspended", Detail: detail})
+}
+
+// suspendDetail is the JSON payload of a suspended task row: the ref under which the
+// drive's committed work was preserved, so a resume can reattach to it rather than
+// re-run from an empty tree.
+type suspendDetail struct {
+	Branch string `json:"branch,omitempty"`
 }
 
 // Interrupt marks every running task "interrupted" — the clean SIGTERM checkpoint

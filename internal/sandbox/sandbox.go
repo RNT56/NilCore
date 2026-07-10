@@ -108,11 +108,20 @@ func (c *Container) Workdir() string { return c.HostDir }
 
 // AllowEgressVia routes the container's network through an allowlist proxy
 // (proxyURL, e.g. policy.ProxyURL(addr)). Without this, egress is denied entirely
-// (--network none). The proxy enforces the policy.Egress allowlist, so only
-// approved hosts are reachable even though the container now has a network.
+// (--network none, the safe default). The proxy enforces the policy.Egress
+// allowlist for proxy-respecting clients.
+//
+// SECURITY (important): this sets `--network bridge`, which gives the container a
+// real NAT route to the internet, and points HTTP(S)_PROXY at the allowlist proxy.
+// The allowlist is therefore COOPERATIVE, not a hard boundary — a model-emitted
+// command that ignores the proxy (curl --noproxy, raw sockets, bash /dev/tcp) can
+// still reach arbitrary hosts, including the cloud-metadata endpoint. For a HARD
+// egress boundary use the namespace backend (Linux), which runs with an empty
+// network namespace (deny-all). applyContainerEgress (cmd/nilcore) warns about this
+// and honors NILCORE_EGRESS_STRICT to fail closed.
 //
 // NOTE: allowlisted egress is a CONTAINER-backend capability only. The namespace
-// backend (Auto-preferred on Linux) has no equivalent — it is deny-all (see
+// backend (Auto-preferred on Linux) has no proxy path — it is hard deny-all (see
 // namespace_linux.go). Callers that need web_fetch / a non-empty egress allowlist
 // must run on the container backend (`-sandbox container`).
 func (c *Container) AllowEgressVia(proxyURL string) {
@@ -123,6 +132,11 @@ func (c *Container) AllowEgressVia(proxyURL string) {
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
 		c.Env[k] = proxyURL
 	}
+	// Pin no_proxy empty so an inherited NO_PROXY can't exempt any host from the
+	// proxy (defense-in-depth; it does NOT stop a client that bypasses the proxy
+	// entirely — see the SECURITY note above).
+	c.Env["NO_PROXY"] = ""
+	c.Env["no_proxy"] = ""
 }
 
 // runArgs builds the container runtime argument list (extracted so the hardening
