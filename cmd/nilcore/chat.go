@@ -487,9 +487,12 @@ func splitHosts(s string) []string {
 // for docker, with an --add-host so it resolves on docker-Linux too).
 // egressWarnOnce/egressStrictWarnOnce bound the container-egress security advisories
 // to one line per process (applyContainerEgress runs per drive / per swarm worker).
+// egressHardWarnOnce/egressHardFailWarnOnce do the same for the HARD-mode advisories.
 var (
-	egressWarnOnce       sync.Once
-	egressStrictWarnOnce sync.Once
+	egressWarnOnce         sync.Once
+	egressStrictWarnOnce   sync.Once
+	egressHardWarnOnce     sync.Once
+	egressHardFailWarnOnce sync.Once
 )
 
 func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, runtime string) {
@@ -498,6 +501,16 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 	}
 	c, ok := box.(*sandbox.Container)
 	if !ok {
+		return
+	}
+	// HARD egress (opt-in NILCORE_EGRESS_HARD): make the allowlist UNBYPASSABLE via a
+	// --internal network + a dual-homed gateway container, instead of the cooperative
+	// bridge+proxy below. On ANY setup failure this FAILS CLOSED — the box stays
+	// --network none (deny-all) — and NEVER silently falls back to cooperative bridge.
+	// Linux-container only, CI-validated (see egress_hard.go). Default (unset) ⇒ the
+	// existing STRICT/cooperative paths below run byte-identically.
+	if envOptIn("NILCORE_EGRESS_HARD") {
+		applyHardEgress(c, egress, runtime)
 		return
 	}
 	// The container backend's egress allowlist is enforced by a COOPERATIVE proxy over a
@@ -533,6 +546,28 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 		}
 	}
 	c.AllowEgressVia(policy.ProxyURL(net.JoinHostPort(hostAlias, port)))
+}
+
+// applyHardEgress wires the container to a HARD egress boundary (opt-in
+// NILCORE_EGRESS_HARD): the allowlist proxy runs as a dual-homed gateway on a
+// --internal network with no route out, so it is UNBYPASSABLE (see egress_hard.go).
+// It reuses ONE gateway per (runtime,image,allowlist) across drives. On ANY setup
+// failure it FAILS CLOSED — the box keeps --network none (deny-all) — and never falls
+// back to the cooperative bridge. Callers pass the container box (already cast).
+func applyHardEgress(c *sandbox.Container, egress policy.Egress, runtime string) {
+	egressHardWarnOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_HARD set — routing container egress through a --internal-network gateway (the allowlist becomes unbypassable). Linux-container only; requires the nilcore image (a debian:stable-slim has no nilcore binary); the DNS-tunnel residual is only mitigated. The namespace backend (Linux) remains the recommended hard boundary.")
+	})
+	h, ok := getHardEgress(runtime, c.Image, egress)
+	if !ok {
+		// FAIL CLOSED: leave the box at --network none. Never cooperative-fallback.
+		egressHardFailWarnOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_HARD — hard egress setup FAILED; egress stays deny-all (--network none). Ensure a Linux container runtime + the nilcore image, or unset NILCORE_EGRESS_HARD to accept cooperative egress.")
+		})
+		return
+	}
+	c.AllowEgressViaHard(h.network, h.proxyURL)
+	c.DNS = h.dns
 }
 
 // containsString reports whether s is present in xs (small linear scan — the slices

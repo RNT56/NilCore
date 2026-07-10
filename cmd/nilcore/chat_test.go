@@ -608,6 +608,107 @@ func TestApplyContainerEgress(t *testing.T) {
 	})
 }
 
+// TestApplyContainerEgressHard proves the HARD-mode DECISION seam in
+// applyContainerEgress without a real container: with NILCORE_EGRESS_HARD set and a
+// FAKE setupHardEgressFn, an ok setup routes the box through the internal-net gateway
+// (AllowEgressViaHard + --dns), while a failing setup FAILS CLOSED (the box stays
+// --network none, no proxy env) — it must NEVER fall back to the cooperative bridge.
+func TestApplyContainerEgressHard(t *testing.T) {
+	egress := policy.Egress{Allowed: []string{"example.com"}}
+
+	// Isolate package-level hard-egress state so cache/teardown carry-over between
+	// subtests (and other tests) can't taint these assertions.
+	reset := func() {
+		hardMu.Lock()
+		hardTeardowns = nil
+		hardCache = map[string]hardEgressHandle{}
+		hardMu.Unlock()
+	}
+	restore := setupHardEgressFn
+	t.Cleanup(func() { setupHardEgressFn = restore; reset() })
+
+	t.Run("setup ok routes through the internal-net gateway", func(t *testing.T) {
+		reset()
+		t.Setenv("NILCORE_EGRESS_HARD", "1")
+		var teardownCalls int
+		setupHardEgressFn = func(runtime string, e policy.Egress, image string) (string, string, func(), error) {
+			return "nilcore-egr-net-fake", "http://10.42.0.5:3128", func() { teardownCalls++ }, nil
+		}
+		box := sandbox.NewContainer("podman", "img", "/work")
+		applyContainerEgress(box, egress, "0.0.0.0:54321", "podman")
+
+		if box.Network != "nilcore-egr-net-fake" {
+			t.Errorf("hard ok: Network = %q, want the internal net", box.Network)
+		}
+		if box.Network == "bridge" {
+			t.Errorf("hard mode must NEVER use the cooperative bridge")
+		}
+		if box.Env["HTTP_PROXY"] != "http://10.42.0.5:3128" {
+			t.Errorf("hard ok: HTTP_PROXY = %q, want the gateway", box.Env["HTTP_PROXY"])
+		}
+		if box.DNS != "10.42.0.5" {
+			t.Errorf("hard ok: DNS = %q, want the gateway IP (blackhole in-sandbox DNS)", box.DNS)
+		}
+		if len(box.ExtraHosts) != 0 {
+			t.Errorf("hard mode must add no --add-host, got %v", box.ExtraHosts)
+		}
+		// Reused across drives: a second apply must not spawn a second gateway.
+		before := teardownCalls
+		box2 := sandbox.NewContainer("podman", "img", "/work")
+		applyContainerEgress(box2, egress, "0.0.0.0:54321", "podman")
+		hardMu.Lock()
+		n := len(hardTeardowns)
+		hardMu.Unlock()
+		if n != 1 {
+			t.Errorf("hard gateway should be reused per (runtime,image,allowlist); teardowns=%d, want 1", n)
+		}
+		if teardownCalls != before {
+			t.Errorf("reuse must not tear down the shared gateway")
+		}
+		// A clean drain fires the single registered teardown exactly once.
+		stopHardEgress()
+		if teardownCalls != 1 {
+			t.Errorf("stopHardEgress should fire the gateway teardown once, got %d", teardownCalls)
+		}
+	})
+
+	t.Run("setup failure fails closed (never bridge)", func(t *testing.T) {
+		reset()
+		t.Setenv("NILCORE_EGRESS_HARD", "1")
+		setupHardEgressFn = func(string, policy.Egress, string) (string, string, func(), error) {
+			return "", "", nil, errStub
+		}
+		box := sandbox.NewContainer("podman", "img", "/work")
+		applyContainerEgress(box, egress, "0.0.0.0:54321", "podman")
+
+		if box.Network != "none" {
+			t.Errorf("hard setup failure must FAIL CLOSED at --network none, got %q", box.Network)
+		}
+		for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY"} {
+			if box.Env[k] != "" {
+				t.Errorf("failed hard setup must set no proxy env, got %s=%q", k, box.Env[k])
+			}
+		}
+	})
+
+	t.Run("default (opt-out) stays cooperative", func(t *testing.T) {
+		reset()
+		// NILCORE_EGRESS_HARD unset ⇒ the fake must never be consulted; cooperative wiring.
+		setupHardEgressFn = func(string, policy.Egress, string) (string, string, func(), error) {
+			t.Fatal("hard setup must NOT run when NILCORE_EGRESS_HARD is unset")
+			return "", "", nil, nil
+		}
+		box := sandbox.NewContainer("podman", "img", "/work")
+		applyContainerEgress(box, egress, "0.0.0.0:54321", "podman")
+		if box.Network != "bridge" {
+			t.Errorf("default path should stay cooperative (bridge), got %q", box.Network)
+		}
+	})
+}
+
+// errStub is a sentinel error for the hard-egress failure path.
+var errStub = errors.New("stub setup failure")
+
 func TestWebEnabled(t *testing.T) {
 	off := chatDeps{}
 	if off.webEnabled() {

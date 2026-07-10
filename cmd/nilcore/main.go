@@ -147,6 +147,11 @@ func main() {
 		browseMain(args[1:])
 	case "desktop":
 		desktopMain(args[1:])
+	case "egress-gateway":
+		// Hidden verb (NOT in `nilcore help`): the process the HARD egress GATEWAY
+		// container runs — an allowlist proxy the hard-egress lifecycle launches
+		// inside a dual-homed container. See egress_gateway.go / egress_hard.go.
+		egressGatewayMain(args[1:])
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			runMain(args) // documented `nilcore -goal ...` default
@@ -1127,6 +1132,15 @@ func serveMain(args []string) {
 		if err := ckpt.SweepSuspended(context.Background(), absDir, 0); err != nil {
 			log.Append(eventlog.Event{Kind: "maint_error", Detail: map[string]any{"op": "suspend_sweep", "error": err.Error()}})
 		}
+	}
+	// Reclaim leaked HARD-egress gateways + internal networks (label-scoped) left by a
+	// crashed prior process. Best-effort + NON-BLOCKING, and only when hard mode is
+	// opted in — a default (opt-out) boot spawns no runtime processes, so its behaviour
+	// is byte-identical. A clean shutdown drains this process's own gateways via the
+	// deferred stopHardEgress below.
+	if envOptIn("NILCORE_EGRESS_HARD") {
+		reapHardEgress(*c.runtime, log)
+		defer stopHardEgress()
 	}
 	validateConcreteBackendFlag("-prefer-backend", *c.preferBackend)
 	// Resolve `-backend auto` / config backend:auto to a concrete name before serve
