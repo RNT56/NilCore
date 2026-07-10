@@ -86,8 +86,8 @@ func enforceRuleOfTwo(log *eventlog.Log, enforce, untrusted, repoMounted bool, e
 		if approver != nil && approver.Approve(prompt) {
 			return nil
 		}
-		return fmt.Errorf("Rule of Two: the lethal trifecta (untrusted web input ∧ private repo data ∧ open egress) was denied at the gate; narrow the egress allowlist, or set NILCORE_RULE_OF_TWO=0 to opt out")
+		return fmt.Errorf("the lethal trifecta (untrusted web input ∧ private repo data ∧ open egress) was denied at the Rule-of-Two gate; narrow the egress allowlist, or set NILCORE_RULE_OF_TWO=0 to opt out")
 	default: // Refuse: the lethal trifecta with no gate available (headless, no envelope).
-		return fmt.Errorf("Rule of Two: refusing the lethal trifecta (untrusted web input ∧ private repo data ∧ open egress) with no human gate; narrow the egress allowlist, run attended, configure a graduated-auto-approval envelope, or set NILCORE_RULE_OF_TWO=0 to opt out")
+		return fmt.Errorf("refusing the lethal trifecta (untrusted web input ∧ private repo data ∧ open egress) with no human gate (Rule of Two); narrow the egress allowlist, run attended, configure a graduated-auto-approval envelope, or set NILCORE_RULE_OF_TWO=0 to opt out")
 	}
 }
