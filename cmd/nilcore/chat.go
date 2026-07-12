@@ -40,7 +40,6 @@ import (
 	"syscall"
 	"time"
 
-	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/blastbudget"
@@ -1352,14 +1351,10 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 		MaxSteps:     *d.flags.common.maxSteps,
 		Seed:         in.Seed,
 	}
-	// Repo orientation + window awareness (upgrade program), exactly as buildBackend
-	// (run/watch) and the serve backend already wire: without these the interactive
-	// chat/TUI drive starts BLIND (no repo map ⇒ ls/cat structure discovery on every
-	// first step) and never proactively compacts (nil CtxWindow ⇒ only the one-shot
-	// overflow-400 recovery). box.Workdir() is the same per-task worktree the backend
-	// is built against; both are nil-safe seams.
-	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
-	n.CtxWindow = meter.CtxWindow
+	configureNativeRuntime(n, nativeRuntimeConfig{
+		Provider: prov, Advisor: adv, Box: box, Memory: d.mem,
+		Project: d.baseRepo, SteeringDir: d.baseRepo,
+	})
 	if in.Inbox != nil {
 		n.Inbox = in.Inbox
 	}
@@ -1374,29 +1369,6 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	if in.AskUser != nil {
 		n.AskUser = in.AskUser
 	}
-	if adv.prov != nil {
-		// A fresh advisor per drive so its per-drive consult ceiling is honored,
-		// exactly as the run path's buildBackend does. Metered against the conversation
-		// budget wall (§6/§7) — a raw adv.prov would let strong-model consults escape it.
-		n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
-		n.EscalateAfter = adv.escalateAfter
-	}
-	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
-	// the conversational loop gets the same worktree-aware `live` tool the run path
-	// has — previously only `buildBackend` (run/watch/propose-edit) wired it, so the
-	// advertised front door silently lacked it. Off by default (nil seam).
-	if envOptIn("NILCORE_LIVE_INDEX") {
-		n.LiveSession = liveSession(d.mem, d.baseRepo)
-	}
-	// Cross-project memory + distilled lessons: the conversational front door reads the
-	// same merged view the run path does. Previously only buildBackend wired this, so
-	// the door people actually use never saw the agent's own distilled scars.
-	attachMemoryContext(n, d.mem, d.baseRepo)
-	// Operator steering (P10-T01): an authoritative project steering file
-	// (NILCORE.md / AGENTS.md) committed at the repo root is loaded ONCE at launch
-	// from the operator's own repo — front-door origin, never tool/inbox text — and
-	// prepended as TRUSTED instructions (the I7 exception). nil/empty ⇒ byte-identical.
-	attachSteering(n, d.baseRepo)
 	return n
 }
 
