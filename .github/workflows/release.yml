@@ -30,9 +30,24 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
         run: |
           out="nilcore-${GOOS}-${GOARCH}"
-          go build -trimpath -ldflags "-s -w" -o "dist/${out}" ./cmd/nilcore
+          ldflags="-s -w"
+          if [[ "${RELEASE_VERSION}" != "dev" ]]; then
+            if [[ ! "${RELEASE_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+              echo "refusing invalid release version: ${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+            ldflags="${ldflags} -X main.version=${RELEASE_VERSION}"
+          fi
+          go build -trimpath -ldflags "${ldflags}" -o "dist/${out}" ./cmd/nilcore
+          # The Linux amd64 matrix leg is runnable on the hosted builder. Prove the
+          # release tag reached the binary, rather than publishing a `dev (<sha>)`
+          # build whose filename and release page claim a different version.
+          if [[ "${RELEASE_VERSION}" != "dev" && "${GOOS}/${GOARCH}" == "linux/amd64" ]]; then
+            test "$("dist/${out}" version)" = "nilcore ${RELEASE_VERSION}"
+          fi
           # Publish a per-binary SHA-256 so the curl|sh installer can verify integrity
           # before running the downloaded binary. The file holds "<hash>  <asset>" so a
           # consumer can `sha256sum -c` it directly.

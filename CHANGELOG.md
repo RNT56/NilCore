@@ -16,6 +16,8 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
+- **release-version-stamp** — Stamp validated version tags into every release binary, execute the native matrix asset to prove `nilcore version` matches the tag, and refuse malformed release refs before publication; the release E2E now verifies identity as well as checksums and completeness. _Owns:_ `.github/workflows/release.yml`, `test/release-assets-e2e.sh`, `CHANGELOG.md`. _(release hardening)_
+
 - **P15-completion-docs** — Reconcile the canonical task, provider-roadmap, and architecture docs after P15-T13: Phase 15 is complete, the hermetic golden eval is shipped, and the documented I7 boundary now matches the implemented native drop-on-decode plus client-side untrusted-data fence. _Owns:_ `docs/{TASKS,ROADMAP-PROVIDERS,ARCHITECTURE}.md`, `CHANGELOG.md`. _(Phase 15 documentation)_
 
 - **P15-T13** — Add a hermetic, golden-transcript provider compatibility evaluation covering custom OpenAI-compatible endpoints, reasoning token caps, strict JSON Schema output, OpenRouter routing/extras/attribution, native search rendering and drop-on-decode containment, plus injection-flagged and untrusted-data-fenced client search fallback. _Owns:_ `eval/provider-compat/`, `CHANGELOG.md`. _(Phase 15)_
