@@ -16,6 +16,22 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-12
+
+NilCore now presents as one serious coding agent across conversation, single-task, project,
+swarm, browser, and desktop work. The core task surfaces route through the unified kernel; every
+surface remains governed by the verifier, sandbox, human gate, and append-only log. This release completes Phases 14–16:
+agentic browser and computer use, the modern OpenAI/OpenRouter/compatible provider surface,
+closed-loop learning and bounded autonomy, recursive decomposition, and the provider
+compatibility eval suite.
+
+The release also incorporates the full defect-hunt/features-review remediation body and closes
+the distribution gap: patched Go and system dependencies, reachable-vulnerability scanning,
+fail-closed checksums and installer tests, complete four-platform asset verification, and version
+identity stamped and executed before publication.
+
+- **release-v1.2.0** — Cut the v1.2.0 changelog boundary, refresh the public release/reference metrics from the live tree, and record the fully gated release baseline; tag publication remains a separately approved irreversible action. _Owns:_ `CHANGELOG.md`, `README.md`, `STATE.md`, `docs/REFERENCE.md`. _(release)_
+
 - **release-version-stamp** — Stamp validated version tags into every release binary, execute the native matrix asset to prove `nilcore version` matches the tag, and refuse malformed release refs before publication; the release E2E now verifies identity as well as checksums and completeness. _Owns:_ `.github/workflows/release.yml`, `test/release-assets-e2e.sh`, `CHANGELOG.md`. _(release hardening)_
 
 - **P15-completion-docs** — Reconcile the canonical task, provider-roadmap, and architecture docs after P15-T13: Phase 15 is complete, the hermetic golden eval is shipped, and the documented I7 boundary now matches the implemented native drop-on-decode plus client-side untrusted-data fence. _Owns:_ `docs/{TASKS,ROADMAP-PROVIDERS,ARCHITECTURE}.md`, `CHANGELOG.md`. _(Phase 15 documentation)_

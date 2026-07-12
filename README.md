@@ -336,8 +336,8 @@ Dependencies point inward; leaf packages never import the orchestrator. The full
 | | |
 |--:|:--|
 | **~90,000** | lines of Go — *the agent itself* (~8k single‑task core · multi‑agent supervisor · conversational front door · verified swarm · recursive decompose · closed‑loop autonomy — all on one orchestration kernel) |
-| ~178,000 | lines including its tests (406 test files) |
-| **120** | small, single‑responsibility packages |
+| ~183,000 | lines including its tests (420 test files) |
+| **121** | small, single‑responsibility packages |
 | **2** | core deps in the default binary — pure‑Go SQLite · `golang.org/x/sys` (Go's extended stdlib); the Charm TUI's 3 modules link only under `make tui`. The browser driver (incl. a pure‑Go CDP/WebSocket client), the multi‑language parser backends, embedder, forge, the provider pool, the swarm runner, and the orchestration kernel + router are all pure stdlib — no module added |
 | **7 / 7** | invariants held |
 | **Phases 0–16** | shipped — incl. the **unified orchestration kernel** (`run`/`build`/`swarm`/`decompose` collapse onto one recursive engine; `nilcore do` routes the goal), **closed‑loop autonomy** (trust‑routing, learned lessons + verify‑cache, a verified self‑improvement flywheel, and graduated auto‑approval fenced by a blast‑budget — opt‑in, never on `main`), the **verifier‑backed artifact factory**, and **verified swarm mode**, atop behavioral browser verification, semantic (HNSW) + multi‑language (**19 languages** / 34 extensions) code intel, event/scheduled triggers, gated draft PRs, and trusted operator steering |

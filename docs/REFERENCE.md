@@ -4,7 +4,7 @@
 
 > **Where this sits in the canon.** This is the *consolidated current-state* reference. It is **not** the technical law. When this file and a spoke doc (or the code) disagree, the **spoke doc and the code win** — fix this file. Authoritative sources: [`CLAUDE.md`](../CLAUDE.md) (constitution + invariants), [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) (decided architecture + frozen contract), [`docs/TASKS.md`](TASKS.md) (master work DAG), [`CHANGELOG.md`](../CHANGELOG.md) (append-only ledger). The first three are contract files.
 >
-> **Snapshot:** v1.1.0 (2026-06-21) + unreleased work. Phases 0–16 (all eight Phase-16 closed-loop pillars, including Pillar 8 — the unified orchestration kernel, default-on) + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
+> **Snapshot:** v1.2.0 (2026-07-12). Phases 0–16 (all eight Phase-16 closed-loop pillars, including Pillar 8 — the unified orchestration kernel, default-on) + computer-use (CU) + native-macOS host control (CU-MAC) **shipped**; deferred items D1–D4 shipped; the external-infrastructure tier (EXT-01..08) is gated/not-eligible. Every default, flag, count, and constant below was verified against source.
 
 ---
 
@@ -46,9 +46,10 @@ There is no other index of the documentation set; this is it.
 | `1.0.0` | 2026-06-20 | Phases 7–12 + deferred D1–D4 (the v1 product) |
 | `1.0.1` | 2026-06-21 | Fixes |
 | `1.1.0` | 2026-06-21 | Phase 13 (model-driven routing + Trust Ledger) |
-| **Unreleased** | — | Phase 14 (browse), CU + CU-MAC (desktop / macOS host), Phase 15 (providers + web search), Phase 16 (closed-loop: unified kernel, `nilcore do` router, `decompose`, lessons, flywheel, graduated auto-approval, autonomy daemon), chat `/ask` + `/save`, TUI verb parity, docs promotion, defect-hunt + features-review fix passes |
+| `1.2.0` | 2026-07-12 | Phases 14–16: browser/desktop agency, provider upgrade + evals, unified kernel/decompose, closed-loop autonomy, audit remediation, and release integrity |
+| **Unreleased** | — | — |
 
-`version` is `dev` unless ldflags-stamped at build (`-X main.version=<tag>`); an un-stamped binary reports the VCS revision.
+`version` is `dev` unless ldflags-stamped at build (`-X main.version=<tag>`); an un-stamped binary reports the VCS revision. The release workflow validates and stamps the tag, then executes the native asset and requires an exact match before publication.
 
 ### 1.2 Phases (all shipped)
 
@@ -82,9 +83,9 @@ There is no other index of the documentation set; this is it.
 
 | Metric | Value |
 |---|---|
-| Go packages | **120** (111 under `internal/`) |
-| Source files (non-test) | **375** |
-| Test files | **406** |
+| Go packages | **121** (111 under `internal/`) |
+| Source files (non-test) | **382** |
+| Test files | **420** |
 | Lines of Go — `internal/` + `cmd/` (non-test) | **~89,200** |
 | Lines of Go — `internal/` + `cmd/` with tests | **~175,900** |
 | Runtime dependencies (default binary) | **2** — pure-Go SQLite (`modernc.org/sqlite`) + `golang.org/x/sys` |
