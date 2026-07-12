@@ -9,7 +9,7 @@ NilCore borrows intelligence instead of re‑encoding it — so the whole agent 
 
 [![CI](https://github.com/RNT56/NilCore/actions/workflows/ci.yml/badge.svg)](https://github.com/RNT56/NilCore/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/RNT56/NilCore?label=release&color=6f42c1)](https://github.com/RNT56/NilCore/releases/latest)
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Go](https://img.shields.io/badge/Go-1.25.12-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Dependencies](https://img.shields.io/badge/dependencies-SQLite%20%2B%20x%2Fsys-2ea44f)](go.mod)
 [![Agent size](https://img.shields.io/badge/agent-~90k%20LOC-1f6feb)](#the-receipts)
 [![Sandboxed](https://img.shields.io/badge/model%20execution-sandboxed-2ea44f)](#the-seven-invariants-non-negotiable)
@@ -136,7 +136,7 @@ A `NILCORE.md` / `AGENTS.md` steering file loads as trusted project instructions
 
 ## Quickstart
 
-**Requires** Go 1.25+. On Linux with a Landlock‑capable kernel (5.13+) and unprivileged user namespaces, NilCore sandboxes the loop with **no container runtime at all** — the auto‑detected host‑native namespace backend. Otherwise (or with `-sandbox container`) it uses a container runtime (`podman` rootless preferred, or `docker`).
+**Requires** Go 1.25.12+. On Linux with a Landlock‑capable kernel (5.13+) and unprivileged user namespaces, NilCore sandboxes the loop with **no container runtime at all** — the auto‑detected host‑native namespace backend. Otherwise (or with `-sandbox container`) it uses a container runtime (`podman` rootless preferred, or `docker`).
 
 ```sh
 # Install (or grab a binary from Releases)

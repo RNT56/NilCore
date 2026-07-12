@@ -6,7 +6,7 @@ Everything you need to build, run, and contribute to NilCore. Source of truth fo
 
 | Tool | Version | Why |
 |---|---|---|
-| Go | 1.25+ (matches the `go` directive in `go.mod`) | the entire core |
+| Go | 1.25.12+ (matches the patched `go` directive in `go.mod`) | the entire core; older 1.25.x releases contain reachable standard-library vulnerabilities |
 | Container runtime | **Podman ≥ 4 (rootless, preferred)** or Docker | the sandbox |
 | git | ≥ 2.30 | worktree-per-task workflow |
 | make | any | `make verify` is the gate |

@@ -1,12 +1,12 @@
 module nilcore
 
-go 1.25.0
+go 1.25.12
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	golang.org/x/sys v0.42.0
+	golang.org/x/sys v0.44.0
 	modernc.org/sqlite v1.52.0
 )
 
