@@ -32,7 +32,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -115,7 +114,7 @@ func (rubyParser) calls(path string) (map[string][]string, error) {
 // brings depth back to their open level. Spans of all open named blocks are extended to
 // each line before close-out, so a block always covers its body.
 func rubyScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open ruby file: %w", err)
 	}

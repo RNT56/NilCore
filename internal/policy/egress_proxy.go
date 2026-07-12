@@ -13,10 +13,20 @@ import (
 )
 
 // EgressProxy is a forward HTTP/HTTPS proxy that permits only hosts the Egress
-// allowlist allows — the documented mechanism for sandbox egress (P2-T02). The
-// sandbox runs with no direct route to the internet and HTTP(S)_PROXY pointed
-// here, so a host the policy denies cannot be reached even if the model tries.
+// allowlist allows — the documented mechanism for sandbox egress (P2-T02).
 // Untrusted destinations are refused with 403 before any connection is made.
+//
+// IMPORTANT — the boundary this enforces depends on the sandbox backend:
+//   - namespace backend (Linux, Auto-preferred): the child runs in an EMPTY network
+//     namespace — there is no route to the internet at all, so egress is a HARD
+//     deny-all (this proxy is not even reachable there).
+//   - container backend: the container runs with `--network bridge` (a real NAT
+//     route) and HTTP(S)_PROXY pointed here, so this proxy is COOPERATIVE — it binds
+//     only proxy-respecting clients. A sandboxed command that ignores the proxy
+//     (`curl --noproxy '*'`, a raw socket, bash `/dev/tcp`) can still reach arbitrary
+//     hosts, including cloud metadata. Treat container-backend egress allowlisting as
+//     defense-in-depth, NOT a hard boundary; use the namespace backend when a hard
+//     egress boundary is required. See Container.AllowEgressVia + applyContainerEgress.
 //
 // Both code paths additionally resolve the destination and refuse any address in
 // loopback/link-local/private/multicast space, then pin the connection to that

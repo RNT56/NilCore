@@ -212,6 +212,10 @@ func sourceFilesUnder(root string) ([]string, error) {
 // huge generated file cannot blow the embedding request.
 const maxEmbedBytes = 100 * 1024
 
+// maxSourceFileBytes caps a single source file read for indexing, so a crafted
+// multi-GB file can't OOM the host before its symbols are even considered.
+const maxSourceFileBytes = 4 << 20
+
 // openSemantic opens a persistent, content-hash-cached semantic index for the
 // worktree (D2-T03) and indexes the given files. It is called only when
 // NILCORE_EMBED_KEY is set. The index lives under the user cache dir keyed by the
@@ -257,7 +261,14 @@ func openSemantic(ctx context.Context, workdir string, files []string, key strin
 		if ctx.Err() != nil {
 			break
 		}
-		b, rerr := os.ReadFile(path)
+		// Skip oversized files (DoS cap) before reading them into memory, and read with
+		// O_NOFOLLOW (readNoFollow → worktreefs.ReadConfined) so an in-tree symlink can't
+		// redirect the read to an out-of-worktree target (I4/I3 — its bytes must never
+		// enter the index or reach the external embedding API).
+		if fi, serr := os.Lstat(path); serr != nil || fi.Size() > maxSourceFileBytes {
+			continue
+		}
+		b, rerr := readNoFollow(path)
 		if rerr != nil || len(b) == 0 {
 			continue
 		}

@@ -51,6 +51,62 @@ func TestSecretSubstitution(t *testing.T) {
 	}
 }
 
+// TestAllowlistResolverRefusesNonAllowlisted proves the secret-name allowlist (the exfil
+// fence, FIX 1): a name NOT on the allowlist resolves to not-found even though the
+// underlying resolver would hand back any name; an allowlisted name resolves normally; and
+// the default empty allowlist refuses every name (fail closed).
+func TestAllowlistResolverRefusesNonAllowlisted(t *testing.T) {
+	// The underlying env-first-style resolver would hand back ANY name (the vulnerability).
+	inner := func(name string) (string, bool) { return "value-of-" + name, true }
+
+	res := AllowlistResolver([]string{"site_password", "  totp  "}, inner)
+	if v, ok := res("site_password"); !ok || v != "value-of-site_password" {
+		t.Fatalf("an allowlisted name must resolve, got (%q,%v)", v, ok)
+	}
+	if v, ok := res("totp"); !ok || v != "value-of-totp" { // whitespace in the list is trimmed
+		t.Fatalf("a trimmed allowlisted name must resolve, got (%q,%v)", v, ok)
+	}
+	if _, ok := res("ANTHROPIC_API_KEY"); ok {
+		t.Fatal("a non-allowlisted name must be refused (the exfil fence)")
+	}
+
+	// Empty / nil allowlist ⇒ nothing resolves (fail-closed default).
+	if _, ok := AllowlistResolver(nil, inner)("site_password"); ok {
+		t.Fatal("a nil allowlist must refuse every name (fail closed)")
+	}
+	if _, ok := AllowlistResolver([]string{"", "  "}, inner)("site_password"); ok {
+		t.Fatal("an all-blank allowlist must refuse every name (fail closed)")
+	}
+}
+
+// TestAllowlistResolverEndToEnd drives the fence through Act: an allowlisted {{secret}}
+// substitutes and reaches the transport, while a non-allowlisted one (the exfil primitive —
+// typing {{secret:ANTHROPIC_API_KEY}} into a page) fails closed before any act is sent.
+func TestAllowlistResolverEndToEnd(t *testing.T) {
+	inner := func(name string) (string, bool) { return "SEKRIT-" + name, true }
+
+	ftOK := &fakeTransport{}
+	sOK := newSession(ftOK, AllowlistResolver([]string{"login_password"}, inner))
+	sOK.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Version: 1}}}
+	if _, err := sOK.Act(context.Background(), browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "{{secret:login_password}}"}); err != nil {
+		t.Fatalf("allowlisted secret must type: %v", err)
+	}
+	if len(ftOK.got) != 1 || ftOK.got[0].Text != "SEKRIT-login_password" {
+		t.Fatalf("allowlisted secret not substituted before send: %+v", ftOK.got)
+	}
+
+	ftNo := &fakeTransport{}
+	sNo := newSession(ftNo, AllowlistResolver([]string{"login_password"}, inner))
+	sNo.latest = browserwire.Observation{Version: 1, Refs: []browserwire.Ref{{ID: 1, Version: 1}}}
+	_, err := sNo.Act(context.Background(), browserwire.Act{Op: browserwire.OpType, Ref: 1, Text: "{{secret:ANTHROPIC_API_KEY}}"})
+	if err == nil || !strings.Contains(err.Error(), "refusing to type a placeholder") {
+		t.Fatalf("a non-allowlisted secret must fail closed, got %v", err)
+	}
+	if len(ftNo.got) != 0 {
+		t.Fatal("a refused-secret act must never reach the transport")
+	}
+}
+
 func TestSecretMissingFailsClosed(t *testing.T) {
 	ft := &fakeTransport{}
 	s := newSession(ft, func(string) (string, bool) { return "", false })

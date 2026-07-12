@@ -36,6 +36,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -126,6 +127,13 @@ func chatMain(args []string) {
 	// the live tool off.
 	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
+	// Resolve `-backend auto` (and a config `backend: auto`) to a concrete backend
+	// BEFORE resolveProvider — exactly as run/serve do — otherwise the primary
+	// conversational front door fatals with `unknown backend "auto"` on a value the
+	// rest of the CLI accepts.
+	if *cf.common.backendName == "auto" {
+		*cf.common.backendName = resolveAutoBackend(cf.common, b, log)
+	}
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
 		fatal(err)
@@ -179,6 +187,17 @@ func chatMain(args []string) {
 	blast := mintBlastBudget(*cf.common.blastRadius, log)
 	egress, proxyAddr, stopProxy := startEgress(ctx, allow, console, proxyBindAddr(*cf.common.sandboxPref, *cf.common.runtime), blast)
 	defer stopProxy()
+
+	// Rule of Two (§2): evaluate the lethal trifecta ONCE at startup — untrusted web input
+	// (A) ∧ private repo data (B, the mounted worktree) ∧ open egress (C). The shipped
+	// default egress is deny-all, so the verdict is Allow and this is byte-identical; only
+	// a wide/wildcard egress allowlist trips it. chat is attended, so a trip prompts once at
+	// the console. NILCORE_RULE_OF_TWO=0 opts out.
+	if err := enforceRuleOfTwo(log, ruleOfTwoEnforced(), !egress.Empty(), true, egress,
+		policy.NewConsoleApprover(os.Stdin, os.Stdout),
+		"start a coding session combining untrusted web input, private repo data, and open egress"); err != nil {
+		fatal(err)
+	}
 
 	sess, err := buildChatSession(chatDeps{
 		flags:           cf,
@@ -485,6 +504,16 @@ func splitHosts(s string) []string {
 // a container-backend capability. The container reaches the host-side proxy via the
 // runtime's host alias (host.containers.internal for podman, host.docker.internal
 // for docker, with an --add-host so it resolves on docker-Linux too).
+// egressWarnOnce/egressStrictWarnOnce bound the container-egress security advisories
+// to one line per process (applyContainerEgress runs per drive / per swarm worker).
+// egressHardWarnOnce/egressHardFailWarnOnce do the same for the HARD-mode advisories.
+var (
+	egressWarnOnce         sync.Once
+	egressStrictWarnOnce   sync.Once
+	egressHardWarnOnce     sync.Once
+	egressHardFailWarnOnce sync.Once
+)
+
 func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, runtime string) {
 	if egress.Empty() || proxyAddr == "" {
 		return
@@ -493,6 +522,33 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 	if !ok {
 		return
 	}
+	// HARD egress (opt-in NILCORE_EGRESS_HARD): make the allowlist UNBYPASSABLE via a
+	// --internal network + a dual-homed gateway container, instead of the cooperative
+	// bridge+proxy below. On ANY setup failure this FAILS CLOSED — the box stays
+	// --network none (deny-all) — and NEVER silently falls back to cooperative bridge.
+	// Linux-container only, CI-validated (see egress_hard.go). Default (unset) ⇒ the
+	// existing STRICT/cooperative paths below run byte-identically.
+	if envOptIn("NILCORE_EGRESS_HARD") {
+		applyHardEgress(c, egress, runtime)
+		return
+	}
+	// The container backend's egress allowlist is enforced by a COOPERATIVE proxy over a
+	// bridged network — a model-emitted command that ignores HTTP(S)_PROXY (curl
+	// --noproxy, raw sockets, /dev/tcp) can still reach arbitrary hosts, including cloud
+	// metadata (see sandbox.Container.AllowEgressVia). NILCORE_EGRESS_STRICT lets an
+	// operator who needs a hard boundary refuse cooperative egress — egress then stays
+	// deny-all (--network none) — rather than pretend the allowlist is a wall. Hard
+	// allowlisted egress isn't available on the container backend, so this fails closed;
+	// the namespace backend (Linux) is the hard-boundary option.
+	if envOptIn("NILCORE_EGRESS_STRICT") {
+		egressStrictWarnOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_STRICT set — refusing cooperative container egress; egress stays deny-all (--network none). Use the namespace backend (Linux) for a hard egress boundary, or unset to accept proxy-cooperative egress.")
+		})
+		return
+	}
+	egressWarnOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "nilcore: container egress allowlist is enforced by a cooperative proxy — a sandboxed command that bypasses HTTP(S)_PROXY (curl --noproxy, raw sockets, /dev/tcp) can still reach arbitrary hosts. For a hard egress boundary use the namespace backend (Linux); set NILCORE_EGRESS_STRICT=1 to fail closed.")
+	})
 	_, port, err := net.SplitHostPort(proxyAddr)
 	if err != nil {
 		return
@@ -509,6 +565,28 @@ func applyContainerEgress(box sandbox.Sandbox, egress policy.Egress, proxyAddr, 
 		}
 	}
 	c.AllowEgressVia(policy.ProxyURL(net.JoinHostPort(hostAlias, port)))
+}
+
+// applyHardEgress wires the container to a HARD egress boundary (opt-in
+// NILCORE_EGRESS_HARD): the allowlist proxy runs as a dual-homed gateway on a
+// --internal network with no route out, so it is UNBYPASSABLE (see egress_hard.go).
+// It reuses ONE gateway per (runtime,image,allowlist) across drives. On ANY setup
+// failure it FAILS CLOSED — the box keeps --network none (deny-all) — and never falls
+// back to the cooperative bridge. Callers pass the container box (already cast).
+func applyHardEgress(c *sandbox.Container, egress policy.Egress, runtime string) {
+	egressHardWarnOnce.Do(func() {
+		fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_HARD set — routing container egress through a --internal-network gateway (the allowlist becomes unbypassable). Linux-container only; requires the nilcore image (a debian:stable-slim has no nilcore binary); the DNS-tunnel residual is only mitigated. The namespace backend (Linux) remains the recommended hard boundary.")
+	})
+	h, ok := getHardEgress(runtime, c.Image, egress)
+	if !ok {
+		// FAIL CLOSED: leave the box at --network none. Never cooperative-fallback.
+		egressHardFailWarnOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "nilcore: NILCORE_EGRESS_HARD — hard egress setup FAILED; egress stays deny-all (--network none). Ensure a Linux container runtime + the nilcore image, or unset NILCORE_EGRESS_HARD to accept cooperative egress.")
+		})
+		return
+	}
+	c.AllowEgressViaHard(h.network, h.proxyURL)
+	c.DNS = h.dns
 }
 
 // containsString reports whether s is present in xs (small linear scan — the slices
@@ -1298,15 +1376,16 @@ func chatNativeBackend(d chatDeps, prov model.Provider, adv advisorCfg, box sand
 	}
 	if adv.prov != nil {
 		// A fresh advisor per drive so its per-drive consult ceiling is honored,
-		// exactly as the run path's buildBackend does.
-		n.Advisor = advisor.New(adv.prov, adv.maxCalls)
+		// exactly as the run path's buildBackend does. Metered against the conversation
+		// budget wall (§6/§7) — a raw adv.prov would let strong-model consults escape it.
+		n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
 		n.EscalateAfter = adv.escalateAfter
 	}
 	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
 	// the conversational loop gets the same worktree-aware `live` tool the run path
 	// has — previously only `buildBackend` (run/watch/propose-edit) wired it, so the
 	// advertised front door silently lacked it. Off by default (nil seam).
-	if os.Getenv("NILCORE_LIVE_INDEX") != "" {
+	if envOptIn("NILCORE_LIVE_INDEX") {
 		n.LiveSession = liveSession(d.mem, d.baseRepo)
 	}
 	// Cross-project memory + distilled lessons: the conversational front door reads the

@@ -180,14 +180,56 @@ func validateURL(raw string) (string, error) {
 	return raw, nil
 }
 
+// valueBlindVerifierIDs is the CLOSED set of verifier-ids that report Pass WITHOUT ever
+// checking a claim's asserted Value against reality — either presence-only (they inspect
+// only the claim's PROVENANCE) or box-free self-consistency (they re-measure nothing):
+//
+//   - web.url_resolves — passes on any HTTP 2xx; never reads Evidence.Value.
+//   - web.not_stale     — passes on a fresh server timestamp; never reads Evidence.Value.
+//   - benchmark.variance_bounded — box-free; asserts only the internal CV of the worker's
+//     OWN model-authored samples, re-measuring nothing. A value-bearing perf claim must be
+//     bound to the re-measuring benchmark.script_threshold, so variance_bounded is refused
+//     as a STANDALONE verifier for such a claim.
+//
+// Binding one of these to a claim that carries a non-empty Value is a HOLLOW GREEN: the
+// verdict reads "verified" while nothing verified the Value (a worker names url_resolves on
+// a claim whose fabricated Value the 2xx probe never inspects). The Resolve gate below fails
+// exactly that closed. This is a DENYLIST on purpose — an unlisted id is assumed
+// value-checking, so every genuine value-checker (web.quote_exists, finance.*, software.*,
+// code.*, …) is untouched and only these known value-blind ids are gated. A NEW
+// presence-only / box-free verifier MUST be added here.
+var valueBlindVerifierIDs = map[string]bool{
+	"web.url_resolves":           true,
+	"web.not_stale":              true,
+	"benchmark.variance_bounded": true,
+}
+
+// valueBlindVerifier reports whether id names a verifier that passes WITHOUT inspecting the
+// claim's asserted Value (see valueBlindVerifierIDs). Such a verifier is adequate ONLY for a
+// value-less claim; bound to a value-bearing claim it would ship a hollow green.
+func valueBlindVerifier(id string) bool {
+	return valueBlindVerifierIDs[strings.TrimSpace(id)]
+}
+
 // Resolve is the small helper the ArtifactVerifier (P11-T04) uses to run a claim's
 // bound check, centralizing the unregistered-id => Unverifiable rule so it is
 // expressed once. An empty Verifier id, or one absent from the Registry, yields
 // StatusUnverifiable with a reason — never StatusPass.
+//
+// It also enforces the STRENGTH binding (I2, anti-"hollow green"): a claim that ASSERTS a
+// Value must name a verifier that actually inspects/re-measures that Value. A value-blind
+// verifier (url_resolves / not_stale) or a box-free self-consistency check
+// (variance_bounded) bound to a value-bearing claim fails closed to StatusUnverifiable
+// BEFORE the check runs — so a report/dossier with fabricated Values can never green on a
+// verifier that never read them. A claim with NO asserted Value keeps the legitimate
+// provenance/consistency use (e.g. "this URL resolves").
 func (r *Registry) Resolve(ctx context.Context, box sandbox.Sandbox, c artifact.Claim) (artifact.Status, string) {
 	id := strings.TrimSpace(c.Evidence.Verifier)
 	if id == "" {
 		return artifact.StatusUnverifiable, "no verifier bound to claim"
+	}
+	if strings.TrimSpace(c.Evidence.Value) != "" && valueBlindVerifier(id) {
+		return artifact.StatusUnverifiable, detail("value-bearing claim bound to a value-blind verifier " + id + " (needs a verifier that checks the claimed value)")
 	}
 	fn, ok := r.Lookup(id)
 	if !ok {

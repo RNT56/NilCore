@@ -1,6 +1,7 @@
 package eventlog
 
 import (
+	"encoding/json"
 	"math"
 	"regexp"
 	"strings"
@@ -173,17 +174,32 @@ func redactMap(m map[string]any) {
 	}
 }
 
+// redactString applies every secret pass to one string. Shared by redactValue's
+// string-shaped cases so a []string / json.RawMessage value in an event Detail is
+// redacted with the SAME rules as a plain string, not silently passed through — the
+// prior type switch only handled string/map/[]any, so a []string of args/env/hosts
+// or a raw-json tool input would reach the append-only log unredacted (I3).
+func redactString(s string) string {
+	s = secretRe.ReplaceAllString(s, "[redacted]")
+	s = inlineSecretRe.ReplaceAllString(s, "${1}${2}${3}${4}[redacted]")
+	s = flagSecretRe.ReplaceAllString(s, "${1}[redacted]")
+	// Last-resort: mask a bare high-entropy token that none of the prefix rules
+	// above recognized (I3). Runs AFTER them so an already-"[redacted]" span is
+	// left alone (it is short and not token-shaped).
+	return maskHighEntropyTokens(s)
+}
+
 func redactValue(v any) any {
 	switch t := v.(type) {
 	case string:
-		s := secretRe.ReplaceAllString(t, "[redacted]")
-		s = inlineSecretRe.ReplaceAllString(s, "${1}${2}${3}${4}[redacted]")
-		s = flagSecretRe.ReplaceAllString(s, "${1}[redacted]")
-		// Last-resort: mask a bare high-entropy token that none of the prefix rules
-		// above recognized (I3). Runs AFTER them so an already-"[redacted]" span is
-		// left alone (it is short and not token-shaped).
-		s = maskHighEntropyTokens(s)
-		return s
+		return redactString(t)
+	case []string:
+		for i, e := range t {
+			t[i] = redactString(e)
+		}
+		return t
+	case json.RawMessage:
+		return json.RawMessage(redactString(string(t)))
 	case map[string]any:
 		redactMap(t)
 		return t

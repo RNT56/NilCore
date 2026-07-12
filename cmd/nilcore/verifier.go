@@ -101,6 +101,14 @@ func vcacheDecorate(base verify.Verifier, box sandbox.Sandbox, verifierID string
 			Log:     log,
 			LogPath: logPath,
 			Hash: func(ctx context.Context) (string, error) {
+				// Hash everything the composite verifier reads. verifiedContentHash returns
+				// the worktree hash (skipping VCS/agent state) and, when evidence verification
+				// is enabled, folds in the .nilcore/artifacts/*.json bytes the worktree hash
+				// skips — so a changed artifact (same source) MISSES the cache and re-runs the
+				// ArtifactVerifier instead of replaying a stale GREEN with the artifact check
+				// skipped (I2). Evidence off ⇒ byte-identical to the plain worktree hash. This
+				// is the same helper the flake probe below keys on, and the verify package's
+				// ContentHashWithArtifacts is the equivalent library form of the same fold.
 				return verifiedContentHash(ctx, box)
 			},
 			// The cache key must cover EVERY input that can change this composite's
@@ -575,6 +583,17 @@ func (b behavioralComposite) Check(ctx context.Context) (verify.Report, error) {
 	return verify.Composite{Named: b.compose()}.Check(ctx)
 }
 
+// evidenceVerifyEnabled reports whether evidence verification is turned on
+// (NILCORE_EVIDENCE_VERIFY set to any non-empty value). It is the SINGLE condition that
+// (a) composes the per-artifact ArtifactVerifier into the verdict (evidenceVerifiers) and
+// (b) folds the .nilcore/artifacts/*.json digest into the vcache key (the Hash closure in
+// vcacheDecorate) — so the cache can never replay a stale GREEN past a changed artifact
+// while the artifact check is live (I2). Unset/blank ⇒ off, byte-identical to the
+// pre-evidence path.
+func evidenceVerifyEnabled() bool {
+	return strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_VERIFY")) != ""
+}
+
 // evidenceVerifiers returns one trailing NamedVerifier per artifact file present in
 // the worktree, gated on NILCORE_EVIDENCE_VERIFY. It is the P11-T05 wiring seam:
 //
@@ -601,7 +620,7 @@ func (b behavioralComposite) Check(ctx context.Context) (verify.Report, error) {
 // dropping the requested check — so a misconfigured run never greens by ignoring a pack
 // it was told to run. The explicit startup signal lives in validateVerifyPacks.
 func evidenceVerifiers(box sandbox.Sandbox, log *eventlog.Log) []verify.NamedVerifier {
-	if strings.TrimSpace(os.Getenv("NILCORE_EVIDENCE_VERIFY")) == "" {
+	if !evidenceVerifyEnabled() {
 		return nil
 	}
 	if box == nil {

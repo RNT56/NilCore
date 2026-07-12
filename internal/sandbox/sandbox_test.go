@@ -96,6 +96,42 @@ func TestAllowEgressVia(t *testing.T) {
 	}
 }
 
+func TestAllowEgressViaHard(t *testing.T) {
+	const net = "nilcore-egr-abc123"
+	c := NewContainer("podman", "img", "/work")
+	c.AllowEgressViaHard(net, "http://10.88.0.2:3128")
+	c.DNS = "10.88.0.2"
+	got := argsString(c, "x")
+
+	// The internal net is emitted verbatim — NOT bridge.
+	if !strings.Contains(got, "--network "+net) {
+		t.Errorf("hard egress should attach the internal net: %s", got)
+	}
+	if strings.Contains(got, "--network bridge") {
+		t.Errorf("hard egress must NOT use a bridge network: %s", got)
+	}
+	// Proxy env points at the gateway; NO_PROXY is pinned empty.
+	if c.Env["HTTP_PROXY"] != "http://10.88.0.2:3128" || c.Env["HTTPS_PROXY"] != "http://10.88.0.2:3128" {
+		t.Errorf("hard egress proxy env not set: %v", c.Env)
+	}
+	if v, ok := c.Env["NO_PROXY"]; !ok || v != "" {
+		t.Errorf("hard egress must pin NO_PROXY empty, got %q (present=%v)", v, ok)
+	}
+	// The gateway resolver is pinned via --dns; no --add-host on the hard path.
+	if !strings.Contains(got, "--dns 10.88.0.2") {
+		t.Errorf("hard egress should pin --dns at the gateway: %s", got)
+	}
+	if strings.Contains(got, "--add-host") {
+		t.Errorf("hard egress must add no --add-host: %s", got)
+	}
+
+	// No DNS set ⇒ no --dns emitted (byte-identical default).
+	c2 := NewContainer("podman", "img", "/work")
+	if strings.Contains(argsString(c2, "x"), "--dns") {
+		t.Errorf("--dns present with no DNS set")
+	}
+}
+
 func TestExtraReadRootsMountedReadOnly(t *testing.T) {
 	c := NewContainer("podman", "img", "/work/tree")
 	c.ExtraReadRoots = []string{"/host/lib", "/host/docs"}

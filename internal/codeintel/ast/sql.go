@@ -32,7 +32,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -76,7 +75,7 @@ func (sqlParser) calls(path string) (map[string][]string, error) {
 // object, and collects candidate call references; after the walk it keeps only references
 // resolving to a FUNCTION/PROCEDURE defined in this file (the self-contained call graph).
 func sqlScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open sql file: %w", err)
 	}

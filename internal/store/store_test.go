@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -107,6 +108,86 @@ func TestMemoryUpsertReplaces(t *testing.T) {
 	}
 	if g, _ := s.QueryMemory(ctx, "project", "p"); len(g) != 2 {
 		t.Errorf("distinct key must add a row, got %d", len(g))
+	}
+}
+
+// TestQueryMemoryRecentBounds proves the bounded task-start read returns at most `limit`
+// rows — the NEWEST — in ascending-id (oldest-first) order so the render's "newest is the
+// tail" expectation holds, and that a non-positive limit falls back to the full scan.
+func TestQueryMemoryRecentBounds(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: fmt.Sprintf("task:%d", i), Value: fmt.Sprintf("v%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// limit=2 → the two newest, oldest-first.
+	got, err := s.QueryMemoryRecent(ctx, "project", "p", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("QueryMemoryRecent(2) = %d rows, want 2", len(got))
+	}
+	if got[0].Key != "task:3" || got[1].Key != "task:4" {
+		t.Errorf("want newest-two oldest-first [task:3 task:4], got [%s %s]", got[0].Key, got[1].Key)
+	}
+	// limit >= count returns all; limit <= 0 is unbounded (== QueryMemory).
+	if all, _ := s.QueryMemoryRecent(ctx, "project", "p", 100); len(all) != 5 {
+		t.Errorf("limit above count = %d, want all 5", len(all))
+	}
+	if unb, _ := s.QueryMemoryRecent(ctx, "project", "p", 0); len(unb) != 5 {
+		t.Errorf("non-positive limit must be unbounded, got %d", len(unb))
+	}
+}
+
+// TestPruneMemoryKeepsNewest proves PruneMemory caps a partition's task:* family to the
+// newest `keep`, deleting older task rows while leaving other keys untouched, and that a
+// non-positive keep is a refuse-to-wipe no-op.
+func TestPruneMemoryKeepsNewest(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	for i := 0; i < 6; i++ {
+		if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: fmt.Sprintf("task:%d", i), Value: "v"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A non-task key in the same partition must survive the task:* prune.
+	if _, err := s.PutMemory(ctx, Memory{Scope: "project", Project: "p", Key: "style", Value: "stdlib only"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// keep <= 0 is a refuse-to-wipe no-op.
+	if n, err := s.PruneMemory(ctx, "project", "p", "task:", 0); err != nil || n != 0 {
+		t.Fatalf("PruneMemory(keep=0) = %d, %v, want a 0 no-op", n, err)
+	}
+
+	deleted, err := s.PruneMemory(ctx, "project", "p", "task:", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 4 { // 6 task rows − 2 kept
+		t.Errorf("PruneMemory deleted %d, want 4", deleted)
+	}
+	rows, err := s.QueryMemory(ctx, "project", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]bool{}
+	for _, r := range rows {
+		keys[r.Key] = true
+	}
+	// Newest two task rows kept, older ones gone, and the non-task key untouched.
+	for _, want := range []string{"task:4", "task:5", "style"} {
+		if !keys[want] {
+			t.Errorf("prune dropped %q; survivors: %v", want, keys)
+		}
+	}
+	for _, gone := range []string{"task:0", "task:1", "task:2", "task:3"} {
+		if keys[gone] {
+			t.Errorf("prune kept stale %q; survivors: %v", gone, keys)
+		}
 	}
 }
 

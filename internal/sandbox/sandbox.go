@@ -61,6 +61,14 @@ type Container struct {
 	// (docker on Linux — podman and Docker Desktop provide the host alias already).
 	ExtraHosts []string
 
+	// DNS, when non-empty, is emitted as `--dns <DNS>` so the container resolves
+	// names only through the given resolver. It is set by the HARD egress path
+	// (AllowEgressViaHard): pointing the sandbox's resolver at the dual-homed gateway
+	// (which serves no :53) blackholes in-sandbox DNS, closing the DNS-tunnel exfil
+	// residual — proxied traffic still works because the client reaches the proxy by
+	// IP and the proxy does the resolving. Empty by default (byte-identical run args).
+	DNS string
+
 	// ExtraReadRoots are additional host directories bind-mounted READ-ONLY into the
 	// container at the SAME absolute path (identity-mapped, so a path the host-side
 	// file tools already resolved is the same path the in-box `run` shell sees). They
@@ -108,21 +116,72 @@ func (c *Container) Workdir() string { return c.HostDir }
 
 // AllowEgressVia routes the container's network through an allowlist proxy
 // (proxyURL, e.g. policy.ProxyURL(addr)). Without this, egress is denied entirely
-// (--network none). The proxy enforces the policy.Egress allowlist, so only
-// approved hosts are reachable even though the container now has a network.
+// (--network none, the safe default). The proxy enforces the policy.Egress
+// allowlist for proxy-respecting clients.
+//
+// SECURITY (important): this sets `--network bridge`, which gives the container a
+// real NAT route to the internet, and points HTTP(S)_PROXY at the allowlist proxy.
+// The allowlist is therefore COOPERATIVE, not a hard boundary — a model-emitted
+// command that ignores the proxy (curl --noproxy, raw sockets, bash /dev/tcp) can
+// still reach arbitrary hosts, including the cloud-metadata endpoint. For a HARD
+// egress boundary use the namespace backend (Linux), which runs with an empty
+// network namespace (deny-all). applyContainerEgress (cmd/nilcore) warns about this
+// and honors NILCORE_EGRESS_STRICT to fail closed.
+//
+// The container backend has an OPT-IN hard option too: AllowEgressViaHard (wired by
+// applyContainerEgress under NILCORE_EGRESS_HARD) attaches the sandbox to a
+// `--internal` network with no route out and routes it through a dual-homed gateway
+// container, making the allowlist unbypassable (Linux-container only, CI-validated,
+// with an honestly-documented DNS-tunnel residual). The namespace backend's empty
+// netns remains the recommended hard boundary.
 //
 // NOTE: allowlisted egress is a CONTAINER-backend capability only. The namespace
-// backend (Auto-preferred on Linux) has no equivalent — it is deny-all (see
+// backend (Auto-preferred on Linux) has no proxy path — it is hard deny-all (see
 // namespace_linux.go). Callers that need web_fetch / a non-empty egress allowlist
 // must run on the container backend (`-sandbox container`).
 func (c *Container) AllowEgressVia(proxyURL string) {
 	c.Network = "bridge"
+	c.setProxyEnv(proxyURL)
+}
+
+// AllowEgressViaHard is the HARD egress path (opt-in, Linux-container only; wired by
+// cmd/nilcore's applyContainerEgress under NILCORE_EGRESS_HARD). Unlike AllowEgressVia
+// it does NOT attach the container to a bridged NAT network. Instead the caller has
+// created a dedicated `--internal` docker/podman network — which has NO default route
+// — and runs the allowlist proxy as a dual-homed GATEWAY container (internal net +
+// a normal net). The sandbox is attached to the INTERNAL net only, so its ONLY path
+// off-box is the gateway: proxy-cooperative traffic reaches the allowlist, while a
+// raw socket / `curl --noproxy` has no route out and simply fails. This makes the
+// allowlist UNBYPASSABLE without host root / NET_ADMIN (the sandbox keeps
+// --cap-drop=ALL), i.e. a genuine boundary rather than the cooperative one.
+//
+// network is the internal network name (emitted as `--network`, so no bridge and no
+// --add-host are needed); proxyURL points HTTP(S)_PROXY at the gateway. The caller
+// additionally sets c.DNS to the gateway so in-sandbox DNS is blackholed (the
+// remaining residual — see the DNS field). HONEST RESIDUALS (documented in
+// applyContainerEgress + docs/ARCHITECTURE.md): DNS-tunnel exfil is only mitigated,
+// not proven-closed; it requires the nilcore image (a debian:stable-slim has no
+// `nilcore` to run the gateway); it is Linux-container only and CI-validated. The
+// namespace backend's empty netns remains the recommended hard boundary.
+func (c *Container) AllowEgressViaHard(network, proxyURL string) {
+	c.Network = network
+	c.setProxyEnv(proxyURL)
+}
+
+// setProxyEnv points the four HTTP(S)_PROXY vars at proxyURL and pins NO_PROXY empty
+// so an inherited NO_PROXY can't exempt any host from the proxy (defense-in-depth;
+// on the cooperative bridge path it does NOT stop a client that bypasses the proxy
+// entirely — see the SECURITY note above — whereas on the hard path there is no
+// route around the proxy at all).
+func (c *Container) setProxyEnv(proxyURL string) {
 	if c.Env == nil {
 		c.Env = map[string]string{}
 	}
 	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
 		c.Env[k] = proxyURL
 	}
+	c.Env["NO_PROXY"] = ""
+	c.Env["no_proxy"] = ""
 }
 
 // runArgs builds the container runtime argument list (extracted so the hardening
@@ -156,6 +215,12 @@ func (c *Container) runArgs(cmd string, perRun map[string]string) []string {
 	// on docker-Linux). Empty unless egress wiring set them.
 	for _, h := range c.ExtraHosts {
 		args = append(args, "--add-host", h)
+	}
+
+	// Pin the resolver to a single DNS server (the HARD egress path points this at
+	// the gateway so in-sandbox DNS is blackholed). Empty unless hard egress set it.
+	if c.DNS != "" {
+		args = append(args, "--dns", c.DNS)
 	}
 
 	// Per-run secret injection (P2-T03): keys reach the container only for this

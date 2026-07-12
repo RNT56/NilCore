@@ -480,11 +480,12 @@ func (b *Bot) call(ctx context.Context, method string, payload any, out any) err
 	// Bounded retry on HTTP 429 so a rate-limited gate/ask/final message is not silently
 	// dropped: honor the retry_after Telegram returns (JSON parameters or Retry-After
 	// header), cap the wait, and give up after maxRateRetries. The body bytes are reusable,
-	// so each attempt rebuilds its own request.
+	// so each attempt rebuilds its own request. Both error paths redact the token: it rides
+	// in the URL path, so a *url.Error would otherwise leak it into a log (I3).
 	for attempt := 0; ; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			return err
+			return b.redactErr(method, err)
 		}
 		req.Header.Set("content-type", "application/json")
 		resp, err := b.http.Do(req)
@@ -575,4 +576,18 @@ func scrubToken(err error, token string) error {
 		return errors.New(strings.ReplaceAll(s, token, "<redacted>"))
 	}
 	return err
+}
+
+// redactErr strips the bot token from an error before returning it. Telegram puts the
+// token in the request URL PATH, so a *url.Error from the HTTP layer carries it in
+// Error() (Go redacts only URL userinfo, not the path). Wrapping here means a token
+// can never ride a call error into a log or the append-only event trail (I3),
+// regardless of what a future caller does with the error. Slack does this correctly
+// by construction (token in the Authorization header, never the URL).
+func (b *Bot) redactErr(method string, err error) error {
+	msg := err.Error()
+	if b.token != "" {
+		msg = strings.ReplaceAll(msg, b.token, "[redacted]")
+	}
+	return fmt.Errorf("telegram %s: %s", method, msg)
 }

@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -216,4 +217,51 @@ func TestSearchEmptyK(t *testing.T) {
 	if hits != nil {
 		t.Errorf("Search with k=0 = %+v, want nil", hits)
 	}
+}
+
+// TestOpenMigratesLegacyDocsHashColumn covers the pragma-guarded hash-column migration
+// (OpenModel): a docs table created before the content-hash column existed must gain it
+// on Open — detected via pragma_table_info, NOT a driver-specific "duplicate column
+// name" error string — and a re-Open must be an idempotent no-op.
+func TestOpenMigratesLegacyDocsHashColumn(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy_sem.db")
+
+	// Pre-D2-T01 docs table: no hash column.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE docs (id TEXT PRIMARY KEY, text TEXT NOT NULL, vec TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO docs (id, text) VALUES ('a', 'legacy row')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open must migrate the hash column in (guarded by pragma_table_info).
+	ix, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("open legacy semantic DB: %v", err)
+	}
+	if has, err := docsHasColumn(ix.db, "hash"); err != nil || !has {
+		t.Fatalf("Open did not migrate docs.hash onto a legacy DB (has=%v err=%v)", has, err)
+	}
+	// The migrated column is usable: an Add records a content hash without error.
+	if err := ix.Add(ctx, "b", "new row"); err != nil {
+		t.Fatalf("Add after migration: %v", err)
+	}
+	if err := ix.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-Open is an idempotent no-op (pragma sees the column, skips the ALTER).
+	ix2, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("re-Open after hash migration (idempotency): %v", err)
+	}
+	t.Cleanup(func() { ix2.Close() })
 }

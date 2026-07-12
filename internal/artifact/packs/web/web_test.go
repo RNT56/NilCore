@@ -275,3 +275,31 @@ func TestWebPackThroughRegistry(t *testing.T) {
 		t.Fatalf("unregistered web id status = %q, want unverifiable", st)
 	}
 }
+
+// TestWebPackRefusesHollowURLResolves is the I2 strength gate through the pack registry: a
+// value-bearing claim bound to web.url_resolves resolves Unverifiable (never Pass) even when
+// the source returns a 2xx — url_resolves never inspects Evidence.Value, so greening it would
+// be a hollow green. A value-LESS url_resolves claim keeps the legit "this URL resolves" use.
+func TestWebPackRefusesHollowURLResolves(t *testing.T) {
+	ctx := context.Background()
+	r := evverify.New()
+	RegisterAll(r)
+	box := &fakeBox{exec: func(string) (sandbox.Result, error) {
+		return sandbox.Result{ExitCode: 0}, nil // a 2xx that WOULD pass url_resolves
+	}}
+
+	// Value-bearing => refused (hollow green blocked); the box is never even reached.
+	st, _ := r.Resolve(ctx, box, claim(IDURLResolves, "https://example.com", "a fabricated fact"))
+	if st != artifact.StatusUnverifiable {
+		t.Fatalf("value-bearing url_resolves status = %q, want unverifiable (hollow green)", st)
+	}
+	if box.lastCmd != "" {
+		t.Fatalf("the gate must fire before the box check; box saw %q", box.lastCmd)
+	}
+
+	// Value-less => still allowed on a 2xx (legit provenance assertion).
+	st, _ = r.Resolve(ctx, box, claim(IDURLResolves, "https://example.com", ""))
+	if st != artifact.StatusPass {
+		t.Fatalf("value-less url_resolves on a 2xx status = %q, want pass", st)
+	}
+}

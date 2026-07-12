@@ -115,12 +115,35 @@ type Loop struct {
 	// Verifier builds the project verifier for a directory (the same factory shape
 	// the orchestrator uses). JudgeProject runs it plus each Criterion command.
 	Verifier func(dir string) verify.Verifier
+	// VerifyTip, when set, is the tip-aware done-authority the loop PREFERS over
+	// Verifier once an integration tip exists (st.Branch != ""). WHY: the run's
+	// verified work lives on integrate/ branches the workers + integrator produced —
+	// it is NEVER checked out into st.Repo (the base repo dir Verifier judges), so a
+	// base-dir judge verifies an EMPTY base: a fresh run could never green a red bar,
+	// and an already-green base would converge goal-blind (I2). VerifyTip cuts a
+	// throwaway worktree from `tip` and runs the project verifier AND every criterion
+	// over THAT tree (the wiring re-binds each criterion's command to the tip's
+	// sandbox, since the seeded criteria are bound to the base box). It returns the
+	// same (done, unmet) shape JudgeProject does. nil ⇒ the loop judges st.Repo as
+	// before (byte-identical), and it also falls back to that until the first tip lands.
+	VerifyTip func(ctx context.Context, tip string, criteria []Criterion) (done bool, unmet int)
 
 	Advisor  *advisor.Advisor                    // strong-tier reasoning for the reflect ladder
 	Reviewer model.Provider                      // cross-model review before a promote (optional)
 	Differ   func(branch string) (string, error) // produces the promote diff for Reviewer (optional; nil ⇒ no review)
 	Gate     func(a policy.GateAction) bool      // the single gated, irreversible promote
 	Channel  ChannelAsk                          // human stop-and-ask (recovery ladder's last rung)
+
+	// BaseBranch is the merge TARGET a converged PromoteToBase advances — the base
+	// repo's current branch (e.g. "main"), resolved by the wiring (the loop is a leaf
+	// and runs no git). converge keys the gate action AND the earned-trust
+	// boundary_outcome on THIS name, not the source integration tip: GradedApprover.scopeFor
+	// reads GateAction.Branch for both the trust bucket AND the "never auto-approve
+	// main/prod" floor (isProtectedBase / isProd / DenyBranches), so keying on the tip
+	// would let that floor go silent — a latent auto-merge-into-main hazard. The source
+	// tip rides in the gate action Detail. Empty (unwired / detached HEAD) ⇒ converge
+	// falls back to the tip (the pre-fix behavior); the production build wiring sets it.
+	BaseBranch string
 
 	MaxIterations int // outer-loop iteration ceiling; <1 → a generous default
 	MaxNoProgress int // consecutive no-progress iterations before stop-ask; <1 → default
@@ -155,7 +178,7 @@ type Outcome struct {
 	Reason     string // one of the Reason* constants below
 	Branch     string // the best verified integration tip (for a gated promote)
 	Iterations int    // outer-loop iterations consumed (a termination witness)
-	Promoted   bool   // a gated PromoteToBase was approved and applied
+	Promoted   bool   // the gated PromoteToBase was APPROVED at the gate (the human said yes). The loop RECORDS approval; it does NOT itself merge — advancing the base is the wiring's job (the CLI build path pins/merges the tip, cmd/nilcore/build.go).
 	Unmet      int    // criteria still unmet at termination (0 when Done)
 	Summary    string // the loop's own account (data, never authoritative)
 }
@@ -331,26 +354,37 @@ func (l *Loop) converge(ctx context.Context, st State) Outcome {
 				}
 			}
 		}
+		// The gate + earned-trust boundary key on the merge TARGET (BaseBranch), not the
+		// source integration tip: GradedApprover.scopeFor reads GateAction.Branch for BOTH
+		// the trust bucket AND the protected-base floor, so keying on the tip would let the
+		// "never auto-approve main/prod" floor go silent (see BaseBranch). The source tip
+		// rides in the gate Detail. When BaseBranch is unwired (detached HEAD / tests) we
+		// fall back to the tip — the pre-fix behavior, still internally consistent (the
+		// boundary scope always equals the gate key).
+		target := st.Branch
+		if l.BaseBranch != "" {
+			target = l.BaseBranch
+		}
+
 		// Earned-trust signal (GAA-T04): right BEFORE the supervised promote gate is
 		// consulted, record a dedicated boundary_outcome carrying the VERIFIER's
-		// verdict on this integration tip — never a backend self-report (I2). We are
-		// in converge only because JudgeProject returned done=true (the project
-		// verifier AND every criterion exited 0), so passed is that verdict, sourced
-		// from the same flag the gate already relies on. action/scope mirror exactly
-		// what the GradedApprover keys trust on (PromoteToBase.String() + the target
-		// branch), so graapprove.BuildTrust folds this into the right (Type,scope)
-		// bucket. This is purely ADDITIVE — a new event alongside the existing promote
-		// events — and changes no control flow and no existing event.
+		// verdict on this promote — never a backend self-report (I2). We are in converge
+		// only because JudgeProject returned done=true (the project verifier AND every
+		// criterion exited 0), so passed is that verdict, sourced from the same flag the
+		// gate already relies on. action/scope mirror exactly what the GradedApprover keys
+		// trust on (PromoteToBase.String() + the target base branch), so graapprove.BuildTrust
+		// folds this into the right (Type,scope) bucket. This is purely ADDITIVE — a new
+		// event alongside the existing promote events — and changes no control flow.
 		l.Log.Append(eventlog.Event{Task: projectTask, Kind: "boundary_outcome",
 			Detail: map[string]any{
 				"action": policy.PromoteToBase.String(), // "promote-to-base"
-				"scope":  st.Branch,                     // the target branch the gate matches on
+				"scope":  target,                        // the merge TARGET the gate matches on (BaseBranch)
 				"passed": true,                          // the verifier verdict (done==true); never a self-report
 				"chain":  true,
 			}})
 
-		action := policy.GateAction{Type: policy.PromoteToBase, Branch: st.Branch,
-			Detail: "promote converged, verifier-green integration tip"}
+		action := policy.GateAction{Type: policy.PromoteToBase, Branch: target,
+			Detail: "promote converged verifier-green tip " + st.Branch + " → " + target}
 		if l.Gate(action) {
 			out.Promoted = true
 			l.Log.Append(eventlog.Event{Task: projectTask, Kind: "project_promote",

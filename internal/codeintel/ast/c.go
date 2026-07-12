@@ -25,7 +25,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -91,7 +90,7 @@ func (cParser) calls(path string) (map[string][]string, error) {
 // receivers (C has no methods): a function header opens a plain block; a struct/union/
 // enum or typedef emits a flat KindType.
 func cScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open c file: %w", err)
 	}

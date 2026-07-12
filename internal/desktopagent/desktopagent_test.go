@@ -230,6 +230,50 @@ func TestSubmitKeyGatedOnConsequentialWindow(t *testing.T) {
 	}
 }
 
+// TestHostGateAllMutations proves FIX 3: on the host-control tier (GateAllMutations=true)
+// EVERY mutating action is routed through the approver — not just irreversibleTarget
+// matches. On the REAL desktop the CV-only observation carries no accessible names, so
+// irreversibleTarget is structurally blind and would gate NOTHING; GateAllMutations is what
+// makes the per-action gate real. A deny-approver blocks a plain, benign click and it never
+// reaches the session; read-only observe stays ungated; and contained mode
+// (GateAllMutations=false) leaves the same click ungated (unchanged behavior).
+func TestHostGateAllMutations(t *testing.T) {
+	// A benign, structure-less screen (host CV mode): a coordinate click with no accessible
+	// target — irreversibleTarget returns "" so contained mode would let it through.
+	latest := desktopwire.Observation{Version: 1, Rung: desktopwire.RungCoordinate}
+
+	// Host mode + deny approver ⇒ the plain click is BLOCKED, never dispatched.
+	fs := &fakeSession{}
+	fs.latest = latest
+	deny := &recordingApprover{verdict: false}
+	c := &ComputerTool{Sess: fs, Approver: deny, GateAllMutations: true}
+	out, _ := run(t, c, map[string]any{"op": "click", "coordinate": []int{10, 20}})
+	if !strings.Contains(out, "BLOCKED") {
+		t.Fatalf("a host-mode click must be gated, got %q", out)
+	}
+	if len(fs.got) != 0 {
+		t.Fatal("a denied host-mode click must never reach the session")
+	}
+	if len(deny.prompts) != 1 {
+		t.Fatalf("the click must route through the approver, prompts=%v", deny.prompts)
+	}
+
+	// A read-only observe is never gated, even in host mode.
+	run(t, c, map[string]any{"op": "observe"})
+	if len(fs.got) != 1 {
+		t.Fatal("observe is read-only and must not be gated in host mode")
+	}
+
+	// Contained mode (GateAllMutations=false): the same benign coordinate click is ungated.
+	fs2 := &fakeSession{}
+	fs2.latest = latest
+	c2 := &ComputerTool{Sess: fs2, Approver: &recordingApprover{verdict: false}, GateAllMutations: false}
+	run(t, c2, map[string]any{"op": "click", "coordinate": []int{10, 20}})
+	if len(fs2.got) != 1 {
+		t.Fatal("contained-mode benign click must NOT be gated (unchanged behavior)")
+	}
+}
+
 func TestEventSink(t *testing.T) {
 	var steps []Step
 	fs := &fakeSession{respFn: func(a desktopwire.Act) (desktopwire.Observation, error) {

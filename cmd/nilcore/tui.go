@@ -63,6 +63,12 @@ func tuiMain(args []string) {
 	// it in-memory only — parity with chatMain.
 	mem, ckpt, _ := setupPersistence(log, *cf.common.logPath)
 
+	// Resolve `-backend auto` (and a config `backend: auto`) to a concrete backend
+	// BEFORE resolveProvider — exactly as run/serve/chat do — otherwise the TUI front
+	// door fatals with `unknown backend "auto"` on a value the rest of the CLI accepts.
+	if *cf.common.backendName == "auto" {
+		*cf.common.backendName = resolveAutoBackend(cf.common, b, log)
+	}
 	prov, err := resolveProvider(*cf.common.backendName, b)
 	if err != nil {
 		fatal(err)

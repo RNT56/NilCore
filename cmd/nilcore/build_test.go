@@ -603,14 +603,14 @@ func TestSpawnTypedArtifact(t *testing.T) {
 
 	t.Run("green artifact => projection non-nil, Green=true, one ClaimStatus per claim", func(t *testing.T) {
 		t.Setenv("NILCORE_EVIDENCE_VERIFY", "1")
-		t.Setenv("NILCORE_VERIFY_PACKS", "")
-		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0} // exit 0 ⇒ url_resolves Pass
+		t.Setenv("NILCORE_VERIFY_PACKS", "web")                          // register web.quote_exists (value-checking)
+		box := &fakeVerifierBox{dir: t.TempDir(), exit: 0, stdout: "v1"} // 2xx + body contains the claimed Value
 		env := buildEnv{Box: box, Verifier: verify.New(box, "true")}
 		// The worker CHOOSES the artifact id; it need not equal the task id (spec.ID).
 		// Write it under a model-chosen id DIFFERENT from typedSpec's "rep" to prove the
 		// harness discovers the artifact id-agnostically — the seam the old code assumed
 		// (filename == spec.ID), which a real model-driven worker would not satisfy.
-		writeURLArtifact(t, box.dir, "entity-acme", "https://example.com")
+		writeQuoteArtifact(t, box.dir, "entity-acme", "https://example.com")
 
 		gov, _ := typedResearchVerifier(typedSpec("rep"), env, nil)
 		rep, err := gov.Check(context.Background())

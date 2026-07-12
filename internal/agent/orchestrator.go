@@ -306,8 +306,60 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		_ = o.Checkpoint.Begin(ctx, t) // durable: mark running (P6-T03)
 	}
 
-	wt, err := worktree.Create(ctx, o.BaseRepo, t.ID)
+	// AUTO-REATTACH (durable resume): if a predecessor drive in this SAME session
+	// self-suspended (the `sleep` tool) and preserved its committed work under a
+	// suspend/ ref, base this resumed drive on that work instead of a fresh HEAD
+	// worktree — so the agent picks up where its earlier self left off rather than
+	// re-driving from scratch and orphaning the preserved commits. Correlation is by
+	// the stable session prefix (ResumeBranch). No suspended predecessor ⇒ branch==""
+	// and the default HEAD path below is byte-identical to before.
+	var wt *worktree.Worktree
+	var err error
+	var resumeBranch, resumedFrom string
+	if o.Checkpoint != nil {
+		if b, sid, rerr := o.Checkpoint.ResumeBranch(ctx, t.ID); rerr != nil {
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resume_lookup",
+				Detail: map[string]any{"error": rerr.Error()}})
+		} else {
+			resumeBranch, resumedFrom = b, sid
+		}
+	}
+	if resumeBranch != "" {
+		leaf := strings.ReplaceAll(t.ID, "/", "-")
+		rwt, cerr := worktree.CreateFrom(ctx, o.BaseRepo, "task/"+t.ID, leaf, resumeBranch)
+		if cerr != nil {
+			// A stale/unresolvable suspend ref (already swept, or its commit is gone):
+			// FALL BACK to a fresh HEAD worktree — today's behavior, no regression, no
+			// data loss. The predecessor row is left "suspended" for a later sweep.
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resume_fallback",
+				Detail: map[string]any{"branch": resumeBranch, "resumed_from": resumedFrom, "error": cerr.Error()}})
+			// wt stays nil ⇒ the HEAD-fallback worktree.Create below runs. resumeBranch is
+			// not read again, so it is intentionally left as-is (no data lost: the ref remains
+			// for a later sweep).
+		} else {
+			wt = rwt
+			// Retire the predecessor so it is never reattached twice AND its anchor
+			// becomes GC-eligible; then delete the consumed ref immediately so it does
+			// not linger (the sweep is only a backstop for the crash-before-here case).
+			if o.Checkpoint != nil {
+				_ = o.Checkpoint.Complete(ctx, resumedFrom, t.Goal, false)
+			}
+			worktree.DeleteBranch(ctx, o.BaseRepo, resumeBranch)
+			o.Log.Append(eventlog.Event{Task: t.ID, Kind: "task_resumed",
+				Detail: map[string]any{"resumed_from": resumedFrom, "branch": resumeBranch}})
+		}
+	}
+	if wt == nil {
+		wt, err = worktree.Create(ctx, o.BaseRepo, t.ID)
+	}
 	if err != nil {
+		// The checkpoint was already marked running (Begin above). Finalize it so a
+		// restart's Resume does not re-drive a task whose setup already faulted here. A
+		// ctx-cancel during create (SIGTERM/deadline) belongs to the Interrupt sweep
+		// (running→interrupted, a deliberate resume point), so leave that case untouched.
+		if o.Checkpoint != nil && ctx.Err() == nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
+		}
 		return Outcome{}, fmt.Errorf("create worktree: %w", err)
 	}
 	// keepBranch is flipped on only for a verified success under KeepBranch (D4):
@@ -367,13 +419,63 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 		// resumer skips it — the wake owns resume, so re-driving here would double it.
 		// Propagate the sentinel so the session unwinds with no verdict/notification.
 		if errors.Is(err, backend.ErrSuspended) {
-			if o.Checkpoint != nil {
-				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal)
+			// PRESERVE the committed work across the nap. The default worktree cleanup
+			// `git branch -D`s the task branch, which would DESTROY every commit the agent
+			// made before sleeping — directly contradicting the sleep guidance ("your
+			// uncommitted edits are discarded — commit them first", which implies commits
+			// survive). So before the disposable task/<id> worktree is cleaned up we pin its
+			// committed HEAD under a distinct, collision-safe, sweep-safe ref
+			// (suspend/<id>, mirroring the resume/ durable-anchor convention): the commits
+			// stay reachable as a durable RECOVERY anchor so they are never lost, while
+			// uncommitted working-tree edits remain disposable exactly as the guidance
+			// states. (The current wake re-engages a fresh drive from the note; it does NOT
+			// yet auto-reattach onto this ref — auto-reattach + suspend/<id> GC is a
+			// documented follow-up. The ref means the committed work is RECOVERABLE, not
+			// destroyed — which is the data-loss finding this closes.) Best-effort — a Head/pin
+			// failure is logged and we still record what we can and unwind cleanly.
+			branch := "suspend/" + t.ID
+			if sha, herr := wt.Head(ctx); herr != nil {
+				branch = ""
+				o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "suspend_preserve",
+					Detail: map[string]any{"error": herr.Error()}})
+			} else if perr := worktree.PinBranch(ctx, o.BaseRepo, branch, sha); perr != nil {
+				branch = ""
+				o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "suspend_preserve",
+					Detail: map[string]any{"error": perr.Error()}})
 			}
-			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended"})
-			return Outcome{Backend: be.Name(), Summary: res.Summary}, backend.ErrSuspended
+			if o.Checkpoint != nil {
+				// Record the preserved branch in the durable checkpoint so the committed work
+				// is discoverable under this ref (a recovery anchor). NOTE: no path reads this
+				// back yet — the wake re-drives fresh from the note; auto-reattach is a follow-up.
+				_ = o.Checkpoint.Suspend(ctx, t.ID, t.Goal, branch)
+			}
+			o.Log.Append(eventlog.Event{Task: t.ID, Backend: be.Name(), Kind: "task_suspended",
+				Detail: map[string]any{"branch": branch}})
+			return Outcome{Backend: be.Name(), Summary: res.Summary, Branch: branch}, backend.ErrSuspended
+		}
+		// A genuine backend fault is terminal: finalize the durable checkpoint so a
+		// restart's Resume does not re-drive a task the live process already failed. But a
+		// ctx-cancel fault (SIGTERM/deadline on the single-task path, which surfaces as a
+		// model-step context.Canceled error) is NOT ours to finalize — the SIGTERM Interrupt
+		// sweep owns that row (running→interrupted, a deliberate resume point), so we leave
+		// it untouched to preserve that handling.
+		if o.Checkpoint != nil && ctx.Err() == nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
 		}
 		return Outcome{Backend: be.Name()}, fmt.Errorf("backend: %w", err)
+	}
+
+	// A cancelled task ctx (operator /cancel, SIGTERM, or a deadline) makes a well-behaved
+	// backend return a CLEAN interrupted Result (native.go returns Result{Summary:
+	// "interrupted: ..."}, nil). Running the final verify on the dead ctx would fail with
+	// "context canceled" and mis-surface the interrupt as a verify FAULT ("Run errored").
+	// So on a cancelled ctx we SKIP verification and return the clean interrupted Outcome:
+	// the work was cut short, not completed, so there is nothing to gate. We do NOT finalize
+	// the checkpoint here — the SIGTERM Interrupt sweep owns that row (deliberate resume).
+	if ctx.Err() != nil {
+		o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "task_interrupted",
+			Detail: map[string]any{"cause": ctx.Err().Error()}})
+		return Outcome{Backend: res.Backend, Summary: res.Summary}, nil
 	}
 
 	// Source of truth: re-run the project's checks no matter which backend ran.
@@ -381,6 +483,20 @@ func (o *Orchestrator) executeSingle(ctx context.Context, t backend.Task) (Outco
 	// self-report never decides whether the work ships (invariant I2).
 	rep, err := env.Verifier.Check(ctx)
 	if err != nil {
+		// A ctx cancelled DURING the verify (an interrupt landing after the check above)
+		// makes Check fail with context.Canceled — the same interrupt caught before the
+		// verify, just later. Surface it as a clean interrupted outcome, not a "final verify"
+		// fault, and leave the row to the Interrupt sweep (do not finalize it).
+		if ctx.Err() != nil {
+			o.Log.Append(eventlog.Event{Task: t.ID, Backend: res.Backend, Kind: "task_interrupted",
+				Detail: map[string]any{"cause": ctx.Err().Error(), "at": "verify"}})
+			return Outcome{Backend: res.Backend, Summary: res.Summary}, nil
+		}
+		// A genuine verify fault is terminal: finalize the checkpoint so a restart's Resume
+		// does not re-drive a task the live process already failed.
+		if o.Checkpoint != nil {
+			_ = o.Checkpoint.Complete(ctx, t.ID, t.Goal, false)
+		}
 		return Outcome{Backend: res.Backend, Summary: res.Summary}, fmt.Errorf("final verify: %w", err)
 	}
 	// Detail["class"] is the deterministic task-class bucket (trust.Classify), added
@@ -539,6 +655,9 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 			}
 			cands = append(cands, rc)
 		}
+		if len(cands) == 0 {
+			return Outcome{}, false
+		}
 		return o.runRace(ctx, t, cands, rwts, passed)
 	}
 
@@ -557,6 +676,9 @@ func (o *Orchestrator) raceEscalate(ctx context.Context, t backend.Task, raceN i
 		rt.Dir = rwt.Path()
 		renv := o.NewEnv(rt.Dir)
 		cands = append(cands, route.Candidate{Backend: renv.Backend, Verifier: verifierFor(renv.Verifier), Task: rt, Class: class})
+	}
+	if len(cands) == 0 {
+		return Outcome{}, false
 	}
 	return o.runRace(ctx, t, cands, rwts, passed)
 }
@@ -625,8 +747,10 @@ func withFailureEvidence(constraints []string, failClass, verifierOutput string)
 // /apply, a gated PR). Without preserving it, a first-attempt-fail + race-win under
 // KeepBranch reported "verified" while deleting the diff and its branch (D4 was honored only
 // on the non-race single path, so chat/serve/TUI drives that set KeepBranch+RaceN kept
-// NOTHING). rwts is parallel to cands; passed is parallel too when KeepBranch is set and
-// picks the WINNER — the lowest-index passing candidate, exactly route.Race's own selection.
+// NOTHING) — silently breaking the -race-n "keep a verifier-green one" contract for the
+// chat /apply, watch/schedule --open-pr, decompose and selfimprove consumers. rwts is
+// parallel to cands; passed is parallel too when KeepBranch is set and picks the WINNER —
+// the lowest-index passing candidate, exactly route.Race's own selection.
 func (o *Orchestrator) runRace(ctx context.Context, t backend.Task, cands []route.Candidate, rwts []*worktree.Worktree, passed []*bool) (Outcome, bool) {
 	// keepIdx is the one race worktree to PRESERVE (a KeepBranch win): its branch carries
 	// the verified work. -1 disposes every worktree — the default and every non-KeepBranch

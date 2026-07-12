@@ -5,11 +5,15 @@ import (
 	"testing"
 )
 
-// TestHardenArgs pins the clamp flags: the two repo-controlled code-execution
-// vectors (per-repo hooks and the fsmonitor binary) must always be neutralized.
+// TestHardenArgs pins the clamp flags: the repo-controlled code-execution vectors a
+// command-line `-c` can cleanly override — per-repo hooks, the fsmonitor binary, and a
+// forced signed commit's gpg.program — must always be neutralized with `-c`, which
+// outranks repo-local $GIT_DIR/config. (diff.external is NOT clamped here: `-c
+// diff.external=` makes git exec the empty string and breaks every diff; it is covered
+// by the .git write-guard + the git tool's per-command --no-ext-diff instead.)
 func TestHardenArgs(t *testing.T) {
 	got := strings.Join(HardenArgs(), " ")
-	want := "-c core.hooksPath=/dev/null -c core.fsmonitor="
+	want := "-c core.hooksPath=/dev/null -c core.fsmonitor= -c commit.gpgSign=false"
 	if got != want {
 		t.Fatalf("HardenArgs() = %q, want %q", got, want)
 	}

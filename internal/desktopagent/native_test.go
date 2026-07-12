@@ -130,6 +130,30 @@ func TestNativeStagnationResetsOnChange(t *testing.T) {
 	}
 }
 
+// TestNativeHostGateAllMutations proves FIX 3 on Path A: with GateAllMutations set
+// (--mac-host) a coordinate click — which in pixel mode has no accessible target for
+// irreversibleTarget to classify — is still routed through the approver, and a deny-approver
+// blocks it before it reaches the session.
+func TestNativeHostGateAllMutations(t *testing.T) {
+	fs := &fakeSession{}
+	fs.latest = desktopwire.Observation{Version: 1, Rung: desktopwire.RungCoordinate}
+	deny := &recordingApprover{verdict: false}
+	nt := &NativeComputerTool{Sess: fs, Approver: deny, GateAllMutations: true}
+	out, _, err := nt.RunWithImage(context.Background(), ".", json.RawMessage(`{"action":"left_click","coordinate":[10,20]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "BLOCKED") {
+		t.Fatalf("a host-mode native click must be gated, got %q", out)
+	}
+	if len(fs.got) != 0 {
+		t.Fatal("a denied host-mode native click must never reach the session")
+	}
+	if len(deny.prompts) != 1 {
+		t.Fatalf("the native click must route through the approver, prompts=%v", deny.prompts)
+	}
+}
+
 // The registry advertises the native tool as a builtin (the loop-dispatch wire).
 func TestRegistryAdvertisesBuiltin(t *testing.T) {
 	reg := tools.NewRegistry(&NativeComputerTool{})

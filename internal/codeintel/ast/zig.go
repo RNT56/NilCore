@@ -32,7 +32,6 @@ package ast
 import (
 	"bufio"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 )
@@ -87,7 +86,7 @@ func (zigParser) calls(path string) (map[string][]string, error) {
 // `const NAME = struct/union/enum/opaque {` opens a named receiver block; a `fn` is a method
 // when nested inside such a container, else a free function.
 func zigScan(path string, wantRefs bool) ([]Symbol, []Reference, error) {
-	f, err := os.Open(path) //nolint:gosec // path is supplied by the worktree-confined walker
+	f, err := openSource(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open zig file: %w", err)
 	}
