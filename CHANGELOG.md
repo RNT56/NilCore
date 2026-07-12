@@ -16,6 +16,8 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
+- **P15-T13** — Add a hermetic, golden-transcript provider compatibility evaluation covering custom OpenAI-compatible endpoints, reasoning token caps, strict JSON Schema output, OpenRouter routing/extras/attribution, native search rendering and drop-on-decode containment, plus injection-flagged and untrusted-data-fenced client search fallback. _Owns:_ `eval/provider-compat/`, `CHANGELOG.md`. _(Phase 15)_
+
 - **frontdoor-parity** — Centralize the native runtime capabilities shared by run/watch/resume/swarm, chat/TUI, and serve (advisor budget, repo orientation, proactive context window, live code intelligence, memory/lessons, and trusted steering) behind one configurator, with a constructor-level parity test across all three real builders so a one-door omission cannot ship inert again. _Owns:_ `cmd/nilcore/{native_runtime.go,native_runtime_test.go,chat.go,main.go}`, `CHANGELOG.md`. _(architecture hardening)_
 
 - **security-release-hardening** — Pin the build/release floor to patched Go 1.25.12 and `x/sys` 0.44.0, add a pinned reachable-vulnerability CI gate, make release publication refuse missing/corrupt platform assets or checksum records, and add real four-target release + installer E2Es proving valid install plus fail-closed partial-release, missing-checksum, and tampered-binary paths; refresh the public toolchain and state snapshot. _Owns:_ `go.mod`, `go.sum`, `.github/workflows/{ci,release}.yml`, `scripts/{install,verify-release-assets}.sh`, `test/{install,release-assets}-e2e.sh`, `README.md`, `STATE.md`, `docs/PREREQUISITES.md`. _(security / release hardening)_

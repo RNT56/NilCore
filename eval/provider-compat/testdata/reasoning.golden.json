@@ -1,0 +1,35 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "auth": "bearer:<redacted>",
+    "body": {
+      "model": "gpt-5-mini",
+      "max_completion_tokens": 768,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a fixture."
+        },
+        {
+          "role": "user",
+          "content": "Return the fixture answer."
+        }
+      ],
+      "reasoning_effort": "high"
+    }
+  },
+  "outcome": {
+    "text": "reasoned",
+    "stop_reason": "end_turn",
+    "served_model": "gpt-5-mini-2026-06-01",
+    "usage": {
+      "input_tokens": 20,
+      "output_tokens": 30,
+      "reasoning_tokens": 18
+    },
+    "content_types": [
+      "text"
+    ]
+  }
+}
