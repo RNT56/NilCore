@@ -30,7 +30,6 @@ import (
 	"syscall"
 	"time"
 
-	"nilcore/internal/advisor"
 	"nilcore/internal/agent"
 	"nilcore/internal/backend"
 	"nilcore/internal/blastbudget"
@@ -1779,6 +1778,10 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 		MaxSteps:     *d.flags.maxSteps,
 		Seed:         in.Seed,
 	}
+	configureNativeRuntime(n, nativeRuntimeConfig{
+		Provider: prov, Advisor: adv, Box: box, Memory: d.mem,
+		Project: d.baseRepo, SteeringDir: d.baseRepo,
+	})
 	if in.Inbox != nil {
 		n.Inbox = in.Inbox
 	}
@@ -1794,26 +1797,6 @@ func serveNativeBackend(d serveDeps, prov model.Provider, adv advisorCfg, box sa
 	if in.AskUser != nil {
 		n.AskUser = in.AskUser
 	}
-	// Same orientation + window seams as buildBackend's native case: serve/chat
-	// drives start with the map and compact before overflow, exactly like run.
-	n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
-	n.CtxWindow = meter.CtxWindow
-	if adv.prov != nil {
-		// Meter the advisor against the same conversation/thread budget wall as the
-		// main provider (§6/§7) — a raw adv.prov would let strong-model consults escape
-		// the ceiling.
-		n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
-		n.EscalateAfter = adv.escalateAfter
-	}
-	// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX —
-	// the serve loop gets the same `live` tool as the run/chat paths.
-	if envOptIn("NILCORE_LIVE_INDEX") {
-		n.LiveSession = liveSession(d.mem, d.baseRepo)
-	}
-	// Cross-project memory + distilled lessons, and the operator's steering file —
-	// both reach serve drives now, exactly as they reach run/watch and chat.
-	attachMemoryContext(n, d.mem, d.baseRepo)
-	attachSteering(n, d.baseRepo)
 	// Self-timer (serve-only): the `sleep` tool arms a durable wake for this thread.
 	// nil ⇒ no `sleep` tool advertised (byte-identical) — e.g. no checkpointer wired.
 	n.Wake = wakeArm
@@ -2274,12 +2257,6 @@ func envFactory(c commonFlags, prov model.Provider, cred func(string) string, ad
 		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := orchestratorVerifier(box, *c.checkCmd, log, *c.logPath)
 		be := buildBackend(*c.backendName, prov, cred, adv, box, v, log, *c.maxSteps, mem, project, cfg)
-		// Operator steering (P10-T01): a committed NILCORE.md / AGENTS.md is present in
-		// the worktree checkout; load it once and prepend as trusted instructions on
-		// the native backend. nil/empty ⇒ byte-identical; only the native loop reads it.
-		if n, ok := be.(*backend.Native); ok {
-			attachSteering(n, dir)
-		}
 		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
 }
@@ -2307,11 +2284,6 @@ func multiEnvFactory(c commonFlags, b boot, log *eventlog.Log, mem *memory.Memor
 		box := attachBlast(selectSandbox(*c.sandboxPref, *c.runtime, *c.image, dir), blast)
 		v := orchestratorVerifier(box, *c.checkCmd, log, *c.logPath)
 		be := buildBackend(name, prov, b.cred, adv, box, v, log, *c.maxSteps, mem, project, b.cfg)
-		// Operator steering parity with envFactory: load committed NILCORE.md/AGENTS.md
-		// once for the native backend (nil/empty ⇒ byte-identical; only native reads it).
-		if n, ok := be.(*backend.Native); ok {
-			attachSteering(n, dir)
-		}
 		return agent.Env{Backend: be, Verifier: v, Box: box}
 	}
 }
@@ -2441,26 +2413,14 @@ func buildBackend(name string, prov model.Provider, cred func(string) string, ad
 			CommandGuard: policy.DefaultCommandPolicy().Check,
 			MaxSteps:     maxSteps,
 		}
-		// A fresh advisor per task so its per-task consult ceiling is honored. Metered
-		// against the main provider's wall (§6/§7) so strong-model consults can't escape it.
-		if adv.prov != nil {
-			n.Advisor = advisor.New(meteredAdvisor(prov, adv.prov), adv.maxCalls)
-			n.EscalateAfter = adv.escalateAfter
+		steeringDir := project
+		if box != nil && box.Workdir() != "" {
+			steeringDir = box.Workdir()
 		}
-		attachMemoryContext(n, mem, project)
-		// Repo orientation + window awareness (upgrade program): the map spares the
-		// first steps of every drive from ls/cat structure discovery, and the window
-		// resolver lets the loop compact BEFORE a context overflow instead of dying
-		// on the 400. Both nil-safe seams; box.Workdir() is the per-task worktree.
-		n.RepoContext = func(context.Context) string { return repoMap(box.Workdir(), repoMapBudget) }
-		n.CtxWindow = meter.CtxWindow
-		// Live incremental code-intelligence (P3-T16), opt-in via NILCORE_LIVE_INDEX:
-		// the loop gets a worktree-aware `live` tool whose graph re-indexes edits
-		// incrementally and fuses project memory. Off by default (nil ⇒ byte-identical;
-		// no full per-run index cost unless requested).
-		if envOptIn("NILCORE_LIVE_INDEX") {
-			n.LiveSession = liveSession(mem, project)
-		}
+		configureNativeRuntime(n, nativeRuntimeConfig{
+			Provider: prov, Advisor: adv, Box: box, Memory: mem,
+			Project: project, SteeringDir: steeringDir,
+		})
 		return n
 	}
 }
