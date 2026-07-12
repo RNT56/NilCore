@@ -8,7 +8,7 @@ without adding a Go module, and keeping the default binary byte-identical until 
 Read order: `CLAUDE.md` §2 (invariants) → `docs/ARCHITECTURE.md` (providers) → this file → `docs/TASKS.md`
 (the Phase-15 queue rows + specs).
 
-> **Status: SHIPPED.** The provider upgrade's non-web waves (T01–T06, T10–T12) merged in PR #61 (this Phase-15 DAG runs T01–T14 — there is no T15/T16).
+> **Status: COMPLETE.** The provider upgrade's non-web waves (T01–T06, T10–T12) merged in PR #61 (this Phase-15 DAG runs T01–T14 — there is no T15/T16).
 > **Web search (T07 · T08 · T09) is now shipped too** — the `model.BuiltinTool` foundation it
 > depended on landed via the computer-use work (#60). Native render: Anthropic tools-entry
 > (`web_search_20250305`), OpenAI top-level `web_search_options`, OpenRouter `web` plugin —
@@ -18,8 +18,9 @@ Read order: `CLAUDE.md` §2 (invariants) → `docs/ARCHITECTURE.md` (providers) 
 > both. The **I7 fence** holds by construction — provider web results are the model's own
 > synthesized text (OpenAI) or distinct non-text blocks dropped from re-injection (Anthropic),
 > and the client path stays `guard.Wrap`'d; raw provider result blocks never re-enter as trusted
-> instructions. Remaining: the optional `eval/provider-compat` coverage harness (T13) and a live
-> end-to-end check against real provider keys (hermetic shape/byte-identity tests gate it today).
+> instructions. The hermetic `eval/provider-compat` golden-transcript suite (T13, PR #105) now gates generic
+> endpoints, reasoning, structured output, OpenRouter extras, and both web-search safety paths without network
+> access. A live check against real provider keys remains an operator-only validation, never a CI requirement.
 
 ---
 
@@ -192,8 +193,8 @@ independently. Sequence the web-search waves after the `BuiltinTool` foundation 
 | **T10** | Onboarding config + wizard for compat vendor | `internal/onboard/*` (+tests) | T02 | M |
 | **T11** | Metering/pricing for new ids + authoritative `usage.cost` | `meter/pricer.go` (+test) | T03 | M |
 | **T12** | Egress allowlist extensibility (sandbox only) | `policy/egress.go` (+test) | — | S |
-| **T13** | Eval coverage (compat, reasoning, structured, native search) — **NOT BUILT** (`eval/provider-compat/` does not exist; hermetic shape/byte-identity tests gate the feature today) | `eval/provider-compat/` | T06,T08,T09 | M |
-| **T14** | 📄 Docs: PREREQUISITES + ARCHITECTURE + TASKS *(contract, serialised)* | `docs/{PREREQUISITES,ARCHITECTURE,TASKS}.md` | T02,T03,T06,T08,T09,T10,T11,T12 | M |
+| **T13** | Eval coverage (compat, reasoning, structured, native search) — **SHIPPED in #105** (hermetic per-provider servers + golden transcripts) | `eval/provider-compat/` | T06,T08,T09 | M |
+| **T14** | 📄 Docs: PREREQUISITES + ARCHITECTURE + TASKS *(contract, serialised)* | `docs/{PREREQUISITES,ARCHITECTURE,TASKS}.md` | T02,T03,T06,T08,T09,T10,T11,T12,T13 | M |
 
 ## 7. Parallel execution waves
 
@@ -205,9 +206,9 @@ Each wave's `Owns` sets are pairwise-disjoint; every dependency resolves to a st
 | 2 | T02 · T04 | `provider.go` ‖ new `openai_maxtokens.go` |
 | 3 | T05 *(alone)* | sole owner of `openai.go` |
 | 4 | T06 · T07 · T10 · T11 | `openrouter_extras.go` ‖ `builtin.go`+`openai_websearch.go` ‖ `onboard/*` ‖ `meter/*` |
-| 5 | T08 *(alone)* | co-edits `openai.go`+`native.go`+`model.go` |
+| 5 | T08 *(alone)* | `provider/anthropic.go` (+tests), as shipped |
 | 6 | T09 *(alone)* | new `cmd/nilcore/webcap.go` |
-| 7 | T13 *(alone — NOT BUILT)* | new `eval/provider-compat/` |
+| 7 | T13 *(alone — shipped #105)* | `eval/provider-compat/` |
 | 8 | T14 *(alone)* | serialised contract docs |
 
 **Critical path:** T01 → T05 → T07 → T08 → T09 → T13 → T14. Peak fan-out: Wave 1 (3) and Wave 4 (4).
