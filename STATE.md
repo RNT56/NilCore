@@ -1,9 +1,9 @@
 # STATE.md — NilCore state snapshot
 
-> **Point-in-time snapshot, 2026-07-10** (HEAD `573a4df`, on branch
-> `claude/nilcore-features-review-931610`; **unmerged** — the features-completeness
-> review + remediation pass). This is a derived report, not a contract. The sources of
-> truth remain `CLAUDE.md` (constitution), `docs/ARCHITECTURE.md` (technical law +
+> **Point-in-time snapshot, 2026-07-12** (`origin/main` after the merged
+> features-completeness review #101 and adversarial remediation #100). This is a
+> derived report, not a contract. The sources of truth remain the mirrored
+> `AGENTS.md` / `CLAUDE.md` constitutions, `docs/ARCHITECTURE.md` (technical law +
 > invariants), and `CHANGELOG.md` (the ledger). Where this file and those disagree,
 > **they win** — regenerate this one.
 
@@ -31,7 +31,7 @@ the audit trail.
 | Go packages | **120** total (`go list ./...`); **111** under `internal/` |
 | Direct module deps | **3 sanctioned families** (5 direct requires) — `modernc.org/sqlite`, `golang.org/x/sys`, Charm TUI (`bubbletea`/`bubbles`/`lipgloss`, behind `//go:build tui`) |
 | `CGO_ENABLED` | **0** (pure-Go; cross-compiles cleanly) |
-| Gate | `make verify` (build + vet + lint + test) — green. (`-race` + the `tui` build are separate lanes, not folded in.) |
+| Gate | `make verify` (build + vet + lint + test) — green. Race, TUI, sandbox, browser E2E, `govulncheck`, and installer-integrity proofs are separate CI lanes. |
 
 ---
 

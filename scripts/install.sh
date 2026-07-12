@@ -4,12 +4,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/RNT56/NilCore/main/scripts/install.sh | sh
 #
-# Override with: NILCORE_VERSION=v0.2.0 NILCORE_BINDIR=$HOME/.local/bin sh install.sh
+# Override with: NILCORE_VERSION=v1.2.0 NILCORE_BINDIR=$HOME/.local/bin sh install.sh
+# Mirrors/tests may set NILCORE_RELEASE_BASE to a trusted directory or HTTPS base URL.
 set -eu
 
 REPO="RNT56/NilCore"
 BINDIR="${NILCORE_BINDIR:-/usr/local/bin}"
 VERSION="${NILCORE_VERSION:-latest}"
+RELEASE_BASE="${NILCORE_RELEASE_BASE:-}"
 
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$os" in
@@ -26,7 +28,9 @@ case "$arch" in
 esac
 
 asset="nilcore-${os}-${arch}"
-if [ "$VERSION" = "latest" ]; then
+if [ -n "$RELEASE_BASE" ]; then
+  base="${RELEASE_BASE%/}"
+elif [ "$VERSION" = "latest" ]; then
   base="https://github.com/${REPO}/releases/latest/download"
 else
   base="https://github.com/${REPO}/releases/download/${VERSION}"
@@ -52,6 +56,13 @@ curl -fsSL "$url" -o "$tmp"
 # FAIL CLOSED rather than install unverified.
 if curl -fsSL "$sumurl" -o "$sumtmp"; then
   expected="$(awk '{print $1}' "$sumtmp" | head -n1)"
+  if [ "${#expected}" -ne 64 ]; then
+    echo "error: invalid SHA-256 record for ${asset}" >&2
+    exit 1
+  fi
+  case "$expected" in
+    *[!0-9a-fA-F]*) echo "error: invalid SHA-256 record for ${asset}" >&2; exit 1 ;;
+  esac
   if command -v sha256sum >/dev/null 2>&1; then
     actual="$(sha256sum "$tmp" | awk '{print $1}')"
   elif command -v shasum >/dev/null 2>&1; then

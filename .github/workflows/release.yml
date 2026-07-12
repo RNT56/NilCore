@@ -48,16 +48,15 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Aggregate a signed-off checksums manifest
-        # One SHA256SUMS covering every binary, alongside the per-binary .sha256 files,
-        # so a consumer can verify the whole release set at once.
-        run: |
-          ( cd dist && sha256sum nilcore-* 2>/dev/null | grep -v '\.sha256$' > SHA256SUMS || true )
-          echo "--- SHA256SUMS ---"; cat dist/SHA256SUMS
+      - name: Verify assets and assemble the checksums manifest
+        # Refuse to publish a partial or corrupt release. The installer requires the
+        # per-binary records, and SHA256SUMS must cover exactly the four supported targets.
+        run: scripts/verify-release-assets.sh dist
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}

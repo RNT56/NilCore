@@ -11,6 +11,40 @@ permissions:
   contents: read
 
 jobs:
+  # The source can be correct while the compiler/runtime or a linked module carries a
+  # reachable vulnerability. Pin govulncheck and run it under the exact patch toolchain
+  # from go.mod so an old standard library cannot produce a fully-green release again.
+  # This is deliberately a separate lane: it consults the Go vulnerability database,
+  # while make verify remains fast and hermetic.
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Reachable vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  # Exercise the same curl/checksum/install path published in the README against a
+  # locally-built release asset. The script also proves missing and mismatched checksum
+  # records fail closed, so release-integrity regressions are caught before tagging.
+  installer:
+    name: release + installer integrity (local E2E)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build and verify the four-asset release set
+        run: bash test/release-assets-e2e.sh
+      - name: Verify and install a local release asset
+        run: bash test/install-e2e.sh
+
   verify:
     name: make verify
     runs-on: ubuntu-latest
