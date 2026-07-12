@@ -1,0 +1,33 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/custom/v1/chat/completions",
+    "auth": "api-key:<redacted>",
+    "body": {
+      "model": "local/fixture-model",
+      "max_tokens": 256,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a fixture."
+        },
+        {
+          "role": "user",
+          "content": "Return the fixture answer."
+        }
+      ]
+    }
+  },
+  "outcome": {
+    "text": "compat ready",
+    "stop_reason": "end_turn",
+    "served_model": "local/fixture-model",
+    "usage": {
+      "input_tokens": 12,
+      "output_tokens": 3
+    },
+    "content_types": [
+      "text"
+    ]
+  }
+}
