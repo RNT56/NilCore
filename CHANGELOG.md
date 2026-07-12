@@ -16,6 +16,8 @@ On a release, the maintainer moves the accumulated `[Unreleased]` entries into a
 
 ## [Unreleased]
 
+- **P15-completion-docs** — Reconcile the canonical task, provider-roadmap, and architecture docs after P15-T13: Phase 15 is complete, the hermetic golden eval is shipped, and the documented I7 boundary now matches the implemented native drop-on-decode plus client-side untrusted-data fence. _Owns:_ `docs/{TASKS,ROADMAP-PROVIDERS,ARCHITECTURE}.md`, `CHANGELOG.md`. _(Phase 15 documentation)_
+
 - **P15-T13** — Add a hermetic, golden-transcript provider compatibility evaluation covering custom OpenAI-compatible endpoints, reasoning token caps, strict JSON Schema output, OpenRouter routing/extras/attribution, native search rendering and drop-on-decode containment, plus injection-flagged and untrusted-data-fenced client search fallback. _Owns:_ `eval/provider-compat/`, `CHANGELOG.md`. _(Phase 15)_
 
 - **frontdoor-parity** — Centralize the native runtime capabilities shared by run/watch/resume/swarm, chat/TUI, and serve (advisor budget, repo orientation, proactive context window, live code intelligence, memory/lessons, and trusted steering) behind one configurator, with a constructor-level parity test across all three real builders so a one-door omission cannot ship inert again. _Owns:_ `cmd/nilcore/{native_runtime.go,native_runtime_test.go,chat.go,main.go}`, `CHANGELOG.md`. _(architecture hardening)_

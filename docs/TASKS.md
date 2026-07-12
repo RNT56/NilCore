@@ -144,7 +144,7 @@ Pick the lowest-ID task whose dependencies are all **Done** and whose `Owns` set
 
 > **First wave:** only `P0-T01` and `P0-T02` are eligible at the start, and `P0-T02` is solo (it may touch the whole tree to get the build green). Once `P0-T02` is Done, the tree opens up: `P0-T03`, `P1-T01`, `P2-T01`, `P2-T06`, `P4-T01` become eligible in parallel.
 
-> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** (full multi-agent concurrency) is **shipped** — dynamic-wave async dispatch, tracked in its own design doc (`docs/CONCURRENCY.md`). **Phase 9** (behavioral verification & event-driven autonomy, promoted from `docs/UPGRADE-PATH.md` Tier 1) is **shipped**. **Phase 10** (context depth, trusted steering & distribution, promoted from Tier 2) is **shipped**. **Phase 11** (verifier-backed artifact factory) is **shipped** (`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`). **Phase 12** (verified swarm mode — the bounded in-process `nilcore swarm` surface over the Phase-11 spine) is **shipped**, tracked in its own design doc (`docs/SWARM.md`). **Phase 13** (model-driven work-routing + earned multi-backend Trust-Ledger selection) is **shipped** (`[1.1.0]`). **Phase 14** (agentic browser use — `nilcore browse`) and **Phase CU** (desktop computer use — `nilcore desktop`, Path B + native Path A, plus the native-macOS host-control tier) are **shipped**, tracked in `docs/ROADMAP-BROWSER-USE.md` · `docs/ROADMAP-COMPUTER-USE.md` · `docs/ROADMAP-COMPUTER-USE-DARWIN.md`. **Phase 15** (OpenAI/OpenRouter/openai-compatible provider upgrade) is **shipped**, including the web-search wave (PR #65) (`docs/ROADMAP-PROVIDERS.md`); the one unbuilt task is **P15-T13** (the `eval/provider-compat/` eval coverage — no such directory exists), so a "completes Phase 15" claim is slightly ahead of reality. The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
+> **Later phases:** Phases 0–6 (56 tasks) shipped at `[0.1.0]`. **Phase 7** (portability — host-native namespace + Landlock sandbox) shipped; its specs are in the section below. **Phase 8** (full multi-agent concurrency) is **shipped** — dynamic-wave async dispatch, tracked in its own design doc (`docs/CONCURRENCY.md`). **Phase 9** (behavioral verification & event-driven autonomy, promoted from `docs/UPGRADE-PATH.md` Tier 1) is **shipped**. **Phase 10** (context depth, trusted steering & distribution, promoted from Tier 2) is **shipped**. **Phase 11** (verifier-backed artifact factory) is **shipped** (`docs/ROADMAP-EVIDENCE-ARTIFACTS.md`). **Phase 12** (verified swarm mode — the bounded in-process `nilcore swarm` surface over the Phase-11 spine) is **shipped**, tracked in its own design doc (`docs/SWARM.md`). **Phase 13** (model-driven work-routing + earned multi-backend Trust-Ledger selection) is **shipped** (`[1.1.0]`). **Phase 14** (agentic browser use — `nilcore browse`) and **Phase CU** (desktop computer use — `nilcore desktop`, Path B + native Path A, plus the native-macOS host-control tier) are **shipped**, tracked in `docs/ROADMAP-BROWSER-USE.md` · `docs/ROADMAP-COMPUTER-USE.md` · `docs/ROADMAP-COMPUTER-USE-DARWIN.md`. **Phase 15** (OpenAI/OpenRouter/openai-compatible provider upgrade) is **complete**, including the web-search wave (PR #65) and hermetic provider compatibility evals (P15-T13, PR #105) (`docs/ROADMAP-PROVIDERS.md`). The external-infrastructure tier (`EXT-01..08`) is registered under "External infrastructure — GATED" below — it is **not** eligible work and stays blocked behind the thesis gate in `docs/ROADMAP-EXTERNAL-INFRA.md` §0. `docs/UPGRADE-PATH.md` holds the deep rationale + file:line sourcing for Phases 9–10 and the gated tier.
 
 > **Deferred items D1–D4 shipped:** the four formerly-deferred items in `docs/IMPLEMENTATION-PLANS.md` are now implemented + merged — **D1** behavioral verification (sandboxed headless browser, the `browser_view` tool + the pure-Go `nilcore-browser` driver, composite verifier opt-in via `NILCORE_BROWSER_VERIFY`), **D2** semantic code search (content-hash-cached pure-Go HNSW, opt-in via `NILCORE_EMBED_KEY`), **D3** multi-language code intelligence (a language-parser seam + pure-Go, CGO-free Python, TS/JS, and Rust backends — not tree-sitter; the seam was broadened to four backends / nine extensions by R2), and **D4** the gated draft PR (`watch --open-pr` / `schedule --open-pr` via `internal/forge`, only after the human gate). All four are additive, opt-in, and pure stdlib — no new module was added (HNSW, the multi-language parser backends, the embedder, the browser driver incl. its pure-Go CDP client, and forge are all stdlib), so the core dependency count in the default binary stays at exactly **two** (pure-Go SQLite + `golang.org/x/sys`); the Charm TUI stack (3 modules) still links **only** under `make tui`. I6 holds; `CGO_ENABLED=0` across the release matrix. Invariants I1–I7 all hold unchanged.
 
@@ -878,8 +878,8 @@ design + feature matrix + rollout in [`docs/ROADMAP-PROVIDERS.md`](ROADMAP-PROVI
 > `Provider.Complete` signature and `backend.CodingBackend` are untouched; I3 keys via env-name/SecretStore,
 > per-request header only, never logged — and a compat endpoint must use a **dedicated `NILCORE_COMPAT_API_KEY`**
 > (a canonical vendor key on a compat BaseURL is rejected with a key-free error); I4 the client-side web search
-> stays sandboxed; I6 stdlib only; I7 provider-returned web-search citations are `guard.Wrap`'d untrusted DATA,
-> never a text block, never via `emitReasoning`.
+> stays sandboxed; I6 stdlib only; I7 raw provider server-tool result blocks are dropped at decode and never
+> re-enter the loop, while client-side search output is `guard.Wrap`'d untrusted DATA.
 
 | ID | Phase | Title | Depends on | Owns | Note |
 |---|---|---|---|---|---|
@@ -890,13 +890,13 @@ design + feature matrix + rollout in [`docs/ROADMAP-PROVIDERS.md`](ROADMAP-PROVI
 | P15-T05 | 15 | SOTA request fields + widened usage/model decode | P15-T01, P15-T03, P15-T04 | `internal/provider/openai.go` (+tests) | sole `openai.go` owner this wave |
 | P15-T06 | 15 | OpenRouter typed extras (routing, `models[]`, transforms, headers) | P15-T05 | `internal/provider/openrouter_extras.go` (+test) | |
 | P15-T07 | 15 | Web-search `BuiltinTool` variant + adapter render | P15-T05 | `internal/model/builtin.go`, `internal/provider/openai_websearch.go` (+tests) | needs `BuiltinTool` in `main` |
-| P15-T08 | 15 | I7 fence: `web_search_result` block + `guard.Wrap` + native.go handler | P15-T05, P15-T07 | `internal/model/model.go`, `internal/provider/openai.go`, `internal/backend/native.go` (+tests) | solo wave |
+| P15-T08 | 15 | I7 fence: drop native server-tool result blocks at decode | P15-T05, P15-T07 | `internal/provider/anthropic.go` (+tests) | solo wave; shipped shape |
 | P15-T09 | 15 | Exactly-one-web-tool capability switch | P15-T07, P15-T08 | `cmd/nilcore/webcap.go` (+test) | mutual-exclusion dispatch invariant |
 | P15-T10 | 15 | Onboarding config + wizard for compat vendor | P15-T02 | `internal/onboard/` (+tests) | |
 | P15-T11 | 15 | Metering/pricing for new ids + authoritative `usage.cost` | P15-T03 | `internal/meter/pricer.go` (+test) | |
 | P15-T12 | 15 | Egress allowlist extensibility (sandbox only) | — | `internal/policy/egress.go` (+test) | small; ∥ Wave 1 |
 | P15-T13 | 15 | Eval coverage (compat, reasoning, structured, native search) | P15-T06, P15-T08, P15-T09 | `eval/provider-compat/` | hermetic httptest fixtures |
-| P15-T14 | 15 | Docs: PREREQUISITES + ARCHITECTURE + TASKS specs | P15-T02, P15-T03, P15-T06, P15-T08, P15-T09, P15-T10, P15-T11, P15-T12 | `docs/PREREQUISITES.md`, `docs/ARCHITECTURE.md`, `docs/TASKS.md` | **contract**, serialised, last |
+| P15-T14 | 15 | Docs: PREREQUISITES + ARCHITECTURE + TASKS specs | P15-T02, P15-T03, P15-T06, P15-T08, P15-T09, P15-T10, P15-T11, P15-T12, P15-T13 | `docs/PREREQUISITES.md`, `docs/ARCHITECTURE.md`, `docs/TASKS.md` | **contract**, serialised, last |
 
 **Waves (Owns disjoint within each; deps in strictly earlier waves):**
 W1 `T01·T03·T12` → W2 `T02·T04` → W3 `T05` → W4 `T06·T07·T10·T11` → W5 `T08` → W6 `T09` → W7 `T13` → W8 `T14`.
@@ -944,10 +944,12 @@ search-capable models only). `TestNormalToolByteIdentical` covers nil-Builtin AN
 **Depends on the `model.BuiltinTool` seam being in `main`.** `make verify` green.
 **Status (shipped, #65):** the feature landed but **not** as the planned standalone `internal/provider/openai_websearch.go` — that source file does **not** exist. The adapter render lives in `internal/provider/openai.go` (`splitWebSearch` + the `web_search_options` request field) atop the `model.BuiltinTool` seam in `internal/model/builtin.go`; only `internal/provider/openai_websearch_test.go` carries the `openai_websearch` name. The `Owns` path above is the plan artifact, not a shipped-file guarantee.
 
-### P15-T08 — I7 fence: `web_search_result` block + `guard.Wrap` at decode + native.go re-entry
-Additive `Block{Type:"web_search_result"}` carrying the `guard.Wrap`'d citation payload; decoders never produce a text
-block from citations; `native.go` runs `guard.Suspicious` + `injection_flagged` and appends as fenced DATA only (never
-via `emitReasoning`; `textBlocks` drops it). No double-fence. Injection-string fixture proves it. `make verify` green.
+### P15-T08 — I7 fence: drop native server-tool result blocks at decode
+**Status (shipped, #65):** the originally planned `Block{Type:"web_search_result"}` and native-loop handler were
+not built. The Anthropic adapter tolerantly decodes and drops `server_tool_use` / `web_search_tool_result` blocks,
+preserving only the model's synthesized text (or a fixed body-free marker for a server-tool-only pause turn). Raw
+provider result content therefore never re-enters conversation history. Client-side search remains independently
+`guard.Wrap`-fenced. The injection fixture in `eval/provider-compat/` pins both boundaries. `make verify` green.
 
 ### P15-T09 — Exactly-one-web-tool capability switch
 `resolveWeb` in cmd selects exactly one path: native (server-side `BuiltinTool`, citations) or the sandboxed client-side
@@ -972,13 +974,16 @@ egress edit). `make verify` green.
 
 ### P15-T13 — Eval coverage for compat endpoints, reasoning, structured output, native search
 `eval/provider-compat/` fixtures exercise a generic compat endpoint, `max_completion_tokens` reasoning model,
-`json_schema` output, OpenRouter extras, and the native web-search-result fence (assert `injection_flagged` + fenced
-data end-to-end). Per-provider `httptest.Server`, golden fixtures, no network. `make verify` green. **Status: NOT built** — no `eval/provider-compat/` directory exists (`eval/` has only `browse`, `desktop`, `self`). Phase-15 web search itself shipped (#65); this eval-coverage task did not, so any "completes Phase 15" claim overstates it until P15-T13 lands.
+`json_schema` output, OpenRouter extras, and both web-search safety paths. Per-provider `httptest.Server`, golden
+transcripts, no network. The native fixture proves an injected raw server-tool result is detected by the audit
+predicate and absent from model-visible content; the client fallback proves the same payload remains inside an
+escaped `guard.Wrap` fence. The suite also rejects duplicate token-cap keys and secret-bearing goldens.
+**Status (shipped, #105):** `make verify`, repeated race runs, lint, TUI verification, and vulnerability scanning green.
 
 ### P15-T14 — Docs: PREREQUISITES + ARCHITECTURE providers section + Phase-15 specs (contract, serialised)
 `PREREQUISITES.md` documents the dedicated compat key-env (hard requirement), auth schemes, BaseURL-as-full-prefix,
 tool/vision as per-model capability flags, and egress-governs-sandbox-not-host. `ARCHITECTURE.md` providers section
-reflects the new vendor, the web-search `BuiltinTool` variant, the `web_search_result` fenced block, and the
+reflects the new vendor, the web-search `BuiltinTool` variant, the native drop-on-decode/client-fence boundary, and the
 `model.APIError`/resilience semantics (consistent with T03). `docs/TASKS.md` Phase-15 specs finalised. `make verify` green.
 
 ---
