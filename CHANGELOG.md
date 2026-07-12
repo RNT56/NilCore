@@ -30,6 +30,8 @@ the distribution gap: patched Go and system dependencies, reachable-vulnerabilit
 fail-closed checksums and installer tests, complete four-platform asset verification, and version
 identity stamped and executed before publication.
 
+- **ci-node24-actions** — Move the CI and release workflows to the current Node 24 action majors (`checkout@v7`, `setup-go@v6`, `upload-artifact@v7`, `download-artifact@v8`, `golangci-lint-action@v9`), eliminating the runner's forced Node 20 compatibility shims before v1.2.0. _Owns:_ `.github/workflows/{ci,release}.yml`, `CHANGELOG.md`. _(CI maintenance)_
+
 - **release-v1.2.0** — Cut the v1.2.0 changelog boundary, refresh the public release/reference metrics from the live tree, and record the fully gated release baseline; tag publication remains a separately approved irreversible action. _Owns:_ `CHANGELOG.md`, `README.md`, `STATE.md`, `docs/REFERENCE.md`. _(release)_
 
 - **release-version-stamp** — Stamp validated version tags into every release binary, execute the native matrix asset to prove `nilcore version` matches the tag, and refuse malformed release refs before publication; the release E2E now verifies identity as well as checksums and completeness. _Owns:_ `.github/workflows/release.yml`, `test/release-assets-e2e.sh`, `CHANGELOG.md`. _(release hardening)_
