@@ -1,7 +1,7 @@
 # STATE.md — NilCore state snapshot
 
-> **Point-in-time snapshot, 2026-07-12** (`origin/main` after the merged
-> features-completeness review #101 and adversarial remediation #100). This is a
+> **Point-in-time snapshot, 2026-07-12** (v1.2.0 release baseline at `origin/main`
+> after provider completion #105–#106 and release identity hardening #107). This is a
 > derived report, not a contract. The sources of truth remain the mirrored
 > `AGENTS.md` / `CLAUDE.md` constitutions, `docs/ARCHITECTURE.md` (technical law +
 > invariants), and `CHANGELOG.md` (the ledger). Where this file and those disagree,
@@ -26,9 +26,9 @@ the audit trail.
 
 | Metric | Value |
 |---|---|
-| Non-test Go | **~89.8K LOC** across **375 files** |
-| Test Go | **~87.7K LOC** across **406 files** (≈0.98 test:code ratio) |
-| Go packages | **120** total (`go list ./...`); **111** under `internal/` |
+| Non-test Go | **~91.8K LOC** across **382 files** |
+| Test Go | **~91.1K LOC** across **420 files** (≈0.99 test:code ratio) |
+| Go packages | **121** total (`go list ./...`); **111** under `internal/` |
 | Direct module deps | **3 sanctioned families** (5 direct requires) — `modernc.org/sqlite`, `golang.org/x/sys`, Charm TUI (`bubbletea`/`bubbles`/`lipgloss`, behind `//go:build tui`) |
 | `CGO_ENABLED` | **0** (pure-Go; cross-compiles cleanly) |
 | Gate | `make verify` (build + vet + lint + test) — green. Race, TUI, sandbox, browser E2E, `govulncheck`, and installer-integrity proofs are separate CI lanes. |
